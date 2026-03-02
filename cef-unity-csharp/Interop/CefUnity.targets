@@ -1,0 +1,10 @@
+<Project>
+    <PropertyGroup>
+        <_CefRustTargetDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\cef-unity-rust\target\debug'))</_CefRustTargetDir>
+    </PropertyGroup>
+
+    <Target Name="LinkCefFramework" AfterTargets="Build"
+            Condition="!Exists('$(OutputPath)Chromium Embedded Framework.framework')">
+        <Exec Command="ln -s `ls -dt &quot;$(_CefRustTargetDir)&quot;/build/cef-dll-sys-*/out/cef_macos_aarch64 | head -1`/&quot;Chromium Embedded Framework.framework&quot; &quot;$(OutputPath)Chromium Embedded Framework.framework&quot;" />
+    </Target>
+</Project>
