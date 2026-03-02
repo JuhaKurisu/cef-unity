@@ -125,7 +125,15 @@ fn main() {
     browser_host_create_browser(
         Some(&window_info),
         Some(&mut client),
-        Some(&CefString::from("https://www.google.com")),
+        Some(&CefString::from(
+            format!(
+                "file://{}",
+                std::fs::canonicalize("test_alpha.html")
+                    .expect("test_alpha.html not found")
+                    .display()
+            )
+            .as_str(),
+        )),
         Some(&BrowserSettings {
             background_color: 0x00000000,
             ..Default::default()
