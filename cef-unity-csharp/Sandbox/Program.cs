@@ -2,7 +2,7 @@ using Interop;
 
 CefRuntime.Init();
 
-using (var browser = new Browser(1920, 1080, "https://example.com"))
+using (var browser = new Browser(1920, 1080, "https://google.com"))
 {
     for (var i = 0; i < 10000; i++)
     {
@@ -29,7 +29,7 @@ using (var browser = new Browser(1920, 1080, "https://example.com"))
             sw.Flush();
             fs.Write(rgb);
 
-            Console.WriteLine("Saved output.ppm");
+            Console.WriteLine($"Saved {outPath}");
             CefRuntime.Shutdown();
             return;
         }
