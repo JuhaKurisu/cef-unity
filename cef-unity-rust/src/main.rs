@@ -52,6 +52,21 @@ wrap_render_handler! {
     }
 }
 
+wrap_app! {
+    struct MyApp;
+    impl App {
+        fn on_before_command_line_processing(
+            &self,
+            _process_type: Option<&CefString>,
+            command_line: Option<&mut CommandLine>,
+        ) {
+            if let Some(cl) = command_line {
+                cl.append_switch(Some(&CefString::from("use-mock-keychain")));
+            }
+        }
+    }
+}
+
 wrap_life_span_handler! {
     struct MyLifeSpanHandler;
     impl LifeSpanHandler {
@@ -108,11 +123,12 @@ fn main() {
         settings.locales_dir_path = CefString::from(locales_dir.to_str().unwrap());
     }
 
+    let mut app = MyApp::new();
     assert_ne!(
         initialize(
             Some(args.as_main_args()),
             Some(&settings),
-            None,
+            Some(&mut app),
             std::ptr::null_mut()
         ),
         0
