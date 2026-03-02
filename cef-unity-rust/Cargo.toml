@@ -1,0 +1,16 @@
+[package]
+name = "cef-unity-rust"
+version = "0.1.0"
+edition = "2024"
+default-run = "cef-unity-rust"
+
+[[bin]]
+name = "cef-unity-rust"
+path = "src/main.rs"
+
+[[bin]]
+name = "cef-unity-rust-helper"
+path = "src/helper.rs"
+
+[dependencies]
+cef = "145.5.0"
