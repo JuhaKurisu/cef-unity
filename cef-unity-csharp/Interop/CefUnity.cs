@@ -111,6 +111,23 @@ public sealed class Browser : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
     }
 
+    /// <summary>
+    /// BGRA バッファを RGBA に変換してコピーする。
+    /// </summary>
+    public static void ConvertBgraToRgba(ReadOnlySpan<byte> bgra, Span<byte> rgba)
+    {
+        if (bgra.Length != rgba.Length)
+            throw new ArgumentException("bgra and rgba must have the same length");
+
+        for (var i = 0; i < bgra.Length; i += 4)
+        {
+            rgba[i]     = bgra[i + 2]; // R <- B
+            rgba[i + 1] = bgra[i + 1]; // G
+            rgba[i + 2] = bgra[i];     // B <- R
+            rgba[i + 3] = bgra[i + 3]; // A
+        }
+    }
+
     private static byte[] ToUtf8Null(string s)
     {
         var bytes = new byte[Encoding.UTF8.GetByteCount(s) + 1];
