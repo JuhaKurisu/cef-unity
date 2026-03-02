@@ -2,6 +2,7 @@ use cef::*;
 use std::ffi::{CStr, c_char};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 
 // ---------------------------------------------------------------------------
 // Opaque handle type (becomes IntPtr in C#)
@@ -50,6 +51,7 @@ fn handle_to_ref<'a>(handle: *mut CefUnityBrowser) -> &'a mut BrowserInstance {
 // ---------------------------------------------------------------------------
 
 static CEF_INITIALIZED: OnceLock<bool> = OnceLock::new();
+static CEF_THREAD: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -116,6 +118,7 @@ wrap_app! {
         ) {
             if let Some(cl) = command_line {
                 cl.append_switch(Some(&CefString::from("use-mock-keychain")));
+                cl.append_switch(Some(&CefString::from("single-process")));
             }
         }
     }
@@ -142,6 +145,9 @@ wrap_client! {
 
 /// Initialize the CEF framework. Call once at app startup.
 /// Returns 0 on success, non-zero on failure.
+///
+/// CEF is initialized on a dedicated background thread to avoid conflicting
+/// with Unity's NSApplication run loop on macOS.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_init() -> i32 {
     if CEF_INITIALIZED.get().is_some() {
@@ -150,10 +156,22 @@ pub extern "C" fn cef_unity_init() -> i32 {
 
     // Resolve all paths relative to the dylib's directory
     let plugin_dir = crate::dylib_dir();
-    crate::load_cef(&plugin_dir);
-    let args = cef::args::Args::new();
+    eprintln!("[cef-unity] plugin_dir = {}", plugin_dir.display());
 
-    let framework_dir = plugin_dir.join("Chromium Embedded Framework.framework");
+    let framework_dir = match crate::find_cef_framework(&plugin_dir) {
+        Some(fw) => fw,
+        None => {
+            eprintln!(
+                "[cef-unity] CEF framework not found in {} or CEF_PATH",
+                plugin_dir.display()
+            );
+            return -3;
+        }
+    };
+    eprintln!("[cef-unity] framework_dir = {}", framework_dir.display());
+
+    // Load the CEF dynamic library (dlopen + api_hash)
+    crate::load_cef(&framework_dir);
 
     // Symlink GPU libraries next to the dylib
     let libraries_dir = framework_dir.join("Libraries");
@@ -167,50 +185,94 @@ pub extern "C" fn cef_unity_init() -> i32 {
         }
     }
 
-    let resources_dir = framework_dir.join("Resources");
-    let mut settings = Settings::default();
-    settings.no_sandbox = 1;
-    settings.windowless_rendering_enabled = 1;
-    settings.external_message_pump = 1;
-    settings.framework_dir_path = CefString::from(framework_dir.to_str().unwrap());
-    settings.browser_subprocess_path =
-        CefString::from(plugin_dir.join("cef-unity-rust-helper").to_str().unwrap());
-    settings.resources_dir_path = CefString::from(resources_dir.to_str().unwrap());
-    let locales_dir = resources_dir.join("locales");
-    if locales_dir.exists() {
-        settings.locales_dir_path = CefString::from(locales_dir.to_str().unwrap());
-    }
+    // Spawn a dedicated thread for CEF initialization + message loop.
+    // This avoids conflicting with Unity's main-thread NSApplication run loop.
+    let fw_dir = framework_dir.clone();
+    let p_dir = plugin_dir.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
 
-    let mut app = MyApp::new();
-    let result = initialize(
-        Some(args.as_main_args()),
-        Some(&settings),
-        Some(&mut app),
-        std::ptr::null_mut(),
-    );
+    let handle = thread::Builder::new()
+        .name("cef-message-loop".into())
+        .spawn(move || {
+            let args = cef::args::Args::new();
+            let resources_dir = fw_dir.join("Resources");
+
+            let mut settings = Settings::default();
+            settings.no_sandbox = 1;
+            settings.windowless_rendering_enabled = 1;
+            // Default message loop: CEF runs its own CFRunLoop on this thread.
+            // (no external_message_pump, no multi_threaded_message_loop)
+            settings.framework_dir_path = CefString::from(fw_dir.to_str().unwrap());
+            settings.browser_subprocess_path =
+                CefString::from(p_dir.join("cef-unity-rust-helper").to_str().unwrap());
+            settings.resources_dir_path = CefString::from(resources_dir.to_str().unwrap());
+            let locales_dir = resources_dir.join("locales");
+            if locales_dir.exists() {
+                settings.locales_dir_path = CefString::from(locales_dir.to_str().unwrap());
+            }
+
+            let mut app = MyApp::new();
+            let result = initialize(
+                Some(args.as_main_args()),
+                Some(&settings),
+                Some(&mut app),
+                std::ptr::null_mut(),
+            );
+
+            let _ = tx.send(result);
+
+            if result != 0 {
+                eprintln!("[cef-unity] CEF message loop starting on background thread");
+                run_message_loop();
+                eprintln!("[cef-unity] CEF message loop ended, calling shutdown");
+                shutdown();
+                eprintln!("[cef-unity] CEF shutdown complete");
+            } else {
+                eprintln!("[cef-unity] initialize() returned 0 (failure)");
+            }
+        })
+        .expect("failed to spawn CEF thread");
+
+    let result = match rx.recv() {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("[cef-unity] CEF thread died before sending result");
+            return -4;
+        }
+    };
 
     if result == 0 {
-        return -2; // initialize failed
+        eprintln!("[cef-unity] initialize() failed");
+        return -2;
     }
 
+    let _ = CEF_THREAD.set(Mutex::new(Some(handle)));
     let _ = CEF_INITIALIZED.set(true);
+    eprintln!("[cef-unity] initialization successful");
     0
 }
 
 /// Pump the CEF message loop for one iteration.
-/// Call from Unity's Update() every frame.
+/// CEF runs its own message loop on a dedicated background thread,
+/// so this is a no-op. Kept for API compatibility.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_tick() {
-    if CEF_INITIALIZED.get().is_some() {
-        do_message_loop_work();
-    }
+    // CEF message loop runs on its own dedicated thread.
 }
 
 /// Shut down the CEF framework. Call once at app exit.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_shutdown() {
     if CEF_INITIALIZED.get().is_some() {
-        shutdown();
+        eprintln!("[cef-unity] requesting CEF message loop quit");
+        quit_message_loop();
+        // Wait for the CEF thread to finish (it calls shutdown() internally)
+        if let Some(mutex) = CEF_THREAD.get() {
+            if let Some(handle) = mutex.lock().unwrap().take() {
+                let _ = handle.join();
+            }
+        }
+        eprintln!("[cef-unity] shutdown complete");
     }
 }
 
