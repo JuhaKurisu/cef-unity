@@ -14,3 +14,4 @@ path = "src/helper.rs"
 
 [dependencies]
 cef = "145.5.0"
+image = "0.25"
