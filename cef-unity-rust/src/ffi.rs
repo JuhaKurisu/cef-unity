@@ -148,19 +148,19 @@ pub extern "C" fn cef_unity_init() -> i32 {
         return -1; // already initialized
     }
 
-    let cef_dir = crate::load_cef();
+    // Resolve all paths relative to the dylib's directory
+    let plugin_dir = crate::dylib_dir();
+    crate::load_cef(&plugin_dir);
     let args = cef::args::Args::new();
 
-    let framework_dir = cef_dir.join("Chromium Embedded Framework.framework");
-    let exe_dir = std::env::current_exe().unwrap();
-    let exe_dir = exe_dir.parent().unwrap();
+    let framework_dir = plugin_dir.join("Chromium Embedded Framework.framework");
 
-    // Symlink GPU libraries next to the executable
+    // Symlink GPU libraries next to the dylib
     let libraries_dir = framework_dir.join("Libraries");
     if libraries_dir.exists() {
         for lib in &["libGLESv2.dylib", "libEGL.dylib"] {
             let src = libraries_dir.join(lib);
-            let dst = exe_dir.join(lib);
+            let dst = plugin_dir.join(lib);
             if src.exists() && !dst.exists() {
                 let _ = std::os::unix::fs::symlink(&src, &dst);
             }
@@ -174,7 +174,7 @@ pub extern "C" fn cef_unity_init() -> i32 {
     settings.external_message_pump = 1;
     settings.framework_dir_path = CefString::from(framework_dir.to_str().unwrap());
     settings.browser_subprocess_path =
-        CefString::from(exe_dir.join("cef-unity-rust-helper").to_str().unwrap());
+        CefString::from(plugin_dir.join("cef-unity-rust-helper").to_str().unwrap());
     settings.resources_dir_path = CefString::from(resources_dir.to_str().unwrap());
     let locales_dir = resources_dir.join("locales");
     if locales_dir.exists() {
