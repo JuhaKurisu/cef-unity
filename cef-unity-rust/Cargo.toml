@@ -2,11 +2,9 @@
 name = "cef-unity-rust"
 version = "0.1.0"
 edition = "2024"
-default-run = "cef-unity-rust"
 
-[[bin]]
-name = "cef-unity-rust"
-path = "src/main.rs"
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "cef-unity-rust-helper"
@@ -14,4 +12,6 @@ path = "src/helper.rs"
 
 [dependencies]
 cef = "145.5.0"
-image = "0.25"
+
+[build-dependencies]
+csbindgen = "1.9"
