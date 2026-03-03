@@ -16,6 +16,11 @@ public static class CefRuntime
     {
         NativeMethods.cef_unity_shutdown();
     }
+
+    public static void Pump()
+    {
+        NativeMethods.cef_unity_pump();
+    }
 }
 
 public sealed class Browser : IDisposable

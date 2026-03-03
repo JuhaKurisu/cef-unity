@@ -13,4 +13,14 @@ fn main() {
             .generate_csharp_file(dest)
             .unwrap();
     }
+
+    // Compile the Objective-C helper for CefAppProtocol injection (macOS only)
+    #[cfg(target_os = "macos")]
+    {
+        cc::Build::new()
+            .file("src/cef_app_inject.m")
+            .flag("-fobjc-arc")
+            .compile("cef_app_inject");
+        println!("cargo:rustc-link-lib=framework=AppKit");
+    }
 }

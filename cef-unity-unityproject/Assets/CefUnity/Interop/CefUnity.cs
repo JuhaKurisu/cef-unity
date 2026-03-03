@@ -17,6 +17,14 @@ namespace CefUnity.Interop
         {
             NativeMethods.cef_unity_shutdown();
         }
+
+        /// <summary>
+        /// CEF メッセージループを駆動する。毎フレーム、メインスレッドから呼ぶこと。
+        /// </summary>
+        public static void Pump()
+        {
+            NativeMethods.cef_unity_pump();
+        }
     }
 
     public sealed class Browser : IDisposable

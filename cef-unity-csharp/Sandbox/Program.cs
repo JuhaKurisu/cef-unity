@@ -2,10 +2,11 @@ using Interop;
 
 CefRuntime.Init();
 
-using (var browser = new Browser(1920, 1080, "data:text/html,<h1>Hello CEF</h1>"))
+using (var browser = new Browser(1920, 1080, "google.com"))
 {
     for (var i = 0; i < 60000; i++)
     {
+        CefRuntime.Pump();
         Thread.Sleep(100);
         if (browser.TryGetBuffer(out var bgra, out var w, out var h))
         {

@@ -19,6 +19,7 @@ public class SampleScript : MonoBehaviour
         {
             CefRuntime.Init();
             _browser = new Browser(_width, _height, _url);
+            Debug.Log("[CefUnity] Initialized");
         }
         catch (Exception e)
         {
@@ -28,12 +29,11 @@ public class SampleScript : MonoBehaviour
 
     private void Update()
     {
+        CefRuntime.Pump();
+
         if (_browser == null) return;
         if (!_browser.TryGetBuffer(out var buffer, out var w, out var h))
-        {
-            Debug.LogError("failed");
             return;
-        }
 
         if (w <= 0 || h <= 0) return;
 
@@ -59,5 +59,6 @@ public class SampleScript : MonoBehaviour
         _browser?.Dispose();
         _browser = null;
         CefRuntime.Shutdown();
+        Debug.Log("[CefUnity] Shutdown");
     }
 }

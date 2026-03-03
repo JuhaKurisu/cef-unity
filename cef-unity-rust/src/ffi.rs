@@ -144,20 +144,31 @@ wrap_client! {
 // Global functions – CEF framework lifecycle
 // ---------------------------------------------------------------------------
 
+unsafe extern "C" {
+    // Defined in cef_app_inject.m
+    fn cef_unity_inject_app_protocol();
+    // Defined in cef_app_inject.m – wraps a function call in @try/@catch
+    fn cef_unity_safe_pump(pump_fn: extern "C" fn());
+}
+
+extern "C" fn do_pump() {
+    do_message_loop_work();
+}
+
 /// Initialize the CEF framework. Call once at app startup.
 /// Returns 0 on success, non-zero on failure.
 ///
-/// CEF is initialized on a dedicated background thread with external_message_pump
-/// to prevent CEF from hooking into the host application's main-thread CFRunLoop.
-/// This avoids the ChromeWebAppShortcutCopierMain crash on macOS.
+/// CEF is initialized on a dedicated background thread. The message pump
+/// runs on that thread with ObjC exception handling to survive the
+/// ChromeWebAppShortcutCopierMain → NSWindow crash.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_init() -> i32 {
-    // CEF cannot be re-initialized after shutdown in the same process.
-    // On subsequent calls (Unity Play/Stop cycles), just ensure the
-    // pump thread is running.
     if CEF_INITIALIZED.load(Ordering::SeqCst) {
         return 0;
     }
+
+    // macOS: NSApplication に CefAppProtocol を注入する。
+    unsafe { cef_unity_inject_app_protocol(); }
 
     let plugin_dir = crate::dylib_dir();
     eprintln!("[cef-unity] plugin_dir = {}", plugin_dir.display());
@@ -188,8 +199,6 @@ pub extern "C" fn cef_unity_init() -> i32 {
         }
     }
 
-    // Spawn a dedicated CEF thread that initializes and then pumps messages.
-    // do_message_loop_work() must be called on the same thread as initialize().
     let fw_dir = framework_dir.clone();
     let p_dir = plugin_dir.clone();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -200,14 +209,9 @@ pub extern "C" fn cef_unity_init() -> i32 {
             let args = cef::args::Args::new();
             let resources_dir = fw_dir.join("Resources");
 
-            // ヘルパーバイナリのパス: .appバンドルがあればそちらを使う。
-            // .appバンドル内のInfo.plistでCFBundleIdentifierを親プロセスに合わせることで
-            // MachPortRendezvousServerのサービス名が一致する。
             let helper_app = p_dir.join("cef-unity-rust-helper.app/Contents/MacOS/cef-unity-rust-helper");
             let helper_bare = p_dir.join("cef-unity-rust-helper");
             let helper_path = if helper_app.exists() { helper_app } else { helper_bare };
-
-            let cache_dir = p_dir.join("cef_cache");
 
             let mut settings = Settings::default();
             settings.no_sandbox = 1;
@@ -216,7 +220,6 @@ pub extern "C" fn cef_unity_init() -> i32 {
             settings.framework_dir_path = CefString::from(fw_dir.to_str().unwrap());
             settings.browser_subprocess_path = CefString::from(helper_path.to_str().unwrap());
             settings.resources_dir_path = CefString::from(resources_dir.to_str().unwrap());
-            settings.root_cache_path = CefString::from(cache_dir.to_str().unwrap());
             let locales_dir = resources_dir.join("locales");
             if locales_dir.exists() {
                 settings.locales_dir_path = CefString::from(locales_dir.to_str().unwrap());
@@ -233,9 +236,11 @@ pub extern "C" fn cef_unity_init() -> i32 {
             let _ = tx.send(result);
 
             if result != 0 {
-                // Pump messages forever on this thread (CEF cannot re-initialize)
+                // Pump messages forever on this thread.
+                // cef_unity_safe_pump() wraps do_message_loop_work() in @try/@catch
+                // to survive the ChromeWebAppShortcutCopierMain ObjC exception.
                 loop {
-                    do_message_loop_work();
+                    unsafe { cef_unity_safe_pump(do_pump); }
                     thread::sleep(std::time::Duration::from_millis(16));
                 }
             }
@@ -258,6 +263,12 @@ pub extern "C" fn cef_unity_init() -> i32 {
     CEF_INITIALIZED.store(true, Ordering::SeqCst);
     0
 }
+
+/// No-op kept for C# API compatibility. The background thread pumps
+/// automatically.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_pump() {}
+
 
 /// No-op. The CEF UI thread runs for the lifetime of the process because
 /// CEF cannot be re-initialized after shutdown.

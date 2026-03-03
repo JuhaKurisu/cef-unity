@@ -34,6 +34,8 @@ cat > "$HELPER_APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+# Unity が .app 内に .meta ファイルを作るので codesign 前に削除
+find "$HELPER_APP" -name '*.meta' -delete
 codesign -s - --force "$HELPER_APP"
 
 # メインバンドル不要 (main_bundle_pathは設定しない)

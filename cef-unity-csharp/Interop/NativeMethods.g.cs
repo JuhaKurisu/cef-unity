@@ -22,12 +22,19 @@ namespace CefUnity
         ///  Initialize the CEF framework. Call once at app startup.
         ///  Returns 0 on success, non-zero on failure.
         ///
-        ///  CEF is initialized on a dedicated background thread with external_message_pump
-        ///  to prevent CEF from hooking into the host application's main-thread CFRunLoop.
-        ///  This avoids the ChromeWebAppShortcutCopierMain crash on macOS.
+        ///  CEF is initialized on a dedicated background thread. The message pump
+        ///  runs on that thread with ObjC exception handling to survive the
+        ///  ChromeWebAppShortcutCopierMain → NSWindow crash.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_init", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern int cef_unity_init();
+
+        /// <summary>
+        ///  No-op kept for C# API compatibility. The background thread pumps
+        ///  automatically.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_pump", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_pump();
 
         /// <summary>
         ///  No-op. The CEF UI thread runs for the lifetime of the process because
