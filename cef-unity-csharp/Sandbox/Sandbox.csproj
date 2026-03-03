@@ -5,10 +5,16 @@
         <TargetFramework>net10.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
+        <RustProjectDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\cef-unity-rust'))</RustProjectDir>
     </PropertyGroup>
 
     <ItemGroup>
       <ProjectReference Include="..\Interop\Interop.csproj" />
     </ItemGroup>
+
+    <!-- Build cef-unity-server.app bundle in Sandbox output directory -->
+    <Target Name="CopyServerApp" AfterTargets="Build">
+        <Exec Command="bash '$(RustProjectDir)/build-server-sandbox.sh' '$(OutputPath)'" />
+    </Target>
 
 </Project>

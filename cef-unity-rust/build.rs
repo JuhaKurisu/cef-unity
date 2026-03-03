@@ -14,7 +14,8 @@ fn main() {
             .unwrap();
     }
 
-    // Compile the Objective-C helper for CefAppProtocol injection (macOS only)
+    // Compile the Objective-C helper for CefAppProtocol injection (macOS only).
+    // Used by the server binary (linked into rlib/cdylib).
     #[cfg(target_os = "macos")]
     {
         cc::Build::new()

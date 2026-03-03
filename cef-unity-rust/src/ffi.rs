@@ -1,8 +1,15 @@
-use cef::*;
+// FFI layer for Unity C# interop.
+//
+// This is now a pure IPC client — no CEF dependency.
+// Communicates with cef-unity-server via Unix domain socket + shared memory.
+
 use std::ffi::{CStr, c_char};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+
+use crate::ipc::{self, Command, Response, ShmReader};
 
 // ---------------------------------------------------------------------------
 // Opaque handle type (becomes IntPtr in C#)
@@ -14,45 +21,35 @@ pub struct CefUnityBrowser {
 }
 
 // ---------------------------------------------------------------------------
-// Shared state between CEF thread and Unity main thread
+// Per-browser client state
 // ---------------------------------------------------------------------------
 
-struct BackBuffer {
-    data: Vec<u8>,
-    width: i32,
-    height: i32,
-    has_new_frame: bool,
-}
-
-struct SharedState {
-    buffer: Mutex<BackBuffer>,
-    browser: Arc<Mutex<Option<Browser>>>,
-    viewport_w: AtomicI32,
-    viewport_h: AtomicI32,
-}
-
-// ---------------------------------------------------------------------------
-// Browser instance (the real data behind the opaque handle)
-// ---------------------------------------------------------------------------
-
-struct BrowserInstance {
-    shared: Arc<SharedState>,
+struct ClientBrowserInstance {
+    browser_id: u32,
+    shm: ShmReader,
     front: Vec<u8>,
     front_w: i32,
     front_h: i32,
 }
 
-fn handle_to_ref<'a>(handle: *mut CefUnityBrowser) -> &'a mut BrowserInstance {
-    unsafe { &mut *(handle as *mut BrowserInstance) }
+fn handle_to_ref<'a>(handle: *mut CefUnityBrowser) -> &'a mut ClientBrowserInstance {
+    unsafe { &mut *(handle as *mut ClientBrowserInstance) }
 }
 
 // ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
 
-static CEF_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static PAINT_COUNT: AtomicU64 = AtomicU64::new(0);
 static PUMP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+struct ServerConnection {
+    stream: UnixStream,
+    socket_path: String,
+}
+
+static CONNECTION: Mutex<Option<ServerConnection>> = Mutex::new(None);
 
 fn log_to_file(msg: &str) {
     let path = std::env::temp_dir().join("cef_unity_debug.log");
@@ -62,284 +59,208 @@ fn log_to_file(msg: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Handlers
+// IPC helpers
 // ---------------------------------------------------------------------------
 
-wrap_render_handler! {
-    struct MyRenderHandler {
-        shared: Arc<SharedState>,
-    }
-    impl RenderHandler {
-        fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
-            let w = self.shared.viewport_w.load(Ordering::Relaxed);
-            let h = self.shared.viewport_h.load(Ordering::Relaxed);
-            if let Some(rect) = rect {
-                rect.x = 0;
-                rect.y = 0;
-                rect.width = w;
-                rect.height = h;
-            }
-        }
-
-        fn on_paint(
-            &self,
-            _browser: Option<&mut Browser>,
-            type_: PaintElementType,
-            _dirty_rects: Option<&[Rect]>,
-            buffer: *const u8,
-            width: ::std::os::raw::c_int,
-            height: ::std::os::raw::c_int,
-        ) {
-            let count = PAINT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            if count <= 5 || count % 100 == 0 {
-                log_to_file(&format!("on_paint #{}: {}x{}", count, width, height));
-            }
-            if type_.get_raw() != PaintElementType::VIEW.get_raw() {
-                return;
-            }
-            let size = (width * height * 4) as usize;
-            let src = unsafe { std::slice::from_raw_parts(buffer, size) };
-            let mut back = self.shared.buffer.lock().unwrap();
-            back.data.resize(size, 0);
-            back.data.copy_from_slice(src);
-            back.width = width;
-            back.height = height;
-            back.has_new_frame = true;
-        }
-    }
-}
-
-wrap_life_span_handler! {
-    struct MyLifeSpanHandler {
-        browser_slot: Arc<Mutex<Option<Browser>>>,
-    }
-    impl LifeSpanHandler {
-        fn on_after_created(&self, browser: Option<&mut Browser>) {
-            log_to_file("on_after_created called");
-            if let Some(b) = browser {
-                *self.browser_slot.lock().unwrap() = Some(b.clone());
-                log_to_file("browser stored in slot");
-            }
-        }
-    }
-}
-
-wrap_app! {
-    struct MyApp;
-    impl App {
-        fn on_before_command_line_processing(
-            &self,
-            _process_type: Option<&CefString>,
-            command_line: Option<&mut CommandLine>,
-        ) {
-            if let Some(cl) = command_line {
-                cl.append_switch(Some(&CefString::from("use-mock-keychain")));
-            }
-        }
-    }
-}
-
-wrap_client! {
-    struct MyClient {
-        render_handler: RenderHandler,
-        life_span_handler: LifeSpanHandler,
-    }
-    impl Client {
-        fn render_handler(&self) -> Option<RenderHandler> {
-            Some(self.render_handler.clone())
-        }
-        fn life_span_handler(&self) -> Option<LifeSpanHandler> {
-            Some(self.life_span_handler.clone())
-        }
-    }
+fn send_command(stream: &mut UnixStream, cmd: &Command) -> std::io::Result<Response> {
+    let payload = cmd.serialize();
+    ipc::send_message(stream, &payload)?;
+    let resp_data = ipc::recv_message(stream)?;
+    Response::deserialize(&resp_data)
 }
 
 // ---------------------------------------------------------------------------
-// ObjC helpers (cef_app_inject.m)
+// Global functions
 // ---------------------------------------------------------------------------
 
-unsafe extern "C" {
-    fn cef_unity_inject_app_protocol();
-    fn cef_unity_safe_pump(pump_fn: extern "C" fn());
-}
-
-extern "C" fn do_pump() {
-    do_message_loop_work();
-}
-
-// ---------------------------------------------------------------------------
-// Global functions – メインスレッドで動作
-// ---------------------------------------------------------------------------
-
-/// Initialize the CEF framework on the calling (main) thread.
+/// Initialize: launch CEF server process and connect via Unix domain socket.
 /// Returns 0 on success, non-zero on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_init() -> i32 {
-    if CEF_INITIALIZED.load(Ordering::SeqCst) {
+    if INITIALIZED.load(Ordering::SeqCst) {
         return 0;
     }
 
     let _ = std::fs::write(std::env::temp_dir().join("cef_unity_debug.log"), "");
-    log_to_file("cef_unity_init() called (main thread)");
+    log_to_file("cef_unity_init() called (IPC client mode)");
 
-    unsafe { cef_unity_inject_app_protocol(); }
-
+    // Find server .app next to dylib
     let plugin_dir = crate::dylib_dir();
-    let framework_dir = match crate::find_cef_framework(&plugin_dir) {
-        Some(fw) => fw,
-        None => {
-            log_to_file("CEF framework not found");
-            return -3;
+    let server_app = plugin_dir.join("cef-unity-server.app/Contents/MacOS/cef-unity-server");
+    if !server_app.exists() {
+        log_to_file(&format!("server binary not found: {}", server_app.display()));
+        return -3;
+    }
+    log_to_file(&format!("server binary: {}", server_app.display()));
+
+    // Socket path in temp dir
+    let socket_path = std::env::temp_dir()
+        .join(format!("cef-unity-{}.sock", std::process::id()))
+        .to_str()
+        .unwrap()
+        .to_string();
+    log_to_file(&format!("socket_path = {}", socket_path));
+
+    // Launch server process directly
+    match std::process::Command::new(&server_app)
+        .arg("--socket-path")
+        .arg(&socket_path)
+        .spawn()
+    {
+        Ok(_child) => {
+            // Server runs independently; we don't track its PID
         }
-    };
-    log_to_file(&format!("framework_dir = {}", framework_dir.display()));
+        Err(e) => {
+            log_to_file(&format!("failed to spawn server: {}", e));
+            return -4;
+        }
+    }
+    log_to_file("server spawned");
 
-    crate::load_cef(&framework_dir);
-
-    // Symlink GPU libraries
-    let libraries_dir = framework_dir.join("Libraries");
-    if libraries_dir.exists() {
-        for lib in &["libGLESv2.dylib", "libEGL.dylib"] {
-            let src = libraries_dir.join(lib);
-            let dst = plugin_dir.join(lib);
-            if src.exists() && !dst.exists() {
-                let _ = std::os::unix::fs::symlink(&src, &dst);
+    // Retry loop to connect to server socket
+    let mut stream = None;
+    for attempt in 0..100 {
+        match UnixStream::connect(&socket_path) {
+            Ok(s) => {
+                log_to_file(&format!("connected to server on attempt {}", attempt));
+                stream = Some(s);
+                break;
+            }
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
     }
 
-    let args = cef::args::Args::new();
-    let resources_dir = framework_dir.join("Resources");
+    let stream = match stream {
+        Some(s) => s,
+        None => {
+            log_to_file("failed to connect to server after retries");
+            return -5;
+        }
+    };
 
-    let helper_app = plugin_dir.join("cef-unity-rust-helper.app/Contents/MacOS/cef-unity-rust-helper");
-    let helper_bare = plugin_dir.join("cef-unity-rust-helper");
-    let helper_path = if helper_app.exists() { helper_app } else { helper_bare };
-    log_to_file(&format!("helper_path = {}", helper_path.display()));
+    *CONNECTION.lock().unwrap() = Some(ServerConnection {
+        stream,
+        socket_path,
+    });
 
-    let cache_dir = std::env::temp_dir().join("cef_unity_cache");
-    let _ = std::fs::create_dir_all(&cache_dir);
-
-    let mut settings = Settings::default();
-    settings.no_sandbox = 1;
-    settings.windowless_rendering_enabled = 1;
-    settings.external_message_pump = 1;
-    settings.root_cache_path = CefString::from(cache_dir.to_str().unwrap());
-    settings.framework_dir_path = CefString::from(framework_dir.to_str().unwrap());
-    settings.browser_subprocess_path = CefString::from(helper_path.to_str().unwrap());
-    settings.resources_dir_path = CefString::from(resources_dir.to_str().unwrap());
-    let locales_dir = resources_dir.join("locales");
-    if locales_dir.exists() {
-        settings.locales_dir_path = CefString::from(locales_dir.to_str().unwrap());
-    }
-    let cef_log = std::env::temp_dir().join("cef_debug.log");
-    settings.log_file = CefString::from(cef_log.to_str().unwrap());
-    settings.log_severity = LogSeverity::VERBOSE;
-
-    let mut app = MyApp::new();
-    let result = initialize(
-        Some(args.as_main_args()),
-        Some(&settings),
-        Some(&mut app),
-        std::ptr::null_mut(),
-    );
-    log_to_file(&format!("initialize() returned {}", result));
-
-    if result == 0 {
-        log_to_file("initialize() FAILED");
-        return -2;
-    }
-
-    CEF_INITIALIZED.store(true, Ordering::SeqCst);
-    log_to_file("CEF initialized successfully on main thread");
+    INITIALIZED.store(true, Ordering::SeqCst);
+    log_to_file("initialized successfully (IPC client)");
     0
 }
 
-/// Pump CEF message loop. Call every frame from Unity's Update().
-/// Wrapped in @try/@catch to survive ObjC exceptions.
+/// Pump CEF message loop — no-op in IPC mode (server has its own loop).
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_pump() {
-    if !CEF_INITIALIZED.load(Ordering::SeqCst) {
-        return;
-    }
-    let count = PUMP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    unsafe { cef_unity_safe_pump(do_pump); }
-    if count <= 3 || count % 1000 == 0 {
-        log_to_file(&format!("pump #{}, paint_count={}", count, PAINT_COUNT.load(Ordering::Relaxed)));
-    }
+    PUMP_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Returns the number of on_paint calls received so far.
+/// Returns the number of on_paint calls (tracked per-frame reads in IPC mode).
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_get_paint_count() -> u64 {
     PAINT_COUNT.load(Ordering::Relaxed)
 }
 
-/// Returns the number of pump iterations so far.
+/// Returns the number of pump iterations.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_get_pump_count() -> u64 {
     PUMP_COUNT.load(Ordering::Relaxed)
 }
 
-/// No-op. CEF cannot be re-initialized after shutdown.
+/// Shut down: send Shutdown command and wait for server to exit.
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_shutdown() {}
+pub extern "C" fn cef_unity_shutdown() {
+    if !INITIALIZED.load(Ordering::SeqCst) {
+        return;
+    }
+    log_to_file("cef_unity_shutdown()");
+
+    if let Some(mut conn) = CONNECTION.lock().unwrap().take() {
+        let _ = send_command(&mut conn.stream, &Command::Shutdown);
+        // Server will exit after receiving Shutdown; give it a moment
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let _ = std::fs::remove_file(&conn.socket_path);
+    }
+
+    INITIALIZED.store(false, Ordering::SeqCst);
+    log_to_file("shutdown complete");
+}
 
 // ---------------------------------------------------------------------------
-// Instance functions – per-browser
+// Per-browser functions
 // ---------------------------------------------------------------------------
 
-/// Create a browser instance on the main (CEF UI) thread.
+/// Create a browser instance via IPC.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_create_browser(
     width: i32,
     height: i32,
     url: *const c_char,
 ) -> *mut CefUnityBrowser {
-    if !CEF_INITIALIZED.load(Ordering::SeqCst) || url.is_null() {
+    if !INITIALIZED.load(Ordering::SeqCst) || url.is_null() {
         return std::ptr::null_mut();
     }
 
     let url_str = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
-    log_to_file(&format!("cef_unity_create_browser({}x{}, {})", width, height, url_str));
+    log_to_file(&format!(
+        "cef_unity_create_browser({}x{}, {})",
+        width, height, url_str
+    ));
 
-    let shared = Arc::new(SharedState {
-        buffer: Mutex::new(BackBuffer {
-            data: Vec::new(),
-            width: 0,
-            height: 0,
-            has_new_frame: false,
-        }),
-        browser: Arc::new(Mutex::new(None)),
-        viewport_w: AtomicI32::new(width),
-        viewport_h: AtomicI32::new(height),
-    });
+    let mut guard = CONNECTION.lock().unwrap();
+    let conn = match guard.as_mut() {
+        Some(c) => c,
+        None => return std::ptr::null_mut(),
+    };
 
-    let render_handler = MyRenderHandler::new(Arc::clone(&shared));
-    let life_span_handler = MyLifeSpanHandler::new(Arc::clone(&shared.browser));
-    let mut client = MyClient::new(render_handler, life_span_handler);
+    let cmd = Command::CreateBrowser {
+        width,
+        height,
+        url: url_str.to_string(),
+    };
+    let resp = match send_command(&mut conn.stream, &cmd) {
+        Ok(r) => r,
+        Err(e) => {
+            log_to_file(&format!("create_browser IPC error: {}", e));
+            return std::ptr::null_mut();
+        }
+    };
 
-    let window_info = WindowInfo::default().set_as_windowless(std::ptr::null_mut());
-
-    let ok = browser_host_create_browser(
-        Some(&window_info),
-        Some(&mut client),
-        Some(&CefString::from(url_str)),
-        Some(&BrowserSettings {
-            background_color: 0xFF000000,
-            ..Default::default()
-        }),
-        None,
-        None,
-    );
-    log_to_file(&format!("browser_host_create_browser returned {}", ok));
-
-    let instance = Box::new(BrowserInstance {
-        shared,
-        front: Vec::new(),
-        front_w: 0,
-        front_h: 0,
-    });
-    Box::into_raw(instance) as *mut CefUnityBrowser
+    match resp {
+        Response::BrowserCreated {
+            browser_id,
+            shm_name,
+        } => {
+            log_to_file(&format!(
+                "browser created: id={}, shm={}",
+                browser_id, shm_name
+            ));
+            let shm = match ShmReader::open(&shm_name) {
+                Ok(s) => s,
+                Err(e) => {
+                    log_to_file(&format!("shm_open failed: {}", e));
+                    return std::ptr::null_mut();
+                }
+            };
+            let instance = Box::new(ClientBrowserInstance {
+                browser_id,
+                shm,
+                front: Vec::new(),
+                front_w: 0,
+                front_h: 0,
+            });
+            Box::into_raw(instance) as *mut CefUnityBrowser
+        }
+        Response::Error { msg } => {
+            log_to_file(&format!("create_browser error: {}", msg));
+            std::ptr::null_mut()
+        }
+        _ => {
+            log_to_file("unexpected response to CreateBrowser");
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// Destroy a browser instance.
@@ -348,11 +269,14 @@ pub extern "C" fn cef_unity_destroy_browser(handle: *mut CefUnityBrowser) {
     if handle.is_null() {
         return;
     }
-    let instance = unsafe { Box::from_raw(handle as *mut BrowserInstance) };
-    if let Some(browser) = instance.shared.browser.lock().unwrap().take() {
-        if let Some(host) = Browser::host(&browser) {
-            BrowserHost::close_browser(&host, 1);
-        }
+    let instance = unsafe { Box::from_raw(handle as *mut ClientBrowserInstance) };
+
+    let mut guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_mut() {
+        let cmd = Command::DestroyBrowser {
+            browser_id: instance.browser_id,
+        };
+        let _ = send_command(&mut conn.stream, &cmd);
     }
     drop(instance);
 }
@@ -365,10 +289,14 @@ pub extern "C" fn cef_unity_load_url(handle: *mut CefUnityBrowser, url: *const c
     }
     let instance = handle_to_ref(handle);
     let url_str = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
-    if let Some(ref browser) = *instance.shared.browser.lock().unwrap() {
-        if let Some(frame) = Browser::main_frame(browser) {
-            Frame::load_url(&frame, Some(&CefString::from(url_str)));
-        }
+
+    let mut guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_mut() {
+        let cmd = Command::LoadUrl {
+            browser_id: instance.browser_id,
+            url: url_str.to_string(),
+        };
+        let _ = send_command(&mut conn.stream, &cmd);
     }
 }
 
@@ -379,16 +307,19 @@ pub extern "C" fn cef_unity_resize(handle: *mut CefUnityBrowser, width: i32, hei
         return;
     }
     let instance = handle_to_ref(handle);
-    instance.shared.viewport_w.store(width, Ordering::Relaxed);
-    instance.shared.viewport_h.store(height, Ordering::Relaxed);
-    if let Some(ref browser) = *instance.shared.browser.lock().unwrap() {
-        if let Some(host) = Browser::host(browser) {
-            BrowserHost::was_resized(&host);
-        }
+
+    let mut guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_mut() {
+        let cmd = Command::Resize {
+            browser_id: instance.browser_id,
+            width,
+            height,
+        };
+        let _ = send_command(&mut conn.stream, &cmd);
     }
 }
 
-/// Get the latest frame buffer.
+/// Get the latest frame buffer from shared memory.
 /// Returns 1 if a new frame is available, 0 if unchanged.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_get_buffer(
@@ -402,20 +333,17 @@ pub extern "C" fn cef_unity_get_buffer(
     }
     let instance = handle_to_ref(handle);
 
-    let mut back = instance.shared.buffer.lock().unwrap();
-    let new_frame = back.has_new_frame;
-    if new_frame {
-        std::mem::swap(&mut instance.front, &mut back.data);
-        instance.front_w = back.width;
-        instance.front_h = back.height;
-        back.has_new_frame = false;
+    let new_frame = instance.shm.read_frame(&mut instance.front);
+    if let Some((w, h)) = new_frame {
+        instance.front_w = w as i32;
+        instance.front_h = h as i32;
+        PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
     }
-    drop(back);
 
     unsafe {
         *out_buffer = instance.front.as_ptr();
         *out_width = instance.front_w;
         *out_height = instance.front_h;
     }
-    new_frame as i32
+    new_frame.is_some() as i32
 }

@@ -10,6 +10,10 @@ crate-type = ["cdylib", "rlib"]
 name = "cef-unity-rust-helper"
 path = "src/helper.rs"
 
+[[bin]]
+name = "cef-unity-server"
+path = "src/server_main.rs"
+
 [dependencies]
 cef = "145.5.0"
 

@@ -11,8 +11,6 @@
     <ItemGroup>
         <None Include="$(RustTargetDir)/libcef_unity_rust.dylib"
               CopyToOutputDirectory="PreserveNewest" Link="libcef_unity_rust.dylib" />
-        <None Include="$(RustTargetDir)/cef-unity-rust-helper"
-              CopyToOutputDirectory="PreserveNewest" Link="cef-unity-rust-helper" />
     </ItemGroup>
 
 </Project>

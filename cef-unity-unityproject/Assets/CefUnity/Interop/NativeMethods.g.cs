@@ -19,39 +19,38 @@ namespace CefUnity
 
 
         /// <summary>
-        ///  Initialize the CEF framework on the calling (main) thread.
+        ///  Initialize: launch CEF server process and connect via Unix domain socket.
         ///  Returns 0 on success, non-zero on failure.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_init", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern int cef_unity_init();
 
         /// <summary>
-        ///  Pump CEF message loop. Call every frame from Unity's Update().
-        ///  Wrapped in @try/@catch to survive ObjC exceptions.
+        ///  Pump CEF message loop — no-op in IPC mode (server has its own loop).
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_pump", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern void cef_unity_pump();
 
         /// <summary>
-        ///  Returns the number of on_paint calls received so far.
+        ///  Returns the number of on_paint calls (tracked per-frame reads in IPC mode).
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_get_paint_count", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern ulong cef_unity_get_paint_count();
 
         /// <summary>
-        ///  Returns the number of pump iterations so far.
+        ///  Returns the number of pump iterations.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_get_pump_count", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern ulong cef_unity_get_pump_count();
 
         /// <summary>
-        ///  No-op. CEF cannot be re-initialized after shutdown.
+        ///  Shut down: send Shutdown command and wait for server to exit.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_shutdown", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern void cef_unity_shutdown();
 
         /// <summary>
-        ///  Create a browser instance on the main (CEF UI) thread.
+        ///  Create a browser instance via IPC.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_create_browser", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern CefUnityBrowser* cef_unity_create_browser(int width, int height, byte* url);
@@ -75,7 +74,7 @@ namespace CefUnity
         public static extern void cef_unity_resize(CefUnityBrowser* handle, int width, int height);
 
         /// <summary>
-        ///  Get the latest frame buffer.
+        ///  Get the latest frame buffer from shared memory.
         ///  Returns 1 if a new frame is available, 0 if unchanged.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_get_buffer", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]

@@ -1,4 +1,6 @@
 pub mod ffi;
+pub mod ipc;
+pub mod server;
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
