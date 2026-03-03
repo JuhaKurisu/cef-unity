@@ -51,7 +51,11 @@ public class SampleScript : MonoBehaviour
         if (_texture == null || _texture.width != w || _texture.height != h)
         {
             _texture = new Texture2D(w, h, TextureFormat.BGRA32, false);
-            if (_rawImage != null) _rawImage.texture = _texture;
+            if (_rawImage != null)
+            {
+                _rawImage.texture = _texture;
+                _rawImage.uvRect = new Rect(0, 1, 1, -1);
+            }
         }
 
         unsafe
