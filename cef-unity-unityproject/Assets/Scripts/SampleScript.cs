@@ -1,24 +1,26 @@
 using System;
-using CefUnity;
 using CefUnity.Interop;
 using UnityEngine;
+using UnityEngine.UI;
 
 public class SampleScript : MonoBehaviour
 {
-    [SerializeField] private int _width;
-    [SerializeField] private int _height;
-    [SerializeField] private string _url;
+    [SerializeField] private int _width = 1280;
+    [SerializeField] private int _height = 720;
+    [SerializeField] private string _url = "https://www.google.com";
+    [SerializeField] private RawImage _rawImage;
+
     private Browser _browser;
-    
+    private Texture2D _texture;
+
     private void Start()
     {
         try
         {
-            var result = NativeMethods.cef_unity_init();
-            Debug.Log($"[CefUnity] cef_unity_init returned {result}");
+            CefRuntime.Init();
             _browser = new Browser(_width, _height, _url);
         }
-        catch (System.Exception e)
+        catch (Exception e)
         {
             Debug.LogError($"[CefUnity] Init failed: {e}");
         }
@@ -26,10 +28,36 @@ public class SampleScript : MonoBehaviour
 
     private void Update()
     {
+        if (_browser == null) return;
+        if (!_browser.TryGetBuffer(out var buffer, out var w, out var h))
+        {
+            Debug.LogError("failed");
+            return;
+        }
+
+        if (w <= 0 || h <= 0) return;
+
+        if (_texture == null || _texture.width != w || _texture.height != h)
+        {
+            _texture = new Texture2D(w, h, TextureFormat.BGRA32, false);
+            if (_rawImage != null) _rawImage.texture = _texture;
+        }
+
+        unsafe
+        {
+            fixed (byte* ptr = buffer)
+            {
+                _texture.LoadRawTextureData((IntPtr)ptr, buffer.Length);
+            }
+        }
+
+        _texture.Apply();
     }
 
     private void OnDestroy()
     {
-        NativeMethods.cef_unity_shutdown();
+        _browser?.Dispose();
+        _browser = null;
+        CefRuntime.Shutdown();
     }
 }
