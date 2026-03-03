@@ -261,12 +261,10 @@ fn start_pump_thread() {
     let handle = thread::Builder::new()
         .name("cef-pump".into())
         .spawn(|| {
-            log("[cef-unity] pump thread started");
             while !CEF_SHUTDOWN.load(Ordering::SeqCst) {
                 do_message_loop_work();
                 thread::sleep(Duration::from_millis(16));
             }
-            log("[cef-unity] pump thread stopped");
         })
         .expect("failed to spawn CEF pump thread");
 
@@ -284,12 +282,10 @@ pub extern "C" fn cef_unity_tick() {
 /// `cef_unity_init()` call.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_shutdown() {
-    log("[cef-unity] shutting down");
     CEF_SHUTDOWN.store(true, Ordering::SeqCst);
     if let Some(handle) = CEF_THREAD.lock().unwrap().take() {
         let _ = handle.join();
     }
-    log("[cef-unity] shutdown complete");
 }
 
 // ---------------------------------------------------------------------------
@@ -409,26 +405,19 @@ pub extern "C" fn cef_unity_get_buffer(
     let instance = handle_to_ref(handle);
 
     let mut back = instance.shared.buffer.lock().unwrap();
-    if back.has_new_frame {
+    let new_frame = back.has_new_frame;
+    if new_frame {
         std::mem::swap(&mut instance.front, &mut back.data);
         instance.front_w = back.width;
         instance.front_h = back.height;
         back.has_new_frame = false;
-        drop(back);
-
-        unsafe {
-            *out_buffer = instance.front.as_ptr();
-            *out_width = instance.front_w;
-            *out_height = instance.front_h;
-        }
-        1
-    } else {
-        drop(back);
-        unsafe {
-            *out_buffer = instance.front.as_ptr();
-            *out_width = instance.front_w;
-            *out_height = instance.front_h;
-        }
-        0
     }
+    drop(back);
+
+    unsafe {
+        *out_buffer = instance.front.as_ptr();
+        *out_width = instance.front_w;
+        *out_height = instance.front_h;
+    }
+    new_frame as i32
 }
