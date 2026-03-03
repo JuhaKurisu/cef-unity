@@ -3,7 +3,6 @@ use std::ffi::{CStr, c_char};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Opaque handle type (becomes IntPtr in C#)
@@ -53,10 +52,6 @@ fn handle_to_ref<'a>(handle: *mut CefUnityBrowser) -> &'a mut BrowserInstance {
 
 /// CEF library loaded + initialized (never reset; CEF cannot re-initialize)
 static CEF_INITIALIZED: AtomicBool = AtomicBool::new(false);
-/// Pump thread handle (re-created each Play session)
-static CEF_THREAD: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
-/// Signal for pump thread to stop
-static CEF_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -85,6 +80,7 @@ wrap_render_handler! {
             width: ::std::os::raw::c_int,
             height: ::std::os::raw::c_int,
         ) {
+            eprintln!("[cef-unity] on_paint called: {}x{}", width, height);
             if type_.get_raw() != PaintElementType::VIEW.get_raw() {
                 return;
             }
@@ -106,6 +102,7 @@ wrap_life_span_handler! {
     }
     impl LifeSpanHandler {
         fn on_after_created(&self, browser: Option<&mut Browser>) {
+            eprintln!("[cef-unity] on_after_created called");
             if let Some(b) = browser {
                 *self.browser_slot.lock().unwrap() = Some(b.clone());
             }
@@ -159,8 +156,6 @@ pub extern "C" fn cef_unity_init() -> i32 {
     // On subsequent calls (Unity Play/Stop cycles), just ensure the
     // pump thread is running.
     if CEF_INITIALIZED.load(Ordering::SeqCst) {
-        eprintln!("[cef-unity] already initialized, restarting pump thread");
-        start_pump_thread();
         return 0;
     }
 
@@ -193,26 +188,35 @@ pub extern "C" fn cef_unity_init() -> i32 {
         }
     }
 
-    // Spawn a dedicated CEF thread for initialize().
+    // Spawn a dedicated CEF thread that initializes and then pumps messages.
+    // do_message_loop_work() must be called on the same thread as initialize().
     let fw_dir = framework_dir.clone();
     let p_dir = plugin_dir.clone();
     let (tx, rx) = std::sync::mpsc::channel();
 
-    thread::Builder::new()
-        .name("cef-init".into())
+    let _handle = thread::Builder::new()
+        .name("cef-ui".into())
         .spawn(move || {
             let args = cef::args::Args::new();
             let resources_dir = fw_dir.join("Resources");
-            let helper_path = p_dir.join("cef-unity-rust-helper");
+
+            // ヘルパーバイナリのパス: .appバンドルがあればそちらを使う。
+            // .appバンドル内のInfo.plistでCFBundleIdentifierを親プロセスに合わせることで
+            // MachPortRendezvousServerのサービス名が一致する。
+            let helper_app = p_dir.join("cef-unity-rust-helper.app/Contents/MacOS/cef-unity-rust-helper");
+            let helper_bare = p_dir.join("cef-unity-rust-helper");
+            let helper_path = if helper_app.exists() { helper_app } else { helper_bare };
+
+            let cache_dir = p_dir.join("cef_cache");
 
             let mut settings = Settings::default();
             settings.no_sandbox = 1;
             settings.windowless_rendering_enabled = 1;
             settings.external_message_pump = 1;
             settings.framework_dir_path = CefString::from(fw_dir.to_str().unwrap());
-            settings.browser_subprocess_path =
-                CefString::from(helper_path.to_str().unwrap());
+            settings.browser_subprocess_path = CefString::from(helper_path.to_str().unwrap());
             settings.resources_dir_path = CefString::from(resources_dir.to_str().unwrap());
+            settings.root_cache_path = CefString::from(cache_dir.to_str().unwrap());
             let locales_dir = resources_dir.join("locales");
             if locales_dir.exists() {
                 settings.locales_dir_path = CefString::from(locales_dir.to_str().unwrap());
@@ -227,15 +231,21 @@ pub extern "C" fn cef_unity_init() -> i32 {
             );
             eprintln!("[cef-unity] initialize() returned {}", result);
             let _ = tx.send(result);
+
+            if result != 0 {
+                // Pump messages forever on this thread (CEF cannot re-initialize)
+                loop {
+                    do_message_loop_work();
+                    thread::sleep(std::time::Duration::from_millis(16));
+                }
+            }
         })
-        .expect("failed to spawn CEF init thread")
-        .join()
-        .expect("CEF init thread panicked");
+        .expect("failed to spawn CEF UI thread");
 
     let result = match rx.recv() {
         Ok(r) => r,
         Err(_) => {
-            eprintln!("[cef-unity] CEF init thread died before sending result");
+            eprintln!("[cef-unity] CEF UI thread died before sending result");
             return -4;
         }
     };
@@ -246,41 +256,13 @@ pub extern "C" fn cef_unity_init() -> i32 {
     }
 
     CEF_INITIALIZED.store(true, Ordering::SeqCst);
-    start_pump_thread();
     0
 }
 
-fn start_pump_thread() {
-    // Stop any existing pump thread
-    CEF_SHUTDOWN.store(true, Ordering::SeqCst);
-    if let Some(handle) = CEF_THREAD.lock().unwrap().take() {
-        let _ = handle.join();
-    }
-
-    CEF_SHUTDOWN.store(false, Ordering::SeqCst);
-    let handle = thread::Builder::new()
-        .name("cef-pump".into())
-        .spawn(|| {
-            while !CEF_SHUTDOWN.load(Ordering::SeqCst) {
-                do_message_loop_work();
-                thread::sleep(Duration::from_millis(16));
-            }
-        })
-        .expect("failed to spawn CEF pump thread");
-
-    *CEF_THREAD.lock().unwrap() = Some(handle);
-}
-
-/// Stop the CEF message pump. CEF remains initialized (it cannot re-initialize
-/// within the same process). The pump thread is restarted on the next
-/// `cef_unity_init()` call.
+/// No-op. The CEF UI thread runs for the lifetime of the process because
+/// CEF cannot be re-initialized after shutdown.
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_shutdown() {
-    CEF_SHUTDOWN.store(true, Ordering::SeqCst);
-    if let Some(handle) = CEF_THREAD.lock().unwrap().take() {
-        let _ = handle.join();
-    }
-}
+pub extern "C" fn cef_unity_shutdown() {}
 
 // ---------------------------------------------------------------------------
 // Instance functions – per-browser, via opaque handle

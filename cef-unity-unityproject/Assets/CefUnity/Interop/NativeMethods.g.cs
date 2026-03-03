@@ -30,9 +30,8 @@ namespace CefUnity
         public static extern int cef_unity_init();
 
         /// <summary>
-        ///  Stop the CEF message pump. CEF remains initialized (it cannot re-initialize
-        ///  within the same process). The pump thread is restarted on the next
-        ///  `cef_unity_init()` call.
+        ///  No-op. The CEF UI thread runs for the lifetime of the process because
+        ///  CEF cannot be re-initialized after shutdown.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_shutdown", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern void cef_unity_shutdown();

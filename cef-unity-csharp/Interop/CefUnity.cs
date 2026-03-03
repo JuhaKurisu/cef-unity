@@ -12,11 +12,6 @@ public static class CefRuntime
             throw new InvalidOperationException($"CEF initialization failed (code {result})");
     }
 
-    public static void Tick()
-    {
-        NativeMethods.cef_unity_tick();
-    }
-
     public static void Shutdown()
     {
         NativeMethods.cef_unity_shutdown();
