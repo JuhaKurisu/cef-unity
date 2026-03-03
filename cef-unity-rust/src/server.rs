@@ -2,7 +2,7 @@
 
 use cef::*;
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -416,5 +416,3 @@ impl ClientConnection {
         Ok(())
     }
 }
-
-use std::io;

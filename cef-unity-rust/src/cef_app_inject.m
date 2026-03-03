@@ -1,17 +1,11 @@
-// CefAppProtocol injection & exception-safe message pump for embedding CEF
-// in a macOS host that owns its own NSApplication (e.g. Unity Editor).
+// CefAppProtocol injection for embedding CEF in a macOS process.
 //
-// Problems solved here:
+// CEF requires NSApplication to conform to CefAppProtocol (CrAppProtocol).
+// We inject this via Objective-C runtime swizzling at startup.
 //
-// 1. CEF requires NSApplication to conform to CefAppProtocol (CrAppProtocol).
-//    We inject this via Objective-C runtime swizzling since we cannot subclass
-//    Unity's NSApplication.
-//
-// 2. Chromium's ChromeWebAppShortcutCopierMain creates an NSWindow on a
-//    background thread, which throws an ObjC exception from
-//    _CFBundleGetValueForInfoKey. The exception propagates through C++ frames
-//    → std::terminate → abort. We swizzle NSWindow init to catch the exception
-//    at the ObjC level before it reaches C++ code.
+// Additionally, NSWindow init is swizzled to catch ObjC exceptions thrown by
+// Chromium's ChromeWebAppShortcutCopierMain on background threads, preventing
+// them from propagating through C++ frames (which would trigger std::terminate).
 
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
@@ -149,79 +143,3 @@ void cef_unity_inject_app_protocol(void) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Exception-safe wrapper for do_message_loop_work
-// ---------------------------------------------------------------------------
-
-void cef_unity_safe_pump(void (*pump_fn)(void)) {
-    @try {
-        pump_fn();
-    } @catch (NSException *e) {
-        NSLog(@"[cef-unity] caught ObjC exception in message pump: %@ – %@",
-              e.name, e.reason);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// NSApplication-based run loop for the CEF server process
-// ---------------------------------------------------------------------------
-
-typedef void (*cef_unity_timer_fn)(void *context);
-
-static cef_unity_timer_fn g_timer_fn = NULL;
-static void *g_timer_context = NULL;
-
-@interface CefUnityTimerTarget : NSObject
-- (void)timerFired:(NSTimer *)timer;
-@end
-
-@implementation CefUnityTimerTarget
-- (void)timerFired:(NSTimer *)timer {
-    if (g_timer_fn) {
-        g_timer_fn(g_timer_context);
-    }
-}
-@end
-
-static CefUnityTimerTarget *g_timer_target = nil;
-
-/// Initialize NSApplication and run its event loop with a periodic timer callback.
-/// This provides proper macOS bootstrap port registration needed for Chromium's
-/// Mach port rendezvous system (required by renderer subprocesses).
-void cef_unity_nsapp_run(double interval_seconds,
-                         cef_unity_timer_fn callback,
-                         void *context) {
-    g_timer_fn = callback;
-    g_timer_context = context;
-
-    [NSApplication sharedApplication];
-    [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
-
-    g_timer_target = [[CefUnityTimerTarget alloc] init];
-    NSTimer *timer = [NSTimer timerWithTimeInterval:interval_seconds
-                                             target:g_timer_target
-                                           selector:@selector(timerFired:)
-                                           userInfo:nil
-                                            repeats:YES];
-    [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSDefaultRunLoopMode];
-
-    [NSApp run];
-}
-
-/// Stop the NSApplication run loop.
-void cef_unity_nsapp_stop(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [NSApp stop:nil];
-        // Post a dummy event to unblock [NSApp run] from its event wait
-        NSEvent *event = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
-                                            location:NSMakePoint(0, 0)
-                                       modifierFlags:0
-                                           timestamp:0
-                                        windowNumber:0
-                                             context:nil
-                                             subtype:0
-                                               data1:0
-                                               data2:0];
-        [NSApp postEvent:event atStart:YES];
-    });
-}
