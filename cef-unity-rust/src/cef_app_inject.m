@@ -1,17 +1,17 @@
 // CefAppProtocol injection & exception-safe message pump for embedding CEF
 // in a macOS host that owns its own NSApplication (e.g. Unity Editor).
 //
-// Two problems are solved here:
+// Problems solved here:
 //
 // 1. CEF requires NSApplication to conform to CefAppProtocol (CrAppProtocol).
 //    We inject this via Objective-C runtime swizzling since we cannot subclass
 //    Unity's NSApplication.
 //
-// 2. CEF registers a CFRunLoop observer that calls ChromeWebAppShortcutCopierMain,
-//    which tries to create an NSWindow. This fails (ObjC exception from
-//    _CFBundleGetValueForInfoKey) because the host bundle lacks Chrome-specific
-//    Info.plist keys. We wrap do_message_loop_work() in @try/@catch so the
-//    background CEF thread survives the exception.
+// 2. Chromium's ChromeWebAppShortcutCopierMain creates an NSWindow on a
+//    background thread, which throws an ObjC exception from
+//    _CFBundleGetValueForInfoKey. The exception propagates through C++ frames
+//    → std::terminate → abort. We swizzle NSWindow init to catch the exception
+//    at the ObjC level before it reaches C++ code.
 
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
@@ -55,6 +55,10 @@ static char kHandlingSendEventKey;
 
 @end
 
+// ---------------------------------------------------------------------------
+// sendEvent: swizzle – track isHandlingSendEvent for CefAppProtocol
+// ---------------------------------------------------------------------------
+
 static IMP g_original_sendEvent = NULL;
 
 static void Swizzled_sendEvent(id self, SEL _cmd, NSEvent *event) {
@@ -64,15 +68,47 @@ static void Swizzled_sendEvent(id self, SEL _cmd, NSEvent *event) {
     [self setHandlingSendEvent:wasHandling];
 }
 
+// ---------------------------------------------------------------------------
+// NSWindow init swizzle – catch exceptions at the ObjC level before they
+// propagate through C++ frames (which would trigger std::terminate).
+// ---------------------------------------------------------------------------
+
+static IMP g_original_nswindow_init = NULL;
+
+static id Swizzled_NSWindow_init(id self, SEL _cmd,
+                                  NSRect contentRect,
+                                  NSWindowStyleMask style,
+                                  NSBackingStoreType backing,
+                                  BOOL defer) {
+    @try {
+        return ((id (*)(id, SEL, NSRect, NSWindowStyleMask,
+                        NSBackingStoreType, BOOL))g_original_nswindow_init)
+            (self, _cmd, contentRect, style, backing, defer);
+    } @catch (NSException *e) {
+        if (![NSThread isMainThread]) {
+            NSLog(@"[cef-unity] suppressed NSWindow init on bg thread: %@ – %@",
+                  e.name, e.reason);
+            return nil;
+        }
+        @throw;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entry point – called once from Rust before CEF initialization
+// ---------------------------------------------------------------------------
+
 void cef_unity_inject_app_protocol(void) {
     Class cls = [NSApplication class];
 
+    // sendEvent: swizzle for CefAppProtocol
     Method m = class_getInstanceMethod(cls, @selector(sendEvent:));
     if (m) {
         g_original_sendEvent = method_getImplementation(m);
         method_setImplementation(m, (IMP)Swizzled_sendEvent);
     }
 
+    // Protocol injection
     Protocol *proto = objc_getProtocol("CefAppProtocol");
     if (!proto) {
         proto = objc_allocateProtocol("CefAppProtocol");
@@ -103,22 +139,24 @@ void cef_unity_inject_app_protocol(void) {
     if (proto) {
         class_addProtocol(cls, proto);
     }
+
+    // NSWindow init swizzle – catch ObjC exceptions at the source
+    Method winInit = class_getInstanceMethod([NSWindow class],
+        @selector(initWithContentRect:styleMask:backing:defer:));
+    if (winInit) {
+        g_original_nswindow_init = method_getImplementation(winInit);
+        method_setImplementation(winInit, (IMP)Swizzled_NSWindow_init);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Exception-safe wrapper for do_message_loop_work
 // ---------------------------------------------------------------------------
 
-// Wraps a function call in @try/@catch so that the
-// ChromeWebAppShortcutCopierMain → NSWindow → _CFBundleGetValueForInfoKey
-// ObjC exception does not kill the thread.
-// The caller passes a function pointer because the CEF library is dynamically
-// loaded and its symbols are not available at link time.
 void cef_unity_safe_pump(void (*pump_fn)(void)) {
     @try {
         pump_fn();
     } @catch (NSException *e) {
-        // Swallow – ChromeWebAppShortcutCopier is not needed for OSR.
         NSLog(@"[cef-unity] caught ObjC exception in message pump: %@ – %@",
               e.name, e.reason);
     }

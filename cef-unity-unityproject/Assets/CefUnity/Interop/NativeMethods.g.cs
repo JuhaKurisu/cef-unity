@@ -19,32 +19,39 @@ namespace CefUnity
 
 
         /// <summary>
-        ///  Initialize the CEF framework. Call once at app startup.
+        ///  Initialize the CEF framework on the calling (main) thread.
         ///  Returns 0 on success, non-zero on failure.
-        ///
-        ///  CEF is initialized on a dedicated background thread. The message pump
-        ///  runs on that thread with ObjC exception handling to survive the
-        ///  ChromeWebAppShortcutCopierMain → NSWindow crash.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_init", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern int cef_unity_init();
 
         /// <summary>
-        ///  No-op kept for C# API compatibility. The background thread pumps
-        ///  automatically.
+        ///  Pump CEF message loop. Call every frame from Unity's Update().
+        ///  Wrapped in @try/@catch to survive ObjC exceptions.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_pump", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern void cef_unity_pump();
 
         /// <summary>
-        ///  No-op. The CEF UI thread runs for the lifetime of the process because
-        ///  CEF cannot be re-initialized after shutdown.
+        ///  Returns the number of on_paint calls received so far.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_get_paint_count", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern ulong cef_unity_get_paint_count();
+
+        /// <summary>
+        ///  Returns the number of pump iterations so far.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_get_pump_count", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern ulong cef_unity_get_pump_count();
+
+        /// <summary>
+        ///  No-op. CEF cannot be re-initialized after shutdown.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_shutdown", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern void cef_unity_shutdown();
 
         /// <summary>
-        ///  Create a browser instance. Returns a handle (null on failure).
+        ///  Create a browser instance on the main (CEF UI) thread.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_create_browser", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern CefUnityBrowser* cef_unity_create_browser(int width, int height, byte* url);

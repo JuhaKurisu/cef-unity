@@ -1,4 +1,5 @@
 using System;
+using CefUnity;
 using CefUnity.Interop;
 using UnityEngine;
 using UnityEngine.UI;
@@ -12,6 +13,7 @@ public class SampleScript : MonoBehaviour
 
     private Browser _browser;
     private Texture2D _texture;
+    private float _diagTimer;
 
     private void Start()
     {
@@ -30,6 +32,15 @@ public class SampleScript : MonoBehaviour
     private void Update()
     {
         CefRuntime.Pump();
+
+        _diagTimer += Time.deltaTime;
+        if (_diagTimer >= 2f)
+        {
+            _diagTimer = 0f;
+            var paintCount = NativeMethods.cef_unity_get_paint_count();
+            var pumpCount = NativeMethods.cef_unity_get_pump_count();
+            Debug.Log($"[CefUnity] diag: paint={paintCount} pump={pumpCount}");
+        }
 
         if (_browser == null) return;
         if (!_browser.TryGetBuffer(out var buffer, out var w, out var h))

@@ -1,8 +1,8 @@
 use cef::*;
 use std::ffi::{CStr, c_char};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 // ---------------------------------------------------------------------------
 // Opaque handle type (becomes IntPtr in C#)
@@ -50,8 +50,16 @@ fn handle_to_ref<'a>(handle: *mut CefUnityBrowser) -> &'a mut BrowserInstance {
 // Global state
 // ---------------------------------------------------------------------------
 
-/// CEF library loaded + initialized (never reset; CEF cannot re-initialize)
 static CEF_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static PAINT_COUNT: AtomicU64 = AtomicU64::new(0);
+static PUMP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn log_to_file(msg: &str) {
+    let path = std::env::temp_dir().join("cef_unity_debug.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now(), msg);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -63,11 +71,13 @@ wrap_render_handler! {
     }
     impl RenderHandler {
         fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
+            let w = self.shared.viewport_w.load(Ordering::Relaxed);
+            let h = self.shared.viewport_h.load(Ordering::Relaxed);
             if let Some(rect) = rect {
                 rect.x = 0;
                 rect.y = 0;
-                rect.width = self.shared.viewport_w.load(Ordering::Relaxed);
-                rect.height = self.shared.viewport_h.load(Ordering::Relaxed);
+                rect.width = w;
+                rect.height = h;
             }
         }
 
@@ -80,7 +90,10 @@ wrap_render_handler! {
             width: ::std::os::raw::c_int,
             height: ::std::os::raw::c_int,
         ) {
-            eprintln!("[cef-unity] on_paint called: {}x{}", width, height);
+            let count = PAINT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if count <= 5 || count % 100 == 0 {
+                log_to_file(&format!("on_paint #{}: {}x{}", count, width, height));
+            }
             if type_.get_raw() != PaintElementType::VIEW.get_raw() {
                 return;
             }
@@ -102,9 +115,10 @@ wrap_life_span_handler! {
     }
     impl LifeSpanHandler {
         fn on_after_created(&self, browser: Option<&mut Browser>) {
-            eprintln!("[cef-unity] on_after_created called");
+            log_to_file("on_after_created called");
             if let Some(b) = browser {
                 *self.browser_slot.lock().unwrap() = Some(b.clone());
+                log_to_file("browser stored in slot");
             }
         }
     }
@@ -141,13 +155,11 @@ wrap_client! {
 }
 
 // ---------------------------------------------------------------------------
-// Global functions – CEF framework lifecycle
+// ObjC helpers (cef_app_inject.m)
 // ---------------------------------------------------------------------------
 
 unsafe extern "C" {
-    // Defined in cef_app_inject.m
     fn cef_unity_inject_app_protocol();
-    // Defined in cef_app_inject.m – wraps a function call in @try/@catch
     fn cef_unity_safe_pump(pump_fn: extern "C" fn());
 }
 
@@ -155,39 +167,36 @@ extern "C" fn do_pump() {
     do_message_loop_work();
 }
 
-/// Initialize the CEF framework. Call once at app startup.
+// ---------------------------------------------------------------------------
+// Global functions – メインスレッドで動作
+// ---------------------------------------------------------------------------
+
+/// Initialize the CEF framework on the calling (main) thread.
 /// Returns 0 on success, non-zero on failure.
-///
-/// CEF is initialized on a dedicated background thread. The message pump
-/// runs on that thread with ObjC exception handling to survive the
-/// ChromeWebAppShortcutCopierMain → NSWindow crash.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_init() -> i32 {
     if CEF_INITIALIZED.load(Ordering::SeqCst) {
         return 0;
     }
 
-    // macOS: NSApplication に CefAppProtocol を注入する。
+    let _ = std::fs::write(std::env::temp_dir().join("cef_unity_debug.log"), "");
+    log_to_file("cef_unity_init() called (main thread)");
+
     unsafe { cef_unity_inject_app_protocol(); }
 
     let plugin_dir = crate::dylib_dir();
-    eprintln!("[cef-unity] plugin_dir = {}", plugin_dir.display());
-
     let framework_dir = match crate::find_cef_framework(&plugin_dir) {
         Some(fw) => fw,
         None => {
-            eprintln!(
-                "[cef-unity] CEF framework not found in {} or CEF_PATH",
-                plugin_dir.display()
-            );
+            log_to_file("CEF framework not found");
             return -3;
         }
     };
-    eprintln!("[cef-unity] framework_dir = {}", framework_dir.display());
+    log_to_file(&format!("framework_dir = {}", framework_dir.display()));
 
     crate::load_cef(&framework_dir);
 
-    // Symlink GPU libraries next to the dylib
+    // Symlink GPU libraries
     let libraries_dir = framework_dir.join("Libraries");
     if libraries_dir.exists() {
         for lib in &["libGLESv2.dylib", "libEGL.dylib"] {
@@ -199,87 +208,87 @@ pub extern "C" fn cef_unity_init() -> i32 {
         }
     }
 
-    let fw_dir = framework_dir.clone();
-    let p_dir = plugin_dir.clone();
-    let (tx, rx) = std::sync::mpsc::channel();
+    let args = cef::args::Args::new();
+    let resources_dir = framework_dir.join("Resources");
 
-    let _handle = thread::Builder::new()
-        .name("cef-ui".into())
-        .spawn(move || {
-            let args = cef::args::Args::new();
-            let resources_dir = fw_dir.join("Resources");
+    let helper_app = plugin_dir.join("cef-unity-rust-helper.app/Contents/MacOS/cef-unity-rust-helper");
+    let helper_bare = plugin_dir.join("cef-unity-rust-helper");
+    let helper_path = if helper_app.exists() { helper_app } else { helper_bare };
+    log_to_file(&format!("helper_path = {}", helper_path.display()));
 
-            let helper_app = p_dir.join("cef-unity-rust-helper.app/Contents/MacOS/cef-unity-rust-helper");
-            let helper_bare = p_dir.join("cef-unity-rust-helper");
-            let helper_path = if helper_app.exists() { helper_app } else { helper_bare };
+    let cache_dir = std::env::temp_dir().join("cef_unity_cache");
+    let _ = std::fs::create_dir_all(&cache_dir);
 
-            let mut settings = Settings::default();
-            settings.no_sandbox = 1;
-            settings.windowless_rendering_enabled = 1;
-            settings.external_message_pump = 1;
-            settings.framework_dir_path = CefString::from(fw_dir.to_str().unwrap());
-            settings.browser_subprocess_path = CefString::from(helper_path.to_str().unwrap());
-            settings.resources_dir_path = CefString::from(resources_dir.to_str().unwrap());
-            let locales_dir = resources_dir.join("locales");
-            if locales_dir.exists() {
-                settings.locales_dir_path = CefString::from(locales_dir.to_str().unwrap());
-            }
+    let mut settings = Settings::default();
+    settings.no_sandbox = 1;
+    settings.windowless_rendering_enabled = 1;
+    settings.external_message_pump = 1;
+    settings.root_cache_path = CefString::from(cache_dir.to_str().unwrap());
+    settings.framework_dir_path = CefString::from(framework_dir.to_str().unwrap());
+    settings.browser_subprocess_path = CefString::from(helper_path.to_str().unwrap());
+    settings.resources_dir_path = CefString::from(resources_dir.to_str().unwrap());
+    let locales_dir = resources_dir.join("locales");
+    if locales_dir.exists() {
+        settings.locales_dir_path = CefString::from(locales_dir.to_str().unwrap());
+    }
+    let cef_log = std::env::temp_dir().join("cef_debug.log");
+    settings.log_file = CefString::from(cef_log.to_str().unwrap());
+    settings.log_severity = LogSeverity::VERBOSE;
 
-            let mut app = MyApp::new();
-            let result = initialize(
-                Some(args.as_main_args()),
-                Some(&settings),
-                Some(&mut app),
-                std::ptr::null_mut(),
-            );
-            eprintln!("[cef-unity] initialize() returned {}", result);
-            let _ = tx.send(result);
-
-            if result != 0 {
-                // Pump messages forever on this thread.
-                // cef_unity_safe_pump() wraps do_message_loop_work() in @try/@catch
-                // to survive the ChromeWebAppShortcutCopierMain ObjC exception.
-                loop {
-                    unsafe { cef_unity_safe_pump(do_pump); }
-                    thread::sleep(std::time::Duration::from_millis(16));
-                }
-            }
-        })
-        .expect("failed to spawn CEF UI thread");
-
-    let result = match rx.recv() {
-        Ok(r) => r,
-        Err(_) => {
-            eprintln!("[cef-unity] CEF UI thread died before sending result");
-            return -4;
-        }
-    };
+    let mut app = MyApp::new();
+    let result = initialize(
+        Some(args.as_main_args()),
+        Some(&settings),
+        Some(&mut app),
+        std::ptr::null_mut(),
+    );
+    log_to_file(&format!("initialize() returned {}", result));
 
     if result == 0 {
-        eprintln!("[cef-unity] initialize() failed");
+        log_to_file("initialize() FAILED");
         return -2;
     }
 
     CEF_INITIALIZED.store(true, Ordering::SeqCst);
+    log_to_file("CEF initialized successfully on main thread");
     0
 }
 
-/// No-op kept for C# API compatibility. The background thread pumps
-/// automatically.
+/// Pump CEF message loop. Call every frame from Unity's Update().
+/// Wrapped in @try/@catch to survive ObjC exceptions.
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_pump() {}
+pub extern "C" fn cef_unity_pump() {
+    if !CEF_INITIALIZED.load(Ordering::SeqCst) {
+        return;
+    }
+    let count = PUMP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    unsafe { cef_unity_safe_pump(do_pump); }
+    if count <= 3 || count % 1000 == 0 {
+        log_to_file(&format!("pump #{}, paint_count={}", count, PAINT_COUNT.load(Ordering::Relaxed)));
+    }
+}
 
+/// Returns the number of on_paint calls received so far.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_get_paint_count() -> u64 {
+    PAINT_COUNT.load(Ordering::Relaxed)
+}
 
-/// No-op. The CEF UI thread runs for the lifetime of the process because
-/// CEF cannot be re-initialized after shutdown.
+/// Returns the number of pump iterations so far.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_get_pump_count() -> u64 {
+    PUMP_COUNT.load(Ordering::Relaxed)
+}
+
+/// No-op. CEF cannot be re-initialized after shutdown.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_shutdown() {}
 
 // ---------------------------------------------------------------------------
-// Instance functions – per-browser, via opaque handle
+// Instance functions – per-browser
 // ---------------------------------------------------------------------------
 
-/// Create a browser instance. Returns a handle (null on failure).
+/// Create a browser instance on the main (CEF UI) thread.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_create_browser(
     width: i32,
@@ -291,6 +300,7 @@ pub extern "C" fn cef_unity_create_browser(
     }
 
     let url_str = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
+    log_to_file(&format!("cef_unity_create_browser({}x{}, {})", width, height, url_str));
 
     let shared = Arc::new(SharedState {
         buffer: Mutex::new(BackBuffer {
@@ -310,17 +320,18 @@ pub extern "C" fn cef_unity_create_browser(
 
     let window_info = WindowInfo::default().set_as_windowless(std::ptr::null_mut());
 
-    browser_host_create_browser(
+    let ok = browser_host_create_browser(
         Some(&window_info),
         Some(&mut client),
         Some(&CefString::from(url_str)),
         Some(&BrowserSettings {
-            background_color: 0x00000000,
+            background_color: 0xFF000000,
             ..Default::default()
         }),
         None,
         None,
     );
+    log_to_file(&format!("browser_host_create_browser returned {}", ok));
 
     let instance = Box::new(BrowserInstance {
         shared,
