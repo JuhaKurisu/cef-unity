@@ -1,8 +1,9 @@
 use cef::*;
 use std::ffi::{CStr, c_char};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Opaque handle type (becomes IntPtr in C#)
@@ -47,11 +48,15 @@ fn handle_to_ref<'a>(handle: *mut CefUnityBrowser) -> &'a mut BrowserInstance {
 }
 
 // ---------------------------------------------------------------------------
-// Global state – tracks whether CEF is initialized
+// Global state
 // ---------------------------------------------------------------------------
 
-static CEF_INITIALIZED: OnceLock<bool> = OnceLock::new();
-static CEF_THREAD: OnceLock<Mutex<Option<thread::JoinHandle<()>>>> = OnceLock::new();
+/// CEF library loaded + initialized (never reset; CEF cannot re-initialize)
+static CEF_INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// Pump thread handle (re-created each Play session)
+static CEF_THREAD: Mutex<Option<thread::JoinHandle<()>>> = Mutex::new(None);
+/// Signal for pump thread to stop
+static CEF_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -118,7 +123,6 @@ wrap_app! {
         ) {
             if let Some(cl) = command_line {
                 cl.append_switch(Some(&CefString::from("use-mock-keychain")));
-                cl.append_switch(Some(&CefString::from("single-process")));
             }
         }
     }
@@ -146,15 +150,20 @@ wrap_client! {
 /// Initialize the CEF framework. Call once at app startup.
 /// Returns 0 on success, non-zero on failure.
 ///
-/// CEF is initialized on a dedicated background thread to avoid conflicting
-/// with Unity's NSApplication run loop on macOS.
+/// CEF is initialized on a dedicated background thread with external_message_pump
+/// to prevent CEF from hooking into the host application's main-thread CFRunLoop.
+/// This avoids the ChromeWebAppShortcutCopierMain crash on macOS.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_init() -> i32 {
-    if CEF_INITIALIZED.get().is_some() {
-        return -1; // already initialized
+    // CEF cannot be re-initialized after shutdown in the same process.
+    // On subsequent calls (Unity Play/Stop cycles), just ensure the
+    // pump thread is running.
+    if CEF_INITIALIZED.load(Ordering::SeqCst) {
+        eprintln!("[cef-unity] already initialized, restarting pump thread");
+        start_pump_thread();
+        return 0;
     }
 
-    // Resolve all paths relative to the dylib's directory
     let plugin_dir = crate::dylib_dir();
     eprintln!("[cef-unity] plugin_dir = {}", plugin_dir.display());
 
@@ -170,7 +179,6 @@ pub extern "C" fn cef_unity_init() -> i32 {
     };
     eprintln!("[cef-unity] framework_dir = {}", framework_dir.display());
 
-    // Load the CEF dynamic library (dlopen + api_hash)
     crate::load_cef(&framework_dir);
 
     // Symlink GPU libraries next to the dylib
@@ -185,26 +193,25 @@ pub extern "C" fn cef_unity_init() -> i32 {
         }
     }
 
-    // Spawn a dedicated thread for CEF initialization + message loop.
-    // This avoids conflicting with Unity's main-thread NSApplication run loop.
+    // Spawn a dedicated CEF thread for initialize().
     let fw_dir = framework_dir.clone();
     let p_dir = plugin_dir.clone();
     let (tx, rx) = std::sync::mpsc::channel();
 
-    let handle = thread::Builder::new()
-        .name("cef-message-loop".into())
+    thread::Builder::new()
+        .name("cef-init".into())
         .spawn(move || {
             let args = cef::args::Args::new();
             let resources_dir = fw_dir.join("Resources");
+            let helper_path = p_dir.join("cef-unity-rust-helper");
 
             let mut settings = Settings::default();
             settings.no_sandbox = 1;
             settings.windowless_rendering_enabled = 1;
-            // Default message loop: CEF runs its own CFRunLoop on this thread.
-            // (no external_message_pump, no multi_threaded_message_loop)
+            settings.external_message_pump = 1;
             settings.framework_dir_path = CefString::from(fw_dir.to_str().unwrap());
             settings.browser_subprocess_path =
-                CefString::from(p_dir.join("cef-unity-rust-helper").to_str().unwrap());
+                CefString::from(helper_path.to_str().unwrap());
             settings.resources_dir_path = CefString::from(resources_dir.to_str().unwrap());
             let locales_dir = resources_dir.join("locales");
             if locales_dir.exists() {
@@ -218,25 +225,17 @@ pub extern "C" fn cef_unity_init() -> i32 {
                 Some(&mut app),
                 std::ptr::null_mut(),
             );
-
+            eprintln!("[cef-unity] initialize() returned {}", result);
             let _ = tx.send(result);
-
-            if result != 0 {
-                eprintln!("[cef-unity] CEF message loop starting on background thread");
-                run_message_loop();
-                eprintln!("[cef-unity] CEF message loop ended, calling shutdown");
-                shutdown();
-                eprintln!("[cef-unity] CEF shutdown complete");
-            } else {
-                eprintln!("[cef-unity] initialize() returned 0 (failure)");
-            }
         })
-        .expect("failed to spawn CEF thread");
+        .expect("failed to spawn CEF init thread")
+        .join()
+        .expect("CEF init thread panicked");
 
     let result = match rx.recv() {
         Ok(r) => r,
         Err(_) => {
-            eprintln!("[cef-unity] CEF thread died before sending result");
+            eprintln!("[cef-unity] CEF init thread died before sending result");
             return -4;
         }
     };
@@ -246,34 +245,51 @@ pub extern "C" fn cef_unity_init() -> i32 {
         return -2;
     }
 
-    let _ = CEF_THREAD.set(Mutex::new(Some(handle)));
-    let _ = CEF_INITIALIZED.set(true);
-    eprintln!("[cef-unity] initialization successful");
+    CEF_INITIALIZED.store(true, Ordering::SeqCst);
+    start_pump_thread();
     0
 }
 
-/// Pump the CEF message loop for one iteration.
-/// CEF runs its own message loop on a dedicated background thread,
-/// so this is a no-op. Kept for API compatibility.
-#[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_tick() {
-    // CEF message loop runs on its own dedicated thread.
+fn start_pump_thread() {
+    // Stop any existing pump thread
+    CEF_SHUTDOWN.store(true, Ordering::SeqCst);
+    if let Some(handle) = CEF_THREAD.lock().unwrap().take() {
+        let _ = handle.join();
+    }
+
+    CEF_SHUTDOWN.store(false, Ordering::SeqCst);
+    let handle = thread::Builder::new()
+        .name("cef-pump".into())
+        .spawn(|| {
+            log("[cef-unity] pump thread started");
+            while !CEF_SHUTDOWN.load(Ordering::SeqCst) {
+                do_message_loop_work();
+                thread::sleep(Duration::from_millis(16));
+            }
+            log("[cef-unity] pump thread stopped");
+        })
+        .expect("failed to spawn CEF pump thread");
+
+    *CEF_THREAD.lock().unwrap() = Some(handle);
 }
 
-/// Shut down the CEF framework. Call once at app exit.
+/// No-op. CEF message pump runs on its own dedicated thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_tick() {
+    // CEF pumps messages on the cef-main thread.
+}
+
+/// Stop the CEF message pump. CEF remains initialized (it cannot re-initialize
+/// within the same process). The pump thread is restarted on the next
+/// `cef_unity_init()` call.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_shutdown() {
-    if CEF_INITIALIZED.get().is_some() {
-        eprintln!("[cef-unity] requesting CEF message loop quit");
-        quit_message_loop();
-        // Wait for the CEF thread to finish (it calls shutdown() internally)
-        if let Some(mutex) = CEF_THREAD.get() {
-            if let Some(handle) = mutex.lock().unwrap().take() {
-                let _ = handle.join();
-            }
-        }
-        eprintln!("[cef-unity] shutdown complete");
+    log("[cef-unity] shutting down");
+    CEF_SHUTDOWN.store(true, Ordering::SeqCst);
+    if let Some(handle) = CEF_THREAD.lock().unwrap().take() {
+        let _ = handle.join();
     }
+    log("[cef-unity] shutdown complete");
 }
 
 // ---------------------------------------------------------------------------
@@ -287,7 +303,7 @@ pub extern "C" fn cef_unity_create_browser(
     height: i32,
     url: *const c_char,
 ) -> *mut CefUnityBrowser {
-    if CEF_INITIALIZED.get().is_none() || url.is_null() {
+    if !CEF_INITIALIZED.load(Ordering::SeqCst) || url.is_null() {
         return std::ptr::null_mut();
     }
 
@@ -339,7 +355,6 @@ pub extern "C" fn cef_unity_destroy_browser(handle: *mut CefUnityBrowser) {
         return;
     }
     let instance = unsafe { Box::from_raw(handle as *mut BrowserInstance) };
-    // Close the browser if it was created
     if let Some(browser) = instance.shared.browser.lock().unwrap().take() {
         if let Some(host) = Browser::host(&browser) {
             BrowserHost::close_browser(&host, 1);
@@ -372,7 +387,6 @@ pub extern "C" fn cef_unity_resize(handle: *mut CefUnityBrowser, width: i32, hei
     let instance = handle_to_ref(handle);
     instance.shared.viewport_w.store(width, Ordering::Relaxed);
     instance.shared.viewport_h.store(height, Ordering::Relaxed);
-    // Notify CEF that the view was resized
     if let Some(ref browser) = *instance.shared.browser.lock().unwrap() {
         if let Some(host) = Browser::host(browser) {
             BrowserHost::was_resized(&host);
