@@ -30,12 +30,6 @@ namespace CefUnity
         public static extern int cef_unity_init();
 
         /// <summary>
-        ///  No-op. CEF message pump runs on its own dedicated thread.
-        /// </summary>
-        [DllImport(__DllName, EntryPoint = "cef_unity_tick", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern void cef_unity_tick();
-
-        /// <summary>
         ///  Stop the CEF message pump. CEF remains initialized (it cannot re-initialize
         ///  within the same process). The pump thread is restarted on the next
         ///  `cef_unity_init()` call.

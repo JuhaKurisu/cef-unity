@@ -271,12 +271,6 @@ fn start_pump_thread() {
     *CEF_THREAD.lock().unwrap() = Some(handle);
 }
 
-/// No-op. CEF message pump runs on its own dedicated thread.
-#[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_tick() {
-    // CEF pumps messages on the cef-main thread.
-}
-
 /// Stop the CEF message pump. CEF remains initialized (it cannot re-initialize
 /// within the same process). The pump thread is restarted on the next
 /// `cef_unity_init()` call.
