@@ -2,8 +2,7 @@
 
 use cef::*;
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::Write;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -228,9 +227,9 @@ impl CefServer {
 
     fn create_browser(&mut self, width: i32, height: i32, url: &str) -> Response {
         let id = self.next_browser_id.fetch_add(1, Ordering::Relaxed);
-        let shm_name = ipc::shm_name(self.server_pid, id);
+        let shm_flink = ipc::shm_flink_path(self.server_pid, id);
 
-        let shm = match ShmWriter::new(&shm_name) {
+        let shm = match ShmWriter::new(&shm_flink) {
             Ok(w) => Arc::new(w),
             Err(e) => {
                 return Response::Error {
@@ -286,7 +285,7 @@ impl CefServer {
 
         Response::BrowserCreated {
             browser_id: id,
-            shm_name,
+            shm_flink,
         }
     }
 
@@ -353,66 +352,5 @@ impl CefServer {
         }
         cef::shutdown();
         log("CEF shutdown complete");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Connection handler
-// ---------------------------------------------------------------------------
-
-pub struct ClientConnection {
-    stream: UnixStream,
-    buf: Vec<u8>,
-}
-
-impl ClientConnection {
-    pub fn new(stream: UnixStream) -> io::Result<Self> {
-        stream.set_nonblocking(true)?;
-        Ok(ClientConnection {
-            stream,
-            buf: Vec::new(),
-        })
-    }
-
-    /// Try to read one command (non-blocking). Returns None if no complete message.
-    pub fn try_recv(&mut self) -> io::Result<Option<Command>> {
-        // Read whatever is available
-        let mut tmp = [0u8; 4096];
-        match self.stream.read(&mut tmp) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    "client disconnected",
-                ));
-            }
-            Ok(n) => {
-                self.buf.extend_from_slice(&tmp[..n]);
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e),
-        }
-
-        // Check if we have a complete frame
-        if self.buf.len() < 4 {
-            return Ok(None);
-        }
-        let msg_len = u32::from_le_bytes(self.buf[..4].try_into().unwrap()) as usize;
-        if self.buf.len() < 4 + msg_len {
-            return Ok(None);
-        }
-
-        let payload: Vec<u8> = self.buf[4..4 + msg_len].to_vec();
-        self.buf.drain(..4 + msg_len);
-        let cmd = Command::deserialize(&payload)?;
-        Ok(Some(cmd))
-    }
-
-    /// Send a response (blocking).
-    pub fn send(&mut self, resp: &Response) -> io::Result<()> {
-        self.stream.set_nonblocking(false)?;
-        let payload = resp.serialize();
-        ipc::send_message(&mut self.stream, &payload)?;
-        self.stream.set_nonblocking(true)?;
-        Ok(())
     }
 }

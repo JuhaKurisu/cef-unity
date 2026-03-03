@@ -1,15 +1,16 @@
 // FFI layer for Unity C# interop.
 //
 // This is now a pure IPC client — no CEF dependency.
-// Communicates with cef-unity-server via Unix domain socket + shared memory.
+// Communicates with cef-unity-server via ipc-channel + shared memory.
 
 use std::ffi::{CStr, c_char};
 use std::io::Write;
-use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::ipc::{self, Command, Response, ShmReader};
+use ipc_channel::ipc::{IpcOneShotServer, IpcReceiver, IpcSender};
+
+use crate::ipc::{Bootstrap, Command, Response, ShmReader};
 
 // ---------------------------------------------------------------------------
 // Opaque handle type (becomes IntPtr in C#)
@@ -45,15 +46,19 @@ static PAINT_COUNT: AtomicU64 = AtomicU64::new(0);
 static PUMP_COUNT: AtomicU64 = AtomicU64::new(0);
 
 struct ServerConnection {
-    stream: UnixStream,
-    socket_path: String,
+    cmd_tx: IpcSender<Command>,
+    resp_rx: IpcReceiver<Response>,
 }
 
 static CONNECTION: Mutex<Option<ServerConnection>> = Mutex::new(None);
 
 fn log_to_file(msg: &str) {
     let path = std::env::temp_dir().join("cef_unity_debug.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now(), msg);
     }
 }
@@ -62,18 +67,16 @@ fn log_to_file(msg: &str) {
 // IPC helpers
 // ---------------------------------------------------------------------------
 
-fn send_command(stream: &mut UnixStream, cmd: &Command) -> std::io::Result<Response> {
-    let payload = cmd.serialize();
-    ipc::send_message(stream, &payload)?;
-    let resp_data = ipc::recv_message(stream)?;
-    Response::deserialize(&resp_data)
+fn send_command(conn: &ServerConnection, cmd: Command) -> Result<Response, String> {
+    conn.cmd_tx.send(cmd).map_err(|e| format!("send: {}", e))?;
+    conn.resp_rx.recv().map_err(|e| format!("recv: {}", e))
 }
 
 // ---------------------------------------------------------------------------
 // Global functions
 // ---------------------------------------------------------------------------
 
-/// Initialize: launch CEF server process and connect via Unix domain socket.
+/// Initialize: launch CEF server process and connect via ipc-channel.
 /// Returns 0 on success, non-zero on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_init() -> i32 {
@@ -88,23 +91,28 @@ pub extern "C" fn cef_unity_init() -> i32 {
     let plugin_dir = crate::dylib_dir();
     let server_app = plugin_dir.join("cef-unity-server.app/Contents/MacOS/cef-unity-server");
     if !server_app.exists() {
-        log_to_file(&format!("server binary not found: {}", server_app.display()));
+        log_to_file(&format!(
+            "server binary not found: {}",
+            server_app.display()
+        ));
         return -3;
     }
     log_to_file(&format!("server binary: {}", server_app.display()));
 
-    // Socket path in temp dir
-    let socket_path = std::env::temp_dir()
-        .join(format!("cef-unity-{}.sock", std::process::id()))
-        .to_str()
-        .unwrap()
-        .to_string();
-    log_to_file(&format!("socket_path = {}", socket_path));
+    // Create one-shot server for bootstrap
+    let (oneshot_server, server_name) = match IpcOneShotServer::<Bootstrap>::new() {
+        Ok(pair) => pair,
+        Err(e) => {
+            log_to_file(&format!("failed to create one-shot server: {}", e));
+            return -4;
+        }
+    };
+    log_to_file(&format!("one-shot server name = {}", server_name));
 
-    // Launch server process directly
+    // Launch server process with --ipc-server argument
     match std::process::Command::new(&server_app)
-        .arg("--socket-path")
-        .arg(&socket_path)
+        .arg("--ipc-server")
+        .arg(&server_name)
         .spawn()
     {
         Ok(_child) => {
@@ -117,32 +125,19 @@ pub extern "C" fn cef_unity_init() -> i32 {
     }
     log_to_file("server spawned");
 
-    // Retry loop to connect to server socket
-    let mut stream = None;
-    for attempt in 0..100 {
-        match UnixStream::connect(&socket_path) {
-            Ok(s) => {
-                log_to_file(&format!("connected to server on attempt {}", attempt));
-                stream = Some(s);
-                break;
-            }
-            Err(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        }
-    }
-
-    let stream = match stream {
-        Some(s) => s,
-        None => {
-            log_to_file("failed to connect to server after retries");
+    // Wait for server to connect and send bootstrap (blocking)
+    let bootstrap = match oneshot_server.accept() {
+        Ok((_rx, bootstrap)) => bootstrap,
+        Err(e) => {
+            log_to_file(&format!("failed to accept bootstrap: {}", e));
             return -5;
         }
     };
+    log_to_file("bootstrap received from server");
 
     *CONNECTION.lock().unwrap() = Some(ServerConnection {
-        stream,
-        socket_path,
+        cmd_tx: bootstrap.cmd_tx,
+        resp_rx: bootstrap.resp_rx,
     });
 
     INITIALIZED.store(true, Ordering::SeqCst);
@@ -176,11 +171,10 @@ pub extern "C" fn cef_unity_shutdown() {
     }
     log_to_file("cef_unity_shutdown()");
 
-    if let Some(mut conn) = CONNECTION.lock().unwrap().take() {
-        let _ = send_command(&mut conn.stream, &Command::Shutdown);
+    if let Some(conn) = CONNECTION.lock().unwrap().take() {
+        let _ = send_command(&conn, Command::Shutdown);
         // Server will exit after receiving Shutdown; give it a moment
         std::thread::sleep(std::time::Duration::from_millis(500));
-        let _ = std::fs::remove_file(&conn.socket_path);
     }
 
     INITIALIZED.store(false, Ordering::SeqCst);
@@ -208,8 +202,8 @@ pub extern "C" fn cef_unity_create_browser(
         width, height, url_str
     ));
 
-    let mut guard = CONNECTION.lock().unwrap();
-    let conn = match guard.as_mut() {
+    let guard = CONNECTION.lock().unwrap();
+    let conn = match guard.as_ref() {
         Some(c) => c,
         None => return std::ptr::null_mut(),
     };
@@ -219,7 +213,7 @@ pub extern "C" fn cef_unity_create_browser(
         height,
         url: url_str.to_string(),
     };
-    let resp = match send_command(&mut conn.stream, &cmd) {
+    let resp = match send_command(conn, cmd) {
         Ok(r) => r,
         Err(e) => {
             log_to_file(&format!("create_browser IPC error: {}", e));
@@ -230,13 +224,13 @@ pub extern "C" fn cef_unity_create_browser(
     match resp {
         Response::BrowserCreated {
             browser_id,
-            shm_name,
+            shm_flink,
         } => {
             log_to_file(&format!(
                 "browser created: id={}, shm={}",
-                browser_id, shm_name
+                browser_id, shm_flink
             ));
-            let shm = match ShmReader::open(&shm_name) {
+            let shm = match ShmReader::open(&shm_flink) {
                 Ok(s) => s,
                 Err(e) => {
                     log_to_file(&format!("shm_open failed: {}", e));
@@ -271,12 +265,12 @@ pub extern "C" fn cef_unity_destroy_browser(handle: *mut CefUnityBrowser) {
     }
     let instance = unsafe { Box::from_raw(handle as *mut ClientBrowserInstance) };
 
-    let mut guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_mut() {
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
         let cmd = Command::DestroyBrowser {
             browser_id: instance.browser_id,
         };
-        let _ = send_command(&mut conn.stream, &cmd);
+        let _ = send_command(conn, cmd);
     }
     drop(instance);
 }
@@ -290,13 +284,13 @@ pub extern "C" fn cef_unity_load_url(handle: *mut CefUnityBrowser, url: *const c
     let instance = handle_to_ref(handle);
     let url_str = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
 
-    let mut guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_mut() {
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
         let cmd = Command::LoadUrl {
             browser_id: instance.browser_id,
             url: url_str.to_string(),
         };
-        let _ = send_command(&mut conn.stream, &cmd);
+        let _ = send_command(conn, cmd);
     }
 }
 
@@ -308,14 +302,14 @@ pub extern "C" fn cef_unity_resize(handle: *mut CefUnityBrowser, width: i32, hei
     }
     let instance = handle_to_ref(handle);
 
-    let mut guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_mut() {
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
         let cmd = Command::Resize {
             browser_id: instance.browser_id,
             width,
             height,
         };
-        let _ = send_command(&mut conn.stream, &cmd);
+        let _ = send_command(conn, cmd);
     }
 }
 

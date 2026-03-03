@@ -16,6 +16,9 @@ path = "src/server_main.rs"
 
 [dependencies]
 cef = "145.5.0"
+ipc-channel = "0.21"
+serde = { version = "1", features = ["derive"] }
+shared_memory = "0.12"
 
 [build-dependencies]
 csbindgen = "1.9"

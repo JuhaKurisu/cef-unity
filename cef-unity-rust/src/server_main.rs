@@ -1,12 +1,14 @@
 // CEF Server entry point.
 //
-// Runs CEF in its own process, communicates with Unity via Unix domain socket + shared memory.
-// Uses CFRunLoopTimer for periodic CEF pump + socket polling on macOS.
+// Runs CEF in its own process, communicates with Unity via ipc-channel + shared memory.
+// Uses CFRunLoopTimer for periodic CEF pump + IPC polling on macOS.
 
 use std::io::Write;
-use std::os::unix::net::UnixListener;
 
-use cef_unity_rust::ipc::Command;
+use ipc_channel::ipc::{self as ipc_ch, IpcReceiver, IpcSender};
+use ipc_channel::TryRecvError;
+
+use cef_unity_rust::ipc::{Bootstrap, Command, Response};
 use cef_unity_rust::server;
 
 fn log(msg: &str) {
@@ -74,11 +76,10 @@ unsafe extern "C" {
 
 struct ServerState {
     cef_server: server::CefServer,
-    listener: UnixListener,
-    client: Option<server::ClientConnection>,
+    cmd_rx: IpcReceiver<Command>,
+    resp_tx: IpcSender<Response>,
     running: bool,
     pump_count: u64,
-    socket_path: String,
 }
 
 static mut SERVER_STATE: *mut ServerState = std::ptr::null_mut();
@@ -90,46 +91,28 @@ unsafe extern "C" fn timer_callback(_timer: CFRunLoopTimerRef, _info: *mut std::
     cef::do_message_loop_work();
     state.pump_count += 1;
 
-    // Accept new connection
-    if state.client.is_none() {
-        match state.listener.accept() {
-            Ok((stream, _)) => {
-                log("client connected");
-                match server::ClientConnection::new(stream) {
-                    Ok(conn) => state.client = Some(conn),
-                    Err(e) => log(&format!("failed to setup client: {}", e)),
-                }
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => log(&format!("accept error: {}", e)),
-        }
-    }
-
-    // Process commands from connected client
-    if let Some(ref mut conn) = state.client {
-        loop {
-            match conn.try_recv() {
-                Ok(Some(cmd)) => {
-                    let is_shutdown = matches!(cmd, Command::Shutdown);
-                    log(&format!("received command: {:?}", cmd));
-                    let resp = state.cef_server.handle_command(cmd);
-                    if let Err(e) = conn.send(&resp) {
-                        log(&format!("send error: {}", e));
-                        state.client = None;
-                        break;
-                    }
-                    if is_shutdown {
-                        state.running = false;
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    log(&format!("client disconnected: {}", e));
-                    state.client = None;
+    // Process commands from client
+    loop {
+        match state.cmd_rx.try_recv() {
+            Ok(cmd) => {
+                let is_shutdown = matches!(cmd, Command::Shutdown);
+                log(&format!("received command: {:?}", cmd));
+                let resp = state.cef_server.handle_command(cmd);
+                if let Err(e) = state.resp_tx.send(resp) {
+                    log(&format!("send error: {}", e));
                     state.running = false;
                     break;
                 }
+                if is_shutdown {
+                    state.running = false;
+                    break;
+                }
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::IpcError(e)) => {
+                log(&format!("client disconnected: {}", e));
+                state.running = false;
+                break;
             }
         }
     }
@@ -145,17 +128,14 @@ fn main() {
     let _ = std::fs::write(std::env::temp_dir().join("cef_unity_server.log"), "");
     log(&format!("server started, pid={}", std::process::id()));
 
-    // Parse --socket-path argument
-    let socket_path = std::env::args()
-        .skip_while(|a| a != "--socket-path")
+    // Parse --ipc-server argument
+    let ipc_server_name = std::env::args()
+        .skip_while(|a| a != "--ipc-server")
         .nth(1)
-        .expect("--socket-path argument required");
-    log(&format!("socket_path = {}", socket_path));
+        .expect("--ipc-server argument required");
+    log(&format!("ipc_server_name = {}", ipc_server_name));
 
-    // Remove stale socket file
-    let _ = std::fs::remove_file(&socket_path);
-
-    // Initialize CEF
+    // Initialize CEF first (server must be ready before accepting connections)
     let cef_server = server::CefServer::new();
     if !cef_server.init_cef() {
         log("CEF initialization failed");
@@ -163,19 +143,29 @@ fn main() {
     }
     log("CEF initialized successfully");
 
-    // Bind Unix domain socket
-    let listener = UnixListener::bind(&socket_path).expect("failed to bind socket");
-    listener.set_nonblocking(true).unwrap();
-    log("socket bound, waiting for connections");
+    // Create bidirectional channels
+    let (cmd_tx, cmd_rx) = ipc_ch::channel::<Command>().expect("failed to create cmd channel");
+    let (resp_tx, resp_rx) =
+        ipc_ch::channel::<Response>().expect("failed to create resp channel");
+
+    // Connect to client's one-shot server and send bootstrap
+    let bootstrap_tx =
+        IpcSender::connect(ipc_server_name).expect("failed to connect to client one-shot server");
+    bootstrap_tx
+        .send(Bootstrap {
+            cmd_tx,
+            resp_rx,
+        })
+        .expect("failed to send bootstrap");
+    log("bootstrap sent to client");
 
     // Set up global state for timer callback
     let state = Box::new(ServerState {
         cef_server,
-        listener,
-        client: None,
+        cmd_rx,
+        resp_tx,
         running: true,
         pump_count: 0,
-        socket_path: socket_path.clone(),
     });
     unsafe {
         SERVER_STATE = Box::into_raw(state);
@@ -213,6 +203,5 @@ fn main() {
     let mut cef_server = state.cef_server;
     cef_server.shutdown();
 
-    let _ = std::fs::remove_file(&state.socket_path);
     log("server exit");
 }
