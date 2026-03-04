@@ -8,14 +8,14 @@ DEST="../cef-unity-unityproject/Assets/CefUnity/Interop/Plugins/osx-arm64"
 # の形式なので、親と子で同じbundle IDが必要。
 BUNDLE_ID="com.cef-unity.server"
 
-cargo build
+cargo build --release
 
 # --- dylib (IPC client only, no CEF) ---
-cp target/debug/libcef_unity_rust.dylib "$DEST/"
+cp target/release/libcef_unity_rust.dylib "$DEST/"
 codesign -s - --force "$DEST/libcef_unity_rust.dylib"
 
 # --- CEF framework path ---
-CEF_OUT=$(ls -d target/debug/build/cef-dll-sys-*/out/cef_macos_* 2>/dev/null | head -1)
+CEF_OUT=$(ls -d target/release/build/cef-dll-sys-*/out/cef_macos_* 2>/dev/null | head -1)
 CEF_FW="$CEF_OUT/Chromium Embedded Framework.framework"
 if [ ! -d "$CEF_FW" ]; then
     echo "ERROR: CEF framework not found at $CEF_FW"
@@ -30,7 +30,7 @@ mkdir -p "$SERVER_APP/Contents/Frameworks"
 mkdir -p "$SERVER_APP/Contents/Helpers"
 
 # Server binary
-cp target/debug/cef-unity-server "$SERVER_APP/Contents/MacOS/"
+cp target/release/cef-unity-server "$SERVER_APP/Contents/MacOS/"
 
 # CEF framework (symlink to avoid doubling disk usage)
 ln -sf "$(cd "$CEF_OUT" && pwd)/Chromium Embedded Framework.framework" \
@@ -61,7 +61,7 @@ PLIST
 # --- helper .app bundle (inside server) ---
 HELPER_APP="$SERVER_APP/Contents/Helpers/cef-unity-rust-helper.app"
 mkdir -p "$HELPER_APP/Contents/MacOS"
-cp target/debug/cef-unity-rust-helper "$HELPER_APP/Contents/MacOS/"
+cp target/release/cef-unity-rust-helper "$HELPER_APP/Contents/MacOS/"
 cat > "$HELPER_APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
