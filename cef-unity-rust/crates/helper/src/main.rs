@@ -29,9 +29,19 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
 
     let log_path = std::env::temp_dir().join("cef_unity_helper.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
         use std::io::Write;
-        let _ = writeln!(f, "[{:?}] helper started: pid={} {}", std::time::SystemTime::now(), std::process::id(), process_type);
+        let _ = writeln!(
+            f,
+            "[{:?}] helper started: pid={} {}",
+            std::time::SystemTime::now(),
+            std::process::id(),
+            process_type
+        );
     }
 
     let result = std::panic::catch_unwind(|| {
@@ -42,16 +52,36 @@ fn main() {
 
     match result {
         Ok(code) => {
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
                 use std::io::Write;
-                let _ = writeln!(f, "[{:?}] helper exit: pid={} code={}", std::time::SystemTime::now(), std::process::id(), code);
+                let _ = writeln!(
+                    f,
+                    "[{:?}] helper exit: pid={} code={}",
+                    std::time::SystemTime::now(),
+                    std::process::id(),
+                    code
+                );
             }
             std::process::exit(code);
         }
         Err(e) => {
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
                 use std::io::Write;
-                let _ = writeln!(f, "[{:?}] helper PANIC: pid={} {:?}", std::time::SystemTime::now(), std::process::id(), e);
+                let _ = writeln!(
+                    f,
+                    "[{:?}] helper PANIC: pid={} {:?}",
+                    std::time::SystemTime::now(),
+                    std::process::id(),
+                    e
+                );
             }
             std::process::exit(1);
         }

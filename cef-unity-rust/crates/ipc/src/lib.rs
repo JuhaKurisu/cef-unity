@@ -14,10 +14,23 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Command {
-    CreateBrowser { width: i32, height: i32, url: String },
-    DestroyBrowser { browser_id: u32 },
-    LoadUrl { browser_id: u32, url: String },
-    Resize { browser_id: u32, width: i32, height: i32 },
+    CreateBrowser {
+        width: i32,
+        height: i32,
+        url: String,
+    },
+    DestroyBrowser {
+        browser_id: u32,
+    },
+    LoadUrl {
+        browser_id: u32,
+        url: String,
+    },
+    Resize {
+        browser_id: u32,
+        width: i32,
+        height: i32,
+    },
     Shutdown,
 }
 
@@ -269,9 +282,7 @@ mod tests {
         let (resp_tx, resp_rx) = ipc::channel::<Response>().unwrap();
 
         // Simulate server sending bootstrap
-        bootstrap_tx
-            .send(Bootstrap { cmd_tx, resp_rx })
-            .unwrap();
+        bootstrap_tx.send(Bootstrap { cmd_tx, resp_rx }).unwrap();
 
         // Client receives bootstrap
         let bootstrap = bootstrap_rx.recv().unwrap();

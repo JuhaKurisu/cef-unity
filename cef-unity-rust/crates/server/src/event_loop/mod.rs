@@ -1,9 +1,9 @@
 // Platform-specific event loop for CEF message pump + IPC polling.
 
-#[cfg(target_os = "macos")]
-mod macos;
 #[cfg(not(target_os = "macos"))]
 mod generic;
+#[cfg(target_os = "macos")]
+mod macos;
 
 use ipc_channel::ipc::{IpcReceiver, IpcSender};
 

@@ -77,7 +77,9 @@ unsafe extern "C" fn timer_callback(_timer: CFRunLoopTimerRef, _info: *mut std::
         log("timer_callback panicked, stopping run loop");
         let state = unsafe { &mut *SERVER_STATE };
         state.running = false;
-        unsafe { CFRunLoopStop(CFRunLoopGetMain()); }
+        unsafe {
+            CFRunLoopStop(CFRunLoopGetMain());
+        }
     }
 }
 
@@ -85,7 +87,9 @@ fn timer_callback_inner() {
     let state = unsafe { &mut *SERVER_STATE };
 
     if !state.running {
-        unsafe { CFRunLoopStop(CFRunLoopGetMain()); }
+        unsafe {
+            CFRunLoopStop(CFRunLoopGetMain());
+        }
         return;
     }
 

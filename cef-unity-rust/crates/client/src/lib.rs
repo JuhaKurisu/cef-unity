@@ -61,15 +61,18 @@ fn dl_info() -> Option<String> {
     type LPWSTR = *mut u16;
 
     unsafe extern "system" {
-        fn GetModuleHandleExW(dwFlags: DWORD, lpModuleName: LPCWSTR, phModule: *mut HMODULE) -> BOOL;
+        fn GetModuleHandleExW(
+            dwFlags: DWORD,
+            lpModuleName: LPCWSTR,
+            phModule: *mut HMODULE,
+        ) -> BOOL;
         fn GetModuleFileNameW(hModule: HMODULE, lpFilename: LPWSTR, nSize: DWORD) -> DWORD;
     }
 
     let mut hmodule: HMODULE = std::ptr::null_mut();
-    let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
-    let ret = unsafe {
-        GetModuleHandleExW(flags, dylib_dir as *const u16, &mut hmodule)
-    };
+    let flags =
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+    let ret = unsafe { GetModuleHandleExW(flags, dylib_dir as *const u16, &mut hmodule) };
     if ret == 0 || hmodule.is_null() {
         return None;
     }

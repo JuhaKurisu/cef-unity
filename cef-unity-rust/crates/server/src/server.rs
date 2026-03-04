@@ -14,7 +14,11 @@ use cef_unity_ipc::{self as ipc, Command, Response, ShmWriter};
 
 fn log(msg: &str) {
     let path = std::env::temp_dir().join("cef_unity_server.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now(), msg);
     }
 }
@@ -185,7 +189,9 @@ impl CefServer {
         log("init_cef() starting");
 
         #[cfg(target_os = "macos")]
-        unsafe { cef_unity_inject_app_protocol(); }
+        unsafe {
+            cef_unity_inject_app_protocol();
+        }
 
         load_cef_auto();
 
@@ -252,15 +258,13 @@ impl CefServer {
             Command::CreateBrowser { width, height, url } => {
                 self.create_browser(width, height, &url)
             }
-            Command::DestroyBrowser { browser_id } => {
-                self.destroy_browser(browser_id)
-            }
-            Command::LoadUrl { browser_id, url } => {
-                self.load_url(browser_id, &url)
-            }
-            Command::Resize { browser_id, width, height } => {
-                self.resize(browser_id, width, height)
-            }
+            Command::DestroyBrowser { browser_id } => self.destroy_browser(browser_id),
+            Command::LoadUrl { browser_id, url } => self.load_url(browser_id, &url),
+            Command::Resize {
+                browser_id,
+                width,
+                height,
+            } => self.resize(browser_id, width, height),
             Command::Shutdown => {
                 // Caller handles shutdown
                 Response::Ok
@@ -407,7 +411,8 @@ impl CefServer {
 fn helper_binary_path(exe_dir: &std::path::Path) -> std::path::PathBuf {
     // <server.app>/Contents/Helpers/cef-unity-rust-helper.app/Contents/MacOS/cef-unity-rust-helper
     exe_dir
-        .parent().unwrap() // Contents
+        .parent()
+        .unwrap() // Contents
         .join("Helpers/cef-unity-rust-helper.app/Contents/MacOS/cef-unity-rust-helper")
 }
 

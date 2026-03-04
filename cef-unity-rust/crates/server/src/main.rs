@@ -14,7 +14,11 @@ use cef_unity_ipc::{Bootstrap, Command, Response};
 
 fn log(msg: &str) {
     let path = std::env::temp_dir().join("cef_unity_server.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now(), msg);
     }
 }
@@ -40,17 +44,13 @@ fn main() {
 
     // Create bidirectional channels
     let (cmd_tx, cmd_rx) = ipc_ch::channel::<Command>().expect("failed to create cmd channel");
-    let (resp_tx, resp_rx) =
-        ipc_ch::channel::<Response>().expect("failed to create resp channel");
+    let (resp_tx, resp_rx) = ipc_ch::channel::<Response>().expect("failed to create resp channel");
 
     // Connect to client's one-shot server and send bootstrap
     let bootstrap_tx =
         IpcSender::connect(ipc_server_name).expect("failed to connect to client one-shot server");
     bootstrap_tx
-        .send(Bootstrap {
-            cmd_tx,
-            resp_rx,
-        })
+        .send(Bootstrap { cmd_tx, resp_rx })
         .expect("failed to send bootstrap");
     log("bootstrap sent to client");
 
