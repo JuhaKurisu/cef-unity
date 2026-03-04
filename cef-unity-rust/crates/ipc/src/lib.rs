@@ -57,6 +57,17 @@ pub enum Command {
     Shutdown,
 }
 
+impl Command {
+    /// Returns true if the sender expects a Response for this command.
+    /// Fire-and-forget commands (mouse events) return false.
+    pub fn needs_response(&self) -> bool {
+        !matches!(
+            self,
+            Command::MouseMove { .. } | Command::MouseClick { .. } | Command::MouseWheel { .. }
+        )
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Response {
     BrowserCreated { browser_id: u32, shm_flink: String },

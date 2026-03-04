@@ -162,6 +162,11 @@ fn send_command(conn: &ServerConnection, cmd: Command) -> Result<Response, Strin
     conn.resp_rx.recv().map_err(|e| format!("recv: {}", e))
 }
 
+/// Fire-and-forget: send only, don't wait for response.
+fn send_command_no_wait(conn: &ServerConnection, cmd: Command) {
+    let _ = conn.cmd_tx.send(cmd);
+}
+
 // ---------------------------------------------------------------------------
 // Global functions
 // ---------------------------------------------------------------------------
@@ -418,13 +423,12 @@ pub extern "C" fn cef_unity_send_mouse_move(
 
     let guard = CONNECTION.lock().unwrap();
     if let Some(conn) = guard.as_ref() {
-        let cmd = Command::MouseMove {
+        send_command_no_wait(conn, Command::MouseMove {
             browser_id: instance.browser_id,
             x,
             y,
             modifiers,
-        };
-        let _ = send_command(conn, cmd);
+        });
     }
 }
 
@@ -446,7 +450,7 @@ pub extern "C" fn cef_unity_send_mouse_click(
 
     let guard = CONNECTION.lock().unwrap();
     if let Some(conn) = guard.as_ref() {
-        let cmd = Command::MouseClick {
+        send_command_no_wait(conn, Command::MouseClick {
             browser_id: instance.browser_id,
             x,
             y,
@@ -454,8 +458,7 @@ pub extern "C" fn cef_unity_send_mouse_click(
             button,
             mouse_up: mouse_up != 0,
             click_count,
-        };
-        let _ = send_command(conn, cmd);
+        });
     }
 }
 
@@ -476,15 +479,14 @@ pub extern "C" fn cef_unity_send_mouse_wheel(
 
     let guard = CONNECTION.lock().unwrap();
     if let Some(conn) = guard.as_ref() {
-        let cmd = Command::MouseWheel {
+        send_command_no_wait(conn, Command::MouseWheel {
             browser_id: instance.browser_id,
             x,
             y,
             modifiers,
             delta_x,
             delta_y,
-        };
-        let _ = send_command(conn, cmd);
+        });
     }
 }
 

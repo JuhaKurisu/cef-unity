@@ -100,12 +100,15 @@ fn timer_callback_inner() {
         match state.cmd_rx.try_recv() {
             Ok(cmd) => {
                 let is_shutdown = matches!(cmd, Command::Shutdown);
+                let needs_response = cmd.needs_response();
                 log(&format!("received command: {:?}", cmd));
                 let resp = state.cef_server.handle_command(cmd);
-                if let Err(e) = state.resp_tx.send(resp) {
-                    log(&format!("send error: {}", e));
-                    state.running = false;
-                    break;
+                if needs_response {
+                    if let Err(e) = state.resp_tx.send(resp) {
+                        log(&format!("send error: {}", e));
+                        state.running = false;
+                        break;
+                    }
                 }
                 if is_shutdown {
                     state.running = false;
