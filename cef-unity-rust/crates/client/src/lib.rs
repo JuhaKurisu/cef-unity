@@ -17,13 +17,14 @@ use cef_unity_ipc::{Bootstrap, Command, Response, ShmReader};
 // dylib location helpers
 // ---------------------------------------------------------------------------
 
-/// dylib 自身のディレクトリを返す。
+/// dylib/DLL 自身のディレクトリを返す。
 fn dylib_dir() -> PathBuf {
-    let info = dl_info().expect("dladdr failed");
+    let info = dl_info().expect("failed to locate dylib/DLL");
     PathBuf::from(info).parent().unwrap().to_path_buf()
 }
 
-/// dladdr で dylib のパスを取得する。
+/// Unix: dladdr で共有ライブラリのパスを取得する。
+#[cfg(unix)]
 fn dl_info() -> Option<String> {
     unsafe extern "C" {
         fn dladdr(addr: *const u8, info: *mut DlInfo) -> i32;
@@ -42,6 +43,60 @@ fn dl_info() -> Option<String> {
     }
     let cstr = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
     Some(cstr.to_str().ok()?.to_string())
+}
+
+/// Windows: GetModuleHandleExW + GetModuleFileNameW で DLL のパスを取得する。
+#[cfg(windows)]
+fn dl_info() -> Option<String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x00000004;
+    const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x00000002;
+
+    type HMODULE = *mut std::ffi::c_void;
+    type BOOL = i32;
+    type DWORD = u32;
+    type LPCWSTR = *const u16;
+    type LPWSTR = *mut u16;
+
+    unsafe extern "system" {
+        fn GetModuleHandleExW(dwFlags: DWORD, lpModuleName: LPCWSTR, phModule: *mut HMODULE) -> BOOL;
+        fn GetModuleFileNameW(hModule: HMODULE, lpFilename: LPWSTR, nSize: DWORD) -> DWORD;
+    }
+
+    let mut hmodule: HMODULE = std::ptr::null_mut();
+    let flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+    let ret = unsafe {
+        GetModuleHandleExW(flags, dylib_dir as *const u16, &mut hmodule)
+    };
+    if ret == 0 || hmodule.is_null() {
+        return None;
+    }
+
+    let mut buf = vec![0u16; 4096];
+    let len = unsafe { GetModuleFileNameW(hmodule, buf.as_mut_ptr(), buf.len() as DWORD) };
+    if len == 0 {
+        return None;
+    }
+    let os_str = OsString::from_wide(&buf[..len as usize]);
+    os_str.into_string().ok()
+}
+
+/// サーバーバイナリのパスを返す。
+#[cfg(target_os = "macos")]
+fn server_binary_path(plugin_dir: &std::path::Path) -> PathBuf {
+    plugin_dir.join("cef-unity-server.app/Contents/MacOS/cef-unity-server")
+}
+
+#[cfg(target_os = "linux")]
+fn server_binary_path(plugin_dir: &std::path::Path) -> PathBuf {
+    plugin_dir.join("cef-unity-server")
+}
+
+#[cfg(target_os = "windows")]
+fn server_binary_path(plugin_dir: &std::path::Path) -> PathBuf {
+    plugin_dir.join("cef-unity-server.exe")
 }
 
 // ---------------------------------------------------------------------------
@@ -119,9 +174,9 @@ pub extern "C" fn cef_unity_init() -> i32 {
     let _ = std::fs::write(std::env::temp_dir().join("cef_unity_debug.log"), "");
     log_to_file("cef_unity_init() called (IPC client mode)");
 
-    // Find server .app next to dylib
+    // Find server binary next to dylib
     let plugin_dir = dylib_dir();
-    let server_app = plugin_dir.join("cef-unity-server.app/Contents/MacOS/cef-unity-server");
+    let server_app = server_binary_path(&plugin_dir);
     if !server_app.exists() {
         log_to_file(&format!(
             "server binary not found: {}",

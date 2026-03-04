@@ -2,9 +2,7 @@
 
 use cef::*;
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -22,11 +20,15 @@ fn log(msg: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// CEF loader (inlined from former lib.rs)
+// CEF loader
 // ---------------------------------------------------------------------------
 
-/// ヘルパープロセス用: get_cef_dir() でフレームワークを探してロードする。
+/// macOS: get_cef_dir() でフレームワークを探して動的ロードする。
+#[cfg(target_os = "macos")]
 fn load_cef_auto() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
     let cef_dir = cef::sys::get_cef_dir().expect("CEF directory not found");
     let framework_path = cef_dir.join(cef::sys::FRAMEWORK_PATH);
     let cstr = CString::new(framework_path.as_os_str().as_bytes()).unwrap();
@@ -35,6 +37,12 @@ fn load_cef_auto() {
         1,
         "Failed to load CEF framework"
     );
+    cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
+}
+
+/// 非 macOS: libcef はリンク時解決。api_hash のみ呼ぶ。
+#[cfg(not(target_os = "macos"))]
+fn load_cef_auto() {
     cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
 }
 
@@ -145,9 +153,10 @@ wrap_client! {
 }
 
 // ---------------------------------------------------------------------------
-// ObjC helpers
+// ObjC helpers (macOS only)
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn cef_unity_inject_app_protocol();
 }
@@ -175,22 +184,17 @@ impl CefServer {
     pub fn init_cef(&self) -> bool {
         log("init_cef() starting");
 
+        #[cfg(target_os = "macos")]
         unsafe { cef_unity_inject_app_protocol(); }
 
         load_cef_auto();
 
         let args = cef::args::Args::new();
-        let cef_dir = cef::sys::get_cef_dir().expect("CEF directory not found");
-        let framework_dir = cef_dir.join("Chromium Embedded Framework.framework");
-        let resources_dir = framework_dir.join("Resources");
-
         let exe_path = std::env::current_exe().unwrap();
         let exe_dir = exe_path.parent().unwrap();
-        // Helper is at: <server.app>/Contents/Helpers/cef-unity-rust-helper.app/Contents/MacOS/cef-unity-rust-helper
-        let helper_app = exe_dir
-            .parent().unwrap() // Contents
-            .join("Helpers/cef-unity-rust-helper.app/Contents/MacOS/cef-unity-rust-helper");
-        log(&format!("helper_path = {}", helper_app.display()));
+
+        let helper_path = helper_binary_path(exe_dir);
+        log(&format!("helper_path = {}", helper_path.display()));
 
         let cache_dir = std::env::temp_dir().join("cef_unity_cache");
         let _ = std::fs::create_dir_all(&cache_dir);
@@ -200,13 +204,33 @@ impl CefServer {
         settings.windowless_rendering_enabled = 1;
         settings.external_message_pump = 1;
         settings.root_cache_path = CefString::from(cache_dir.to_str().unwrap());
-        settings.framework_dir_path = CefString::from(framework_dir.to_str().unwrap());
-        settings.browser_subprocess_path = CefString::from(helper_app.to_str().unwrap());
-        settings.resources_dir_path = CefString::from(resources_dir.to_str().unwrap());
-        let locales_dir = resources_dir.join("locales");
-        if locales_dir.exists() {
-            settings.locales_dir_path = CefString::from(locales_dir.to_str().unwrap());
+        settings.browser_subprocess_path = CefString::from(helper_path.to_str().unwrap());
+
+        // macOS: Framework ベースのパス設定
+        #[cfg(target_os = "macos")]
+        {
+            let cef_dir = cef::sys::get_cef_dir().expect("CEF directory not found");
+            let framework_dir = cef_dir.join("Chromium Embedded Framework.framework");
+            let resources_dir = framework_dir.join("Resources");
+            settings.framework_dir_path = CefString::from(framework_dir.to_str().unwrap());
+            settings.resources_dir_path = CefString::from(resources_dir.to_str().unwrap());
+            let locales_dir = resources_dir.join("locales");
+            if locales_dir.exists() {
+                settings.locales_dir_path = CefString::from(locales_dir.to_str().unwrap());
+            }
         }
+
+        // 非 macOS: 実行ファイルと同じディレクトリ
+        #[cfg(not(target_os = "macos"))]
+        {
+            let exe_dir_str = exe_dir.to_str().unwrap();
+            settings.resources_dir_path = CefString::from(exe_dir_str);
+            let locales_dir = exe_dir.join("locales");
+            if locales_dir.exists() {
+                settings.locales_dir_path = CefString::from(locales_dir.to_str().unwrap());
+            }
+        }
+
         let cef_log = std::env::temp_dir().join("cef_debug.log");
         settings.log_file = CefString::from(cef_log.to_str().unwrap());
         settings.log_severity = LogSeverity::VERBOSE;
@@ -373,4 +397,26 @@ impl CefServer {
         cef::shutdown();
         log("CEF shutdown complete");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Platform-specific helper binary path
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+fn helper_binary_path(exe_dir: &std::path::Path) -> std::path::PathBuf {
+    // <server.app>/Contents/Helpers/cef-unity-rust-helper.app/Contents/MacOS/cef-unity-rust-helper
+    exe_dir
+        .parent().unwrap() // Contents
+        .join("Helpers/cef-unity-rust-helper.app/Contents/MacOS/cef-unity-rust-helper")
+}
+
+#[cfg(target_os = "linux")]
+fn helper_binary_path(exe_dir: &std::path::Path) -> std::path::PathBuf {
+    exe_dir.join("cef-unity-rust-helper")
+}
+
+#[cfg(target_os = "windows")]
+fn helper_binary_path(exe_dir: &std::path::Path) -> std::path::PathBuf {
+    exe_dir.join("cef-unity-rust-helper.exe")
 }

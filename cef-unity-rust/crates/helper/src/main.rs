@@ -1,8 +1,9 @@
-use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
-
-/// ヘルパープロセス用: get_cef_dir() でフレームワークを探してロードする。
+/// macOS: get_cef_dir() でフレームワークを探して動的ロードする。
+#[cfg(target_os = "macos")]
 fn load_cef_auto() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
     let cef_dir = cef::sys::get_cef_dir().expect("CEF directory not found");
     let framework_path = cef_dir.join(cef::sys::FRAMEWORK_PATH);
     let cstr = CString::new(framework_path.as_os_str().as_bytes()).unwrap();
@@ -11,6 +12,12 @@ fn load_cef_auto() {
         1,
         "Failed to load CEF framework"
     );
+    cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
+}
+
+/// 非 macOS: libcef はリンク時解決。api_hash のみ呼ぶ。
+#[cfg(not(target_os = "macos"))]
+fn load_cef_auto() {
     cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
 }
 
