@@ -43,7 +43,7 @@ public class SampleScript : MonoBehaviour
         }
         
         UpdateTexture();
-        NativeMethods.cef_unity_send_mouse_move();
+        _browser.SendMouseMove();
     }
 
     private void UpdateTexture()
