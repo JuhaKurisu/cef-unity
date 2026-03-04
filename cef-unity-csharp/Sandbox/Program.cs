@@ -2,49 +2,41 @@ using Interop;
 
 CefRuntime.Init();
 
-using (var browser = new Browser(1920*2, 1080*2, "https://www.google.com"))
+using (var browser = new Browser(1280, 720, "https://youtu.be/dQw4w9WgXcQ"))
 {
-    for (var i = 0; i < 60000; i++)
+    var frameCount = 0;
+    var snapshotAt = new HashSet<int> { 1, 10, 50, 100, 200, 300, 400, 500 };
+    for (var i = 0; i < 600; i++) // 60秒間キャプチャ
     {
         CefRuntime.Pump();
         Thread.Sleep(100);
         if (browser.TryGetBuffer(out var bgra, out var w, out var h))
         {
-            Console.WriteLine($"Got frame: {w}x{h}, {bgra.Length} bytes");
+            frameCount++;
+            if (frameCount <= 5 || frameCount % 50 == 0)
+                Console.WriteLine($"Frame #{frameCount}: {w}x{h}, {bgra.Length} bytes (t={i*100}ms)");
 
-            // BGRA -> RGB for PPM
-            var rgb = new byte[w * h * 3];
-            for (var p = 0; p < w * h; p++)
+            if (snapshotAt.Contains(frameCount))
             {
-                rgb[p * 3]     = bgra[p * 4 + 2]; // R
-                rgb[p * 3 + 1] = bgra[p * 4 + 1]; // G
-                rgb[p * 3 + 2] = bgra[p * 4];     // B
+                var rgb = new byte[w * h * 3];
+                for (var p = 0; p < w * h; p++)
+                {
+                    rgb[p * 3]     = bgra[p * 4 + 2];
+                    rgb[p * 3 + 1] = bgra[p * 4 + 1];
+                    rgb[p * 3 + 2] = bgra[p * 4];
+                }
+                var outPath = Path.Combine(AppContext.BaseDirectory, $"youtube_{frameCount}.ppm");
+                using var fs = File.Create(outPath);
+                using var sw = new StreamWriter(fs, System.Text.Encoding.ASCII);
+                sw.Write($"P6\n{w} {h}\n255\n");
+                sw.Flush();
+                fs.Write(rgb);
+                Console.WriteLine($"  -> Saved {outPath}");
             }
-
-            var outPath = Path.Combine(AppContext.BaseDirectory, "output.ppm");
-            using var fs = File.Create(outPath);
-            using var sw = new StreamWriter(fs, System.Text.Encoding.ASCII);
-            sw.Write($"P6\n{w} {h}\n255\n");
-            sw.Flush();
-            fs.Write(rgb);
-
-            Console.WriteLine($"Saved {outPath}");
-
-            // マウスイベント動作確認: ページ中央をクリック
-            var cx = w / 2;
-            var cy = h / 2;
-            Console.WriteLine($"Sending mouse click at ({cx}, {cy})");
-            browser.SendMouseMove(cx, cy);
-            browser.SendMouseClick(cx, cy, MouseButton.Left, false);  // mouse down
-            browser.SendMouseClick(cx, cy, MouseButton.Left, true);   // mouse up
-            Thread.Sleep(500);
-
-            CefRuntime.Shutdown();
-            return;
         }
     }
 
-    Console.WriteLine("No new frame yet");
+    Console.WriteLine($"Total frames: {frameCount}");
 }
 
 CefRuntime.Shutdown();

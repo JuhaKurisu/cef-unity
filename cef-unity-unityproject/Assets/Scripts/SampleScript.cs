@@ -52,6 +52,13 @@ public class SampleScript : MonoBehaviour
     {
         _browser?.Dispose();
         _browser = null;
+
+        if (_texture != null)
+        {
+            Destroy(_texture);
+            _texture = null;
+        }
+
         CefRuntime.Shutdown();
         Debug.Log("[CefUnity] Shutdown");
     }
@@ -125,6 +132,8 @@ public class SampleScript : MonoBehaviour
     private void UpdateTexture()
     {
         if (_browser == null) return;
+
+        // TryGetBuffer は新しいフレームがある場合のみ true を返す
         if (!_browser.TryGetBuffer(out var buffer, out var w, out var h))
             return;
 
@@ -132,6 +141,10 @@ public class SampleScript : MonoBehaviour
 
         if (_texture == null || _texture.width != w || _texture.height != h)
         {
+            // 古いテクスチャを破棄して GPU メモリリークを防ぐ
+            if (_texture != null)
+                Destroy(_texture);
+
             _texture = new Texture2D(w, h, TextureFormat.BGRA32, false);
             if (_rawImage != null)
             {
@@ -148,6 +161,6 @@ public class SampleScript : MonoBehaviour
             }
         }
 
-        _texture.Apply();
+        _texture.Apply(false);
     }
 }

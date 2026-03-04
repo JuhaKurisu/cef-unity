@@ -147,6 +147,16 @@ wrap_app! {
             if let Some(cl) = command_line {
                 cl.append_switch(Some(&CefString::from("use-mock-keychain")));
                 cl.append_switch(Some(&CefString::from("single-process")));
+                cl.append_switch_with_value(
+                    Some(&CefString::from("autoplay-policy")),
+                    Some(&CefString::from("no-user-gesture-required")),
+                );
+                // YouTube SABR ストリーミング対応
+                cl.append_switch(Some(&CefString::from("disable-gpu-compositing")));
+                cl.append_switch_with_value(
+                    Some(&CefString::from("disable-features")),
+                    Some(&CefString::from("MediaFoundationClearKeyCdm")),
+                );
             }
         }
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
