@@ -14,6 +14,8 @@ public class SampleScript : MonoBehaviour
     private Browser _browser;
     private float _diagTimer;
     private Texture2D _texture;
+    private int _lastMouseX = -1;
+    private int _lastMouseY = -1;
 
     private void Start()
     {
@@ -61,8 +63,13 @@ public class SampleScript : MonoBehaviour
         if (!TryGetBrowserCoord(out var bx, out var by))
             return;
 
-        // Mouse move
-        _browser.SendMouseMove(bx, by);
+        // Mouse move (座標が変わった時だけ送信)
+        if (bx != _lastMouseX || by != _lastMouseY)
+        {
+            _lastMouseX = bx;
+            _lastMouseY = by;
+            _browser.SendMouseMove(bx, by);
+        }
 
         // Mouse buttons: Left=0, Right=1, Middle=2
         HandleButton(bx, by, 0, MouseButton.Left);

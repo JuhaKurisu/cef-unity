@@ -22,9 +22,8 @@ FFI 関数の追加・変更時は以下の **両方** を更新する:
 
 ### 3. Unity プロジェクトへのデプロイ
 
-ビルド成果物を Unity プロジェクトにコピーする:
+`deploy.sh` を使う。ビルド・コピー・codesign を一括で行う:
 
 ```bash
-cp target/debug/libcef_unity_rust.dylib ../cef-unity-unityproject/Assets/CefUnity/Interop/Plugins/osx-arm64/
-cp target/debug/cef-unity-server ../cef-unity-unityproject/Assets/CefUnity/Interop/Plugins/osx-arm64/cef-unity-server.app/Contents/MacOS/
+bash deploy.sh
 ```

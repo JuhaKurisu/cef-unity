@@ -269,9 +269,9 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: b266723374a144d27989f433d8f34cea, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::SampleScript
-  _width: 1280
-  _height: 720
-  _url: https://twigl.app/
+  _width: 1920
+  _height: 1080
+  _url: https://twigl.app
   _rawImage: {fileID: 1153544198}
 --- !u!1 &410087039
 GameObject:

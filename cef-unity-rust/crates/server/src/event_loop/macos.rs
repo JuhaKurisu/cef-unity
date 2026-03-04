@@ -101,7 +101,9 @@ fn timer_callback_inner() {
             Ok(cmd) => {
                 let is_shutdown = matches!(cmd, Command::Shutdown);
                 let needs_response = cmd.needs_response();
-                log(&format!("received command: {:?}", cmd));
+                if needs_response {
+                    log(&format!("received command: {:?}", cmd));
+                }
                 let resp = state.cef_server.handle_command(cmd);
                 if needs_response {
                     if let Err(e) = state.resp_tx.send(resp) {
