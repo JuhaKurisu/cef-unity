@@ -2,7 +2,7 @@ using Interop;
 
 CefRuntime.Init();
 
-using (var browser = new Browser(1920, 1080, "https://www.google.com"))
+using (var browser = new Browser(1920*2, 1080*2, "https://www.google.com"))
 {
     for (var i = 0; i < 60000; i++)
     {

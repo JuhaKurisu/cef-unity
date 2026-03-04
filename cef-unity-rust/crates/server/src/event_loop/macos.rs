@@ -69,7 +69,25 @@ fn log(msg: &str) {
 }
 
 unsafe extern "C" fn timer_callback(_timer: CFRunLoopTimerRef, _info: *mut std::ffi::c_void) {
+    // catch_unwind で保護: extern "C" コールバック内の panic は abort を引き起こすため
+    let result = std::panic::catch_unwind(|| {
+        timer_callback_inner();
+    });
+    if result.is_err() {
+        log("timer_callback panicked, stopping run loop");
+        let state = unsafe { &mut *SERVER_STATE };
+        state.running = false;
+        unsafe { CFRunLoopStop(CFRunLoopGetMain()); }
+    }
+}
+
+fn timer_callback_inner() {
     let state = unsafe { &mut *SERVER_STATE };
+
+    if !state.running {
+        unsafe { CFRunLoopStop(CFRunLoopGetMain()); }
+        return;
+    }
 
     cef::do_message_loop_work();
     state.pump_count += 1;
