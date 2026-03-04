@@ -4,6 +4,13 @@ using System.Text;
 namespace CefUnity.Interop
 {
 
+    public enum MouseButton : byte
+    {
+        Left = 0,
+        Middle = 1,
+        Right = 2,
+    }
+
     public static class CefRuntime
     {
         public static void Init()
@@ -93,6 +100,33 @@ namespace CefUnity.Interop
             }
 
             return hasNew != 0;
+        }
+
+        public void SendMouseMove(int x, int y, uint modifiers = 0)
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                NativeMethods.cef_unity_send_mouse_move(_handle, x, y, modifiers);
+            }
+        }
+
+        public void SendMouseClick(int x, int y, MouseButton button, bool mouseUp, int clickCount = 1, uint modifiers = 0)
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                NativeMethods.cef_unity_send_mouse_click(_handle, x, y, modifiers, (byte)button, mouseUp ? 1 : 0, clickCount);
+            }
+        }
+
+        public void SendMouseWheel(int x, int y, int deltaX, int deltaY, uint modifiers = 0)
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                NativeMethods.cef_unity_send_mouse_wheel(_handle, x, y, modifiers, deltaX, deltaY);
+            }
         }
 
         public void Dispose()
