@@ -403,6 +403,91 @@ pub extern "C" fn cef_unity_resize(handle: *mut CefUnityBrowser, width: i32, hei
     }
 }
 
+/// Send a mouse move event.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_send_mouse_move(
+    handle: *mut CefUnityBrowser,
+    x: i32,
+    y: i32,
+    modifiers: u32,
+) {
+    if handle.is_null() {
+        return;
+    }
+    let instance = handle_to_ref(handle);
+
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        let cmd = Command::MouseMove {
+            browser_id: instance.browser_id,
+            x,
+            y,
+            modifiers,
+        };
+        let _ = send_command(conn, cmd);
+    }
+}
+
+/// Send a mouse click event.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_send_mouse_click(
+    handle: *mut CefUnityBrowser,
+    x: i32,
+    y: i32,
+    modifiers: u32,
+    button: u8,
+    mouse_up: i32,
+    click_count: i32,
+) {
+    if handle.is_null() {
+        return;
+    }
+    let instance = handle_to_ref(handle);
+
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        let cmd = Command::MouseClick {
+            browser_id: instance.browser_id,
+            x,
+            y,
+            modifiers,
+            button,
+            mouse_up: mouse_up != 0,
+            click_count,
+        };
+        let _ = send_command(conn, cmd);
+    }
+}
+
+/// Send a mouse wheel event.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_send_mouse_wheel(
+    handle: *mut CefUnityBrowser,
+    x: i32,
+    y: i32,
+    modifiers: u32,
+    delta_x: i32,
+    delta_y: i32,
+) {
+    if handle.is_null() {
+        return;
+    }
+    let instance = handle_to_ref(handle);
+
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        let cmd = Command::MouseWheel {
+            browser_id: instance.browser_id,
+            x,
+            y,
+            modifiers,
+            delta_x,
+            delta_y,
+        };
+        let _ = send_command(conn, cmd);
+    }
+}
+
 /// Get the latest frame buffer from shared memory.
 /// Returns 1 if a new frame is available, 0 if unchanged.
 #[unsafe(no_mangle)]

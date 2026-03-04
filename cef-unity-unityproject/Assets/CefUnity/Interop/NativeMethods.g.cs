@@ -74,6 +74,24 @@ namespace CefUnity
         public static extern void cef_unity_resize(CefUnityBrowser* handle, int width, int height);
 
         /// <summary>
+        ///  Send a mouse move event.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_send_mouse_move", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_send_mouse_move(CefUnityBrowser* handle, int x, int y, uint modifiers);
+
+        /// <summary>
+        ///  Send a mouse click event.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_send_mouse_click", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_send_mouse_click(CefUnityBrowser* handle, int x, int y, uint modifiers, byte button, int mouse_up, int click_count);
+
+        /// <summary>
+        ///  Send a mouse wheel event.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_send_mouse_wheel", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_send_mouse_wheel(CefUnityBrowser* handle, int x, int y, uint modifiers, int delta_x, int delta_y);
+
+        /// <summary>
         ///  Get the latest frame buffer from shared memory.
         ///  Returns 1 if a new frame is available, 0 if unchanged.
         /// </summary>

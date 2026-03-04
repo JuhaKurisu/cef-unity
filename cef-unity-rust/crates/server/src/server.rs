@@ -265,6 +265,29 @@ impl CefServer {
                 width,
                 height,
             } => self.resize(browser_id, width, height),
+            Command::MouseMove {
+                browser_id,
+                x,
+                y,
+                modifiers,
+            } => self.mouse_move(browser_id, x, y, modifiers),
+            Command::MouseClick {
+                browser_id,
+                x,
+                y,
+                modifiers,
+                button,
+                mouse_up,
+                click_count,
+            } => self.mouse_click(browser_id, x, y, modifiers, button, mouse_up, click_count),
+            Command::MouseWheel {
+                browser_id,
+                x,
+                y,
+                modifiers,
+                delta_x,
+                delta_y,
+            } => self.mouse_wheel(browser_id, x, y, modifiers, delta_x, delta_y),
             Command::Shutdown => {
                 // Caller handles shutdown
                 Response::Ok
@@ -375,6 +398,79 @@ impl CefServer {
             if let Some(ref browser) = *state.browser.lock().unwrap()
                 && let Some(host) = Browser::host(browser) {
                     BrowserHost::was_resized(&host);
+                }
+            Response::Ok
+        } else {
+            Response::Error {
+                msg: format!("browser {} not found", browser_id),
+            }
+        }
+    }
+
+    fn mouse_move(&self, browser_id: u32, x: i32, y: i32, modifiers: u32) -> Response {
+        if let Some(state) = self.browsers.get(&browser_id) {
+            if let Some(ref browser) = *state.browser.lock().unwrap()
+                && let Some(host) = Browser::host(browser) {
+                    let event = MouseEvent { x, y, modifiers };
+                    BrowserHost::send_mouse_move_event(&host, Some(&event), 0);
+                }
+            Response::Ok
+        } else {
+            Response::Error {
+                msg: format!("browser {} not found", browser_id),
+            }
+        }
+    }
+
+    fn mouse_click(
+        &self,
+        browser_id: u32,
+        x: i32,
+        y: i32,
+        modifiers: u32,
+        button: u8,
+        mouse_up: bool,
+        click_count: i32,
+    ) -> Response {
+        if let Some(state) = self.browsers.get(&browser_id) {
+            if let Some(ref browser) = *state.browser.lock().unwrap()
+                && let Some(host) = Browser::host(browser) {
+                    let event = MouseEvent { x, y, modifiers };
+                    let button_type = match button {
+                        1 => MouseButtonType::MIDDLE,
+                        2 => MouseButtonType::RIGHT,
+                        _ => MouseButtonType::LEFT,
+                    };
+                    BrowserHost::send_mouse_click_event(
+                        &host,
+                        Some(&event),
+                        button_type,
+                        mouse_up as i32,
+                        click_count,
+                    );
+                }
+            Response::Ok
+        } else {
+            Response::Error {
+                msg: format!("browser {} not found", browser_id),
+            }
+        }
+    }
+
+    fn mouse_wheel(
+        &self,
+        browser_id: u32,
+        x: i32,
+        y: i32,
+        modifiers: u32,
+        delta_x: i32,
+        delta_y: i32,
+    ) -> Response {
+        if let Some(state) = self.browsers.get(&browser_id) {
+            if let Some(ref browser) = *state.browser.lock().unwrap()
+                && let Some(host) = Browser::host(browser) {
+                    let event = MouseEvent { x, y, modifiers };
+                    BrowserHost::send_mouse_wheel_event(&host, Some(&event), delta_x, delta_y);
                 }
             Response::Ok
         } else {

@@ -31,6 +31,29 @@ pub enum Command {
         width: i32,
         height: i32,
     },
+    MouseMove {
+        browser_id: u32,
+        x: i32,
+        y: i32,
+        modifiers: u32,
+    },
+    MouseClick {
+        browser_id: u32,
+        x: i32,
+        y: i32,
+        modifiers: u32,
+        button: u8,
+        mouse_up: bool,
+        click_count: i32,
+    },
+    MouseWheel {
+        browser_id: u32,
+        x: i32,
+        y: i32,
+        modifiers: u32,
+        delta_x: i32,
+        delta_y: i32,
+    },
     Shutdown,
 }
 

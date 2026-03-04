@@ -41,7 +41,13 @@ public class SampleScript : MonoBehaviour
             var pumpCount = NativeMethods.cef_unity_get_pump_count();
             Debug.Log($"[CefUnity] diag: paint={paintCount} pump={pumpCount}");
         }
+        
+        UpdateTexture();
+        NativeMethods.cef_unity_send_mouse_move();
+    }
 
+    private void UpdateTexture()
+    {
         if (_browser == null) return;
         if (!_browser.TryGetBuffer(out var buffer, out var w, out var h))
             return;

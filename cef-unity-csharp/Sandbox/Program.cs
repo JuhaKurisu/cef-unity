@@ -29,6 +29,16 @@ using (var browser = new Browser(1920*2, 1080*2, "https://www.google.com"))
             fs.Write(rgb);
 
             Console.WriteLine($"Saved {outPath}");
+
+            // マウスイベント動作確認: ページ中央をクリック
+            var cx = w / 2;
+            var cy = h / 2;
+            Console.WriteLine($"Sending mouse click at ({cx}, {cy})");
+            browser.SendMouseMove(cx, cy);
+            browser.SendMouseClick(cx, cy, MouseButton.Left, false);  // mouse down
+            browser.SendMouseClick(cx, cy, MouseButton.Left, true);   // mouse up
+            Thread.Sleep(500);
+
             CefRuntime.Shutdown();
             return;
         }
