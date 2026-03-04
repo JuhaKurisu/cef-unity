@@ -520,11 +520,12 @@ impl CefServer {
 
 #[cfg(target_os = "macos")]
 fn helper_binary_path(exe_dir: &std::path::Path) -> std::path::PathBuf {
-    // <server.app>/Contents/Helpers/cef-unity-rust-helper.app/Contents/MacOS/cef-unity-rust-helper
+    // CEF は browser_subprocess_path から "Helper (GPU)" 等のバリアントを自動検出する。
+    // <server.app>/Contents/Frameworks/cef-unity-server Helper.app/Contents/MacOS/cef-unity-server Helper
     exe_dir
         .parent()
         .unwrap() // Contents
-        .join("Helpers/cef-unity-rust-helper.app/Contents/MacOS/cef-unity-rust-helper")
+        .join("Frameworks/cef-unity-server Helper.app/Contents/MacOS/cef-unity-server Helper")
 }
 
 #[cfg(target_os = "linux")]

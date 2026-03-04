@@ -27,7 +27,6 @@ SERVER_APP="$DEST/cef-unity-server.app"
 rm -rf "$SERVER_APP"
 mkdir -p "$SERVER_APP/Contents/MacOS"
 mkdir -p "$SERVER_APP/Contents/Frameworks"
-mkdir -p "$SERVER_APP/Contents/Helpers"
 
 # Server binary
 cp target/release/cef-unity-server "$SERVER_APP/Contents/MacOS/"
@@ -58,11 +57,16 @@ cat > "$SERVER_APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# --- helper .app bundle (inside server) ---
-HELPER_APP="$SERVER_APP/Contents/Helpers/cef-unity-rust-helper.app"
-mkdir -p "$HELPER_APP/Contents/MacOS"
-cp target/release/cef-unity-rust-helper "$HELPER_APP/Contents/MacOS/"
-cat > "$HELPER_APP/Contents/Info.plist" <<PLIST
+# --- helper .app bundles (CEF expects these in Contents/Frameworks/) ---
+# CEF は "<app_name> Helper.app" および "(GPU)", "(Renderer)", "(Plugin)", "(Alerts)" バリアントを探す。
+# 全バリアントで同じバイナリを使用する。
+HELPER_VARIANTS=("cef-unity-server Helper" "cef-unity-server Helper (GPU)" "cef-unity-server Helper (Renderer)" "cef-unity-server Helper (Plugin)" "cef-unity-server Helper (Alerts)")
+
+for VARIANT in "${HELPER_VARIANTS[@]}"; do
+    HELPER_APP="$SERVER_APP/Contents/Frameworks/${VARIANT}.app"
+    mkdir -p "$HELPER_APP/Contents/MacOS"
+    cp target/release/cef-unity-rust-helper "$HELPER_APP/Contents/MacOS/${VARIANT}"
+    cat > "$HELPER_APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -70,9 +74,9 @@ cat > "$HELPER_APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key>
     <string>${BUNDLE_ID}</string>
     <key>CFBundleExecutable</key>
-    <string>cef-unity-rust-helper</string>
+    <string>${VARIANT}</string>
     <key>CFBundleName</key>
-    <string>cef-unity-rust-helper</string>
+    <string>${VARIANT}</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleVersion</key>
@@ -80,12 +84,13 @@ cat > "$HELPER_APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+    codesign -s - --force --entitlements helper.entitlements "$HELPER_APP"
+done
 
 # Unity が .app 内に .meta ファイルを作るので codesign 前に削除
 find "$SERVER_APP" -name '*.meta' -delete
 
-# Codesign (helper first, then server)
-codesign -s - --force --entitlements helper.entitlements "$HELPER_APP"
+# Codesign server (helpers are already signed above)
 codesign -s - --force --entitlements server.entitlements "$SERVER_APP"
 
 # 旧構成のファイルを削除
