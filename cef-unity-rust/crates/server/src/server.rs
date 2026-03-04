@@ -97,7 +97,7 @@ wrap_render_handler! {
             height: ::std::os::raw::c_int,
         ) {
             let count = PAINT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            if count <= 5 || count % 100 == 0 {
+            if count <= 5 || count.is_multiple_of(100) {
                 log(&format!("on_paint #{}: {}x{}", count, width, height));
             }
             if type_.get_raw() != PaintElementType::VIEW.get_raw() {
@@ -339,11 +339,10 @@ impl CefServer {
 
     fn destroy_browser(&mut self, browser_id: u32) -> Response {
         if let Some(state) = self.browsers.remove(&browser_id) {
-            if let Some(browser) = state.browser.lock().unwrap().take() {
-                if let Some(host) = Browser::host(&browser) {
+            if let Some(browser) = state.browser.lock().unwrap().take()
+                && let Some(host) = Browser::host(&browser) {
                     BrowserHost::close_browser(&host, 1);
                 }
-            }
             Response::Ok
         } else {
             Response::Error {
@@ -354,12 +353,11 @@ impl CefServer {
 
     fn load_url(&mut self, browser_id: u32, url: &str) -> Response {
         if let Some(state) = self.browsers.get(&browser_id) {
-            if let Some(ref browser) = *state.browser.lock().unwrap() {
-                if let Some(frame) = Browser::main_frame(browser) {
+            if let Some(ref browser) = *state.browser.lock().unwrap()
+                && let Some(frame) = Browser::main_frame(browser) {
                     Frame::load_url(&frame, Some(&CefString::from(url)));
                     return Response::Ok;
                 }
-            }
             Response::Error {
                 msg: "browser not ready yet".to_string(),
             }
@@ -374,11 +372,10 @@ impl CefServer {
         if let Some(state) = self.browsers.get(&browser_id) {
             state.viewport_w.store(width, Ordering::Relaxed);
             state.viewport_h.store(height, Ordering::Relaxed);
-            if let Some(ref browser) = *state.browser.lock().unwrap() {
-                if let Some(host) = Browser::host(browser) {
+            if let Some(ref browser) = *state.browser.lock().unwrap()
+                && let Some(host) = Browser::host(browser) {
                     BrowserHost::was_resized(&host);
                 }
-            }
             Response::Ok
         } else {
             Response::Error {

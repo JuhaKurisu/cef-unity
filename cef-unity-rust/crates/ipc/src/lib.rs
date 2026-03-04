@@ -101,7 +101,7 @@ impl ShmWriter {
             .size(SHM_TOTAL_SIZE)
             .flink(flink)
             .create()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Zero-initialize header
         unsafe {
@@ -155,7 +155,7 @@ impl ShmReader {
         let shmem = ShmemConf::new()
             .flink(flink)
             .open()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         Ok(ShmReader {
             shmem,
