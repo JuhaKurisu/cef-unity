@@ -3,13 +3,14 @@
 // Runs CEF in its own process, communicates with Unity via ipc-channel + shared memory.
 // Uses CFRunLoopTimer for periodic CEF pump + IPC polling on macOS.
 
+mod server;
+
 use std::io::Write;
 
 use ipc_channel::ipc::{self as ipc_ch, IpcReceiver, IpcSender};
 use ipc_channel::TryRecvError;
 
-use cef_unity_rust::ipc::{Bootstrap, Command, Response};
-use cef_unity_rust::server;
+use cef_unity_ipc::{Bootstrap, Command, Response};
 
 fn log(msg: &str) {
     let path = std::env::temp_dir().join("cef_unity_server.log");

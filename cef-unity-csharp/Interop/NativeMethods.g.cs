@@ -19,7 +19,7 @@ namespace CefUnity
 
 
         /// <summary>
-        ///  Initialize: launch CEF server process and connect via Unix domain socket.
+        ///  Initialize: launch CEF server process and connect via ipc-channel.
         ///  Returns 0 on success, non-zero on failure.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_init", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]

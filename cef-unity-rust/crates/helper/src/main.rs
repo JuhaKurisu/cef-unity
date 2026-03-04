@@ -1,3 +1,19 @@
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
+
+/// ヘルパープロセス用: get_cef_dir() でフレームワークを探してロードする。
+fn load_cef_auto() {
+    let cef_dir = cef::sys::get_cef_dir().expect("CEF directory not found");
+    let framework_path = cef_dir.join(cef::sys::FRAMEWORK_PATH);
+    let cstr = CString::new(framework_path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(
+        cef::load_library(Some(unsafe { &*cstr.as_ptr().cast() })),
+        1,
+        "Failed to load CEF framework"
+    );
+    cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
+}
+
 fn main() {
     // ヘルパーの起動をログファイルに記録
     let process_type = std::env::args()
@@ -12,7 +28,7 @@ fn main() {
     }
 
     let result = std::panic::catch_unwind(|| {
-        cef_unity_rust::load_cef_auto();
+        load_cef_auto();
         let args = cef::args::Args::new();
         cef::execute_process(Some(args.as_main_args()), None, std::ptr::null_mut())
     });

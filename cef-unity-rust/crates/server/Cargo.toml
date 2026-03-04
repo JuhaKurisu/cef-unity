@@ -1,0 +1,16 @@
+[package]
+name = "cef-unity-server"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "cef-unity-server"
+path = "src/main.rs"
+
+[dependencies]
+cef-unity-ipc = { path = "../ipc" }
+cef = "145.5.0"
+ipc-channel = "0.21"
+
+[build-dependencies]
+cc = "1"

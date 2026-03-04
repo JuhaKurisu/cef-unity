@@ -1,0 +1,15 @@
+[package]
+name = "cef-unity-client"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "cef_unity_rust"
+crate-type = ["cdylib"]
+
+[dependencies]
+cef-unity-ipc = { path = "../ipc" }
+ipc-channel = "0.21"
+
+[build-dependencies]
+csbindgen = "1.9"

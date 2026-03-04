@@ -2,11 +2,13 @@
 
 use cef::*;
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::ipc::{self, Command, Response, ShmWriter};
+use cef_unity_ipc::{self as ipc, Command, Response, ShmWriter};
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -17,6 +19,23 @@ fn log(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now(), msg);
     }
+}
+
+// ---------------------------------------------------------------------------
+// CEF loader (inlined from former lib.rs)
+// ---------------------------------------------------------------------------
+
+/// ヘルパープロセス用: get_cef_dir() でフレームワークを探してロードする。
+fn load_cef_auto() {
+    let cef_dir = cef::sys::get_cef_dir().expect("CEF directory not found");
+    let framework_path = cef_dir.join(cef::sys::FRAMEWORK_PATH);
+    let cstr = CString::new(framework_path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(
+        cef::load_library(Some(unsafe { &*cstr.as_ptr().cast() })),
+        1,
+        "Failed to load CEF framework"
+    );
+    cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -158,7 +177,7 @@ impl CefServer {
 
         unsafe { cef_unity_inject_app_protocol(); }
 
-        crate::load_cef_auto();
+        load_cef_auto();
 
         let args = cef::args::Args::new();
         let cef_dir = cef::sys::get_cef_dir().expect("CEF directory not found");

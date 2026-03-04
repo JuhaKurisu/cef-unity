@@ -1,16 +1,48 @@
 // FFI layer for Unity C# interop.
 //
-// This is now a pure IPC client — no CEF dependency.
+// This is a pure IPC client — no CEF dependency.
 // Communicates with cef-unity-server via ipc-channel + shared memory.
 
 use std::ffi::{CStr, c_char};
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ipc_channel::ipc::{IpcOneShotServer, IpcReceiver, IpcSender};
 
-use crate::ipc::{Bootstrap, Command, Response, ShmReader};
+use cef_unity_ipc::{Bootstrap, Command, Response, ShmReader};
+
+// ---------------------------------------------------------------------------
+// dylib location helpers
+// ---------------------------------------------------------------------------
+
+/// dylib 自身のディレクトリを返す。
+fn dylib_dir() -> PathBuf {
+    let info = dl_info().expect("dladdr failed");
+    PathBuf::from(info).parent().unwrap().to_path_buf()
+}
+
+/// dladdr で dylib のパスを取得する。
+fn dl_info() -> Option<String> {
+    unsafe extern "C" {
+        fn dladdr(addr: *const u8, info: *mut DlInfo) -> i32;
+    }
+    #[repr(C)]
+    struct DlInfo {
+        dli_fname: *const std::ffi::c_char,
+        dli_fbase: *const u8,
+        dli_sname: *const std::ffi::c_char,
+        dli_saddr: *const u8,
+    }
+    let mut info: DlInfo = unsafe { std::mem::zeroed() };
+    let ret = unsafe { dladdr(dylib_dir as *const u8, &mut info) };
+    if ret == 0 || info.dli_fname.is_null() {
+        return None;
+    }
+    let cstr = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
+    Some(cstr.to_str().ok()?.to_string())
+}
 
 // ---------------------------------------------------------------------------
 // Opaque handle type (becomes IntPtr in C#)
@@ -88,7 +120,7 @@ pub extern "C" fn cef_unity_init() -> i32 {
     log_to_file("cef_unity_init() called (IPC client mode)");
 
     // Find server .app next to dylib
-    let plugin_dir = crate::dylib_dir();
+    let plugin_dir = dylib_dir();
     let server_app = plugin_dir.join("cef-unity-server.app/Contents/MacOS/cef-unity-server");
     if !server_app.exists() {
         log_to_file(&format!(

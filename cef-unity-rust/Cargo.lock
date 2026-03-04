@@ -200,15 +200,38 @@ dependencies = [
 ]
 
 [[package]]
-name = "cef-unity-rust"
+name = "cef-unity-client"
+version = "0.1.0"
+dependencies = [
+ "cef-unity-ipc",
+ "csbindgen",
+ "ipc-channel",
+]
+
+[[package]]
+name = "cef-unity-helper"
+version = "0.1.0"
+dependencies = [
+ "cef",
+]
+
+[[package]]
+name = "cef-unity-ipc"
+version = "0.1.0"
+dependencies = [
+ "ipc-channel",
+ "serde",
+ "shared_memory",
+]
+
+[[package]]
+name = "cef-unity-server"
 version = "0.1.0"
 dependencies = [
  "cc",
  "cef",
- "csbindgen",
+ "cef-unity-ipc",
  "ipc-channel",
- "serde",
- "shared_memory",
 ]
 
 [[package]]

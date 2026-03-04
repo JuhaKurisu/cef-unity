@@ -1,0 +1,9 @@
+[package]
+name = "cef-unity-ipc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ipc-channel = "0.21"
+serde = { version = "1", features = ["derive"] }
+shared_memory = "0.12"
