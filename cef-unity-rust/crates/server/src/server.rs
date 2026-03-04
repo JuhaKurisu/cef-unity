@@ -125,8 +125,19 @@ wrap_life_span_handler! {
     }
 }
 
+wrap_browser_process_handler! {
+    struct ServerBrowserProcessHandler;
+    impl BrowserProcessHandler {
+        fn on_schedule_message_pump_work(&self, delay_ms: i64) {
+            crate::event_loop::schedule_pump(delay_ms);
+        }
+    }
+}
+
 wrap_app! {
-    struct ServerApp;
+    struct ServerApp {
+        browser_process_handler: BrowserProcessHandler,
+    }
     impl App {
         fn on_before_command_line_processing(
             &self,
@@ -137,6 +148,9 @@ wrap_app! {
                 cl.append_switch(Some(&CefString::from("use-mock-keychain")));
                 cl.append_switch(Some(&CefString::from("single-process")));
             }
+        }
+        fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
+            Some(self.browser_process_handler.clone())
         }
     }
 }
@@ -241,7 +255,8 @@ impl CefServer {
         settings.log_file = CefString::from(cef_log.to_str().unwrap());
         settings.log_severity = LogSeverity::VERBOSE;
 
-        let mut app = ServerApp::new();
+        let bph = ServerBrowserProcessHandler::new();
+        let mut app = ServerApp::new(bph);
         let result = initialize(
             Some(args.as_main_args()),
             Some(&settings),

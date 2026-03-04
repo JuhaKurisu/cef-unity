@@ -1,5 +1,7 @@
-// Generic event loop (Linux/Windows): thread::sleep ベースのポーリング。
+// Generic event loop (Linux/Windows): condvar ベースのポーリング。
 
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use ipc_channel::TryRecvError;
@@ -7,6 +9,22 @@ use ipc_channel::TryRecvError;
 use cef_unity_ipc::Command;
 
 use super::ServerState;
+
+// ---------------------------------------------------------------------------
+// Global schedule signal
+// ---------------------------------------------------------------------------
+
+static SCHEDULE_DELAY_MS: AtomicI64 = AtomicI64::new(4);
+static WAKE_MUTEX: Mutex<()> = Mutex::new(());
+static WAKE_CONDVAR: Condvar = Condvar::new();
+
+/// Called from BrowserProcessHandler::on_schedule_message_pump_work.
+pub fn schedule_pump(delay_ms: i64) {
+    SCHEDULE_DELAY_MS.store(delay_ms.max(0), Ordering::Release);
+    // Wake the sleeping event loop
+    let _guard = WAKE_MUTEX.lock().unwrap();
+    WAKE_CONDVAR.notify_one();
+}
 
 fn log(msg: &str) {
     crate::log(msg);
@@ -25,7 +43,10 @@ pub fn run_event_loop(mut state: ServerState) -> ServerState {
         }
 
         if state.running {
-            std::thread::sleep(Duration::from_millis(4));
+            let delay = SCHEDULE_DELAY_MS.load(Ordering::Acquire);
+            let wait = Duration::from_millis(delay.max(1) as u64);
+            let guard = WAKE_MUTEX.lock().unwrap();
+            let _ = WAKE_CONDVAR.wait_timeout(guard, wait);
         }
     }
 

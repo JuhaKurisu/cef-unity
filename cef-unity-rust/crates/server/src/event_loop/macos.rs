@@ -1,5 +1,7 @@
 // macOS event loop: CFRunLoopTimer for periodic CEF pump + IPC polling.
 
+use std::sync::atomic::{AtomicPtr, Ordering};
+
 use ipc_channel::TryRecvError;
 
 use cef_unity_ipc::Command;
@@ -53,16 +55,40 @@ unsafe extern "C" {
         callout: CFRunLoopTimerCallBack,
         context: *mut CFRunLoopTimerContext,
     ) -> CFRunLoopTimerRef;
+    fn CFRunLoopTimerSetNextFireDate(timer: CFRunLoopTimerRef, fire_date: CFAbsoluteTime);
     fn CFAbsoluteTimeGetCurrent() -> CFAbsoluteTime;
     fn CFRunLoopRun();
     fn CFRunLoopStop(rl: CFRunLoopRef);
+    fn CFRunLoopWakeUp(rl: CFRunLoopRef);
 }
 
 // ---------------------------------------------------------------------------
-// Global mutable state for timer callback
+// Global state
 // ---------------------------------------------------------------------------
 
 static mut SERVER_STATE: *mut ServerState = std::ptr::null_mut();
+
+/// Global timer ref so BrowserProcessHandler can adjust it from any thread.
+static TIMER: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Called from BrowserProcessHandler::on_schedule_message_pump_work.
+/// Adjusts the timer to fire after `delay_ms` and wakes the run loop.
+pub fn schedule_pump(delay_ms: i64) {
+    let timer = TIMER.load(Ordering::Acquire);
+    if timer.is_null() {
+        return;
+    }
+    unsafe {
+        let now = CFAbsoluteTimeGetCurrent();
+        let delay = if delay_ms <= 0 {
+            0.0
+        } else {
+            delay_ms as f64 / 1000.0
+        };
+        CFRunLoopTimerSetNextFireDate(timer, now + delay);
+        CFRunLoopWakeUp(CFRunLoopGetMain());
+    }
+}
 
 fn log(msg: &str) {
     crate::log(msg);
@@ -147,15 +173,18 @@ pub fn run_event_loop(state: ServerState) -> ServerState {
             release: std::ptr::null(),
             copy_description: std::ptr::null(),
         };
+        // Large interval — CEF will control actual timing via schedule_pump().
+        // The timer still acts as a fallback to ensure pumping never stops.
         let timer = CFRunLoopTimerCreate(
             std::ptr::null(),
             CFAbsoluteTimeGetCurrent(),
-            0.004, // 4ms interval
+            0.1, // 100ms fallback interval
             0,
             0,
             timer_callback,
             &mut ctx,
         );
+        TIMER.store(timer, Ordering::Release);
         CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopDefaultMode);
     }
 
@@ -164,5 +193,6 @@ pub fn run_event_loop(state: ServerState) -> ServerState {
         CFRunLoopRun();
     }
 
+    TIMER.store(std::ptr::null_mut(), Ordering::Release);
     unsafe { *Box::from_raw(SERVER_STATE) }
 }

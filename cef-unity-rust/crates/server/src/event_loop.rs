@@ -19,13 +19,8 @@ pub struct ServerState {
     pub pump_count: u64,
 }
 
-/// Run the event loop until shutdown. Returns the ServerState for cleanup.
 #[cfg(target_os = "macos")]
-pub fn run_event_loop(state: ServerState) -> ServerState {
-    macos::run_event_loop(state)
-}
+pub use macos::{run_event_loop, schedule_pump};
 
 #[cfg(not(target_os = "macos"))]
-pub fn run_event_loop(state: ServerState) -> ServerState {
-    generic::run_event_loop(state)
-}
+pub use generic::{run_event_loop, schedule_pump};
