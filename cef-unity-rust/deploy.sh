@@ -31,9 +31,8 @@ mkdir -p "$SERVER_APP/Contents/Frameworks"
 # Server binary
 cp target/release/cef-unity-server "$SERVER_APP/Contents/MacOS/"
 
-# CEF framework (symlink to avoid doubling disk usage)
-ln -sf "$(cd "$CEF_OUT" && pwd)/Chromium Embedded Framework.framework" \
-    "$SERVER_APP/Contents/Frameworks/Chromium Embedded Framework.framework"
+# CEF framework (実コピー: Unity はシンボリックリンクを正しくインポートできない)
+rsync -a "$CEF_FW/" "$SERVER_APP/Contents/Frameworks/Chromium Embedded Framework.framework/"
 
 # Server Info.plist (LSBackgroundOnly = headless)
 cat > "$SERVER_APP/Contents/Info.plist" <<PLIST
