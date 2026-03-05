@@ -64,22 +64,13 @@ public class SampleScript : MonoBehaviour
         Debug.Log("[CefUnity] Shutdown");
     }
 
-    // -----------------------------------------------------------------------
-    // CEF modifier flags (cef_event_flags_t)
-    // -----------------------------------------------------------------------
-    private const uint EVENTFLAG_SHIFT_DOWN   = 1 << 1;
-    private const uint EVENTFLAG_CONTROL_DOWN = 1 << 2;
-    private const uint EVENTFLAG_ALT_DOWN     = 1 << 3;
-    private const uint EVENTFLAG_COMMAND_DOWN  = 1 << 7; // macOS Cmd
-    private const uint EVENTFLAG_IS_KEY_PAD   = 1 << 9;
-
     private uint GetCefModifiers()
     {
         uint m = 0;
-        if (Input.GetKey(KeyCode.LeftShift)   || Input.GetKey(KeyCode.RightShift))   m |= EVENTFLAG_SHIFT_DOWN;
-        if (Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl)) m |= EVENTFLAG_CONTROL_DOWN;
-        if (Input.GetKey(KeyCode.LeftAlt)     || Input.GetKey(KeyCode.RightAlt))     m |= EVENTFLAG_ALT_DOWN;
-        if (Input.GetKey(KeyCode.LeftCommand) || Input.GetKey(KeyCode.RightCommand)) m |= EVENTFLAG_COMMAND_DOWN;
+        if (Input.GetKey(KeyCode.LeftShift)   || Input.GetKey(KeyCode.RightShift))   m |= (uint)CefEventFlags.ShiftDown;
+        if (Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl)) m |= (uint)CefEventFlags.ControlDown;
+        if (Input.GetKey(KeyCode.LeftAlt)     || Input.GetKey(KeyCode.RightAlt))     m |= (uint)CefEventFlags.AltDown;
+        if (Input.GetKey(KeyCode.LeftCommand) || Input.GetKey(KeyCode.RightCommand)) m |= (uint)CefEventFlags.CommandDown;
         return m;
     }
 
@@ -156,61 +147,53 @@ public class SampleScript : MonoBehaviour
     // Keyboard
     // -----------------------------------------------------------------------
 
-    // Unity KeyCode → (Windows VK, macOS native keycode, character) の対応テーブル
-    // character は CEF が要求する値。macOS では NSEvent の characters に対応する。
-    // バックスペース=0x7F (NSDeleteCharacter), 矢印キー=0xF700〜 (NSFunction keys) など。
-    // character=0 のキーは修飾キー等、文字値を持たないもの。
-    private static readonly (KeyCode unity, int vk, int mac, char ch)[] SpecialKeyTable =
+    // Unity KeyCode → CefKeyCode の対応テーブル
+    private static readonly (KeyCode unity, CefKeyCode cef)[] SpecialKeyTable =
     {
-        // 制御キー                      VK        macOS    character
-        (KeyCode.Backspace,   0x08,  51, '\u007F'), // VK_BACK  — NSDeleteCharacter
-        (KeyCode.Tab,         0x09,  48, '\t'),      // VK_TAB
-        (KeyCode.Return,      0x0D,  36, '\r'),      // VK_RETURN
-        (KeyCode.Escape,      0x1B,  53, '\u001B'),  // VK_ESCAPE
-        (KeyCode.Delete,      0x2E, 117, '\uF728'),  // VK_DELETE (Forward) — NSDeleteFunctionKey
-        (KeyCode.Insert,      0x2D, 114, '\uF727'),  // VK_INSERT — NSInsertFunctionKey
+        (KeyCode.Backspace,      CefKeyCodes.Backspace),
+        (KeyCode.Tab,            CefKeyCodes.Tab),
+        (KeyCode.Return,         CefKeyCodes.Return),
+        (KeyCode.Escape,         CefKeyCodes.Escape),
+        (KeyCode.Delete,         CefKeyCodes.Delete),
+        (KeyCode.Insert,         CefKeyCodes.Insert),
 
-        // ナビゲーション — macOS NSFunction key characters
-        (KeyCode.UpArrow,     0x26, 126, '\uF700'),  // NSUpArrowFunctionKey
-        (KeyCode.DownArrow,   0x28, 125, '\uF701'),  // NSDownArrowFunctionKey
-        (KeyCode.LeftArrow,   0x25, 123, '\uF702'),  // NSLeftArrowFunctionKey
-        (KeyCode.RightArrow,  0x27, 124, '\uF703'),  // NSRightArrowFunctionKey
-        (KeyCode.Home,        0x24, 115, '\uF729'),  // NSHomeFunctionKey
-        (KeyCode.End,         0x23, 119, '\uF72B'),  // NSEndFunctionKey
-        (KeyCode.PageUp,      0x21, 116, '\uF72C'),  // NSPageUpFunctionKey
-        (KeyCode.PageDown,    0x22, 121, '\uF72D'),  // NSPageDownFunctionKey
+        (KeyCode.UpArrow,        CefKeyCodes.UpArrow),
+        (KeyCode.DownArrow,      CefKeyCodes.DownArrow),
+        (KeyCode.LeftArrow,      CefKeyCodes.LeftArrow),
+        (KeyCode.RightArrow,     CefKeyCodes.RightArrow),
+        (KeyCode.Home,           CefKeyCodes.Home),
+        (KeyCode.End,            CefKeyCodes.End),
+        (KeyCode.PageUp,         CefKeyCodes.PageUp),
+        (KeyCode.PageDown,       CefKeyCodes.PageDown),
 
-        // ファンクションキー — NSF1FunctionKey (0xF704) 〜
-        (KeyCode.F1,  0x70, 122, '\uF704'), (KeyCode.F2,  0x71, 120, '\uF705'),
-        (KeyCode.F3,  0x72,  99, '\uF706'), (KeyCode.F4,  0x73, 118, '\uF707'),
-        (KeyCode.F5,  0x74,  96, '\uF708'), (KeyCode.F6,  0x75,  97, '\uF709'),
-        (KeyCode.F7,  0x76,  98, '\uF70A'), (KeyCode.F8,  0x77, 100, '\uF70B'),
-        (KeyCode.F9,  0x78, 101, '\uF70C'), (KeyCode.F10, 0x79, 109, '\uF70D'),
-        (KeyCode.F11, 0x7A, 103, '\uF70E'), (KeyCode.F12, 0x7B, 111, '\uF70F'),
+        (KeyCode.F1,  CefKeyCodes.F1),  (KeyCode.F2,  CefKeyCodes.F2),
+        (KeyCode.F3,  CefKeyCodes.F3),  (KeyCode.F4,  CefKeyCodes.F4),
+        (KeyCode.F5,  CefKeyCodes.F5),  (KeyCode.F6,  CefKeyCodes.F6),
+        (KeyCode.F7,  CefKeyCodes.F7),  (KeyCode.F8,  CefKeyCodes.F8),
+        (KeyCode.F9,  CefKeyCodes.F9),  (KeyCode.F10, CefKeyCodes.F10),
+        (KeyCode.F11, CefKeyCodes.F11), (KeyCode.F12, CefKeyCodes.F12),
 
-        // テンキー — 文字値は対応する数字/記号
-        (KeyCode.Keypad0, 0x60, 82, '0'), (KeyCode.Keypad1, 0x61, 83, '1'),
-        (KeyCode.Keypad2, 0x62, 84, '2'), (KeyCode.Keypad3, 0x63, 85, '3'),
-        (KeyCode.Keypad4, 0x64, 86, '4'), (KeyCode.Keypad5, 0x65, 87, '5'),
-        (KeyCode.Keypad6, 0x66, 88, '6'), (KeyCode.Keypad7, 0x67, 89, '7'),
-        (KeyCode.Keypad8, 0x68, 91, '8'), (KeyCode.Keypad9, 0x69, 92, '9'),
-        (KeyCode.KeypadPeriod,   0x6E, 65, '.'),
-        (KeyCode.KeypadDivide,   0x6F, 75, '/'),
-        (KeyCode.KeypadMultiply, 0x6A, 67, '*'),
-        (KeyCode.KeypadMinus,    0x6D, 78, '-'),
-        (KeyCode.KeypadPlus,     0x6B, 69, '+'),
-        (KeyCode.KeypadEnter,    0x0D, 76, '\r'),
+        (KeyCode.Keypad0, CefKeyCodes.Keypad0), (KeyCode.Keypad1, CefKeyCodes.Keypad1),
+        (KeyCode.Keypad2, CefKeyCodes.Keypad2), (KeyCode.Keypad3, CefKeyCodes.Keypad3),
+        (KeyCode.Keypad4, CefKeyCodes.Keypad4), (KeyCode.Keypad5, CefKeyCodes.Keypad5),
+        (KeyCode.Keypad6, CefKeyCodes.Keypad6), (KeyCode.Keypad7, CefKeyCodes.Keypad7),
+        (KeyCode.Keypad8, CefKeyCodes.Keypad8), (KeyCode.Keypad9, CefKeyCodes.Keypad9),
+        (KeyCode.KeypadPeriod,   CefKeyCodes.KeypadPeriod),
+        (KeyCode.KeypadDivide,   CefKeyCodes.KeypadDivide),
+        (KeyCode.KeypadMultiply, CefKeyCodes.KeypadMultiply),
+        (KeyCode.KeypadMinus,    CefKeyCodes.KeypadMinus),
+        (KeyCode.KeypadPlus,     CefKeyCodes.KeypadPlus),
+        (KeyCode.KeypadEnter,    CefKeyCodes.KeypadEnter),
 
-        // 修飾キー — 文字値なし
-        (KeyCode.LeftShift,    0x10, 56, '\0'),
-        (KeyCode.RightShift,   0x10, 60, '\0'),
-        (KeyCode.LeftControl,  0x11, 59, '\0'),
-        (KeyCode.RightControl, 0x11, 62, '\0'),
-        (KeyCode.LeftAlt,      0x12, 58, '\0'),
-        (KeyCode.RightAlt,     0x12, 61, '\0'),
-        (KeyCode.LeftCommand,  0x5B, 55, '\0'),
-        (KeyCode.RightCommand, 0x5C, 54, '\0'),
-        (KeyCode.CapsLock,     0x14, 57, '\0'),
+        (KeyCode.LeftShift,    CefKeyCodes.LeftShift),
+        (KeyCode.RightShift,   CefKeyCodes.RightShift),
+        (KeyCode.LeftControl,  CefKeyCodes.LeftControl),
+        (KeyCode.RightControl, CefKeyCodes.RightControl),
+        (KeyCode.LeftAlt,      CefKeyCodes.LeftAlt),
+        (KeyCode.RightAlt,     CefKeyCodes.RightAlt),
+        (KeyCode.LeftCommand,  CefKeyCodes.LeftCommand),
+        (KeyCode.RightCommand, CefKeyCodes.RightCommand),
+        (KeyCode.CapsLock,     CefKeyCodes.CapsLock),
     };
 
     private void HandleKeyboardInput()
@@ -223,45 +206,17 @@ public class SampleScript : MonoBehaviour
         foreach (var c in Input.inputString)
         {
             if (char.IsControl(c)) continue;
-            var vk = CharToWindowsVk(c);
-            _browser.SendKeyEvent(KeyEventType.RawKeyDown, vk, modifiers: mods, character: c, unmodifiedCharacter: c);
-            _browser.SendKeyEvent(KeyEventType.Char, c, modifiers: mods, character: c, unmodifiedCharacter: c);
-            _browser.SendKeyEvent(KeyEventType.KeyUp, vk, modifiers: mods, character: c, unmodifiedCharacter: c);
+            _browser.SendCharEvent(c, mods);
         }
 
         // 2) 非印字キー — GetKeyDown / GetKeyUp (RAWKEYDOWN / KEYUP のみ)
-        //    character/unmodifiedCharacter を正しく設定しないと CEF が無視する
-        //    (例: バックスペースは 0x7F = NSDeleteCharacter が必須)
-        foreach (var (key, vk, mac, ch) in SpecialKeyTable)
+        foreach (var (key, cef) in SpecialKeyTable)
         {
             if (Input.GetKeyDown(key))
-                _browser.SendKeyEvent(KeyEventType.RawKeyDown, vk, nativeKeyCode: mac, modifiers: mods, character: ch, unmodifiedCharacter: ch);
+                _browser.SendKeyEvent(KeyEventType.RawKeyDown, cef, mods);
             if (Input.GetKeyUp(key))
-                _browser.SendKeyEvent(KeyEventType.KeyUp, vk, nativeKeyCode: mac, modifiers: mods, character: ch, unmodifiedCharacter: ch);
+                _browser.SendKeyEvent(KeyEventType.KeyUp, cef, mods);
         }
-    }
-
-    private static int CharToWindowsVk(char c)
-    {
-        return c switch
-        {
-            >= 'a' and <= 'z' => c - 32, // VK_A..VK_Z (0x41-0x5A)
-            >= 'A' and <= 'Z' => c,       // VK_A..VK_Z
-            >= '0' and <= '9' => c,        // VK_0..VK_9 (0x30-0x39)
-            ' ' => 0x20,                   // VK_SPACE
-            ';' or ':' => 0xBA,            // VK_OEM_1
-            '=' or '+' => 0xBB,            // VK_OEM_PLUS
-            ',' or '<' => 0xBC,            // VK_OEM_COMMA
-            '-' or '_' => 0xBD,            // VK_OEM_MINUS
-            '.' or '>' => 0xBE,            // VK_OEM_PERIOD
-            '/' or '?' => 0xBF,            // VK_OEM_2
-            '`' or '~' => 0xC0,            // VK_OEM_3
-            '[' or '{' => 0xDB,            // VK_OEM_4
-            '\\' or '|' => 0xDC,           // VK_OEM_5
-            ']' or '}' => 0xDD,            // VK_OEM_6
-            '\'' or '"' => 0xDE,           // VK_OEM_7
-            _ => c,
-        };
     }
 
     private void UpdateTexture()
