@@ -322,6 +322,179 @@ mod tests {
     }
 
     #[test]
+    fn key_event_backspace_roundtrip() {
+        // Backspace on macOS: VK_BACK=0x08, native=51 (kVK_Delete),
+        // character=0x7F (NSDeleteCharacter)
+        let (tx, rx) = ipc::channel::<Command>().unwrap();
+        tx.send(Command::KeyEvent {
+            browser_id: 1,
+            event_type: 0, // RAWKEYDOWN
+            modifiers: 0,
+            windows_key_code: 0x08,
+            native_key_code: 51,
+            character: 0x7F,
+            unmodified_character: 0x7F,
+            is_system_key: 0,
+            focus_on_editable_field: 0,
+        })
+        .unwrap();
+        let cmd = rx.recv().unwrap();
+        match cmd {
+            Command::KeyEvent {
+                browser_id,
+                event_type,
+                modifiers,
+                windows_key_code,
+                native_key_code,
+                character,
+                unmodified_character,
+                is_system_key,
+                focus_on_editable_field,
+            } => {
+                assert_eq!(browser_id, 1);
+                assert_eq!(event_type, 0); // RAWKEYDOWN
+                assert_eq!(modifiers, 0);
+                assert_eq!(windows_key_code, 0x08); // VK_BACK
+                assert_eq!(native_key_code, 51); // macOS kVK_Delete
+                assert_eq!(character, 0x7F); // NSDeleteCharacter
+                assert_eq!(unmodified_character, 0x7F);
+                assert_eq!(is_system_key, 0);
+                assert_eq!(focus_on_editable_field, 0);
+            }
+            _ => panic!("expected KeyEvent"),
+        }
+    }
+
+    #[test]
+    fn key_event_printable_char_roundtrip() {
+        // Typing 'a': VK_A=0x41, native=0 (macOS keycode), char='a'=0x61
+        let (tx, rx) = ipc::channel::<Command>().unwrap();
+
+        // RAWKEYDOWN
+        tx.send(Command::KeyEvent {
+            browser_id: 1,
+            event_type: 0,
+            modifiers: 0,
+            windows_key_code: 0x41,
+            native_key_code: 0,
+            character: 0x61, // 'a'
+            unmodified_character: 0x61,
+            is_system_key: 0,
+            focus_on_editable_field: 0,
+        })
+        .unwrap();
+
+        // CHAR
+        tx.send(Command::KeyEvent {
+            browser_id: 1,
+            event_type: 2, // CHAR
+            modifiers: 0,
+            windows_key_code: 0x61, // 'a' as key code for CHAR event
+            native_key_code: 0,
+            character: 0x61,
+            unmodified_character: 0x61,
+            is_system_key: 0,
+            focus_on_editable_field: 0,
+        })
+        .unwrap();
+
+        // KEYUP
+        tx.send(Command::KeyEvent {
+            browser_id: 1,
+            event_type: 1, // KEYUP
+            modifiers: 0,
+            windows_key_code: 0x41,
+            native_key_code: 0,
+            character: 0x61,
+            unmodified_character: 0x61,
+            is_system_key: 0,
+            focus_on_editable_field: 0,
+        })
+        .unwrap();
+
+        // Verify all three events
+        let cmd1 = rx.recv().unwrap();
+        assert!(matches!(cmd1, Command::KeyEvent { event_type: 0, .. }));
+
+        let cmd2 = rx.recv().unwrap();
+        assert!(matches!(cmd2, Command::KeyEvent { event_type: 2, .. }));
+
+        let cmd3 = rx.recv().unwrap();
+        assert!(matches!(cmd3, Command::KeyEvent { event_type: 1, .. }));
+    }
+
+    #[test]
+    fn key_event_needs_no_response() {
+        let cmd = Command::KeyEvent {
+            browser_id: 1,
+            event_type: 0,
+            modifiers: 0,
+            windows_key_code: 0x08,
+            native_key_code: 51,
+            character: 0x7F,
+            unmodified_character: 0x7F,
+            is_system_key: 0,
+            focus_on_editable_field: 0,
+        };
+        assert!(!cmd.needs_response(), "KeyEvent should be fire-and-forget");
+    }
+
+    #[test]
+    fn key_event_special_keys_values() {
+        // Verify correct values for common special keys on macOS
+        struct SpecialKey {
+            name: &'static str,
+            vk: i32,
+            native: i32,
+            character: u16,
+        }
+
+        let keys = [
+            SpecialKey { name: "Backspace", vk: 0x08, native: 51, character: 0x7F },
+            SpecialKey { name: "Tab", vk: 0x09, native: 48, character: 0x09 },
+            SpecialKey { name: "Return", vk: 0x0D, native: 36, character: 0x0D },
+            SpecialKey { name: "Escape", vk: 0x1B, native: 53, character: 0x1B },
+            SpecialKey { name: "Delete", vk: 0x2E, native: 117, character: 0xF728 },
+            SpecialKey { name: "UpArrow", vk: 0x26, native: 126, character: 0xF700 },
+            SpecialKey { name: "DownArrow", vk: 0x28, native: 125, character: 0xF701 },
+            SpecialKey { name: "LeftArrow", vk: 0x25, native: 123, character: 0xF702 },
+            SpecialKey { name: "RightArrow", vk: 0x27, native: 124, character: 0xF703 },
+        ];
+
+        let (tx, rx) = ipc::channel::<Command>().unwrap();
+
+        for key in &keys {
+            tx.send(Command::KeyEvent {
+                browser_id: 1,
+                event_type: 0,
+                modifiers: 0,
+                windows_key_code: key.vk,
+                native_key_code: key.native,
+                character: key.character,
+                unmodified_character: key.character,
+                is_system_key: 0,
+                focus_on_editable_field: 0,
+            })
+            .unwrap();
+
+            let cmd = rx.recv().unwrap();
+            match cmd {
+                Command::KeyEvent {
+                    windows_key_code,
+                    native_key_code,
+                    character,
+                    ..
+                } => {
+                    assert_eq!(windows_key_code, key.vk, "{} VK mismatch", key.name);
+                    assert_eq!(native_key_code, key.native, "{} native mismatch", key.name);
+                    assert_eq!(character, key.character, "{} character mismatch", key.name);
+                }
+                _ => panic!("expected KeyEvent for {}", key.name),
+            }
+        }
+    }
+
+    #[test]
     fn ipc_bootstrap_roundtrip() {
         // IpcOneShotServer bootstrap requires separate processes on macOS (Mach ports).
         // Here we test the channel transfer pattern using regular IPC channels instead.

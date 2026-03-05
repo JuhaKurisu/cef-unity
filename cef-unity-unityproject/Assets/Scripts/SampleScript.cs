@@ -156,55 +156,61 @@ public class SampleScript : MonoBehaviour
     // Keyboard
     // -----------------------------------------------------------------------
 
-    // Unity KeyCode → Windows Virtual-Key の対応テーブル (非印字キー)
-    private static readonly (KeyCode unity, int vk)[] SpecialKeyTable =
+    // Unity KeyCode → (Windows VK, macOS native keycode, character) の対応テーブル
+    // character は CEF が要求する値。macOS では NSEvent の characters に対応する。
+    // バックスペース=0x7F (NSDeleteCharacter), 矢印キー=0xF700〜 (NSFunction keys) など。
+    // character=0 のキーは修飾キー等、文字値を持たないもの。
+    private static readonly (KeyCode unity, int vk, int mac, char ch)[] SpecialKeyTable =
     {
-        // 制御キー
-        (KeyCode.Backspace,   0x08), // VK_BACK
-        (KeyCode.Tab,         0x09), // VK_TAB
-        (KeyCode.Return,      0x0D), // VK_RETURN
-        (KeyCode.Escape,      0x1B), // VK_ESCAPE
-        (KeyCode.Delete,      0x2E), // VK_DELETE
-        (KeyCode.Insert,      0x2D), // VK_INSERT
+        // 制御キー                      VK        macOS    character
+        (KeyCode.Backspace,   0x08,  51, '\u007F'), // VK_BACK  — NSDeleteCharacter
+        (KeyCode.Tab,         0x09,  48, '\t'),      // VK_TAB
+        (KeyCode.Return,      0x0D,  36, '\r'),      // VK_RETURN
+        (KeyCode.Escape,      0x1B,  53, '\u001B'),  // VK_ESCAPE
+        (KeyCode.Delete,      0x2E, 117, '\uF728'),  // VK_DELETE (Forward) — NSDeleteFunctionKey
+        (KeyCode.Insert,      0x2D, 114, '\uF727'),  // VK_INSERT — NSInsertFunctionKey
 
-        // ナビゲーション
-        (KeyCode.UpArrow,     0x26), // VK_UP
-        (KeyCode.DownArrow,   0x28), // VK_DOWN
-        (KeyCode.LeftArrow,   0x25), // VK_LEFT
-        (KeyCode.RightArrow,  0x27), // VK_RIGHT
-        (KeyCode.Home,        0x24), // VK_HOME
-        (KeyCode.End,         0x23), // VK_END
-        (KeyCode.PageUp,      0x21), // VK_PRIOR
-        (KeyCode.PageDown,    0x22), // VK_NEXT
+        // ナビゲーション — macOS NSFunction key characters
+        (KeyCode.UpArrow,     0x26, 126, '\uF700'),  // NSUpArrowFunctionKey
+        (KeyCode.DownArrow,   0x28, 125, '\uF701'),  // NSDownArrowFunctionKey
+        (KeyCode.LeftArrow,   0x25, 123, '\uF702'),  // NSLeftArrowFunctionKey
+        (KeyCode.RightArrow,  0x27, 124, '\uF703'),  // NSRightArrowFunctionKey
+        (KeyCode.Home,        0x24, 115, '\uF729'),  // NSHomeFunctionKey
+        (KeyCode.End,         0x23, 119, '\uF72B'),  // NSEndFunctionKey
+        (KeyCode.PageUp,      0x21, 116, '\uF72C'),  // NSPageUpFunctionKey
+        (KeyCode.PageDown,    0x22, 121, '\uF72D'),  // NSPageDownFunctionKey
 
-        // ファンクションキー
-        (KeyCode.F1,  0x70), (KeyCode.F2,  0x71), (KeyCode.F3,  0x72),
-        (KeyCode.F4,  0x73), (KeyCode.F5,  0x74), (KeyCode.F6,  0x75),
-        (KeyCode.F7,  0x76), (KeyCode.F8,  0x77), (KeyCode.F9,  0x78),
-        (KeyCode.F10, 0x79), (KeyCode.F11, 0x7A), (KeyCode.F12, 0x7B),
+        // ファンクションキー — NSF1FunctionKey (0xF704) 〜
+        (KeyCode.F1,  0x70, 122, '\uF704'), (KeyCode.F2,  0x71, 120, '\uF705'),
+        (KeyCode.F3,  0x72,  99, '\uF706'), (KeyCode.F4,  0x73, 118, '\uF707'),
+        (KeyCode.F5,  0x74,  96, '\uF708'), (KeyCode.F6,  0x75,  97, '\uF709'),
+        (KeyCode.F7,  0x76,  98, '\uF70A'), (KeyCode.F8,  0x77, 100, '\uF70B'),
+        (KeyCode.F9,  0x78, 101, '\uF70C'), (KeyCode.F10, 0x79, 109, '\uF70D'),
+        (KeyCode.F11, 0x7A, 103, '\uF70E'), (KeyCode.F12, 0x7B, 111, '\uF70F'),
 
-        // テンキー (文字は inputString で処理されるが Down/Up は必要)
-        (KeyCode.Keypad0, 0x60), (KeyCode.Keypad1, 0x61), (KeyCode.Keypad2, 0x62),
-        (KeyCode.Keypad3, 0x63), (KeyCode.Keypad4, 0x64), (KeyCode.Keypad5, 0x65),
-        (KeyCode.Keypad6, 0x66), (KeyCode.Keypad7, 0x67), (KeyCode.Keypad8, 0x68),
-        (KeyCode.Keypad9, 0x69),
-        (KeyCode.KeypadPeriod,   0x6E), // VK_DECIMAL
-        (KeyCode.KeypadDivide,   0x6F), // VK_DIVIDE
-        (KeyCode.KeypadMultiply, 0x6A), // VK_MULTIPLY
-        (KeyCode.KeypadMinus,    0x6D), // VK_SUBTRACT
-        (KeyCode.KeypadPlus,     0x6B), // VK_ADD
-        (KeyCode.KeypadEnter,    0x0D), // VK_RETURN
+        // テンキー — 文字値は対応する数字/記号
+        (KeyCode.Keypad0, 0x60, 82, '0'), (KeyCode.Keypad1, 0x61, 83, '1'),
+        (KeyCode.Keypad2, 0x62, 84, '2'), (KeyCode.Keypad3, 0x63, 85, '3'),
+        (KeyCode.Keypad4, 0x64, 86, '4'), (KeyCode.Keypad5, 0x65, 87, '5'),
+        (KeyCode.Keypad6, 0x66, 88, '6'), (KeyCode.Keypad7, 0x67, 89, '7'),
+        (KeyCode.Keypad8, 0x68, 91, '8'), (KeyCode.Keypad9, 0x69, 92, '9'),
+        (KeyCode.KeypadPeriod,   0x6E, 65, '.'),
+        (KeyCode.KeypadDivide,   0x6F, 75, '/'),
+        (KeyCode.KeypadMultiply, 0x6A, 67, '*'),
+        (KeyCode.KeypadMinus,    0x6D, 78, '-'),
+        (KeyCode.KeypadPlus,     0x6B, 69, '+'),
+        (KeyCode.KeypadEnter,    0x0D, 76, '\r'),
 
-        // 修飾キー (CEF にも Down/Up を通知)
-        (KeyCode.LeftShift,    0x10), // VK_SHIFT
-        (KeyCode.RightShift,   0x10),
-        (KeyCode.LeftControl,  0x11), // VK_CONTROL
-        (KeyCode.RightControl, 0x11),
-        (KeyCode.LeftAlt,      0x12), // VK_MENU
-        (KeyCode.RightAlt,     0x12),
-        (KeyCode.LeftCommand,  0x5B), // VK_LWIN (macOS Cmd)
-        (KeyCode.RightCommand, 0x5C), // VK_RWIN
-        (KeyCode.CapsLock,     0x14), // VK_CAPITAL
+        // 修飾キー — 文字値なし
+        (KeyCode.LeftShift,    0x10, 56, '\0'),
+        (KeyCode.RightShift,   0x10, 60, '\0'),
+        (KeyCode.LeftControl,  0x11, 59, '\0'),
+        (KeyCode.RightControl, 0x11, 62, '\0'),
+        (KeyCode.LeftAlt,      0x12, 58, '\0'),
+        (KeyCode.RightAlt,     0x12, 61, '\0'),
+        (KeyCode.LeftCommand,  0x5B, 55, '\0'),
+        (KeyCode.RightCommand, 0x5C, 54, '\0'),
+        (KeyCode.CapsLock,     0x14, 57, '\0'),
     };
 
     private void HandleKeyboardInput()
@@ -224,12 +230,14 @@ public class SampleScript : MonoBehaviour
         }
 
         // 2) 非印字キー — GetKeyDown / GetKeyUp (RAWKEYDOWN / KEYUP のみ)
-        foreach (var (key, vk) in SpecialKeyTable)
+        //    character/unmodifiedCharacter を正しく設定しないと CEF が無視する
+        //    (例: バックスペースは 0x7F = NSDeleteCharacter が必須)
+        foreach (var (key, vk, mac, ch) in SpecialKeyTable)
         {
             if (Input.GetKeyDown(key))
-                _browser.SendKeyEvent(KeyEventType.RawKeyDown, vk, modifiers: mods);
+                _browser.SendKeyEvent(KeyEventType.RawKeyDown, vk, nativeKeyCode: mac, modifiers: mods, character: ch, unmodifiedCharacter: ch);
             if (Input.GetKeyUp(key))
-                _browser.SendKeyEvent(KeyEventType.KeyUp, vk, modifiers: mods);
+                _browser.SendKeyEvent(KeyEventType.KeyUp, vk, nativeKeyCode: mac, modifiers: mods, character: ch, unmodifiedCharacter: ch);
         }
     }
 
