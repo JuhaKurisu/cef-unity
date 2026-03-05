@@ -510,6 +510,10 @@ impl CefServer {
                     2 => MouseButtonType::RIGHT,
                     _ => MouseButtonType::LEFT,
                 };
+                // mouse-down 時にフォーカスを設定 (OSR ではこれがないとキャレットが出ない)
+                if !mouse_up {
+                    BrowserHost::set_focus(&host, 1);
+                }
                 BrowserHost::send_mouse_click_event(
                     &host,
                     Some(&event),
