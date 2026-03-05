@@ -1,10 +1,9 @@
 // Generic event loop (Linux/Windows): condvar ベースのポーリング。
 
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
-
-use ipc_channel::TryRecvError;
 
 use cef_unity_ipc::Command;
 
@@ -54,9 +53,18 @@ pub fn run_event_loop(mut state: ServerState) -> ServerState {
 }
 
 fn tick(state: &mut ServerState) {
+    // IPC コマンドを先に処理 → マウスイベント等が同じ pump サイクルで CEF に反映される
+    drain_commands(state);
+
+    if !state.running {
+        return;
+    }
+
     cef::do_message_loop_work();
     state.pump_count += 1;
+}
 
+fn drain_commands(state: &mut ServerState) {
     loop {
         match state.cmd_rx.try_recv() {
             Ok(cmd) => {
@@ -78,9 +86,9 @@ fn tick(state: &mut ServerState) {
                     break;
                 }
             }
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::IpcError(e)) => {
-                log(&format!("client disconnected: {}", e));
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                log("IPC bridge disconnected");
                 state.running = false;
                 break;
             }

@@ -54,10 +54,27 @@ fn main() {
         .expect("failed to send bootstrap");
     log("bootstrap sent to client");
 
+    // IPC → mpsc ブリッジスレッド: IPC recv をブロッキング待ちし、
+    // コマンド到着時に即座にイベントループを起こす。
+    let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Command>();
+    std::thread::spawn(move || {
+        loop {
+            match cmd_rx.recv() {
+                Ok(cmd) => {
+                    if mpsc_tx.send(cmd).is_err() {
+                        break;
+                    }
+                    event_loop::schedule_pump(0);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     // Run platform-specific event loop
     let state = event_loop::ServerState {
         cef_server,
-        cmd_rx,
+        cmd_rx: mpsc_rx,
         resp_tx,
         running: true,
         pump_count: 0,

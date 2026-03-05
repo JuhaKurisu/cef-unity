@@ -1,8 +1,7 @@
 // macOS event loop: CFRunLoopTimer for periodic CEF pump + IPC polling.
 
 use std::sync::atomic::{AtomicPtr, Ordering};
-
-use ipc_channel::TryRecvError;
+use std::sync::mpsc;
 
 use cef_unity_ipc::Command;
 
@@ -119,9 +118,22 @@ fn timer_callback_inner() {
         return;
     }
 
+    // IPC コマンドを先に処理 → マウスイベント等が同じ pump サイクルで CEF に反映される
+    drain_commands(state);
+
+    if !state.running {
+        unsafe {
+            CFRunLoopStop(CFRunLoopGetMain());
+        }
+        return;
+    }
+
     cef::do_message_loop_work();
     state.pump_count += 1;
+}
 
+/// mpsc チャネルからコマンドを全て取り出して処理する。
+fn drain_commands(state: &mut ServerState) {
     loop {
         match state.cmd_rx.try_recv() {
             Ok(cmd) => {
@@ -143,18 +155,12 @@ fn timer_callback_inner() {
                     break;
                 }
             }
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::IpcError(e)) => {
-                log(&format!("client disconnected: {}", e));
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                log("IPC bridge disconnected");
                 state.running = false;
                 break;
             }
-        }
-    }
-
-    if !state.running {
-        unsafe {
-            CFRunLoopStop(CFRunLoopGetMain());
         }
     }
 }
