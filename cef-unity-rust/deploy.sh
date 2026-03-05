@@ -81,6 +81,8 @@ for VARIANT in "${HELPER_VARIANTS[@]}"; do
     <string>APPL</string>
     <key>CFBundleVersion</key>
     <string>1.0</string>
+    <key>LSUIElement</key>
+    <true/>
 </dict>
 </plist>
 PLIST
