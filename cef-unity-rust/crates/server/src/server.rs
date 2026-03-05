@@ -115,6 +115,31 @@ wrap_life_span_handler! {
         browser_slot: Arc<Mutex<Option<Browser>>>,
     }
     impl LifeSpanHandler {
+        fn on_before_popup(
+            &self,
+            browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _popup_id: ::std::os::raw::c_int,
+            target_url: Option<&CefString>,
+            _target_frame_name: Option<&CefString>,
+            _target_disposition: WindowOpenDisposition,
+            _user_gesture: ::std::os::raw::c_int,
+            _popup_features: Option<&PopupFeatures>,
+            _window_info: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>,
+            _settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            // ポップアップをキャンセルし、現在のブラウザで URL を開く
+            if let (Some(b), Some(url)) = (browser, target_url) {
+                if let Some(frame) = Browser::main_frame(b) {
+                    Frame::load_url(&frame, Some(url));
+                }
+            }
+            1 // キャンセル
+        }
+
         fn on_after_created(&self, browser: Option<&mut Browser>) {
             log("on_after_created called");
             if let Some(b) = browser {
@@ -381,9 +406,10 @@ impl CefServer {
     fn destroy_browser(&mut self, browser_id: u32) -> Response {
         if let Some(state) = self.browsers.remove(&browser_id) {
             if let Some(browser) = state.browser.lock().unwrap().take()
-                && let Some(host) = Browser::host(&browser) {
-                    BrowserHost::close_browser(&host, 1);
-                }
+                && let Some(host) = Browser::host(&browser)
+            {
+                BrowserHost::close_browser(&host, 1);
+            }
             Response::Ok
         } else {
             Response::Error {
@@ -395,10 +421,11 @@ impl CefServer {
     fn load_url(&mut self, browser_id: u32, url: &str) -> Response {
         if let Some(state) = self.browsers.get(&browser_id) {
             if let Some(ref browser) = *state.browser.lock().unwrap()
-                && let Some(frame) = Browser::main_frame(browser) {
-                    Frame::load_url(&frame, Some(&CefString::from(url)));
-                    return Response::Ok;
-                }
+                && let Some(frame) = Browser::main_frame(browser)
+            {
+                Frame::load_url(&frame, Some(&CefString::from(url)));
+                return Response::Ok;
+            }
             Response::Error {
                 msg: "browser not ready yet".to_string(),
             }
@@ -414,9 +441,10 @@ impl CefServer {
             state.viewport_w.store(width, Ordering::Relaxed);
             state.viewport_h.store(height, Ordering::Relaxed);
             if let Some(ref browser) = *state.browser.lock().unwrap()
-                && let Some(host) = Browser::host(browser) {
-                    BrowserHost::was_resized(&host);
-                }
+                && let Some(host) = Browser::host(browser)
+            {
+                BrowserHost::was_resized(&host);
+            }
             Response::Ok
         } else {
             Response::Error {
@@ -428,10 +456,11 @@ impl CefServer {
     fn mouse_move(&self, browser_id: u32, x: i32, y: i32, modifiers: u32) -> Response {
         if let Some(state) = self.browsers.get(&browser_id) {
             if let Some(ref browser) = *state.browser.lock().unwrap()
-                && let Some(host) = Browser::host(browser) {
-                    let event = MouseEvent { x, y, modifiers };
-                    BrowserHost::send_mouse_move_event(&host, Some(&event), 0);
-                }
+                && let Some(host) = Browser::host(browser)
+            {
+                let event = MouseEvent { x, y, modifiers };
+                BrowserHost::send_mouse_move_event(&host, Some(&event), 0);
+            }
             Response::Ok
         } else {
             Response::Error {
@@ -452,21 +481,22 @@ impl CefServer {
     ) -> Response {
         if let Some(state) = self.browsers.get(&browser_id) {
             if let Some(ref browser) = *state.browser.lock().unwrap()
-                && let Some(host) = Browser::host(browser) {
-                    let event = MouseEvent { x, y, modifiers };
-                    let button_type = match button {
-                        1 => MouseButtonType::MIDDLE,
-                        2 => MouseButtonType::RIGHT,
-                        _ => MouseButtonType::LEFT,
-                    };
-                    BrowserHost::send_mouse_click_event(
-                        &host,
-                        Some(&event),
-                        button_type,
-                        mouse_up as i32,
-                        click_count,
-                    );
-                }
+                && let Some(host) = Browser::host(browser)
+            {
+                let event = MouseEvent { x, y, modifiers };
+                let button_type = match button {
+                    1 => MouseButtonType::MIDDLE,
+                    2 => MouseButtonType::RIGHT,
+                    _ => MouseButtonType::LEFT,
+                };
+                BrowserHost::send_mouse_click_event(
+                    &host,
+                    Some(&event),
+                    button_type,
+                    mouse_up as i32,
+                    click_count,
+                );
+            }
             Response::Ok
         } else {
             Response::Error {
@@ -486,10 +516,11 @@ impl CefServer {
     ) -> Response {
         if let Some(state) = self.browsers.get(&browser_id) {
             if let Some(ref browser) = *state.browser.lock().unwrap()
-                && let Some(host) = Browser::host(browser) {
-                    let event = MouseEvent { x, y, modifiers };
-                    BrowserHost::send_mouse_wheel_event(&host, Some(&event), delta_x, delta_y);
-                }
+                && let Some(host) = Browser::host(browser)
+            {
+                let event = MouseEvent { x, y, modifiers };
+                BrowserHost::send_mouse_wheel_event(&host, Some(&event), delta_x, delta_y);
+            }
             Response::Ok
         } else {
             Response::Error {
