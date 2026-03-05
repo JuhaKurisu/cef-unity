@@ -11,6 +11,13 @@ namespace CefUnity.Interop
         Right = 2,
     }
 
+    public enum KeyEventType : byte
+    {
+        RawKeyDown = 0,
+        KeyUp = 1,
+        Char = 2,
+    }
+
     public static class CefRuntime
     {
         public static void Init()
@@ -126,6 +133,32 @@ namespace CefUnity.Interop
             unsafe
             {
                 NativeMethods.cef_unity_send_mouse_wheel(_handle, x, y, modifiers, deltaX, deltaY);
+            }
+        }
+
+        public void SendKeyEvent(
+            KeyEventType eventType,
+            int windowsKeyCode,
+            int nativeKeyCode = 0,
+            uint modifiers = 0,
+            char character = '\0',
+            char unmodifiedCharacter = '\0',
+            bool isSystemKey = false,
+            bool focusOnEditableField = false)
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                NativeMethods.cef_unity_send_key_event(
+                    _handle,
+                    (byte)eventType,
+                    modifiers,
+                    windowsKeyCode,
+                    nativeKeyCode,
+                    character,
+                    unmodifiedCharacter,
+                    isSystemKey ? 1 : 0,
+                    focusOnEditableField ? 1 : 0);
             }
         }
 

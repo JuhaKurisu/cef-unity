@@ -271,7 +271,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::SampleScript
   _width: 1920
   _height: 1080
-  _url: https://app.diagrams.net/
+  _url: google.com
   _rawImage: {fileID: 1153544198}
 --- !u!1 &410087039
 GameObject:

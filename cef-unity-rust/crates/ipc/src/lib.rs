@@ -54,16 +54,31 @@ pub enum Command {
         delta_x: i32,
         delta_y: i32,
     },
+    KeyEvent {
+        browser_id: u32,
+        /// 0=RAWKEYDOWN, 1=KEYUP, 2=CHAR
+        event_type: u8,
+        modifiers: u32,
+        windows_key_code: i32,
+        native_key_code: i32,
+        character: u16,
+        unmodified_character: u16,
+        is_system_key: i32,
+        focus_on_editable_field: i32,
+    },
     Shutdown,
 }
 
 impl Command {
     /// Returns true if the sender expects a Response for this command.
-    /// Fire-and-forget commands (mouse events) return false.
+    /// Fire-and-forget commands (input events) return false.
     pub fn needs_response(&self) -> bool {
         !matches!(
             self,
-            Command::MouseMove { .. } | Command::MouseClick { .. } | Command::MouseWheel { .. }
+            Command::MouseMove { .. }
+                | Command::MouseClick { .. }
+                | Command::MouseWheel { .. }
+                | Command::KeyEvent { .. }
         )
     }
 }

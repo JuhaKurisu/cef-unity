@@ -490,6 +490,43 @@ pub extern "C" fn cef_unity_send_mouse_wheel(
     }
 }
 
+/// Send a key event.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_send_key_event(
+    handle: *mut CefUnityBrowser,
+    event_type: u8,
+    modifiers: u32,
+    windows_key_code: i32,
+    native_key_code: i32,
+    character: u16,
+    unmodified_character: u16,
+    is_system_key: i32,
+    focus_on_editable_field: i32,
+) {
+    if handle.is_null() {
+        return;
+    }
+    let instance = handle_to_ref(handle);
+
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        send_command_no_wait(
+            conn,
+            Command::KeyEvent {
+                browser_id: instance.browser_id,
+                event_type,
+                modifiers,
+                windows_key_code,
+                native_key_code,
+                character,
+                unmodified_character,
+                is_system_key,
+                focus_on_editable_field,
+            },
+        );
+    }
+}
+
 /// Get the latest frame buffer from shared memory.
 /// Returns 1 if a new frame is available, 0 if unchanged.
 #[unsafe(no_mangle)]

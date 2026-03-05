@@ -331,6 +331,27 @@ impl CefServer {
                 delta_x,
                 delta_y,
             } => self.mouse_wheel(browser_id, x, y, modifiers, delta_x, delta_y),
+            Command::KeyEvent {
+                browser_id,
+                event_type,
+                modifiers,
+                windows_key_code,
+                native_key_code,
+                character,
+                unmodified_character,
+                is_system_key,
+                focus_on_editable_field,
+            } => self.key_event(
+                browser_id,
+                event_type,
+                modifiers,
+                windows_key_code,
+                native_key_code,
+                character,
+                unmodified_character,
+                is_system_key,
+                focus_on_editable_field,
+            ),
             Command::Shutdown => {
                 // Caller handles shutdown
                 Response::Ok
@@ -520,6 +541,49 @@ impl CefServer {
             {
                 let event = MouseEvent { x, y, modifiers };
                 BrowserHost::send_mouse_wheel_event(&host, Some(&event), delta_x, delta_y);
+            }
+            Response::Ok
+        } else {
+            Response::Error {
+                msg: format!("browser {} not found", browser_id),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn key_event(
+        &self,
+        browser_id: u32,
+        event_type: u8,
+        modifiers: u32,
+        windows_key_code: i32,
+        native_key_code: i32,
+        character: u16,
+        unmodified_character: u16,
+        is_system_key: i32,
+        focus_on_editable_field: i32,
+    ) -> Response {
+        if let Some(state) = self.browsers.get(&browser_id) {
+            if let Some(ref browser) = *state.browser.lock().unwrap()
+                && let Some(host) = Browser::host(browser)
+            {
+                let type_ = match event_type {
+                    1 => KeyEventType::KEYUP,
+                    2 => KeyEventType::CHAR,
+                    _ => KeyEventType::RAWKEYDOWN,
+                };
+                let event = KeyEvent {
+                    size: std::mem::size_of::<KeyEvent>(),
+                    type_,
+                    modifiers,
+                    windows_key_code,
+                    native_key_code,
+                    is_system_key,
+                    character,
+                    unmodified_character,
+                    focus_on_editable_field,
+                };
+                BrowserHost::send_key_event(&host, Some(&event));
             }
             Response::Ok
         } else {

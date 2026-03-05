@@ -92,6 +92,12 @@ namespace CefUnity
         public static extern void cef_unity_send_mouse_wheel(CefUnityBrowser* handle, int x, int y, uint modifiers, int delta_x, int delta_y);
 
         /// <summary>
+        ///  Send a key event.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_send_key_event", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_send_key_event(CefUnityBrowser* handle, byte event_type, uint modifiers, int windows_key_code, int native_key_code, ushort character, ushort unmodified_character, int is_system_key, int focus_on_editable_field);
+
+        /// <summary>
         ///  Get the latest frame buffer from shared memory.
         ///  Returns 1 if a new frame is available, 0 if unchanged.
         /// </summary>
