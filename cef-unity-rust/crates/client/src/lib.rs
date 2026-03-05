@@ -527,6 +527,27 @@ pub extern "C" fn cef_unity_send_key_event(
     }
 }
 
+/// Execute JavaScript in the browser's main frame.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_execute_javascript(handle: *mut CefUnityBrowser, code: *const c_char) {
+    if handle.is_null() || code.is_null() {
+        return;
+    }
+    let instance = handle_to_ref(handle);
+    let code_str = unsafe { CStr::from_ptr(code) }.to_str().unwrap_or("");
+
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        send_command_no_wait(
+            conn,
+            Command::ExecuteJavaScript {
+                browser_id: instance.browser_id,
+                code: code_str.to_string(),
+            },
+        );
+    }
+}
+
 /// Get the latest frame buffer from shared memory.
 /// Returns 1 if a new frame is available, 0 if unchanged.
 #[unsafe(no_mangle)]

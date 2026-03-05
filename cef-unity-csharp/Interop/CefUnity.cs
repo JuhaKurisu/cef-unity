@@ -290,6 +290,18 @@ public sealed class Browser : IDisposable
         SendKeyEvent(KeyEventType.KeyUp, vk, modifiers: modifiers, character: c, unmodifiedCharacter: c);
     }
 
+    public void ExecuteJavaScript(string code)
+    {
+        ThrowIfDisposed();
+        unsafe
+        {
+            fixed (byte* codePtr = ToUtf8Null(code))
+            {
+                NativeMethods.cef_unity_execute_javascript(_handle, codePtr);
+            }
+        }
+    }
+
     public void Dispose()
     {
         if (_disposed) return;

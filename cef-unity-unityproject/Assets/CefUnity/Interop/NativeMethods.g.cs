@@ -98,6 +98,12 @@ namespace CefUnity
         public static extern void cef_unity_send_key_event(CefUnityBrowser* handle, byte event_type, uint modifiers, int windows_key_code, int native_key_code, ushort character, ushort unmodified_character, int is_system_key, int focus_on_editable_field);
 
         /// <summary>
+        ///  Execute JavaScript in the browser's main frame.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_execute_javascript", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_execute_javascript(CefUnityBrowser* handle, byte* code);
+
+        /// <summary>
         ///  Get the latest frame buffer from shared memory.
         ///  Returns 1 if a new frame is available, 0 if unchanged.
         /// </summary>

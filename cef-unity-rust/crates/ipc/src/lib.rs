@@ -66,6 +66,10 @@ pub enum Command {
         is_system_key: i32,
         focus_on_editable_field: i32,
     },
+    ExecuteJavaScript {
+        browser_id: u32,
+        code: String,
+    },
     Shutdown,
 }
 
@@ -79,6 +83,7 @@ impl Command {
                 | Command::MouseClick { .. }
                 | Command::MouseWheel { .. }
                 | Command::KeyEvent { .. }
+                | Command::ExecuteJavaScript { .. }
         )
     }
 }

@@ -94,7 +94,6 @@ fn log(msg: &str) {
 }
 
 unsafe extern "C" fn timer_callback(_timer: CFRunLoopTimerRef, _info: *mut std::ffi::c_void) {
-    // catch_unwind で保護: extern "C" コールバック内の panic は abort を引き起こすため
     let result = std::panic::catch_unwind(|| {
         timer_callback_inner();
     });
@@ -129,6 +128,7 @@ fn timer_callback_inner() {
     }
 
     cef::do_message_loop_work();
+    state.cef_server.invalidate_all();
     state.pump_count += 1;
 }
 
@@ -179,12 +179,12 @@ pub fn run_event_loop(state: ServerState) -> ServerState {
             release: std::ptr::null(),
             copy_description: std::ptr::null(),
         };
-        // Large interval — CEF will control actual timing via schedule_pump().
-        // The timer still acts as a fallback to ensure pumping never stops.
+        // Short fallback interval for responsive JS execution.
+        // CEF also controls timing via schedule_pump() for immediate work.
         let timer = CFRunLoopTimerCreate(
             std::ptr::null(),
             CFAbsoluteTimeGetCurrent(),
-            0.1, // 100ms fallback interval
+            0.004, // 4ms fallback interval (~250Hz)
             0,
             0,
             timer_callback,

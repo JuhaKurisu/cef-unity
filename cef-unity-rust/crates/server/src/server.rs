@@ -97,7 +97,7 @@ wrap_render_handler! {
             height: ::std::os::raw::c_int,
         ) {
             let count = PAINT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            if count <= 5 || count.is_multiple_of(100) {
+            if count <= 3 || count % 100 == 0 {
                 log(&format!("on_paint #{}: {}x{}", count, width, height));
             }
             if type_.get_raw() != PaintElementType::VIEW.get_raw() {
@@ -132,6 +132,8 @@ wrap_life_span_handler! {
             _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
         ) -> ::std::os::raw::c_int {
             // ポップアップをキャンセルし、現在のブラウザで URL を開く
+            let url_str = target_url.map(|u| u.to_string()).unwrap_or_default();
+            log(&format!("on_before_popup: url={}", url_str));
             if let (Some(b), Some(url)) = (browser, target_url) {
                 if let Some(frame) = Browser::main_frame(b) {
                     Frame::load_url(&frame, Some(url));
@@ -252,8 +254,10 @@ impl CefServer {
         log(&format!("helper_path = {}", helper_path.display()));
 
         let cache_dir = std::env::temp_dir().join("cef_unity_cache");
-        // 前回のキャッシュを削除してクリーンな状態で起動
-        let _ = std::fs::remove_dir_all(&cache_dir);
+        // HTTP キャッシュのみ削除。V8 コードキャッシュ (Code Cache) は残す
+        // → --disable-cache と併用で検索結果は常に最新、JS コンパイルは高速
+        let http_cache = cache_dir.join("Cache");
+        let _ = std::fs::remove_dir_all(&http_cache);
         let _ = std::fs::create_dir_all(&cache_dir);
 
         let mut settings = Settings::default();
@@ -361,6 +365,9 @@ impl CefServer {
                 is_system_key,
                 focus_on_editable_field,
             ),
+            Command::ExecuteJavaScript { browser_id, code } => {
+                self.execute_javascript(browser_id, &code)
+            }
             Command::Shutdown => {
                 // Caller handles shutdown
                 Response::Ok
@@ -449,6 +456,7 @@ impl CefServer {
     }
 
     fn load_url(&mut self, browser_id: u32, url: &str) -> Response {
+        log(&format!("load_url: browser_id={}, url={}", browser_id, url));
         if let Some(state) = self.browsers.get(&browser_id) {
             if let Some(ref browser) = *state.browser.lock().unwrap()
                 && let Some(frame) = Browser::main_frame(browser)
@@ -602,6 +610,46 @@ impl CefServer {
         } else {
             Response::Error {
                 msg: format!("browser {} not found", browser_id),
+            }
+        }
+    }
+
+    fn execute_javascript(&self, browser_id: u32, code: &str) -> Response {
+        log(&format!(
+            "execute_javascript: browser_id={}, code={}",
+            browser_id,
+            &code[..code.char_indices().nth(100).map_or(code.len(), |(i, _)| i)]
+        ));
+        if let Some(state) = self.browsers.get(&browser_id) {
+            if let Some(ref browser) = *state.browser.lock().unwrap()
+                && let Some(frame) = Browser::main_frame(browser)
+            {
+                log("execute_javascript: calling Frame::execute_java_script");
+                Frame::execute_java_script(
+                    &frame,
+                    Some(&CefString::from(code)),
+                    Some(&CefString::from("cef-unity://execute")),
+                    0,
+                );
+                log("execute_javascript: done");
+            } else {
+                log("execute_javascript: browser or frame not available");
+            }
+            Response::Ok
+        } else {
+            Response::Error {
+                msg: format!("browser {} not found", browser_id),
+            }
+        }
+    }
+
+    /// Force invalidate all browsers (triggers on_paint for pending DOM changes).
+    pub fn invalidate_all(&self) {
+        for state in self.browsers.values() {
+            if let Some(ref browser) = *state.browser.lock().unwrap() {
+                if let Some(host) = Browser::host(browser) {
+                    BrowserHost::invalidate(&host, PaintElementType::VIEW);
+                }
             }
         }
     }
