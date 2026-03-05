@@ -46,6 +46,7 @@ public class SampleScript : MonoBehaviour
 
         UpdateTexture();
         HandleMouseInput();
+        HandleKeyboardInput();
     }
 
     private void OnDestroy()
@@ -127,6 +128,67 @@ public class SampleScript : MonoBehaviour
         bx = Mathf.Clamp((int)(nx * _width), 0, _width - 1);
         by = Mathf.Clamp((int)(ny * _height), 0, _height - 1);
         return true;
+    }
+
+    private void HandleKeyboardInput()
+    {
+        if (_browser == null) return;
+
+        // 文字入力 (inputString は今フレームで入力された文字列)
+        foreach (var c in Input.inputString)
+        {
+            var vk = CharToWindowsVk(c);
+            _browser.SendKeyEvent(KeyEventType.RawKeyDown, vk, character: c, unmodifiedCharacter: c);
+            _browser.SendKeyEvent(KeyEventType.Char, c, character: c, unmodifiedCharacter: c);
+            _browser.SendKeyEvent(KeyEventType.KeyUp, vk, character: c, unmodifiedCharacter: c);
+        }
+
+        // 特殊キー (inputString に含まれないもの)
+        HandleSpecialKey(KeyCode.LeftArrow, 0x25);
+        HandleSpecialKey(KeyCode.RightArrow, 0x27);
+        HandleSpecialKey(KeyCode.UpArrow, 0x26);
+        HandleSpecialKey(KeyCode.DownArrow, 0x28);
+        HandleSpecialKey(KeyCode.Home, 0x24);
+        HandleSpecialKey(KeyCode.End, 0x23);
+        HandleSpecialKey(KeyCode.PageUp, 0x21);
+        HandleSpecialKey(KeyCode.PageDown, 0x22);
+        HandleSpecialKey(KeyCode.F1, 0x70);
+        HandleSpecialKey(KeyCode.F2, 0x71);
+        HandleSpecialKey(KeyCode.F3, 0x72);
+        HandleSpecialKey(KeyCode.F4, 0x73);
+        HandleSpecialKey(KeyCode.F5, 0x74);
+        HandleSpecialKey(KeyCode.F6, 0x75);
+        HandleSpecialKey(KeyCode.F7, 0x76);
+        HandleSpecialKey(KeyCode.F8, 0x77);
+        HandleSpecialKey(KeyCode.F9, 0x78);
+        HandleSpecialKey(KeyCode.F10, 0x79);
+        HandleSpecialKey(KeyCode.F11, 0x7A);
+        HandleSpecialKey(KeyCode.F12, 0x7B);
+    }
+
+    private void HandleSpecialKey(KeyCode key, int windowsVk)
+    {
+        if (Input.GetKeyDown(key))
+            _browser.SendKeyEvent(KeyEventType.RawKeyDown, windowsVk);
+        if (Input.GetKeyUp(key))
+            _browser.SendKeyEvent(KeyEventType.KeyUp, windowsVk);
+    }
+
+    private static int CharToWindowsVk(char c)
+    {
+        return c switch
+        {
+            '\b' => 0x08, // Backspace
+            '\t' => 0x09, // Tab
+            '\r' or '\n' => 0x0D, // Enter
+            '\x1b' => 0x1B, // Escape
+            '\x7f' => 0x2E, // Delete
+            >= 'a' and <= 'z' => c - 32, // VK_A..VK_Z
+            >= 'A' and <= 'Z' => c, // VK_A..VK_Z
+            >= '0' and <= '9' => c, // VK_0..VK_9
+            ' ' => 0x20,
+            _ => c,
+        };
     }
 
     private void UpdateTexture()
