@@ -175,6 +175,13 @@ wrap_app! {
                     Some(&CefString::from("autoplay-policy")),
                     Some(&CefString::from("no-user-gesture-required")),
                 );
+                // キャッシュ無効化
+                cl.append_switch(Some(&CefString::from("disable-cache")));
+                cl.append_switch(Some(&CefString::from("disable-application-cache")));
+                cl.append_switch_with_value(
+                    Some(&CefString::from("disk-cache-size")),
+                    Some(&CefString::from("0")),
+                );
             }
         }
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
@@ -245,6 +252,8 @@ impl CefServer {
         log(&format!("helper_path = {}", helper_path.display()));
 
         let cache_dir = std::env::temp_dir().join("cef_unity_cache");
+        // 前回のキャッシュを削除してクリーンな状態で起動
+        let _ = std::fs::remove_dir_all(&cache_dir);
         let _ = std::fs::create_dir_all(&cache_dir);
 
         let mut settings = Settings::default();
