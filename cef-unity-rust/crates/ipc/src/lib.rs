@@ -70,6 +70,9 @@ pub enum Command {
         browser_id: u32,
         code: String,
     },
+    GetCurrentUrl {
+        browser_id: u32,
+    },
     Shutdown,
 }
 
@@ -91,6 +94,7 @@ impl Command {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Response {
     BrowserCreated { browser_id: u32, shm_flink: String },
+    CurrentUrl { url: String },
     Ok,
     Error { msg: String },
 }

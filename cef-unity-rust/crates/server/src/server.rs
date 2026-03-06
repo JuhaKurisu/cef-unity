@@ -23,6 +23,149 @@ fn log(msg: &str) {
     }
 }
 
+const GOOGLE_OSR_WORKAROUND_JS: &str = r#"
+try {
+  var isGoogleSearch = /(^|\.)google\./.test(location.hostname) && location.pathname === '/search';
+  if (isGoogleSearch) {
+    if (window.NavigateEvent && NavigateEvent.prototype.intercept) {
+      NavigateEvent.prototype.intercept = function() {};
+    }
+
+    if (!window.__cefUnityRafFallback && window.requestAnimationFrame) {
+      window.__cefUnityRafFallback = true;
+      var originalRaf = window.requestAnimationFrame.bind(window);
+      window.requestAnimationFrame = function(cb) {
+        var fired = false;
+        var id = originalRaf(function(ts) {
+          if (!fired) {
+            fired = true;
+            cb(ts);
+          }
+        });
+        setTimeout(function() {
+          if (!fired) {
+            fired = true;
+            cb(performance.now());
+          }
+        }, 50);
+        return id;
+      };
+    }
+
+    if (!window.__cefUnityViewTransitionBypass && document.startViewTransition) {
+      window.__cefUnityViewTransitionBypass = true;
+      document.startViewTransition = function(arg) {
+        var update = typeof arg === 'function' ? arg : (arg && arg.update);
+        var result;
+        if (update) {
+          try {
+            result = update();
+          } catch (_) {}
+        }
+        var promise = result instanceof Promise ? result : Promise.resolve(result);
+        return {
+          finished: promise,
+          ready: Promise.resolve(),
+          updateCallbackDone: promise,
+          skipTransition: function() {}
+        };
+      };
+    }
+
+    if (!window.__cefUnitySearchTabClickHandler) {
+      window.__cefUnitySearchTabClickHandler = true;
+      var shouldForceNavigation = function(anchor) {
+        if (!anchor) {
+          return null;
+        }
+
+        var url;
+        try {
+          url = new URL(anchor.href, location.href);
+        } catch (_) {
+          return null;
+        }
+
+        if (!/(^|\.)google\./.test(url.hostname) || url.pathname !== '/search') {
+          return null;
+        }
+
+        if (!url.searchParams.has('udm') && url.searchParams.get('tbm') !== 'isch') {
+          return null;
+        }
+
+        return url;
+      };
+
+      var forceNavigation = function(anchor, e) {
+        var url = shouldForceNavigation(anchor);
+        if (!url) {
+          return false;
+        }
+
+        if (e) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+        }
+
+        location.href = url.toString();
+        return true;
+      };
+
+      var originalAnchorClick = HTMLAnchorElement.prototype.click;
+      HTMLAnchorElement.prototype.click = function() {
+        if (forceNavigation(this, null)) {
+          return;
+        }
+        return originalAnchorClick.call(this);
+      };
+
+      var handler = function(e) {
+        var anchor = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+        forceNavigation(anchor, e);
+      };
+
+      document.addEventListener('pointerdown', handler, true);
+      document.addEventListener('mousedown', handler, true);
+      document.addEventListener('click', handler, true);
+    }
+  }
+} catch (_) {}
+"#;
+
+fn inject_google_osr_workarounds(browser: &Browser) {
+    if let Some(host) = Browser::host(browser) {
+        let enable_msg = br#"{"id":1,"method":"Page.enable"}"#;
+        let add_script_msg = format!(
+            r#"{{"id":2,"method":"Page.addScriptToEvaluateOnNewDocument","params":{{"source":{}}}}}"#,
+            serde_json::to_string(GOOGLE_OSR_WORKAROUND_JS).unwrap()
+        );
+
+        let enable_ok = BrowserHost::send_dev_tools_message(&host, Some(enable_msg));
+        log(&format!(
+            "inject_google_osr_workarounds: Page.enable returned {}",
+            enable_ok
+        ));
+
+        let add_ok = BrowserHost::send_dev_tools_message(&host, Some(add_script_msg.as_bytes()));
+        log(&format!(
+            "inject_google_osr_workarounds: addScript returned {}",
+            add_ok
+        ));
+    } else {
+        log("inject_google_osr_workarounds: no host");
+    }
+
+    if let Some(frame) = Browser::main_frame(browser) {
+        Frame::execute_java_script(
+            &frame,
+            Some(&CefString::from(GOOGLE_OSR_WORKAROUND_JS)),
+            Some(&CefString::from("cef-unity://google-osr-workaround")),
+            0,
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CEF loader
 // ---------------------------------------------------------------------------
@@ -147,6 +290,7 @@ wrap_life_span_handler! {
             if let Some(b) = browser {
                 *self.browser_slot.lock().unwrap() = Some(b.clone());
                 log("browser stored in slot");
+                inject_google_osr_workarounds(b);
             }
         }
     }
@@ -176,6 +320,15 @@ wrap_app! {
                 cl.append_switch_with_value(
                     Some(&CefString::from("autoplay-policy")),
                     Some(&CefString::from("no-user-gesture-required")),
+                );
+                cl.append_switch(Some(&CefString::from("disable-background-timer-throttling")));
+                cl.append_switch(Some(&CefString::from("disable-renderer-backgrounding")));
+                cl.append_switch(Some(&CefString::from("disable-backgrounding-occluded-windows")));
+                cl.append_switch_with_value(
+                    Some(&CefString::from("enable-blink-features")),
+                    Some(&CefString::from(
+                        "ViewTransition,ViewTransitionOnNavigation,PaintHolding",
+                    )),
                 );
                 // キャッシュ無効化
                 cl.append_switch(Some(&CefString::from("disable-cache")));
@@ -368,6 +521,7 @@ impl CefServer {
             Command::ExecuteJavaScript { browser_id, code } => {
                 self.execute_javascript(browser_id, &code)
             }
+            Command::GetCurrentUrl { browser_id } => self.get_current_url(browser_id),
             Command::Shutdown => {
                 // Caller handles shutdown
                 Response::Ok
@@ -636,6 +790,27 @@ impl CefServer {
                 log("execute_javascript: browser or frame not available");
             }
             Response::Ok
+        } else {
+            Response::Error {
+                msg: format!("browser {} not found", browser_id),
+            }
+        }
+    }
+
+    fn get_current_url(&self, browser_id: u32) -> Response {
+        if let Some(state) = self.browsers.get(&browser_id) {
+            if let Some(ref browser) = *state.browser.lock().unwrap()
+                && let Some(frame) = Browser::main_frame(browser)
+            {
+                let url = frame.url();
+                let url_str = CefString::from(&url);
+                return Response::CurrentUrl {
+                    url: url_str.to_string(),
+                };
+            }
+            Response::Error {
+                msg: "browser or frame not available".to_string(),
+            }
         } else {
             Response::Error {
                 msg: format!("browser {} not found", browser_id),

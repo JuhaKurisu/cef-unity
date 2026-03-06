@@ -320,6 +320,27 @@ namespace CefUnity.Interop
             SendKeyEvent(KeyEventType.KeyUp, vk, modifiers: modifiers, character: c, unmodifiedCharacter: c);
         }
 
+        public string GetUrl()
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                var required = NativeMethods.cef_unity_get_url(_handle, null, 0);
+                if (required <= 1)
+                    return string.Empty;
+
+                var buffer = new byte[required];
+                fixed (byte* ptr = buffer)
+                {
+                    var written = NativeMethods.cef_unity_get_url(_handle, ptr, buffer.Length);
+                    if (written <= 1)
+                        return string.Empty;
+
+                    return Encoding.UTF8.GetString(buffer, 0, written - 1);
+                }
+            }
+        }
+
         public void Dispose()
         {
             if (_disposed) return;

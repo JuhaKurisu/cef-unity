@@ -1,83 +1,238 @@
 using System.Diagnostics;
 using Interop;
 
-// User-Agent 確認 + SPA遅延がAIレスポンス時間なのか確認
+const string Query = "openai";
+const string SearchUrl = $"https://www.google.com/search?q={Query}&hl=en";
+const int Width = 1280;
+const int Height = 720;
+
+var tempDir = Path.GetTempPath();
+var serverLogPath = Path.Combine(tempDir, "cef_unity_server.log");
+var debugLogPath = Path.Combine(tempDir, "cef_unity_debug.log");
+
+ResetLog(serverLogPath);
+ResetLog(debugLogPath);
 
 CefRuntime.Init();
-using var browser = new Browser(1280, 720, "https://www.google.com/search?q=test");
+using var browser = new Browser(Width, Height, SearchUrl);
 
-long WaitForFirstFrame(string label, int timeoutMs)
+Console.WriteLine($"Search URL: {SearchUrl}");
+
+DrainFrames(500);
+var initialLoad = WaitForFirstFrame("initial_load", 8000);
+DrainFrames(1000);
+
+var aiMode = RunScenario(
+    "search_to_ai_mode",
+    @"
+(() => {
+  const selectors = [
+    'a[href*=""udm=50""]',
+    'a[href*=""sca_esv=""][href*=""udm=50""]'
+  ];
+  let link = null;
+  for (const selector of selectors) {
+    link = document.querySelector(selector);
+    if (link) break;
+  }
+  if (link) {
+    link.click();
+  }
+})();
+",
+    url => url.Contains("udm=50", StringComparison.OrdinalIgnoreCase),
+    8000);
+
+DrainFrames(1500);
+
+var images = RunScenario(
+    "ai_mode_to_images",
+    @"
+(() => {
+  const selectors = [
+    'a[href*=""tbm=isch""]',
+    'a[href*=""udm=2""]'
+  ];
+  let link = null;
+  for (const selector of selectors) {
+    link = document.querySelector(selector);
+    if (link) break;
+  }
+  if (link) {
+    link.click();
+  }
+})();
+",
+    url => url.Contains("tbm=isch", StringComparison.OrdinalIgnoreCase) || url.Contains("udm=2", StringComparison.OrdinalIgnoreCase),
+    8000);
+
+Console.WriteLine();
+Console.WriteLine("Summary:");
+Console.WriteLine($"  initial_load: {initialLoad.FirstFrameMs}ms");
+Console.WriteLine($"  search_to_ai_mode: first_frame={aiMode.FirstFrameMs}ms url_changed={aiMode.UrlChangedMs}ms matched={aiMode.UrlMatched}");
+Console.WriteLine($"  ai_mode_to_images: first_frame={images.FirstFrameMs}ms url_changed={images.UrlChangedMs}ms matched={images.UrlMatched}");
+
+PrintInterestingLogLines(serverLogPath);
+PrintInterestingLogLines(debugLogPath);
+
+CefRuntime.Shutdown();
+
+return;
+
+ScenarioResult RunScenario(string name, string clickScript, Func<string, bool> urlMatched, int timeoutMs)
+{
+    Console.WriteLine();
+    Console.WriteLine($"=== {name} ===");
+
+    var logStart = GetLogLineCount(serverLogPath);
+    var beforeUrl = browser.GetUrl();
+    Console.WriteLine($"  before_url={beforeUrl}");
+    browser.ExecuteJavaScript($$"""
+        (() => {
+          console.log('[TEST] {{name}} location_before=' + location.href);
+          {{clickScript}}
+        })();
+        """);
+
+    var result = WaitForNavigationAndFrame(name, beforeUrl, urlMatched, timeoutMs);
+    DrainFrames(1200);
+    PrintNewLogLines(serverLogPath, logStart, name);
+    return result;
+}
+
+ScenarioResult WaitForNavigationAndFrame(string label, string beforeUrl, Func<string, bool> urlMatched, int timeoutMs)
+{
+    var sw = Stopwatch.StartNew();
+    long firstFrameMs = -1;
+    long urlChangedMs = -1;
+    var frames = 0;
+    var finalUrl = beforeUrl;
+    var matched = false;
+
+    while (sw.ElapsedMilliseconds < timeoutMs)
+    {
+        CefRuntime.Pump();
+        if (browser.TryGetBuffer(out _, out _, out _))
+        {
+            frames++;
+            if (firstFrameMs < 0)
+                firstFrameMs = sw.ElapsedMilliseconds;
+        }
+
+        finalUrl = browser.GetUrl();
+        matched = urlMatched(finalUrl);
+        if (urlChangedMs < 0 && !string.Equals(finalUrl, beforeUrl, StringComparison.Ordinal))
+            urlChangedMs = sw.ElapsedMilliseconds;
+
+        if (matched && firstFrameMs >= 0)
+            break;
+
+        Thread.Sleep(16);
+    }
+
+    Console.WriteLine($"  [{label}] first_frame={firstFrameMs}ms url_changed={urlChangedMs}ms frames={frames}");
+    Console.WriteLine($"  [{label}] after_url={finalUrl}");
+    return new ScenarioResult(label, firstFrameMs, urlChangedMs, frames, matched, finalUrl);
+}
+
+ScenarioResult WaitForFirstFrame(string label, int timeoutMs)
 {
     var sw = Stopwatch.StartNew();
     long firstFrameMs = -1;
     var frames = 0;
+    var finalUrl = browser.GetUrl();
+
     while (sw.ElapsedMilliseconds < timeoutMs)
     {
         CefRuntime.Pump();
-        Thread.Sleep(16);
         if (browser.TryGetBuffer(out _, out _, out _))
         {
             frames++;
-            if (firstFrameMs < 0) firstFrameMs = sw.ElapsedMilliseconds;
+            if (firstFrameMs < 0)
+                firstFrameMs = sw.ElapsedMilliseconds;
         }
+
+        finalUrl = browser.GetUrl();
+        if (firstFrameMs >= 0)
+            break;
+
+        Thread.Sleep(16);
     }
-    Console.WriteLine($"  [{label}] first_frame={firstFrameMs}ms, frames={frames}");
-    return firstFrameMs;
+
+    Console.WriteLine($"  [{label}] first_frame={firstFrameMs}ms frames={frames}");
+    return new ScenarioResult(label, firstFrameMs, -1, frames, true, finalUrl);
 }
 
-Console.WriteLine("=== 初期ロード ===");
-WaitForFirstFrame("load", 5000);
-
-// User-Agent をタイトルに設定
-browser.ExecuteJavaScript("document.title = navigator.userAgent;");
-Thread.Sleep(500);
-for (int i = 0; i < 30; i++) { CefRuntime.Pump(); Thread.Sleep(16); }
-
-// JS で fetch タイミングを計測: SPA ナビゲーション中の実際のネットワーク時間
-Console.WriteLine("\n=== AI Mode fetch timing (JS performance.now) ===");
-browser.ExecuteJavaScript(@"
-    (function() {
-        var start = performance.now();
-        // AI Mode リンクをクリック
-        var link = document.querySelector('a[href*=""udm=50""]');
-        if (!link) { document.title = 'NO_AI_LINK'; return; }
-
-        // PerformanceObserver で fetch/navigation 時間を追跡
-        var observer = new PerformanceObserver(function(list) {
-            list.getEntries().forEach(function(e) {
-                if (e.name.includes('udm=50') || e.name.includes('aio')) {
-                    console.log('PERF: ' + e.entryType + ' ' + e.name.substring(0,80) + ' duration=' + Math.round(e.duration) + 'ms responseStart=' + Math.round(e.responseStart) + 'ms');
-                }
-            });
-        });
-        observer.observe({entryTypes: ['resource', 'navigation']});
-
-        // MutationObserver で DOM 変更を追跡
-        var firstMutation = 0;
-        var mutCount = 0;
-        var mutObserver = new MutationObserver(function(mutations) {
-            mutCount += mutations.length;
-            if (!firstMutation) {
-                firstMutation = performance.now() - start;
-                console.log('FIRST_MUTATION: ' + Math.round(firstMutation) + 'ms after click, mutations=' + mutations.length);
-            }
-        });
-        mutObserver.observe(document.body, {childList: true, subtree: true, attributes: true, characterData: true});
-
-        document.title = 'UA:' + navigator.userAgent.substring(0, 100);
-        link.click();
-        console.log('CLICK_TIME: ' + Math.round(performance.now() - start) + 'ms');
-    })();
-");
-WaitForFirstFrame("click_ai", 8000);
-
-// サーバーログのon_paintタイミング
-var logPath = Path.Combine(Path.GetTempPath(), "cef_unity_server.log");
-if (File.Exists(logPath))
+void DrainFrames(int durationMs)
 {
-    var lines = File.ReadAllLines(logPath);
-    var paintLines = lines.Where(l => l.Contains("on_paint")).ToArray();
-    Console.WriteLine($"\non_paint total: {paintLines.Length}");
+    var sw = Stopwatch.StartNew();
+    while (sw.ElapsedMilliseconds < durationMs)
+    {
+        CefRuntime.Pump();
+        browser.TryGetBuffer(out _, out _, out _);
+        Thread.Sleep(16);
+    }
 }
 
-CefRuntime.Shutdown();
+static void ResetLog(string path)
+{
+    try
+    {
+        File.WriteAllText(path, string.Empty);
+    }
+    catch
+    {
+    }
+}
+
+static int GetLogLineCount(string path)
+{
+    if (!File.Exists(path))
+        return 0;
+
+    return File.ReadLines(path).Count();
+}
+
+static void PrintNewLogLines(string path, int startLine, string label)
+{
+    if (!File.Exists(path))
+        return;
+
+    var newLines = File.ReadLines(path)
+        .Skip(startLine)
+        .Where(line =>
+            line.Contains("[TEST]", StringComparison.Ordinal) ||
+            line.Contains("[JS]", StringComparison.Ordinal) ||
+            line.Contains("inject_google_osr_workarounds", StringComparison.Ordinal))
+        .ToArray();
+
+    if (newLines.Length == 0)
+        return;
+
+    Console.WriteLine($"  [{label}] log excerpts:");
+    foreach (var line in newLines)
+        Console.WriteLine($"    {line}");
+}
+
+static void PrintInterestingLogLines(string path)
+{
+    if (!File.Exists(path))
+        return;
+
+    var lines = File.ReadLines(path)
+        .Where(line =>
+            line.Contains("[TEST]", StringComparison.Ordinal) ||
+            line.Contains("[JS]", StringComparison.Ordinal) ||
+            line.Contains("inject_google_osr_workarounds", StringComparison.Ordinal))
+        .ToArray();
+
+    if (lines.Length == 0)
+        return;
+
+    Console.WriteLine();
+    Console.WriteLine($"Interesting lines from {Path.GetFileName(path)}:");
+    foreach (var line in lines)
+        Console.WriteLine($"  {line}");
+}
+
+readonly record struct ScenarioResult(string Label, long FirstFrameMs, long UrlChangedMs, int Frames, bool UrlMatched, string FinalUrl);

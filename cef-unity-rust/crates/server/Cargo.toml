@@ -11,6 +11,7 @@ path = "src/main.rs"
 cef-unity-ipc = { path = "../ipc" }
 cef = "145.5.0"
 ipc-channel = "0.21"
+serde_json = "1"
 
 [build-dependencies]
 cc = "1"

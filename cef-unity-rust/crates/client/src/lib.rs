@@ -548,6 +548,57 @@ pub extern "C" fn cef_unity_execute_javascript(handle: *mut CefUnityBrowser, cod
     }
 }
 
+/// Get the browser's current main-frame URL as UTF-8 bytes.
+/// Returns the required buffer size including the trailing NUL terminator.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_get_url(
+    handle: *mut CefUnityBrowser,
+    buffer: *mut u8,
+    buffer_len: i32,
+) -> i32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let instance = handle_to_ref(handle);
+
+    let guard = CONNECTION.lock().unwrap();
+    let Some(conn) = guard.as_ref() else {
+        return 0;
+    };
+
+    let url = match send_command(
+        conn,
+        Command::GetCurrentUrl {
+            browser_id: instance.browser_id,
+        },
+    ) {
+        Ok(Response::CurrentUrl { url }) => url,
+        Ok(Response::Error { msg }) => {
+            log_to_file(&format!("get_url error: {}", msg));
+            return 0;
+        }
+        Ok(other) => {
+            log_to_file(&format!("get_url unexpected response: {:?}", other));
+            return 0;
+        }
+        Err(e) => {
+            log_to_file(&format!("get_url IPC error: {}", e));
+            return 0;
+        }
+    };
+
+    let bytes = url.as_bytes();
+    let required = bytes.len() + 1;
+    if !buffer.is_null() && buffer_len as usize >= required {
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len());
+            *buffer.add(bytes.len()) = 0;
+        }
+    }
+
+    required as i32
+}
+
 /// Get the latest frame buffer from shared memory.
 /// Returns 1 if a new frame is available, 0 if unchanged.
 #[unsafe(no_mangle)]

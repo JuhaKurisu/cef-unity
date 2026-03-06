@@ -232,6 +232,7 @@ dependencies = [
  "cef",
  "cef-unity-ipc",
  "ipc-channel",
+ "serde_json",
 ]
 
 [[package]]

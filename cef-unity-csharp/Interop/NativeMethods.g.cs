@@ -104,6 +104,13 @@ namespace CefUnity
         public static extern void cef_unity_execute_javascript(CefUnityBrowser* handle, byte* code);
 
         /// <summary>
+        ///  Get the browser's current main-frame URL as UTF-8 bytes.
+        ///  Returns the required buffer size including the trailing NUL terminator.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_get_url", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_get_url(CefUnityBrowser* handle, byte* buffer, int buffer_len);
+
+        /// <summary>
         ///  Get the latest frame buffer from shared memory.
         ///  Returns 1 if a new frame is available, 0 if unchanged.
         /// </summary>
