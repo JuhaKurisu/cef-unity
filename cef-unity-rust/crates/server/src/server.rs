@@ -27,51 +27,6 @@ const GOOGLE_OSR_WORKAROUND_JS: &str = r#"
 try {
   var isGoogleSearch = /(^|\.)google\./.test(location.hostname) && location.pathname === '/search';
   if (isGoogleSearch) {
-    if (window.NavigateEvent && NavigateEvent.prototype.intercept) {
-      NavigateEvent.prototype.intercept = function() {};
-    }
-
-    if (!window.__cefUnityRafFallback && window.requestAnimationFrame) {
-      window.__cefUnityRafFallback = true;
-      var originalRaf = window.requestAnimationFrame.bind(window);
-      window.requestAnimationFrame = function(cb) {
-        var fired = false;
-        var id = originalRaf(function(ts) {
-          if (!fired) {
-            fired = true;
-            cb(ts);
-          }
-        });
-        setTimeout(function() {
-          if (!fired) {
-            fired = true;
-            cb(performance.now());
-          }
-        }, 50);
-        return id;
-      };
-    }
-
-    if (!window.__cefUnityViewTransitionBypass && document.startViewTransition) {
-      window.__cefUnityViewTransitionBypass = true;
-      document.startViewTransition = function(arg) {
-        var update = typeof arg === 'function' ? arg : (arg && arg.update);
-        var result;
-        if (update) {
-          try {
-            result = update();
-          } catch (_) {}
-        }
-        var promise = result instanceof Promise ? result : Promise.resolve(result);
-        return {
-          finished: promise,
-          ready: Promise.resolve(),
-          updateCallbackDone: promise,
-          skipTransition: function() {}
-        };
-      };
-    }
-
     if (!window.__cefUnitySearchTabClickHandler) {
       window.__cefUnitySearchTabClickHandler = true;
       var shouldForceNavigation = function(anchor) {
