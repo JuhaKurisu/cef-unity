@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ipc_channel::ipc::{IpcOneShotServer, IpcReceiver, IpcSender};
 
-use cef_unity_ipc::{Bootstrap, Command, Response, ShmReader};
+use cef_unity_ipc::{Bootstrap, Command, CommandEnvelope, Response, ShmReader};
 
 // ---------------------------------------------------------------------------
 // dylib location helpers
@@ -136,7 +136,7 @@ static PAINT_COUNT: AtomicU64 = AtomicU64::new(0);
 static PUMP_COUNT: AtomicU64 = AtomicU64::new(0);
 
 struct ServerConnection {
-    cmd_tx: IpcSender<Command>,
+    cmd_tx: IpcSender<CommandEnvelope>,
     resp_rx: IpcReceiver<Response>,
 }
 
@@ -158,13 +158,21 @@ fn log_to_file(msg: &str) {
 // ---------------------------------------------------------------------------
 
 fn send_command(conn: &ServerConnection, cmd: Command) -> Result<Response, String> {
-    conn.cmd_tx.send(cmd).map_err(|e| format!("send: {}", e))?;
+    conn.cmd_tx
+        .send(CommandEnvelope {
+            command: cmd,
+            expects_response: true,
+        })
+        .map_err(|e| format!("send: {}", e))?;
     conn.resp_rx.recv().map_err(|e| format!("recv: {}", e))
 }
 
 /// Fire-and-forget: send only, don't wait for response.
 fn send_command_no_wait(conn: &ServerConnection, cmd: Command) {
-    let _ = conn.cmd_tx.send(cmd);
+    let _ = conn.cmd_tx.send(CommandEnvelope {
+        command: cmd,
+        expects_response: false,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -626,4 +634,254 @@ pub extern "C" fn cef_unity_get_buffer(
         *out_height = instance.front_h;
     }
     new_frame.is_some() as i32
+}
+
+// ---------------------------------------------------------------------------
+// Blocking variants — wait for server response, return 0=ok / -1=error.
+// ---------------------------------------------------------------------------
+
+/// Helper: send a command and wait for Response. Returns 0 on Ok, -1 on error.
+fn blocking_simple(conn: &ServerConnection, cmd: Command) -> i32 {
+    match send_command(conn, cmd) {
+        Ok(Response::Ok) => 0,
+        Ok(Response::Error { msg }) => {
+            log_to_file(&format!("blocking command error: {}", msg));
+            -1
+        }
+        Ok(_) => 0,
+        Err(e) => {
+            log_to_file(&format!("blocking command IPC error: {}", e));
+            -1
+        }
+    }
+}
+
+/// Destroy a browser instance (blocking).
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_destroy_browser_blocking(handle: *mut CefUnityBrowser) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    let instance = unsafe { Box::from_raw(handle as *mut ClientBrowserInstance) };
+    let guard = CONNECTION.lock().unwrap();
+    let result = if let Some(conn) = guard.as_ref() {
+        blocking_simple(
+            conn,
+            Command::DestroyBrowser {
+                browser_id: instance.browser_id,
+            },
+        )
+    } else {
+        -1
+    };
+    drop(instance);
+    result
+}
+
+/// Load a URL in the browser (blocking).
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_load_url_blocking(
+    handle: *mut CefUnityBrowser,
+    url: *const c_char,
+) -> i32 {
+    if handle.is_null() || url.is_null() {
+        return -1;
+    }
+    let instance = handle_to_ref(handle);
+    let url_str = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        blocking_simple(
+            conn,
+            Command::LoadUrl {
+                browser_id: instance.browser_id,
+                url: url_str.to_string(),
+            },
+        )
+    } else {
+        -1
+    }
+}
+
+/// Resize the browser viewport (blocking).
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_resize_blocking(
+    handle: *mut CefUnityBrowser,
+    width: i32,
+    height: i32,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    let instance = handle_to_ref(handle);
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        blocking_simple(
+            conn,
+            Command::Resize {
+                browser_id: instance.browser_id,
+                width,
+                height,
+            },
+        )
+    } else {
+        -1
+    }
+}
+
+/// Send a mouse move event (blocking).
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_send_mouse_move_blocking(
+    handle: *mut CefUnityBrowser,
+    x: i32,
+    y: i32,
+    modifiers: u32,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    let instance = handle_to_ref(handle);
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        blocking_simple(
+            conn,
+            Command::MouseMove {
+                browser_id: instance.browser_id,
+                x,
+                y,
+                modifiers,
+            },
+        )
+    } else {
+        -1
+    }
+}
+
+/// Send a mouse click event (blocking).
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_send_mouse_click_blocking(
+    handle: *mut CefUnityBrowser,
+    x: i32,
+    y: i32,
+    modifiers: u32,
+    button: u8,
+    mouse_up: i32,
+    click_count: i32,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    let instance = handle_to_ref(handle);
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        blocking_simple(
+            conn,
+            Command::MouseClick {
+                browser_id: instance.browser_id,
+                x,
+                y,
+                modifiers,
+                button,
+                mouse_up: mouse_up != 0,
+                click_count,
+            },
+        )
+    } else {
+        -1
+    }
+}
+
+/// Send a mouse wheel event (blocking).
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_send_mouse_wheel_blocking(
+    handle: *mut CefUnityBrowser,
+    x: i32,
+    y: i32,
+    modifiers: u32,
+    delta_x: i32,
+    delta_y: i32,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    let instance = handle_to_ref(handle);
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        blocking_simple(
+            conn,
+            Command::MouseWheel {
+                browser_id: instance.browser_id,
+                x,
+                y,
+                modifiers,
+                delta_x,
+                delta_y,
+            },
+        )
+    } else {
+        -1
+    }
+}
+
+/// Send a key event (blocking).
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_send_key_event_blocking(
+    handle: *mut CefUnityBrowser,
+    event_type: u8,
+    modifiers: u32,
+    windows_key_code: i32,
+    native_key_code: i32,
+    character: u16,
+    unmodified_character: u16,
+    is_system_key: i32,
+    focus_on_editable_field: i32,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    let instance = handle_to_ref(handle);
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        blocking_simple(
+            conn,
+            Command::KeyEvent {
+                browser_id: instance.browser_id,
+                event_type,
+                modifiers,
+                windows_key_code,
+                native_key_code,
+                character,
+                unmodified_character,
+                is_system_key,
+                focus_on_editable_field,
+            },
+        )
+    } else {
+        -1
+    }
+}
+
+/// Execute JavaScript in the browser's main frame (blocking).
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_execute_javascript_blocking(
+    handle: *mut CefUnityBrowser,
+    code: *const c_char,
+) -> i32 {
+    if handle.is_null() || code.is_null() {
+        return -1;
+    }
+    let instance = handle_to_ref(handle);
+    let code_str = unsafe { CStr::from_ptr(code) }.to_str().unwrap_or("");
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        blocking_simple(
+            conn,
+            Command::ExecuteJavaScript {
+                browser_id: instance.browser_id,
+                code: code_str.to_string(),
+            },
+        )
+    } else {
+        -1
+    }
 }

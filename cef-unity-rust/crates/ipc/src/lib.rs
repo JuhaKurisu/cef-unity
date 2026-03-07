@@ -76,19 +76,12 @@ pub enum Command {
     Shutdown,
 }
 
-impl Command {
-    /// Returns true if the sender expects a Response for this command.
-    /// Fire-and-forget commands (input events) return false.
-    pub fn needs_response(&self) -> bool {
-        !matches!(
-            self,
-            Command::MouseMove { .. }
-                | Command::MouseClick { .. }
-                | Command::MouseWheel { .. }
-                | Command::KeyEvent { .. }
-                | Command::ExecuteJavaScript { .. }
-        )
-    }
+/// Wrapper that pairs a Command with whether the sender expects a response.
+/// The server only sends back a Response when `expects_response` is true.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CommandEnvelope {
+    pub command: Command,
+    pub expects_response: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -102,7 +95,7 @@ pub enum Response {
 /// Sent from server to client during bootstrap to establish bidirectional channels.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Bootstrap {
-    pub cmd_tx: IpcSender<Command>,
+    pub cmd_tx: IpcSender<CommandEnvelope>,
     pub resp_rx: IpcReceiver<Response>,
 }
 
@@ -433,19 +426,39 @@ mod tests {
     }
 
     #[test]
-    fn key_event_needs_no_response() {
-        let cmd = Command::KeyEvent {
-            browser_id: 1,
-            event_type: 0,
-            modifiers: 0,
-            windows_key_code: 0x08,
-            native_key_code: 51,
-            character: 0x7F,
-            unmodified_character: 0x7F,
-            is_system_key: 0,
-            focus_on_editable_field: 0,
-        };
-        assert!(!cmd.needs_response(), "KeyEvent should be fire-and-forget");
+    fn command_envelope_roundtrip() {
+        let (tx, rx) = ipc::channel::<CommandEnvelope>().unwrap();
+        tx.send(CommandEnvelope {
+            command: Command::Resize {
+                browser_id: 1,
+                width: 1920,
+                height: 1080,
+            },
+            expects_response: false,
+        })
+        .unwrap();
+        let env = rx.recv().unwrap();
+        assert!(!env.expects_response);
+        assert!(matches!(
+            env.command,
+            Command::Resize {
+                browser_id: 1,
+                width: 1920,
+                height: 1080,
+            }
+        ));
+
+        tx.send(CommandEnvelope {
+            command: Command::Resize {
+                browser_id: 1,
+                width: 800,
+                height: 600,
+            },
+            expects_response: true,
+        })
+        .unwrap();
+        let env2 = rx.recv().unwrap();
+        assert!(env2.expects_response);
     }
 
     #[test]
@@ -509,7 +522,7 @@ mod tests {
         // Here we test the channel transfer pattern using regular IPC channels instead.
         let (bootstrap_tx, bootstrap_rx) = ipc::channel::<Bootstrap>().unwrap();
 
-        let (cmd_tx, cmd_rx) = ipc::channel::<Command>().unwrap();
+        let (cmd_tx, cmd_rx) = ipc::channel::<CommandEnvelope>().unwrap();
         let (resp_tx, resp_rx) = ipc::channel::<Response>().unwrap();
 
         // Simulate server sending bootstrap
@@ -519,9 +532,16 @@ mod tests {
         let bootstrap = bootstrap_rx.recv().unwrap();
 
         // Send a command through the bootstrapped channel
-        bootstrap.cmd_tx.send(Command::Shutdown).unwrap();
-        let cmd = cmd_rx.recv().unwrap();
-        assert!(matches!(cmd, Command::Shutdown));
+        bootstrap
+            .cmd_tx
+            .send(CommandEnvelope {
+                command: Command::Shutdown,
+                expects_response: true,
+            })
+            .unwrap();
+        let env = cmd_rx.recv().unwrap();
+        assert!(matches!(env.command, Command::Shutdown));
+        assert!(env.expects_response);
 
         // Send a response back
         resp_tx.send(Response::Ok).unwrap();

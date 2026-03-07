@@ -10,7 +10,7 @@ use std::io::Write;
 
 use ipc_channel::ipc::{self as ipc_ch, IpcSender};
 
-use cef_unity_ipc::{Bootstrap, Command, Response};
+use cef_unity_ipc::{Bootstrap, CommandEnvelope, Response};
 
 fn log(msg: &str) {
     let path = std::env::temp_dir().join("cef_unity_server.log");
@@ -43,7 +43,8 @@ fn main() {
     log("CEF initialized successfully");
 
     // Create bidirectional channels
-    let (cmd_tx, cmd_rx) = ipc_ch::channel::<Command>().expect("failed to create cmd channel");
+    let (cmd_tx, cmd_rx) =
+        ipc_ch::channel::<CommandEnvelope>().expect("failed to create cmd channel");
     let (resp_tx, resp_rx) = ipc_ch::channel::<Response>().expect("failed to create resp channel");
 
     // Connect to client's one-shot server and send bootstrap
@@ -56,12 +57,12 @@ fn main() {
 
     // IPC → mpsc ブリッジスレッド: IPC recv をブロッキング待ちし、
     // コマンド到着時に即座にイベントループを起こす。
-    let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<Command>();
+    let (mpsc_tx, mpsc_rx) = std::sync::mpsc::channel::<CommandEnvelope>();
     std::thread::spawn(move || {
         loop {
             match cmd_rx.recv() {
-                Ok(cmd) => {
-                    if mpsc_tx.send(cmd).is_err() {
+                Ok(env) => {
+                    if mpsc_tx.send(env).is_err() {
                         break;
                     }
                     event_loop::schedule_pump(0);

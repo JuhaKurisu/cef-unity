@@ -5,8 +5,6 @@ use std::sync::mpsc;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
-use cef_unity_ipc::Command;
-
 use super::ServerState;
 
 // ---------------------------------------------------------------------------
@@ -67,14 +65,13 @@ fn tick(state: &mut ServerState) {
 fn drain_commands(state: &mut ServerState) {
     loop {
         match state.cmd_rx.try_recv() {
-            Ok(cmd) => {
-                let is_shutdown = matches!(cmd, Command::Shutdown);
-                let needs_response = cmd.needs_response();
-                if needs_response {
-                    log(&format!("received command: {:?}", cmd));
+            Ok(env) => {
+                let is_shutdown = matches!(env.command, cef_unity_ipc::Command::Shutdown);
+                if env.expects_response {
+                    log(&format!("received command: {:?}", env.command));
                 }
-                let resp = state.cef_server.handle_command(cmd);
-                if needs_response {
+                let resp = state.cef_server.handle_command(env.command);
+                if env.expects_response {
                     if let Err(e) = state.resp_tx.send(resp) {
                         log(&format!("send error: {}", e));
                         state.running = false;

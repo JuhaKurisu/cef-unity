@@ -117,6 +117,54 @@ namespace CefUnity
         [DllImport(__DllName, EntryPoint = "cef_unity_get_buffer", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern int cef_unity_get_buffer(CefUnityBrowser* handle, byte** out_buffer, int* out_width, int* out_height);
 
+        /// <summary>
+        ///  Destroy a browser instance (blocking).
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_destroy_browser_blocking", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_destroy_browser_blocking(CefUnityBrowser* handle);
+
+        /// <summary>
+        ///  Load a URL in the browser (blocking).
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_load_url_blocking", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_load_url_blocking(CefUnityBrowser* handle, byte* url);
+
+        /// <summary>
+        ///  Resize the browser viewport (blocking).
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_resize_blocking", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_resize_blocking(CefUnityBrowser* handle, int width, int height);
+
+        /// <summary>
+        ///  Send a mouse move event (blocking).
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_send_mouse_move_blocking", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_send_mouse_move_blocking(CefUnityBrowser* handle, int x, int y, uint modifiers);
+
+        /// <summary>
+        ///  Send a mouse click event (blocking).
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_send_mouse_click_blocking", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_send_mouse_click_blocking(CefUnityBrowser* handle, int x, int y, uint modifiers, byte button, int mouse_up, int click_count);
+
+        /// <summary>
+        ///  Send a mouse wheel event (blocking).
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_send_mouse_wheel_blocking", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_send_mouse_wheel_blocking(CefUnityBrowser* handle, int x, int y, uint modifiers, int delta_x, int delta_y);
+
+        /// <summary>
+        ///  Send a key event (blocking).
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_send_key_event_blocking", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_send_key_event_blocking(CefUnityBrowser* handle, byte event_type, uint modifiers, int windows_key_code, int native_key_code, ushort character, ushort unmodified_character, int is_system_key, int focus_on_editable_field);
+
+        /// <summary>
+        ///  Execute JavaScript in the browser's main frame (blocking).
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_execute_javascript_blocking", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_execute_javascript_blocking(CefUnityBrowser* handle, byte* code);
+
 
     }
 

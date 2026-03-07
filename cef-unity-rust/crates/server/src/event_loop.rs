@@ -9,14 +9,14 @@ use std::sync::mpsc;
 
 use ipc_channel::ipc::IpcSender;
 
-use cef_unity_ipc::{Command, Response};
+use cef_unity_ipc::{CommandEnvelope, Response};
 
 use crate::server::CefServer;
 
 pub struct ServerState {
     pub cef_server: CefServer,
     /// IPC bridge thread がコマンドを転送してくる mpsc チャネル。
-    pub cmd_rx: mpsc::Receiver<Command>,
+    pub cmd_rx: mpsc::Receiver<CommandEnvelope>,
     pub resp_tx: IpcSender<Response>,
     pub running: bool,
     pub pump_count: u64,

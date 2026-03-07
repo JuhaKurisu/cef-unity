@@ -320,6 +320,94 @@ namespace CefUnity.Interop
             SendKeyEvent(KeyEventType.KeyUp, vk, modifiers: modifiers, character: c, unmodifiedCharacter: c);
         }
 
+        // ----- Blocking variants -----
+
+        public int LoadUrlBlocking(string url)
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                fixed (byte* urlPtr = ToUtf8Null(url))
+                {
+                    return NativeMethods.cef_unity_load_url_blocking(_handle, urlPtr);
+                }
+            }
+        }
+
+        public int ResizeBlocking(int width, int height)
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                return NativeMethods.cef_unity_resize_blocking(_handle, width, height);
+            }
+        }
+
+        public int SendMouseMoveBlocking(int x, int y, uint modifiers = 0)
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                return NativeMethods.cef_unity_send_mouse_move_blocking(_handle, x, y, modifiers);
+            }
+        }
+
+        public int SendMouseClickBlocking(int x, int y, MouseButton button, bool mouseUp, int clickCount = 1, uint modifiers = 0)
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                return NativeMethods.cef_unity_send_mouse_click_blocking(_handle, x, y, modifiers, (byte)button, mouseUp ? 1 : 0, clickCount);
+            }
+        }
+
+        public int SendMouseWheelBlocking(int x, int y, int deltaX, int deltaY, uint modifiers = 0)
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                return NativeMethods.cef_unity_send_mouse_wheel_blocking(_handle, x, y, modifiers, deltaX, deltaY);
+            }
+        }
+
+        public int SendKeyEventBlocking(
+            KeyEventType eventType,
+            int windowsKeyCode,
+            int nativeKeyCode = 0,
+            uint modifiers = 0,
+            char character = '\0',
+            char unmodifiedCharacter = '\0',
+            bool isSystemKey = false,
+            bool focusOnEditableField = false)
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                return NativeMethods.cef_unity_send_key_event_blocking(
+                    _handle,
+                    (byte)eventType,
+                    modifiers,
+                    windowsKeyCode,
+                    nativeKeyCode,
+                    character,
+                    unmodifiedCharacter,
+                    isSystemKey ? 1 : 0,
+                    focusOnEditableField ? 1 : 0);
+            }
+        }
+
+        public int ExecuteJavaScriptBlocking(string code)
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                fixed (byte* codePtr = ToUtf8Null(code))
+                {
+                    return NativeMethods.cef_unity_execute_javascript_blocking(_handle, codePtr);
+                }
+            }
+        }
+
         public string GetUrl()
         {
             ThrowIfDisposed();
