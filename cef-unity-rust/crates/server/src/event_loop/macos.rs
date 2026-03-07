@@ -126,7 +126,6 @@ fn timer_callback_inner() {
     }
 
     cef::do_message_loop_work();
-    state.cef_server.invalidate_all();
     state.pump_count += 1;
 }
 

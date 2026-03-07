@@ -654,17 +654,6 @@ impl CefServer {
         }
     }
 
-    /// Force invalidate all browsers (triggers on_paint for pending DOM changes).
-    pub fn invalidate_all(&self) {
-        for state in self.browsers.values() {
-            if let Some(ref browser) = *state.browser.lock().unwrap() {
-                if let Some(host) = Browser::host(browser) {
-                    BrowserHost::invalidate(&host, PaintElementType::VIEW);
-                }
-            }
-        }
-    }
-
     /// Shut down all browsers and CEF.
     pub fn shutdown(&mut self) {
         log("shutting down all browsers");

@@ -19,6 +19,14 @@ public class SampleScript : MonoBehaviour
     private int _currentWidth;
     private int _currentHeight;
 
+    // Double/triple click detection
+    private float _lastClickTime;
+    private int _lastClickX = -1;
+    private int _lastClickY = -1;
+    private int _clickCount;
+    private const float DoubleClickTime = 0.3f;
+    private const int DoubleClickDistance = 4;
+
     private void Start()
     {
         try
@@ -76,6 +84,9 @@ public class SampleScript : MonoBehaviour
         if (Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl)) m |= (uint)CefEventFlags.ControlDown;
         if (Input.GetKey(KeyCode.LeftAlt)     || Input.GetKey(KeyCode.RightAlt))     m |= (uint)CefEventFlags.AltDown;
         if (Input.GetKey(KeyCode.LeftCommand) || Input.GetKey(KeyCode.RightCommand)) m |= (uint)CefEventFlags.CommandDown;
+        if (Input.GetMouseButton(0)) m |= (uint)CefEventFlags.LeftMouseDown;
+        if (Input.GetMouseButton(1)) m |= (uint)CefEventFlags.RightMouseDown;
+        if (Input.GetMouseButton(2)) m |= (uint)CefEventFlags.MiddleMouseDown;
         return m;
     }
 
@@ -110,9 +121,32 @@ public class SampleScript : MonoBehaviour
     private void HandleButton(int bx, int by, int unityButton, MouseButton cefButton, uint mods)
     {
         if (Input.GetMouseButtonDown(unityButton))
-            _browser.SendMouseClick(bx, by, cefButton, false, modifiers: mods);
+        {
+            if (unityButton == 0)
+            {
+                float now = Time.unscaledTime;
+                if (now - _lastClickTime < DoubleClickTime
+                    && Math.Abs(bx - _lastClickX) <= DoubleClickDistance
+                    && Math.Abs(by - _lastClickY) <= DoubleClickDistance)
+                {
+                    _clickCount = _clickCount >= 3 ? 1 : _clickCount + 1;
+                }
+                else
+                {
+                    _clickCount = 1;
+                }
+                _lastClickTime = now;
+                _lastClickX = bx;
+                _lastClickY = by;
+            }
+            else
+            {
+                _clickCount = 1;
+            }
+            _browser.SendMouseClick(bx, by, cefButton, false, clickCount: _clickCount, modifiers: mods);
+        }
         if (Input.GetMouseButtonUp(unityButton))
-            _browser.SendMouseClick(bx, by, cefButton, true, modifiers: mods);
+            _browser.SendMouseClick(bx, by, cefButton, true, clickCount: _clickCount, modifiers: mods);
     }
 
     /// <summary>
@@ -221,6 +255,25 @@ public class SampleScript : MonoBehaviour
                 _browser.SendKeyEvent(KeyEventType.RawKeyDown, cef, mods);
             if (Input.GetKeyUp(key))
                 _browser.SendKeyEvent(KeyEventType.KeyUp, cef, mods);
+        }
+
+        // 3) Cmd/Ctrl + アルファキー (コピペ等のショートカット)
+        //    Input.inputString は修飾キー押下時に文字を返さないため別途処理
+        if ((mods & (uint)CefEventFlags.CommandDown) != 0 || (mods & (uint)CefEventFlags.ControlDown) != 0)
+        {
+            for (var kc = KeyCode.A; kc <= KeyCode.Z; kc++)
+            {
+                if (Input.GetKeyDown(kc))
+                {
+                    int vk = 0x41 + (kc - KeyCode.A);
+                    _browser.SendKeyEvent(KeyEventType.RawKeyDown, vk, modifiers: mods);
+                }
+                if (Input.GetKeyUp(kc))
+                {
+                    int vk = 0x41 + (kc - KeyCode.A);
+                    _browser.SendKeyEvent(KeyEventType.KeyUp, vk, modifiers: mods);
+                }
+            }
         }
     }
 
