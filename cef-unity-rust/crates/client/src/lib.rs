@@ -118,9 +118,6 @@ pub struct CefUnityBrowser {
 struct ClientBrowserInstance {
     browser_id: u32,
     shm: ShmReader,
-    front: Vec<u8>,
-    front_w: i32,
-    front_h: i32,
 }
 
 fn handle_to_ref<'a>(handle: *mut CefUnityBrowser) -> &'a mut ClientBrowserInstance {
@@ -343,9 +340,6 @@ pub extern "C" fn cef_unity_create_browser(
             let instance = Box::new(ClientBrowserInstance {
                 browser_id,
                 shm,
-                front: Vec::new(),
-                front_w: 0,
-                front_h: 0,
             });
             Box::into_raw(instance) as *mut CefUnityBrowser
         }
@@ -621,19 +615,25 @@ pub extern "C" fn cef_unity_get_buffer(
     }
     let instance = handle_to_ref(handle);
 
-    let new_frame = instance.shm.read_frame(&mut instance.front);
-    if let Some((w, h)) = new_frame {
-        instance.front_w = w as i32;
-        instance.front_h = h as i32;
-        PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
+    match instance.shm.get_active_buffer_ptr() {
+        Some((ptr, w, h)) => {
+            PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
+            unsafe {
+                *out_buffer = ptr;
+                *out_width = w as i32;
+                *out_height = h as i32;
+            }
+            1
+        }
+        None => {
+            unsafe {
+                *out_buffer = std::ptr::null();
+                *out_width = 0;
+                *out_height = 0;
+            }
+            0
+        }
     }
-
-    unsafe {
-        *out_buffer = instance.front.as_ptr();
-        *out_width = instance.front_w;
-        *out_height = instance.front_h;
-    }
-    new_frame.is_some() as i32
 }
 
 // ---------------------------------------------------------------------------

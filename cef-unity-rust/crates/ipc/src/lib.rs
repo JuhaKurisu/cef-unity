@@ -214,6 +214,30 @@ impl ShmReader {
         })
     }
 
+    /// Zero-copy variant: returns a raw pointer into the shared memory active buffer
+    /// instead of copying. Returns None if no new frame since last call.
+    /// The pointer is valid as long as this ShmReader (and its underlying Shmem) is alive.
+    pub fn get_active_buffer_ptr(&mut self) -> Option<(*const u8, u32, u32)> {
+        let header = unsafe { &*(self.shmem.as_ptr() as *const ShmHeader) };
+        let frame_id = header.frame_id.load(Ordering::Acquire);
+        if frame_id == self.last_frame_id {
+            return None;
+        }
+        self.last_frame_id = frame_id;
+
+        let active = header.active_buffer.load(Ordering::Acquire);
+        let width = header.width.load(Ordering::Acquire);
+        let height = header.height.load(Ordering::Acquire);
+        let size = (width * height * 4) as usize;
+        if size == 0 || size > BUFFER_SIZE {
+            return None;
+        }
+
+        let offset = SHM_HEADER_SIZE + active as usize * BUFFER_SIZE;
+        let ptr = unsafe { self.shmem.as_ptr().add(offset) as *const u8 };
+        Some((ptr, width, height))
+    }
+
     /// Check if there's a new frame. If so, copy it into `dst` and return (width, height).
     /// Returns None if no new frame since last call.
     pub fn read_frame(&mut self, dst: &mut Vec<u8>) -> Option<(u32, u32)> {
@@ -280,6 +304,46 @@ mod tests {
         let result2 = reader.read_frame(&mut buf);
         assert_eq!(result2, Some((2, 2)));
         assert_eq!(buf, pixels2);
+    }
+
+    #[test]
+    fn shm_zero_copy_read() {
+        let flink = std::env::temp_dir()
+            .join("cef-unity-test-shm-zerocopy")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let writer = ShmWriter::new(&flink).expect("ShmWriter::new");
+        let mut reader = ShmReader::open(&flink).expect("ShmReader::open");
+
+        // No frame yet
+        assert!(reader.get_active_buffer_ptr().is_none());
+
+        // Write a 2x2 BGRA frame (16 bytes)
+        let pixels: Vec<u8> = (0..16).collect();
+        writer.write_frame(&pixels, 2, 2);
+
+        // Zero-copy read: pointer should point into shared memory with correct data
+        let result = reader.get_active_buffer_ptr();
+        assert!(result.is_some());
+        let (ptr, w, h) = result.unwrap();
+        assert_eq!(w, 2);
+        assert_eq!(h, 2);
+        let slice = unsafe { std::slice::from_raw_parts(ptr, 16) };
+        assert_eq!(slice, &pixels[..]);
+
+        // No new frame on second call
+        assert!(reader.get_active_buffer_ptr().is_none());
+
+        // Write another frame, verify double-buffer swap
+        let pixels2: Vec<u8> = (16..32).collect();
+        writer.write_frame(&pixels2, 2, 2);
+        let (ptr2, w2, h2) = reader.get_active_buffer_ptr().unwrap();
+        assert_eq!(w2, 2);
+        assert_eq!(h2, 2);
+        let slice2 = unsafe { std::slice::from_raw_parts(ptr2, 16) };
+        assert_eq!(slice2, &pixels2[..]);
     }
 
     #[test]
