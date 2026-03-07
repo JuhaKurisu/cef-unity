@@ -365,7 +365,7 @@ pub extern "C" fn cef_unity_destroy_browser(handle: *mut CefUnityBrowser) {
         let cmd = Command::DestroyBrowser {
             browser_id: instance.browser_id,
         };
-        let _ = send_command(conn, cmd);
+        send_command_no_wait(conn, cmd);
     }
     drop(instance);
 }
@@ -385,7 +385,7 @@ pub extern "C" fn cef_unity_load_url(handle: *mut CefUnityBrowser, url: *const c
             browser_id: instance.browser_id,
             url: url_str.to_string(),
         };
-        let _ = send_command(conn, cmd);
+        send_command_no_wait(conn, cmd);
     }
 }
 
@@ -404,7 +404,7 @@ pub extern "C" fn cef_unity_resize(handle: *mut CefUnityBrowser, width: i32, hei
             width,
             height,
         };
-        let _ = send_command(conn, cmd);
+        send_command_no_wait(conn, cmd);
     }
 }
 

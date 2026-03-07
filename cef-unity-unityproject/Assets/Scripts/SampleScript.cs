@@ -16,14 +16,18 @@ public class SampleScript : MonoBehaviour
     private Texture2D _texture;
     private int _lastMouseX = -1;
     private int _lastMouseY = -1;
+    private int _currentWidth;
+    private int _currentHeight;
 
     private void Start()
     {
         try
         {
+            _currentWidth = Screen.width;
+            _currentHeight = Screen.height;
             CefRuntime.Init();
-            _browser = new Browser(_width, _height, _url);
-            Debug.Log("[CefUnity] Initialized");
+            _browser = new Browser(_currentWidth, _currentHeight, _url);
+            Debug.Log($"[CefUnity] Initialized ({_currentWidth}x{_currentHeight})");
         }
         catch (Exception e)
         {
@@ -44,6 +48,7 @@ public class SampleScript : MonoBehaviour
             Debug.Log($"[CefUnity] diag: paint={paintCount} pump={pumpCount}");
         }
 
+        CheckScreenResize();
         UpdateTexture();
         HandleMouseInput();
         HandleKeyboardInput();
@@ -138,8 +143,8 @@ public class SampleScript : MonoBehaviour
         // uvRect (0,1,1,-1) で Y 反転しているので補正
         ny = 1f - ny;
 
-        bx = Mathf.Clamp((int)(nx * _width), 0, _width - 1);
-        by = Mathf.Clamp((int)(ny * _height), 0, _height - 1);
+        bx = Mathf.Clamp((int)(nx * _currentWidth), 0, _currentWidth - 1);
+        by = Mathf.Clamp((int)(ny * _currentHeight), 0, _currentHeight - 1);
         return true;
     }
 
@@ -216,6 +221,19 @@ public class SampleScript : MonoBehaviour
                 _browser.SendKeyEvent(KeyEventType.RawKeyDown, cef, mods);
             if (Input.GetKeyUp(key))
                 _browser.SendKeyEvent(KeyEventType.KeyUp, cef, mods);
+        }
+    }
+
+    private void CheckScreenResize()
+    {
+        var sw = Screen.width;
+        var sh = Screen.height;
+        if (sw != _currentWidth || sh != _currentHeight)
+        {
+            _currentWidth = sw;
+            _currentHeight = sh;
+            _browser?.Resize(_currentWidth, _currentHeight);
+            Debug.Log($"[CefUnity] Resized to {_currentWidth}x{_currentHeight}");
         }
     }
 
