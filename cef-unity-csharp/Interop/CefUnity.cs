@@ -223,6 +223,19 @@ public sealed class Browser : IDisposable
         return hasNew != 0;
     }
 
+    public void EditCommand(byte command)
+    {
+        ThrowIfDisposed();
+        unsafe { NativeMethods.cef_unity_edit_command(_handle, command); }
+    }
+
+    public void Copy() => EditCommand(0);
+    public void Paste() => EditCommand(1);
+    public void Cut() => EditCommand(2);
+    public void SelectAll() => EditCommand(3);
+    public void Undo() => EditCommand(4);
+    public void Redo() => EditCommand(5);
+
     public void SendMouseMove(int x, int y, uint modifiers = 0)
     {
         ThrowIfDisposed();

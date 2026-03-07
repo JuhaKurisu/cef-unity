@@ -257,22 +257,20 @@ public class SampleScript : MonoBehaviour
                 _browser.SendKeyEvent(KeyEventType.KeyUp, cef, mods);
         }
 
-        // 3) Cmd/Ctrl + アルファキー (コピペ等のショートカット)
-        //    Input.inputString は修飾キー押下時に文字を返さないため別途処理
-        if ((mods & (uint)CefEventFlags.CommandDown) != 0 || (mods & (uint)CefEventFlags.ControlDown) != 0)
+        // 3) Cmd/Ctrl + 編集コマンド
+        //    CEF OSR では send_key_event でショートカットが処理されないため Frame の編集メソッドを直接呼ぶ
+        bool cmd = (mods & (uint)CefEventFlags.CommandDown) != 0;
+        bool ctrl = (mods & (uint)CefEventFlags.ControlDown) != 0;
+        if (cmd || ctrl)
         {
-            for (var kc = KeyCode.A; kc <= KeyCode.Z; kc++)
+            if (Input.GetKeyDown(KeyCode.C)) _browser.Copy();
+            if (Input.GetKeyDown(KeyCode.V)) _browser.Paste();
+            if (Input.GetKeyDown(KeyCode.X)) _browser.Cut();
+            if (Input.GetKeyDown(KeyCode.A)) _browser.SelectAll();
+            if (Input.GetKeyDown(KeyCode.Z))
             {
-                if (Input.GetKeyDown(kc))
-                {
-                    int vk = 0x41 + (kc - KeyCode.A);
-                    _browser.SendKeyEvent(KeyEventType.RawKeyDown, vk, modifiers: mods);
-                }
-                if (Input.GetKeyUp(kc))
-                {
-                    int vk = 0x41 + (kc - KeyCode.A);
-                    _browser.SendKeyEvent(KeyEventType.KeyUp, vk, modifiers: mods);
-                }
+                if ((mods & (uint)CefEventFlags.ShiftDown) != 0) _browser.Redo();
+                else _browser.Undo();
             }
         }
     }

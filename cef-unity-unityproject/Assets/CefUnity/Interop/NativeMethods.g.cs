@@ -104,6 +104,13 @@ namespace CefUnity
         public static extern void cef_unity_execute_javascript(CefUnityBrowser* handle, byte* code);
 
         /// <summary>
+        ///  Execute an editing command (copy, paste, cut, select_all, undo, redo).
+        ///  command: 0=Copy, 1=Paste, 2=Cut, 3=SelectAll, 4=Undo, 5=Redo
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_edit_command", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_edit_command(CefUnityBrowser* handle, byte command);
+
+        /// <summary>
         ///  Get the browser's current main-frame URL as UTF-8 bytes.
         ///  Returns the required buffer size including the trailing NUL terminator.
         /// </summary>

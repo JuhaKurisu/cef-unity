@@ -357,6 +357,10 @@ impl CefServer {
             Command::ExecuteJavaScript { browser_id, code } => {
                 self.execute_javascript(browser_id, &code)
             }
+            Command::EditCommand {
+                browser_id,
+                command,
+            } => self.edit_command(browser_id, command),
             Command::GetCurrentUrl { browser_id } => self.get_current_url(browser_id),
             Command::Shutdown => {
                 // Caller handles shutdown
@@ -626,6 +630,32 @@ impl CefServer {
                 log("execute_javascript: browser or frame not available");
             }
             Response::Ok
+        } else {
+            Response::Error {
+                msg: format!("browser {} not found", browser_id),
+            }
+        }
+    }
+
+    fn edit_command(&self, browser_id: u32, command: u8) -> Response {
+        if let Some(state) = self.browsers.get(&browser_id) {
+            if let Some(ref browser) = *state.browser.lock().unwrap()
+                && let Some(frame) = Browser::main_frame(browser)
+            {
+                match command {
+                    0 => frame.copy(),
+                    1 => frame.paste(),
+                    2 => frame.cut(),
+                    3 => frame.select_all(),
+                    4 => frame.undo(),
+                    5 => frame.redo(),
+                    _ => {}
+                }
+                return Response::Ok;
+            }
+            Response::Error {
+                msg: "browser or frame not available".to_string(),
+            }
         } else {
             Response::Error {
                 msg: format!("browser {} not found", browser_id),

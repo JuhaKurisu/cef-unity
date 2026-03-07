@@ -550,6 +550,27 @@ pub extern "C" fn cef_unity_execute_javascript(handle: *mut CefUnityBrowser, cod
     }
 }
 
+/// Execute an editing command (copy, paste, cut, select_all, undo, redo).
+/// command: 0=Copy, 1=Paste, 2=Cut, 3=SelectAll, 4=Undo, 5=Redo
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_edit_command(handle: *mut CefUnityBrowser, command: u8) {
+    if handle.is_null() {
+        return;
+    }
+    let instance = handle_to_ref(handle);
+
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        send_command_no_wait(
+            conn,
+            Command::EditCommand {
+                browser_id: instance.browser_id,
+                command,
+            },
+        );
+    }
+}
+
 /// Get the browser's current main-frame URL as UTF-8 bytes.
 /// Returns the required buffer size including the trailing NUL terminator.
 #[unsafe(no_mangle)]

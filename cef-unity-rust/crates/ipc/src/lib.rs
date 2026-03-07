@@ -70,6 +70,11 @@ pub enum Command {
         browser_id: u32,
         code: String,
     },
+    EditCommand {
+        browser_id: u32,
+        /// 0=Copy, 1=Paste, 2=Cut, 3=SelectAll, 4=Undo, 5=Redo
+        command: u8,
+    },
     GetCurrentUrl {
         browser_id: u32,
     },
