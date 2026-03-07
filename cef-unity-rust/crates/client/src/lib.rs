@@ -976,6 +976,63 @@ pub extern "C" fn cef_unity_ime_cancel_composition(handle: *mut CefUnityBrowser)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Log retrieval
+// ---------------------------------------------------------------------------
+
+static CACHED_LOGS: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+/// Retrieve server logs as NUL-separated UTF-8 entries.
+/// If buffer is null, sends GetLogs via IPC, caches result, and returns required size.
+/// If buffer is non-null, copies cached data into buffer and clears the cache.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_get_logs(buffer: *mut u8, buffer_len: i32) -> i32 {
+    if !INITIALIZED.load(Ordering::SeqCst) {
+        return 0;
+    }
+
+    if buffer.is_null() {
+        // Phase 1: fetch from server and cache
+        let guard = CONNECTION.lock().unwrap();
+        let Some(conn) = guard.as_ref() else {
+            return 0;
+        };
+
+        let entries = match send_command(conn, Command::GetLogs) {
+            Ok(Response::Logs { entries }) => entries,
+            _ => return 0,
+        };
+
+        if entries.is_empty() {
+            *CACHED_LOGS.lock().unwrap() = None;
+            return 0;
+        }
+
+        // Encode as "msg1\0msg2\0" (trailing NUL included)
+        let mut encoded = Vec::new();
+        for entry in &entries {
+            encoded.extend_from_slice(entry.as_bytes());
+            encoded.push(0);
+        }
+
+        let size = encoded.len() as i32;
+        *CACHED_LOGS.lock().unwrap() = Some(encoded);
+        size
+    } else {
+        // Phase 2: copy cached data to buffer
+        let mut cache = CACHED_LOGS.lock().unwrap();
+        let Some(data) = cache.take() else {
+            return 0;
+        };
+
+        let copy_len = data.len().min(buffer_len as usize);
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buffer, copy_len);
+        }
+        copy_len as i32
+    }
+}
+
 /// Execute JavaScript in the browser's main frame (blocking).
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_execute_javascript_blocking(

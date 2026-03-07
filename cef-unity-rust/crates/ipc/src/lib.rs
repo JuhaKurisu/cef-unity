@@ -95,6 +95,7 @@ pub enum Command {
     ImeCancelComposition {
         browser_id: u32,
     },
+    GetLogs,
     Shutdown,
 }
 
@@ -110,6 +111,7 @@ pub struct CommandEnvelope {
 pub enum Response {
     BrowserCreated { browser_id: u32, shm_flink: String },
     CurrentUrl { url: String },
+    Logs { entries: Vec<String> },
     Ok,
     Error { msg: String },
 }

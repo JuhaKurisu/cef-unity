@@ -191,6 +191,14 @@ namespace CefUnity
         public static extern void cef_unity_ime_cancel_composition(CefUnityBrowser* handle);
 
         /// <summary>
+        ///  Retrieve server logs as NUL-separated UTF-8 entries.
+        ///  If buffer is null, sends GetLogs via IPC, caches result, and returns required size.
+        ///  If buffer is non-null, copies cached data into buffer and clears the cache.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_get_logs", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_get_logs(byte* buffer, int buffer_len);
+
+        /// <summary>
         ///  Execute JavaScript in the browser's main frame (blocking).
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_execute_javascript_blocking", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]

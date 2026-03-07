@@ -12,6 +12,9 @@ use cef_unity_ipc::{self as ipc, Command, Response, ShmWriter};
 // Logging
 // ---------------------------------------------------------------------------
 
+const MAX_LOG_ENTRIES: usize = 1000;
+static LOG_BUFFER: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 fn log(msg: &str) {
     let path = std::env::temp_dir().join("cef_unity_server.log");
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -21,6 +24,16 @@ fn log(msg: &str) {
     {
         let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now(), msg);
     }
+
+    let mut buf = LOG_BUFFER.lock().unwrap();
+    if buf.len() >= MAX_LOG_ENTRIES {
+        buf.remove(0);
+    }
+    buf.push(msg.to_string());
+}
+
+fn drain_logs() -> Vec<String> {
+    std::mem::take(&mut *LOG_BUFFER.lock().unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -368,16 +381,15 @@ impl CefServer {
                 selection_start,
                 selection_end,
             } => self.ime_set_composition(browser_id, &text, selection_start, selection_end),
-            Command::ImeCommitText { browser_id, text } => {
-                self.ime_commit_text(browser_id, &text)
-            }
+            Command::ImeCommitText { browser_id, text } => self.ime_commit_text(browser_id, &text),
             Command::ImeFinishComposingText {
                 browser_id,
                 keep_selection,
             } => self.ime_finish_composing_text(browser_id, keep_selection),
-            Command::ImeCancelComposition { browser_id } => {
-                self.ime_cancel_composition(browser_id)
-            }
+            Command::ImeCancelComposition { browser_id } => self.ime_cancel_composition(browser_id),
+            Command::GetLogs => Response::Logs {
+                entries: drain_logs(),
+            },
             Command::Shutdown => {
                 // Caller handles shutdown
                 Response::Ok
@@ -723,6 +735,11 @@ impl CefServer {
                     None,
                     Some(&selection_range),
                 );
+                log(format!(
+                    "ime set composition: text={}, selection_start={}, selection_end={}",
+                    text, selection_start, selection_end
+                )
+                .as_str());
             }
             Response::Ok
         } else {
@@ -739,6 +756,7 @@ impl CefServer {
             {
                 let cef_text = CefString::from(text);
                 BrowserHost::ime_commit_text(&host, Some(&cef_text), None, 0);
+                log(format!("ime commit text: text={}", text).as_str());
             }
             Response::Ok
         } else {

@@ -1,10 +1,9 @@
 using System;
 using CefUnity;
 using CefUnity.Interop;
-using UnityEngine;
-using UnityEngine.InputSystem;
-using UnityEngine.UI;
 using TMPro;
+using UnityEngine;
+using UnityEngine.UI;
 
 public class SampleScript : MonoBehaviour
 {
@@ -67,7 +66,7 @@ public class SampleScript : MonoBehaviour
 
     [SerializeField] private int _width = 1280;
     [SerializeField] private int _height = 720;
-    [SerializeField] private string _url = "https://www.google.com";
+    [SerializeField] private string _url;
     [SerializeField] private RawImage _rawImage;
 
     private Browser _browser;
@@ -75,26 +74,22 @@ public class SampleScript : MonoBehaviour
     private int _currentHeight;
     private int _currentWidth;
     private float _diagTimer;
-    private Keyboard _keyboard;
+    private bool _imeActive;
+
+    // IME proxy
+    private TMP_InputField _imeProxy;
 
     // Double/triple click detection
     private float _lastClickTime;
     private int _lastClickX = -1;
     private int _lastClickY = -1;
+    private string _lastComposition = "";
     private int _lastMouseX = -1;
     private int _lastMouseY = -1;
     private Texture2D _texture;
 
-    // IME proxy
-    private TMP_InputField _imeProxy;
-    private string _lastComposition = "";
-    private bool _imeActive;
-
     private void Start()
     {
-        _keyboard = Keyboard.current;
-        CreateImeProxy();
-
         try
         {
             _currentWidth = Screen.width;
@@ -109,86 +104,9 @@ public class SampleScript : MonoBehaviour
         }
     }
 
-    private void CreateImeProxy()
-    {
-        var canvas = _rawImage.canvas;
-
-        // --- InputField 本体 ---
-        var go = new GameObject("ImeProxy");
-        go.transform.SetParent(canvas.transform, false);
-
-        var rt = go.AddComponent<RectTransform>();
-        rt.sizeDelta = new Vector2(1, 1);
-        rt.anchoredPosition = Vector2.zero;
-
-        // InputField が Raycast ターゲットを必要とするので透明 Image を追加
-        var bg = go.AddComponent<Image>();
-        bg.color = Color.clear;
-        bg.raycastTarget = false;
-
-        // --- テキスト表示用の子オブジェクト (TMP) ---
-        var textGo = new GameObject("Text");
-        textGo.transform.SetParent(go.transform, false);
-        var textRt = textGo.AddComponent<RectTransform>();
-        textRt.anchorMin = Vector2.zero;
-        textRt.anchorMax = Vector2.one;
-        textRt.sizeDelta = Vector2.zero;
-
-        var tmp = textGo.AddComponent<TextMeshProUGUI>();
-        tmp.fontSize = 16;
-        tmp.color = Color.clear; // 完全に透明
-        tmp.raycastTarget = false;
-
-        // --- TMP_InputField ---
-        _imeProxy = go.AddComponent<TMP_InputField>();
-        _imeProxy.textComponent = tmp;
-        _imeProxy.caretWidth = 0;           // キャレット非表示
-        _imeProxy.caretColor = Color.clear;  // キャレット透明
-        _imeProxy.selectionColor = Color.clear;
-
-        // テキスト変更イベント
-        _imeProxy.onValueChanged.AddListener(OnImeValueChanged);
-
-        Debug.Log("[IME] Proxy InputField created");
-    }
-
     private void Update()
     {
         CefRuntime.Pump();
-
-        // O: IME プロキシ有効化 / P: 無効化
-        if (Input.GetKeyDown(KeyCode.O) && !_imeActive)
-        {
-            _imeActive = true;
-            _imeProxy.ActivateInputField();
-            Input.imeCompositionMode = IMECompositionMode.On;
-            Debug.Log("[IME] Proxy activated");
-        }
-
-        if (Input.GetKeyDown(KeyCode.P) && _imeActive)
-        {
-            _imeActive = false;
-            _imeProxy.DeactivateInputField();
-            Debug.Log("[IME] Proxy deactivated");
-        }
-
-        // IME 変換中テキスト (preedit) の監視 → CEF に転送
-        var comp = Input.compositionString;
-        if (comp != _lastComposition)
-        {
-            _lastComposition = comp;
-            if (_browser != null)
-            {
-                if (!string.IsNullOrEmpty(comp))
-                {
-                    _browser.ImeSetComposition(comp, 0, (uint)comp.Length);
-                }
-                else
-                {
-                    _browser.ImeFinishComposingText();
-                }
-            }
-        }
 
         _diagTimer += Time.deltaTime;
         if (_diagTimer >= 2f)
@@ -197,6 +115,17 @@ public class SampleScript : MonoBehaviour
             var paintCount = NativeMethods.cef_unity_get_paint_count();
             var pumpCount = NativeMethods.cef_unity_get_pump_count();
             Debug.Log($"[CefUnity] diag: paint={paintCount} pump={pumpCount}");
+
+            var logs = CefRuntime.GetLogs();
+            foreach (var line in logs)
+                Debug.Log($"[CefServer] {line}");
+        }
+
+        if (Input.GetKeyDown(KeyCode.O))
+        {
+            _browser.ImeSetComposition("あなた", 3, 3);
+            _browser.ImeCommitText("貴方");
+            Debug.Log($"send ime commit");
         }
 
         CheckScreenResize();
@@ -205,21 +134,8 @@ public class SampleScript : MonoBehaviour
         HandleKeyboardInput();
     }
 
-    private void OnImeValueChanged(string text)
-    {
-        if (_browser == null || string.IsNullOrEmpty(text)) return;
-
-        // IME 確定テキストを CEF に送信
-        Debug.Log($"[IME] Committed: '{text}'");
-        _browser.ImeCommitText(text);
-
-        // リセット
-        _imeProxy.text = "";
-    }
-
     private void OnDestroy()
     {
-
         _browser?.Dispose();
         _browser = null;
 
@@ -348,13 +264,11 @@ public class SampleScript : MonoBehaviour
         // 1) 印字可能文字 — Input.inputString 経由 (RAWKEYDOWN + CHAR + KEYUP)
         //    IME 変換中は抑制（preedit/commit は別経路で CEF に送信される）
         if (string.IsNullOrEmpty(Input.compositionString))
-        {
             foreach (var c in Input.inputString)
             {
                 if (char.IsControl(c)) continue;
                 _browser.SendCharEvent(c, mods);
             }
-        }
 
         // 2) macOS キー変換: CEF OSR は interpretKeyEvents: パイプラインが無いため手動変換
         //    Cmd+Arrow → Home/End, Alt+Arrow → Ctrl+Arrow (単語移動)

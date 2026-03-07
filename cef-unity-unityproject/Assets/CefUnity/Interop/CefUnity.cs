@@ -177,6 +177,23 @@ namespace CefUnity.Interop
         {
             NativeMethods.cef_unity_pump();
         }
+
+        public static string[] GetLogs()
+        {
+            unsafe
+            {
+                var required = NativeMethods.cef_unity_get_logs(null, 0);
+                if (required <= 1) return Array.Empty<string>();
+                var buffer = new byte[required];
+                fixed (byte* ptr = buffer)
+                {
+                    var written = NativeMethods.cef_unity_get_logs(ptr, buffer.Length);
+                    if (written <= 1) return Array.Empty<string>();
+                    var raw = Encoding.UTF8.GetString(buffer, 0, written - 1);
+                    return raw.Split('\0', StringSplitOptions.RemoveEmptyEntries);
+                }
+            }
+        }
     }
 
     public sealed class Browser : IDisposable
