@@ -23,104 +23,6 @@ fn log(msg: &str) {
     }
 }
 
-const GOOGLE_OSR_WORKAROUND_JS: &str = r#"
-try {
-  var isGoogleSearch = /(^|\.)google\./.test(location.hostname) && location.pathname === '/search';
-  if (isGoogleSearch) {
-    if (!window.__cefUnitySearchTabClickHandler) {
-      window.__cefUnitySearchTabClickHandler = true;
-      var shouldForceNavigation = function(anchor) {
-        if (!anchor) {
-          return null;
-        }
-
-        var url;
-        try {
-          url = new URL(anchor.href, location.href);
-        } catch (_) {
-          return null;
-        }
-
-        if (!/(^|\.)google\./.test(url.hostname) || url.pathname !== '/search') {
-          return null;
-        }
-
-        if (!url.searchParams.has('udm') && url.searchParams.get('tbm') !== 'isch') {
-          return null;
-        }
-
-        return url;
-      };
-
-      var forceNavigation = function(anchor, e) {
-        var url = shouldForceNavigation(anchor);
-        if (!url) {
-          return false;
-        }
-
-        if (e) {
-          e.preventDefault();
-          e.stopImmediatePropagation();
-        }
-
-        location.href = url.toString();
-        return true;
-      };
-
-      var originalAnchorClick = HTMLAnchorElement.prototype.click;
-      HTMLAnchorElement.prototype.click = function() {
-        if (forceNavigation(this, null)) {
-          return;
-        }
-        return originalAnchorClick.call(this);
-      };
-
-      var handler = function(e) {
-        var anchor = e.target && e.target.closest ? e.target.closest('a[href]') : null;
-        forceNavigation(anchor, e);
-      };
-
-      document.addEventListener('pointerdown', handler, true);
-      document.addEventListener('mousedown', handler, true);
-      document.addEventListener('click', handler, true);
-    }
-  }
-} catch (_) {}
-"#;
-
-fn inject_google_osr_workarounds(browser: &Browser) {
-    if let Some(host) = Browser::host(browser) {
-        let enable_msg = br#"{"id":1,"method":"Page.enable"}"#;
-        let add_script_msg = format!(
-            r#"{{"id":2,"method":"Page.addScriptToEvaluateOnNewDocument","params":{{"source":{}}}}}"#,
-            serde_json::to_string(GOOGLE_OSR_WORKAROUND_JS).unwrap()
-        );
-
-        let enable_ok = BrowserHost::send_dev_tools_message(&host, Some(enable_msg));
-        log(&format!(
-            "inject_google_osr_workarounds: Page.enable returned {}",
-            enable_ok
-        ));
-
-        let add_ok = BrowserHost::send_dev_tools_message(&host, Some(add_script_msg.as_bytes()));
-        log(&format!(
-            "inject_google_osr_workarounds: addScript returned {}",
-            add_ok
-        ));
-    } else {
-        log("inject_google_osr_workarounds: no host");
-    }
-
-    if let Some(frame) = Browser::main_frame(browser) {
-        Frame::execute_java_script(
-            &frame,
-            Some(&CefString::from(GOOGLE_OSR_WORKAROUND_JS)),
-            Some(&CefString::from("cef-unity://google-osr-workaround")),
-            0,
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // CEF loader
 // ---------------------------------------------------------------------------
@@ -245,7 +147,6 @@ wrap_life_span_handler! {
             if let Some(b) = browser {
                 *self.browser_slot.lock().unwrap() = Some(b.clone());
                 log("browser stored in slot");
-                inject_google_osr_workarounds(b);
             }
         }
     }
@@ -275,22 +176,6 @@ wrap_app! {
                 cl.append_switch_with_value(
                     Some(&CefString::from("autoplay-policy")),
                     Some(&CefString::from("no-user-gesture-required")),
-                );
-                cl.append_switch(Some(&CefString::from("disable-background-timer-throttling")));
-                cl.append_switch(Some(&CefString::from("disable-renderer-backgrounding")));
-                cl.append_switch(Some(&CefString::from("disable-backgrounding-occluded-windows")));
-                cl.append_switch_with_value(
-                    Some(&CefString::from("enable-blink-features")),
-                    Some(&CefString::from(
-                        "ViewTransition,ViewTransitionOnNavigation,PaintHolding",
-                    )),
-                );
-                // キャッシュ無効化
-                cl.append_switch(Some(&CefString::from("disable-cache")));
-                cl.append_switch(Some(&CefString::from("disable-application-cache")));
-                cl.append_switch_with_value(
-                    Some(&CefString::from("disk-cache-size")),
-                    Some(&CefString::from("0")),
                 );
             }
         }
@@ -362,10 +247,6 @@ impl CefServer {
         log(&format!("helper_path = {}", helper_path.display()));
 
         let cache_dir = std::env::temp_dir().join("cef_unity_cache");
-        // HTTP キャッシュのみ削除。V8 コードキャッシュ (Code Cache) は残す
-        // → --disable-cache と併用で検索結果は常に最新、JS コンパイルは高速
-        let http_cache = cache_dir.join("Cache");
-        let _ = std::fs::remove_dir_all(&http_cache);
         let _ = std::fs::create_dir_all(&cache_dir);
 
         let mut settings = Settings::default();
