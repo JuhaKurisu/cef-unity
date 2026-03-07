@@ -240,6 +240,9 @@ public class SampleScript : MonoBehaviour
         if (_browser == null) return;
 
         var mods = GetCefModifiers();
+        bool cmd = (mods & (uint)CefEventFlags.CommandDown) != 0;
+        bool ctrl = (mods & (uint)CefEventFlags.ControlDown) != 0;
+        bool alt = (mods & (uint)CefEventFlags.AltDown) != 0;
 
         // 1) 印字可能文字 — Input.inputString 経由 (RAWKEYDOWN + CHAR + KEYUP)
         foreach (var c in Input.inputString)
@@ -248,19 +251,40 @@ public class SampleScript : MonoBehaviour
             _browser.SendCharEvent(c, mods);
         }
 
-        // 2) 非印字キー — GetKeyDown / GetKeyUp (RAWKEYDOWN / KEYUP のみ)
+        // 2) macOS キー変換: CEF OSR は interpretKeyEvents: パイプラインが無いため手動変換
+        //    Cmd+Arrow → Home/End, Alt+Arrow → Ctrl+Arrow (単語移動)
+        //    Shift が併用された場合は選択操作になる (ShiftDown は baseMods に残る)
+        bool suppressHArrows = cmd || alt;
+        bool suppressVArrows = cmd;
+        if (cmd)
+        {
+            uint baseMods = mods & ~(uint)CefEventFlags.CommandDown;
+            SendTranslatedKey(KeyCode.LeftArrow,  CefKeyCodes.Home, baseMods);
+            SendTranslatedKey(KeyCode.RightArrow, CefKeyCodes.End,  baseMods);
+            SendTranslatedKey(KeyCode.UpArrow,    CefKeyCodes.Home, baseMods | (uint)CefEventFlags.ControlDown);
+            SendTranslatedKey(KeyCode.DownArrow,  CefKeyCodes.End,  baseMods | (uint)CefEventFlags.ControlDown);
+        }
+        else if (alt)
+        {
+            uint wordMods = (mods & ~(uint)CefEventFlags.AltDown) | (uint)CefEventFlags.ControlDown;
+            SendTranslatedKey(KeyCode.LeftArrow,  CefKeyCodes.LeftArrow,  wordMods);
+            SendTranslatedKey(KeyCode.RightArrow, CefKeyCodes.RightArrow, wordMods);
+        }
+
+        // 3) 非印字キー — GetKeyDown / GetKeyUp (RAWKEYDOWN / KEYUP のみ)
         foreach (var (key, cef) in SpecialKeyTable)
         {
+            if (suppressHArrows && (key == KeyCode.LeftArrow || key == KeyCode.RightArrow)) continue;
+            if (suppressVArrows && (key == KeyCode.UpArrow || key == KeyCode.DownArrow)) continue;
+
             if (Input.GetKeyDown(key))
                 _browser.SendKeyEvent(KeyEventType.RawKeyDown, cef, mods);
             if (Input.GetKeyUp(key))
                 _browser.SendKeyEvent(KeyEventType.KeyUp, cef, mods);
         }
 
-        // 3) Cmd/Ctrl + 編集コマンド
+        // 4) Cmd/Ctrl + 編集コマンド
         //    CEF OSR では send_key_event でショートカットが処理されないため Frame の編集メソッドを直接呼ぶ
-        bool cmd = (mods & (uint)CefEventFlags.CommandDown) != 0;
-        bool ctrl = (mods & (uint)CefEventFlags.ControlDown) != 0;
         if (cmd || ctrl)
         {
             if (Input.GetKeyDown(KeyCode.C)) _browser.Copy();
@@ -273,6 +297,14 @@ public class SampleScript : MonoBehaviour
                 else _browser.Undo();
             }
         }
+    }
+
+    private void SendTranslatedKey(KeyCode from, CefKeyCode translated, uint translatedMods)
+    {
+        if (Input.GetKeyDown(from))
+            _browser.SendKeyEvent(KeyEventType.RawKeyDown, translated, translatedMods);
+        if (Input.GetKeyUp(from))
+            _browser.SendKeyEvent(KeyEventType.KeyUp, translated, translatedMods);
     }
 
     private void CheckScreenResize()
