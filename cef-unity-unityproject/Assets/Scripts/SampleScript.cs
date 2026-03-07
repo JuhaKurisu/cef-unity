@@ -2,33 +2,99 @@ using System;
 using CefUnity;
 using CefUnity.Interop;
 using UnityEngine;
+using UnityEngine.InputSystem;
 using UnityEngine.UI;
+using TMPro;
 
 public class SampleScript : MonoBehaviour
 {
+    private const float DoubleClickTime = 0.3f;
+    private const int DoubleClickDistance = 4;
+
+
+    // -----------------------------------------------------------------------
+    // Keyboard
+    // -----------------------------------------------------------------------
+
+    // Unity KeyCode → CefKeyCode の対応テーブル
+    private static readonly (KeyCode unity, CefKeyCode cef)[] SpecialKeyTable =
+    {
+        (KeyCode.Backspace, CefKeyCodes.Backspace),
+        (KeyCode.Tab, CefKeyCodes.Tab),
+        (KeyCode.Return, CefKeyCodes.Return),
+        (KeyCode.Escape, CefKeyCodes.Escape),
+        (KeyCode.Delete, CefKeyCodes.Delete),
+        (KeyCode.Insert, CefKeyCodes.Insert),
+
+        (KeyCode.UpArrow, CefKeyCodes.UpArrow),
+        (KeyCode.DownArrow, CefKeyCodes.DownArrow),
+        (KeyCode.LeftArrow, CefKeyCodes.LeftArrow),
+        (KeyCode.RightArrow, CefKeyCodes.RightArrow),
+        (KeyCode.Home, CefKeyCodes.Home),
+        (KeyCode.End, CefKeyCodes.End),
+        (KeyCode.PageUp, CefKeyCodes.PageUp),
+        (KeyCode.PageDown, CefKeyCodes.PageDown),
+
+        (KeyCode.F1, CefKeyCodes.F1), (KeyCode.F2, CefKeyCodes.F2),
+        (KeyCode.F3, CefKeyCodes.F3), (KeyCode.F4, CefKeyCodes.F4),
+        (KeyCode.F5, CefKeyCodes.F5), (KeyCode.F6, CefKeyCodes.F6),
+        (KeyCode.F7, CefKeyCodes.F7), (KeyCode.F8, CefKeyCodes.F8),
+        (KeyCode.F9, CefKeyCodes.F9), (KeyCode.F10, CefKeyCodes.F10),
+        (KeyCode.F11, CefKeyCodes.F11), (KeyCode.F12, CefKeyCodes.F12),
+
+        (KeyCode.Keypad0, CefKeyCodes.Keypad0), (KeyCode.Keypad1, CefKeyCodes.Keypad1),
+        (KeyCode.Keypad2, CefKeyCodes.Keypad2), (KeyCode.Keypad3, CefKeyCodes.Keypad3),
+        (KeyCode.Keypad4, CefKeyCodes.Keypad4), (KeyCode.Keypad5, CefKeyCodes.Keypad5),
+        (KeyCode.Keypad6, CefKeyCodes.Keypad6), (KeyCode.Keypad7, CefKeyCodes.Keypad7),
+        (KeyCode.Keypad8, CefKeyCodes.Keypad8), (KeyCode.Keypad9, CefKeyCodes.Keypad9),
+        (KeyCode.KeypadPeriod, CefKeyCodes.KeypadPeriod),
+        (KeyCode.KeypadDivide, CefKeyCodes.KeypadDivide),
+        (KeyCode.KeypadMultiply, CefKeyCodes.KeypadMultiply),
+        (KeyCode.KeypadMinus, CefKeyCodes.KeypadMinus),
+        (KeyCode.KeypadPlus, CefKeyCodes.KeypadPlus),
+        (KeyCode.KeypadEnter, CefKeyCodes.KeypadEnter),
+
+        (KeyCode.LeftShift, CefKeyCodes.LeftShift),
+        (KeyCode.RightShift, CefKeyCodes.RightShift),
+        (KeyCode.LeftControl, CefKeyCodes.LeftControl),
+        (KeyCode.RightControl, CefKeyCodes.RightControl),
+        (KeyCode.LeftAlt, CefKeyCodes.LeftAlt),
+        (KeyCode.RightAlt, CefKeyCodes.RightAlt),
+        (KeyCode.LeftCommand, CefKeyCodes.LeftCommand),
+        (KeyCode.RightCommand, CefKeyCodes.RightCommand),
+        (KeyCode.CapsLock, CefKeyCodes.CapsLock)
+    };
+
     [SerializeField] private int _width = 1280;
     [SerializeField] private int _height = 720;
     [SerializeField] private string _url = "https://www.google.com";
     [SerializeField] private RawImage _rawImage;
 
     private Browser _browser;
-    private float _diagTimer;
-    private Texture2D _texture;
-    private int _lastMouseX = -1;
-    private int _lastMouseY = -1;
-    private int _currentWidth;
+    private int _clickCount;
     private int _currentHeight;
+    private int _currentWidth;
+    private float _diagTimer;
+    private Keyboard _keyboard;
 
     // Double/triple click detection
     private float _lastClickTime;
     private int _lastClickX = -1;
     private int _lastClickY = -1;
-    private int _clickCount;
-    private const float DoubleClickTime = 0.3f;
-    private const int DoubleClickDistance = 4;
+    private int _lastMouseX = -1;
+    private int _lastMouseY = -1;
+    private Texture2D _texture;
+
+    // IME proxy
+    private TMP_InputField _imeProxy;
+    private string _lastComposition = "";
+    private bool _imeActive;
 
     private void Start()
     {
+        _keyboard = Keyboard.current;
+        CreateImeProxy();
+
         try
         {
             _currentWidth = Screen.width;
@@ -43,9 +109,86 @@ public class SampleScript : MonoBehaviour
         }
     }
 
+    private void CreateImeProxy()
+    {
+        var canvas = _rawImage.canvas;
+
+        // --- InputField 本体 ---
+        var go = new GameObject("ImeProxy");
+        go.transform.SetParent(canvas.transform, false);
+
+        var rt = go.AddComponent<RectTransform>();
+        rt.sizeDelta = new Vector2(1, 1);
+        rt.anchoredPosition = Vector2.zero;
+
+        // InputField が Raycast ターゲットを必要とするので透明 Image を追加
+        var bg = go.AddComponent<Image>();
+        bg.color = Color.clear;
+        bg.raycastTarget = false;
+
+        // --- テキスト表示用の子オブジェクト (TMP) ---
+        var textGo = new GameObject("Text");
+        textGo.transform.SetParent(go.transform, false);
+        var textRt = textGo.AddComponent<RectTransform>();
+        textRt.anchorMin = Vector2.zero;
+        textRt.anchorMax = Vector2.one;
+        textRt.sizeDelta = Vector2.zero;
+
+        var tmp = textGo.AddComponent<TextMeshProUGUI>();
+        tmp.fontSize = 16;
+        tmp.color = Color.clear; // 完全に透明
+        tmp.raycastTarget = false;
+
+        // --- TMP_InputField ---
+        _imeProxy = go.AddComponent<TMP_InputField>();
+        _imeProxy.textComponent = tmp;
+        _imeProxy.caretWidth = 0;           // キャレット非表示
+        _imeProxy.caretColor = Color.clear;  // キャレット透明
+        _imeProxy.selectionColor = Color.clear;
+
+        // テキスト変更イベント
+        _imeProxy.onValueChanged.AddListener(OnImeValueChanged);
+
+        Debug.Log("[IME] Proxy InputField created");
+    }
+
     private void Update()
     {
         CefRuntime.Pump();
+
+        // O: IME プロキシ有効化 / P: 無効化
+        if (Input.GetKeyDown(KeyCode.O) && !_imeActive)
+        {
+            _imeActive = true;
+            _imeProxy.ActivateInputField();
+            Input.imeCompositionMode = IMECompositionMode.On;
+            Debug.Log("[IME] Proxy activated");
+        }
+
+        if (Input.GetKeyDown(KeyCode.P) && _imeActive)
+        {
+            _imeActive = false;
+            _imeProxy.DeactivateInputField();
+            Debug.Log("[IME] Proxy deactivated");
+        }
+
+        // IME 変換中テキスト (preedit) の監視 → CEF に転送
+        var comp = Input.compositionString;
+        if (comp != _lastComposition)
+        {
+            _lastComposition = comp;
+            if (_browser != null)
+            {
+                if (!string.IsNullOrEmpty(comp))
+                {
+                    _browser.ImeSetComposition(comp, 0, (uint)comp.Length);
+                }
+                else
+                {
+                    _browser.ImeFinishComposingText();
+                }
+            }
+        }
 
         _diagTimer += Time.deltaTime;
         if (_diagTimer >= 2f)
@@ -62,8 +205,21 @@ public class SampleScript : MonoBehaviour
         HandleKeyboardInput();
     }
 
+    private void OnImeValueChanged(string text)
+    {
+        if (_browser == null || string.IsNullOrEmpty(text)) return;
+
+        // IME 確定テキストを CEF に送信
+        Debug.Log($"[IME] Committed: '{text}'");
+        _browser.ImeCommitText(text);
+
+        // リセット
+        _imeProxy.text = "";
+    }
+
     private void OnDestroy()
     {
+
         _browser?.Dispose();
         _browser = null;
 
@@ -80,9 +236,9 @@ public class SampleScript : MonoBehaviour
     private uint GetCefModifiers()
     {
         uint m = 0;
-        if (Input.GetKey(KeyCode.LeftShift)   || Input.GetKey(KeyCode.RightShift))   m |= (uint)CefEventFlags.ShiftDown;
+        if (Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift)) m |= (uint)CefEventFlags.ShiftDown;
         if (Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl)) m |= (uint)CefEventFlags.ControlDown;
-        if (Input.GetKey(KeyCode.LeftAlt)     || Input.GetKey(KeyCode.RightAlt))     m |= (uint)CefEventFlags.AltDown;
+        if (Input.GetKey(KeyCode.LeftAlt) || Input.GetKey(KeyCode.RightAlt)) m |= (uint)CefEventFlags.AltDown;
         if (Input.GetKey(KeyCode.LeftCommand) || Input.GetKey(KeyCode.RightCommand)) m |= (uint)CefEventFlags.CommandDown;
         if (Input.GetMouseButton(0)) m |= (uint)CefEventFlags.LeftMouseDown;
         if (Input.GetMouseButton(1)) m |= (uint)CefEventFlags.RightMouseDown;
@@ -124,17 +280,13 @@ public class SampleScript : MonoBehaviour
         {
             if (unityButton == 0)
             {
-                float now = Time.unscaledTime;
+                var now = Time.unscaledTime;
                 if (now - _lastClickTime < DoubleClickTime
                     && Math.Abs(bx - _lastClickX) <= DoubleClickDistance
                     && Math.Abs(by - _lastClickY) <= DoubleClickDistance)
-                {
                     _clickCount = _clickCount >= 3 ? 1 : _clickCount + 1;
-                }
                 else
-                {
                     _clickCount = 1;
-                }
                 _lastClickTime = now;
                 _lastClickX = bx;
                 _lastClickY = by;
@@ -143,10 +295,12 @@ public class SampleScript : MonoBehaviour
             {
                 _clickCount = 1;
             }
-            _browser.SendMouseClick(bx, by, cefButton, false, clickCount: _clickCount, modifiers: mods);
+
+            _browser.SendMouseClick(bx, by, cefButton, false, _clickCount, mods);
         }
+
         if (Input.GetMouseButtonUp(unityButton))
-            _browser.SendMouseClick(bx, by, cefButton, true, clickCount: _clickCount, modifiers: mods);
+            _browser.SendMouseClick(bx, by, cefButton, true, _clickCount, mods);
     }
 
     /// <summary>
@@ -182,92 +336,43 @@ public class SampleScript : MonoBehaviour
         return true;
     }
 
-    // -----------------------------------------------------------------------
-    // Keyboard
-    // -----------------------------------------------------------------------
-
-    // Unity KeyCode → CefKeyCode の対応テーブル
-    private static readonly (KeyCode unity, CefKeyCode cef)[] SpecialKeyTable =
-    {
-        (KeyCode.Backspace,      CefKeyCodes.Backspace),
-        (KeyCode.Tab,            CefKeyCodes.Tab),
-        (KeyCode.Return,         CefKeyCodes.Return),
-        (KeyCode.Escape,         CefKeyCodes.Escape),
-        (KeyCode.Delete,         CefKeyCodes.Delete),
-        (KeyCode.Insert,         CefKeyCodes.Insert),
-
-        (KeyCode.UpArrow,        CefKeyCodes.UpArrow),
-        (KeyCode.DownArrow,      CefKeyCodes.DownArrow),
-        (KeyCode.LeftArrow,      CefKeyCodes.LeftArrow),
-        (KeyCode.RightArrow,     CefKeyCodes.RightArrow),
-        (KeyCode.Home,           CefKeyCodes.Home),
-        (KeyCode.End,            CefKeyCodes.End),
-        (KeyCode.PageUp,         CefKeyCodes.PageUp),
-        (KeyCode.PageDown,       CefKeyCodes.PageDown),
-
-        (KeyCode.F1,  CefKeyCodes.F1),  (KeyCode.F2,  CefKeyCodes.F2),
-        (KeyCode.F3,  CefKeyCodes.F3),  (KeyCode.F4,  CefKeyCodes.F4),
-        (KeyCode.F5,  CefKeyCodes.F5),  (KeyCode.F6,  CefKeyCodes.F6),
-        (KeyCode.F7,  CefKeyCodes.F7),  (KeyCode.F8,  CefKeyCodes.F8),
-        (KeyCode.F9,  CefKeyCodes.F9),  (KeyCode.F10, CefKeyCodes.F10),
-        (KeyCode.F11, CefKeyCodes.F11), (KeyCode.F12, CefKeyCodes.F12),
-
-        (KeyCode.Keypad0, CefKeyCodes.Keypad0), (KeyCode.Keypad1, CefKeyCodes.Keypad1),
-        (KeyCode.Keypad2, CefKeyCodes.Keypad2), (KeyCode.Keypad3, CefKeyCodes.Keypad3),
-        (KeyCode.Keypad4, CefKeyCodes.Keypad4), (KeyCode.Keypad5, CefKeyCodes.Keypad5),
-        (KeyCode.Keypad6, CefKeyCodes.Keypad6), (KeyCode.Keypad7, CefKeyCodes.Keypad7),
-        (KeyCode.Keypad8, CefKeyCodes.Keypad8), (KeyCode.Keypad9, CefKeyCodes.Keypad9),
-        (KeyCode.KeypadPeriod,   CefKeyCodes.KeypadPeriod),
-        (KeyCode.KeypadDivide,   CefKeyCodes.KeypadDivide),
-        (KeyCode.KeypadMultiply, CefKeyCodes.KeypadMultiply),
-        (KeyCode.KeypadMinus,    CefKeyCodes.KeypadMinus),
-        (KeyCode.KeypadPlus,     CefKeyCodes.KeypadPlus),
-        (KeyCode.KeypadEnter,    CefKeyCodes.KeypadEnter),
-
-        (KeyCode.LeftShift,    CefKeyCodes.LeftShift),
-        (KeyCode.RightShift,   CefKeyCodes.RightShift),
-        (KeyCode.LeftControl,  CefKeyCodes.LeftControl),
-        (KeyCode.RightControl, CefKeyCodes.RightControl),
-        (KeyCode.LeftAlt,      CefKeyCodes.LeftAlt),
-        (KeyCode.RightAlt,     CefKeyCodes.RightAlt),
-        (KeyCode.LeftCommand,  CefKeyCodes.LeftCommand),
-        (KeyCode.RightCommand, CefKeyCodes.RightCommand),
-        (KeyCode.CapsLock,     CefKeyCodes.CapsLock),
-    };
-
     private void HandleKeyboardInput()
     {
         if (_browser == null) return;
 
         var mods = GetCefModifiers();
-        bool cmd = (mods & (uint)CefEventFlags.CommandDown) != 0;
-        bool ctrl = (mods & (uint)CefEventFlags.ControlDown) != 0;
-        bool alt = (mods & (uint)CefEventFlags.AltDown) != 0;
+        var cmd = (mods & (uint)CefEventFlags.CommandDown) != 0;
+        var ctrl = (mods & (uint)CefEventFlags.ControlDown) != 0;
+        var alt = (mods & (uint)CefEventFlags.AltDown) != 0;
 
         // 1) 印字可能文字 — Input.inputString 経由 (RAWKEYDOWN + CHAR + KEYUP)
-        foreach (var c in Input.inputString)
+        //    IME 変換中は抑制（preedit/commit は別経路で CEF に送信される）
+        if (string.IsNullOrEmpty(Input.compositionString))
         {
-            if (char.IsControl(c)) continue;
-            _browser.SendCharEvent(c, mods);
+            foreach (var c in Input.inputString)
+            {
+                if (char.IsControl(c)) continue;
+                _browser.SendCharEvent(c, mods);
+            }
         }
 
         // 2) macOS キー変換: CEF OSR は interpretKeyEvents: パイプラインが無いため手動変換
         //    Cmd+Arrow → Home/End, Alt+Arrow → Ctrl+Arrow (単語移動)
         //    Shift が併用された場合は選択操作になる (ShiftDown は baseMods に残る)
-        bool suppressHArrows = cmd || alt;
-        bool suppressVArrows = cmd;
+        var suppressHArrows = cmd || alt;
+        var suppressVArrows = cmd;
         if (cmd)
         {
-            uint baseMods = mods & ~(uint)CefEventFlags.CommandDown;
-            SendTranslatedKey(KeyCode.LeftArrow,  CefKeyCodes.Home, baseMods);
-            SendTranslatedKey(KeyCode.RightArrow, CefKeyCodes.End,  baseMods);
-            SendTranslatedKey(KeyCode.UpArrow,    CefKeyCodes.Home, baseMods | (uint)CefEventFlags.ControlDown);
-            SendTranslatedKey(KeyCode.DownArrow,  CefKeyCodes.End,  baseMods | (uint)CefEventFlags.ControlDown);
+            var baseMods = mods & ~(uint)CefEventFlags.CommandDown;
+            SendTranslatedKey(KeyCode.LeftArrow, CefKeyCodes.Home, baseMods);
+            SendTranslatedKey(KeyCode.RightArrow, CefKeyCodes.End, baseMods);
+            SendTranslatedKey(KeyCode.UpArrow, CefKeyCodes.Home, baseMods | (uint)CefEventFlags.ControlDown);
+            SendTranslatedKey(KeyCode.DownArrow, CefKeyCodes.End, baseMods | (uint)CefEventFlags.ControlDown);
         }
         else if (alt)
         {
-            uint wordMods = (mods & ~(uint)CefEventFlags.AltDown) | (uint)CefEventFlags.ControlDown;
-            SendTranslatedKey(KeyCode.LeftArrow,  CefKeyCodes.LeftArrow,  wordMods);
+            var wordMods = (mods & ~(uint)CefEventFlags.AltDown) | (uint)CefEventFlags.ControlDown;
+            SendTranslatedKey(KeyCode.LeftArrow, CefKeyCodes.LeftArrow, wordMods);
             SendTranslatedKey(KeyCode.RightArrow, CefKeyCodes.RightArrow, wordMods);
         }
 

@@ -78,6 +78,23 @@ pub enum Command {
     GetCurrentUrl {
         browser_id: u32,
     },
+    ImeSetComposition {
+        browser_id: u32,
+        text: String,
+        selection_start: u32,
+        selection_end: u32,
+    },
+    ImeCommitText {
+        browser_id: u32,
+        text: String,
+    },
+    ImeFinishComposingText {
+        browser_id: u32,
+        keep_selection: bool,
+    },
+    ImeCancelComposition {
+        browser_id: u32,
+    },
     Shutdown,
 }
 

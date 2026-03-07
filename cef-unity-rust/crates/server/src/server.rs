@@ -362,6 +362,22 @@ impl CefServer {
                 command,
             } => self.edit_command(browser_id, command),
             Command::GetCurrentUrl { browser_id } => self.get_current_url(browser_id),
+            Command::ImeSetComposition {
+                browser_id,
+                text,
+                selection_start,
+                selection_end,
+            } => self.ime_set_composition(browser_id, &text, selection_start, selection_end),
+            Command::ImeCommitText { browser_id, text } => {
+                self.ime_commit_text(browser_id, &text)
+            }
+            Command::ImeFinishComposingText {
+                browser_id,
+                keep_selection,
+            } => self.ime_finish_composing_text(browser_id, keep_selection),
+            Command::ImeCancelComposition { browser_id } => {
+                self.ime_cancel_composition(browser_id)
+            }
             Command::Shutdown => {
                 // Caller handles shutdown
                 Response::Ok
@@ -677,6 +693,84 @@ impl CefServer {
             Response::Error {
                 msg: "browser or frame not available".to_string(),
             }
+        } else {
+            Response::Error {
+                msg: format!("browser {} not found", browser_id),
+            }
+        }
+    }
+
+    fn ime_set_composition(
+        &self,
+        browser_id: u32,
+        text: &str,
+        selection_start: u32,
+        selection_end: u32,
+    ) -> Response {
+        if let Some(state) = self.browsers.get(&browser_id) {
+            if let Some(ref browser) = *state.browser.lock().unwrap()
+                && let Some(host) = Browser::host(browser)
+            {
+                let cef_text = CefString::from(text);
+                let selection_range = Range {
+                    from: selection_start,
+                    to: selection_end,
+                };
+                BrowserHost::ime_set_composition(
+                    &host,
+                    Some(&cef_text),
+                    None,
+                    None,
+                    Some(&selection_range),
+                );
+            }
+            Response::Ok
+        } else {
+            Response::Error {
+                msg: format!("browser {} not found", browser_id),
+            }
+        }
+    }
+
+    fn ime_commit_text(&self, browser_id: u32, text: &str) -> Response {
+        if let Some(state) = self.browsers.get(&browser_id) {
+            if let Some(ref browser) = *state.browser.lock().unwrap()
+                && let Some(host) = Browser::host(browser)
+            {
+                let cef_text = CefString::from(text);
+                BrowserHost::ime_commit_text(&host, Some(&cef_text), None, 0);
+            }
+            Response::Ok
+        } else {
+            Response::Error {
+                msg: format!("browser {} not found", browser_id),
+            }
+        }
+    }
+
+    fn ime_finish_composing_text(&self, browser_id: u32, keep_selection: bool) -> Response {
+        if let Some(state) = self.browsers.get(&browser_id) {
+            if let Some(ref browser) = *state.browser.lock().unwrap()
+                && let Some(host) = Browser::host(browser)
+            {
+                BrowserHost::ime_finish_composing_text(&host, keep_selection as i32);
+            }
+            Response::Ok
+        } else {
+            Response::Error {
+                msg: format!("browser {} not found", browser_id),
+            }
+        }
+    }
+
+    fn ime_cancel_composition(&self, browser_id: u32) -> Response {
+        if let Some(state) = self.browsers.get(&browser_id) {
+            if let Some(ref browser) = *state.browser.lock().unwrap()
+                && let Some(host) = Browser::host(browser)
+            {
+                BrowserHost::ime_cancel_composition(&host);
+            }
+            Response::Ok
         } else {
             Response::Error {
                 msg: format!("browser {} not found", browser_id),

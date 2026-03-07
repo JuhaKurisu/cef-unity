@@ -315,7 +315,51 @@ public sealed class Browser : IDisposable
         }
     }
 
-    // ----- Blocking variants -----
+    // ----- IME -----
+
+        public void ImeSetComposition(string text, uint selectionStart, uint selectionEnd)
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                fixed (byte* textPtr = ToUtf8Null(text))
+                {
+                    NativeMethods.cef_unity_ime_set_composition(_handle, textPtr, selectionStart, selectionEnd);
+                }
+            }
+        }
+
+        public void ImeCommitText(string text)
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                fixed (byte* textPtr = ToUtf8Null(text))
+                {
+                    NativeMethods.cef_unity_ime_commit_text(_handle, textPtr);
+                }
+            }
+        }
+
+        public void ImeFinishComposingText(bool keepSelection = false)
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                NativeMethods.cef_unity_ime_finish_composing_text(_handle, keepSelection ? 1 : 0);
+            }
+        }
+
+        public void ImeCancelComposition()
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                NativeMethods.cef_unity_ime_cancel_composition(_handle);
+            }
+        }
+
+        // ----- Blocking variants -----
 
     public int LoadUrlBlocking(string url)
     {

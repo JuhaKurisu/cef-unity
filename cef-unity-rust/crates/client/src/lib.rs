@@ -882,6 +882,100 @@ pub extern "C" fn cef_unity_send_key_event_blocking(
     }
 }
 
+/// Set IME composition text (preedit).
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_ime_set_composition(
+    handle: *mut CefUnityBrowser,
+    text: *const c_char,
+    selection_start: u32,
+    selection_end: u32,
+) {
+    if handle.is_null() || text.is_null() {
+        return;
+    }
+    let instance = handle_to_ref(handle);
+    let text_str = unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("");
+
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        send_command_no_wait(
+            conn,
+            Command::ImeSetComposition {
+                browser_id: instance.browser_id,
+                text: text_str.to_string(),
+                selection_start,
+                selection_end,
+            },
+        );
+    }
+}
+
+/// Commit IME text (finalize composition and insert text).
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_ime_commit_text(
+    handle: *mut CefUnityBrowser,
+    text: *const c_char,
+) {
+    if handle.is_null() || text.is_null() {
+        return;
+    }
+    let instance = handle_to_ref(handle);
+    let text_str = unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("");
+
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        send_command_no_wait(
+            conn,
+            Command::ImeCommitText {
+                browser_id: instance.browser_id,
+                text: text_str.to_string(),
+            },
+        );
+    }
+}
+
+/// Finish composing text (apply current composition).
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_ime_finish_composing_text(
+    handle: *mut CefUnityBrowser,
+    keep_selection: i32,
+) {
+    if handle.is_null() {
+        return;
+    }
+    let instance = handle_to_ref(handle);
+
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        send_command_no_wait(
+            conn,
+            Command::ImeFinishComposingText {
+                browser_id: instance.browser_id,
+                keep_selection: keep_selection != 0,
+            },
+        );
+    }
+}
+
+/// Cancel the current IME composition.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_ime_cancel_composition(handle: *mut CefUnityBrowser) {
+    if handle.is_null() {
+        return;
+    }
+    let instance = handle_to_ref(handle);
+
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        send_command_no_wait(
+            conn,
+            Command::ImeCancelComposition {
+                browser_id: instance.browser_id,
+            },
+        );
+    }
+}
+
 /// Execute JavaScript in the browser's main frame (blocking).
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_execute_javascript_blocking(

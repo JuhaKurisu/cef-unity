@@ -167,6 +167,30 @@ namespace CefUnity
         public static extern int cef_unity_send_key_event_blocking(CefUnityBrowser* handle, byte event_type, uint modifiers, int windows_key_code, int native_key_code, ushort character, ushort unmodified_character, int is_system_key, int focus_on_editable_field);
 
         /// <summary>
+        ///  Set IME composition text (preedit).
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_ime_set_composition", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_ime_set_composition(CefUnityBrowser* handle, byte* text, uint selection_start, uint selection_end);
+
+        /// <summary>
+        ///  Commit IME text (finalize composition and insert text).
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_ime_commit_text", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_ime_commit_text(CefUnityBrowser* handle, byte* text);
+
+        /// <summary>
+        ///  Finish composing text (apply current composition).
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_ime_finish_composing_text", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_ime_finish_composing_text(CefUnityBrowser* handle, int keep_selection);
+
+        /// <summary>
+        ///  Cancel the current IME composition.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_ime_cancel_composition", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_ime_cancel_composition(CefUnityBrowser* handle);
+
+        /// <summary>
         ///  Execute JavaScript in the browser's main frame (blocking).
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_execute_javascript_blocking", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
