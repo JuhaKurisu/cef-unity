@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 using CefUnity;
 using CefUnity.Interop;
 using UnityEngine;
@@ -70,6 +71,8 @@ public class SampleScript : MonoBehaviour
     [SerializeField] private int _height = 720;
     [SerializeField] private string _url;
     [SerializeField] private RawImage _rawImage;
+    private readonly Dictionary<KeyCode, float> _keyDownTime = new();
+    private readonly Dictionary<KeyCode, float> _keyLastRepeat = new();
 
     private Browser _browser;
     private int _clickCount;
@@ -78,6 +81,11 @@ public class SampleScript : MonoBehaviour
     private float _diagTimer;
     private bool _imeActive;
     private bool _imeCommitPending;
+    private Vector4 _imeDebugCefCaret;
+
+    private Vector2 _imeDebugMarkerPos;
+    private string _imeDebugScaleInfo = "";
+    private string _imeDebugText = "";
     private bool _imeSuppressKeys;
 
 
@@ -88,9 +96,6 @@ public class SampleScript : MonoBehaviour
     private string _lastComposition = "";
     private int _lastMouseX = -1;
     private int _lastMouseY = -1;
-    private readonly Dictionary<KeyCode, float> _keyDownTime = new();
-    private string _imeDebugText = "";
-    private readonly Dictionary<KeyCode, float> _keyLastRepeat = new();
     private Texture2D _texture;
 
     private void Start()
@@ -155,6 +160,21 @@ public class SampleScript : MonoBehaviour
         Debug.Log("[CefUnity] Shutdown");
     }
 
+    private void OnGUI()
+    {
+        // compositionCursorPos の位置に赤い十字マーカー (OnGUI は Y=0 上端 = compositionCursorPos と同じ座標系)
+        var pos = _imeDebugMarkerPos;
+        var old = GUI.color;
+        GUI.color = Color.red;
+        GUI.Box(new Rect(pos.x - 15, pos.y, 30, 2), GUIContent.none); // 横線
+        GUI.Box(new Rect(pos.x, pos.y - 15, 2, 30), GUIContent.none); // 縦線
+        GUI.color = old;
+
+        var style = new GUIStyle(GUI.skin.label) { fontSize = 14, normal = { textColor = Color.yellow } };
+        var text = $"cursorPos: ({Input.compositionCursorPos.x:F0},{Input.compositionCursorPos.y:F0})  marker: ({pos.x:F0},{pos.y:F0})  {_imeDebugScaleInfo}";
+        GUI.Label(new Rect(10, Screen.height - 30, Screen.width, 30), text, style);
+    }
+
     // -----------------------------------------------------------------------
     // IME
     // -----------------------------------------------------------------------
@@ -171,10 +191,7 @@ public class SampleScript : MonoBehaviour
         var input = Input.inputString;
 
         // デバッグ: 変化があるときだけログ出力
-        if (!string.IsNullOrEmpty(comp) || !string.IsNullOrEmpty(input) || _imeActive)
-        {
-            Debug.Log($"[IME] comp=\"{comp}\" input=\"{EscapeForLog(input)}\" imeActive={_imeActive} commitPending={_imeCommitPending}");
-        }
+        if (!string.IsNullOrEmpty(comp) || !string.IsNullOrEmpty(input) || _imeActive) Debug.Log($"[IME] comp=\"{comp}\" input=\"{EscapeForLog(input)}\" imeActive={_imeActive} commitPending={_imeCommitPending}");
 
         if (!string.IsNullOrEmpty(comp))
         {
@@ -183,12 +200,10 @@ public class SampleScript : MonoBehaviour
             // この場合 Input.inputString に確定テキストが入っている
             if (_imeActive && !string.IsNullOrEmpty(input))
             {
-                var commitSb = new System.Text.StringBuilder();
+                var commitSb = new StringBuilder();
                 foreach (var c in input)
-                {
                     if (!char.IsControl(c))
                         commitSb.Append(c);
-                }
                 if (commitSb.Length > 0)
                 {
                     var commitText = commitSb.ToString();
@@ -208,23 +223,19 @@ public class SampleScript : MonoBehaviour
             // composition 終了 (非空 → 空に変化)
             var committed = false;
             foreach (var c in input)
-            {
                 if (!char.IsControl(c))
                 {
                     committed = true;
                     break;
                 }
-            }
 
             if (committed)
             {
                 // 制御文字を除いた確定テキストを取得
-                var sb = new System.Text.StringBuilder();
+                var sb = new StringBuilder();
                 foreach (var c in input)
-                {
                     if (!char.IsControl(c))
                         sb.Append(c);
-                }
                 var text = sb.ToString();
                 Debug.Log($"[IME] → ImeCommitText(\"{text}\")");
                 _browser.ImeCommitText(text);
@@ -249,14 +260,12 @@ public class SampleScript : MonoBehaviour
     private static string EscapeForLog(string s)
     {
         if (string.IsNullOrEmpty(s)) return "";
-        var sb = new System.Text.StringBuilder();
+        var sb = new StringBuilder();
         foreach (var c in s)
-        {
             if (char.IsControl(c))
                 sb.Append($"\\x{(int)c:X2}");
             else
                 sb.Append(c);
-        }
         return sb.ToString();
     }
 
@@ -269,6 +278,7 @@ public class SampleScript : MonoBehaviour
         var rt = _rawImage.rectTransform;
         var rect = rt.rect;
 
+        // CEF座標 → RawImage ローカル座標
         var nx = (float)cx / _currentWidth;
         var ny = (float)(cy + ch) / _currentHeight;
 
@@ -279,32 +289,12 @@ public class SampleScript : MonoBehaviour
         var canvas = _rawImage.canvas;
         var cam = canvas.renderMode == RenderMode.ScreenSpaceOverlay ? null : canvas.worldCamera;
         var worldPoint = rt.TransformPoint(localPoint);
+
+        // WorldToScreenPoint は Input.mousePosition と同じ座標系 (Y=0 が下端)
+        // compositionCursorPos も同じ座標系 → Y反転不要
         var screenPos = RectTransformUtility.WorldToScreenPoint(cam, worldPoint);
 
-        screenPos.y = Screen.height - screenPos.y;
         Input.compositionCursorPos = screenPos;
-
-        // デバッグマーカー位置更新 (compositionCursorPos の座標)
-        _imeDebugMarkerPos = screenPos;
-        _imeDebugCefCaret = new Vector4(cx, cy, cw, ch);
-    }
-
-    private Vector2 _imeDebugMarkerPos;
-    private Vector4 _imeDebugCefCaret;
-
-    private void OnGUI()
-    {
-        // compositionCursorPos の位置に赤い十字マーカー (OnGUI は Y=0 上端 = compositionCursorPos と同じ座標系)
-        var pos = _imeDebugMarkerPos;
-        var old = GUI.color;
-        GUI.color = Color.red;
-        GUI.Box(new UnityEngine.Rect(pos.x - 15, pos.y, 30, 2), GUIContent.none);  // 横線
-        GUI.Box(new UnityEngine.Rect(pos.x, pos.y - 15, 2, 30), GUIContent.none);  // 縦線
-        GUI.color = old;
-
-        var style = new GUIStyle(GUI.skin.label) { fontSize = 14, normal = { textColor = Color.yellow } };
-        var text = $"compositionCursorPos: ({pos.x:F0},{pos.y:F0})  CEF: ({_imeDebugCefCaret.x},{_imeDebugCefCaret.y},{_imeDebugCefCaret.z},{_imeDebugCefCaret.w})  Screen: {Screen.width}x{Screen.height}";
-        GUI.Label(new UnityEngine.Rect(10, Screen.height - 30, Screen.width, 30), text, style);
     }
 
     private uint GetCefModifiers()
