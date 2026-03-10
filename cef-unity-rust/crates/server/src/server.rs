@@ -100,6 +100,25 @@ wrap_render_handler! {
             }
         }
 
+        fn screen_info(
+            &self,
+            _browser: Option<&mut Browser>,
+            screen_info: Option<&mut ScreenInfo>,
+        ) -> ::std::os::raw::c_int {
+            let w = self.viewport_w.load(Ordering::Relaxed);
+            let h = self.viewport_h.load(Ordering::Relaxed);
+            if let Some(si) = screen_info {
+                si.size = std::mem::size_of::<ScreenInfo>();
+                si.device_scale_factor = 1.0;
+                si.depth = 32;
+                si.depth_per_component = 8;
+                si.is_monochrome = 0;
+                si.rect = Rect { x: 0, y: 0, width: w, height: h };
+                si.available_rect = Rect { x: 0, y: 0, width: w, height: h };
+            }
+            1
+        }
+
         fn on_paint(
             &self,
             _browser: Option<&mut Browser>,
@@ -119,6 +138,27 @@ wrap_render_handler! {
             let size = (width * height * 4) as usize;
             let src = unsafe { std::slice::from_raw_parts(buffer, size) };
             self.shm.write_frame(src, width as u32, height as u32);
+        }
+
+        fn on_virtual_keyboard_requested(
+            &self,
+            _browser: Option<&mut Browser>,
+            input_mode: TextInputMode,
+        ) {
+            log(&format!("on_virtual_keyboard_requested: mode={:?}", input_mode));
+        }
+
+        fn on_ime_composition_range_changed(
+            &self,
+            _browser: Option<&mut Browser>,
+            selected_range: Option<&Range>,
+            character_bounds: Option<&[Rect]>,
+        ) {
+            log(&format!(
+                "on_ime_composition_range_changed: range={:?}, bounds_count={}",
+                selected_range,
+                character_bounds.map_or(0, |b| b.len())
+            ));
         }
     }
 }
@@ -728,11 +768,12 @@ impl CefServer {
                     from: selection_start,
                     to: selection_end,
                 };
+                let invalid_range = Range { from: u32::MAX, to: u32::MAX };
                 BrowserHost::ime_set_composition(
                     &host,
                     Some(&cef_text),
                     None,
-                    None,
+                    Some(&invalid_range),
                     Some(&selection_range),
                 );
                 log(format!(
@@ -755,7 +796,10 @@ impl CefServer {
                 && let Some(host) = Browser::host(browser)
             {
                 let cef_text = CefString::from(text);
-                BrowserHost::ime_commit_text(&host, Some(&cef_text), None, 0);
+                // macOS では replacement_range に InvalidRange ({UINT32_MAX, UINT32_MAX}) を渡す必要がある。
+                // None (null pointer) を渡すと CEF 内部で {0, 0} に変換され、正しく動作しない。
+                let invalid_range = Range { from: u32::MAX, to: u32::MAX };
+                BrowserHost::ime_commit_text(&host, Some(&cef_text), Some(&invalid_range), 0);
                 log(format!("ime commit text: text={}", text).as_str());
             }
             Response::Ok

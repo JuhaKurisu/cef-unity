@@ -63,6 +63,16 @@ impl TestHttpServer {
                     let html = r#"<!DOCTYPE html>
 <html><body>
 <input id="t" type="text" style="font-size:24px;width:400px;">
+<div id="log"></div>
+<script>
+var t = document.getElementById('t');
+var log = document.getElementById('log');
+['compositionstart','compositionupdate','compositionend','input','keydown','keypress','keyup'].forEach(function(ev){
+  t.addEventListener(ev, function(e){
+    log.textContent += ev + ':' + (e.data||e.key||'') + ' ';
+  });
+});
+</script>
 </body></html>"#;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
@@ -193,14 +203,16 @@ impl TestCefServer {
         browser_id
     }
 
-    /// JS で input の値を HTTP サーバーへ POST する。
+    /// JS で input の値と event log を HTTP サーバーへ POST する。
     fn post_input_value(&self, browser_id: u32, http_port: u16) {
         let js = format!(
             r#"(function(){{
                 var v = document.getElementById('t').value;
+                var logEl = document.getElementById('log');
+                var eventLog = logEl ? logEl.textContent : '';
                 var xhr = new XMLHttpRequest();
                 xhr.open('POST', 'http://127.0.0.1:{}/value', false);
-                xhr.send(v);
+                xhr.send(v + '|EVENTS|' + eventLog);
             }})()"#,
             http_port
         );
@@ -275,7 +287,12 @@ fn key_event_sanity_check() {
     thread::sleep(Duration::from_millis(500));
 
     cef.post_input_value(bid, http.port);
-    let value = http.take_value().unwrap_or_default();
+    let raw = http.take_value().unwrap_or_default();
+    let parts: Vec<&str> = raw.splitn(2, "|EVENTS|").collect();
+    let value = parts[0];
+    let events = if parts.len() > 1 { parts[1] } else { "" };
+    eprintln!("=== KEY INPUT VALUE: {:?} ===", value);
+    eprintln!("=== KEY EVENTS: {:?} ===", events);
     assert_eq!(value, "a", "regular key input should work");
 
     cef.shutdown();
@@ -368,7 +385,12 @@ fn ime_commit_text_standalone() {
     thread::sleep(Duration::from_millis(500));
 
     cef.post_input_value(bid, http.port);
-    let value = http.take_value().unwrap_or_default();
+    let raw = http.take_value().unwrap_or_default();
+    let parts: Vec<&str> = raw.splitn(2, "|EVENTS|").collect();
+    let value = parts[0];
+    let events = if parts.len() > 1 { parts[1] } else { "" };
+    eprintln!("=== INPUT VALUE: {:?} ===", value);
+    eprintln!("=== EVENTS: {:?} ===", events);
     assert_eq!(value, "直接入力", "standalone CommitText");
 
     cef.shutdown();
