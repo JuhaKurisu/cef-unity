@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using CefUnity;
 using CefUnity.Interop;
 using TMPro;
@@ -9,6 +10,8 @@ public class SampleScript : MonoBehaviour
 {
     private const float DoubleClickTime = 0.3f;
     private const int DoubleClickDistance = 4;
+    private const float KeyRepeatDelay = 0.5f;
+    private const float KeyRepeatRate = 0.035f;
 
 
     // -----------------------------------------------------------------------
@@ -87,6 +90,8 @@ public class SampleScript : MonoBehaviour
     private string _lastComposition = "";
     private int _lastMouseX = -1;
     private int _lastMouseY = -1;
+    private readonly Dictionary<KeyCode, float> _keyDownTime = new();
+    private readonly Dictionary<KeyCode, float> _keyLastRepeat = new();
     private Texture2D _texture;
 
     private void Start()
@@ -388,28 +393,25 @@ public class SampleScript : MonoBehaviour
         if (cmd)
         {
             var baseMods = mods & ~(uint)CefEventFlags.CommandDown;
-            SendTranslatedKey(KeyCode.LeftArrow, CefKeyCodes.Home, baseMods);
-            SendTranslatedKey(KeyCode.RightArrow, CefKeyCodes.End, baseMods);
-            SendTranslatedKey(KeyCode.UpArrow, CefKeyCodes.Home, baseMods | (uint)CefEventFlags.ControlDown);
-            SendTranslatedKey(KeyCode.DownArrow, CefKeyCodes.End, baseMods | (uint)CefEventFlags.ControlDown);
+            SendKeyWithRepeat(KeyCode.LeftArrow, CefKeyCodes.Home, baseMods);
+            SendKeyWithRepeat(KeyCode.RightArrow, CefKeyCodes.End, baseMods);
+            SendKeyWithRepeat(KeyCode.UpArrow, CefKeyCodes.Home, baseMods | (uint)CefEventFlags.ControlDown);
+            SendKeyWithRepeat(KeyCode.DownArrow, CefKeyCodes.End, baseMods | (uint)CefEventFlags.ControlDown);
         }
         else if (alt)
         {
             var wordMods = (mods & ~(uint)CefEventFlags.AltDown) | (uint)CefEventFlags.ControlDown;
-            SendTranslatedKey(KeyCode.LeftArrow, CefKeyCodes.LeftArrow, wordMods);
-            SendTranslatedKey(KeyCode.RightArrow, CefKeyCodes.RightArrow, wordMods);
+            SendKeyWithRepeat(KeyCode.LeftArrow, CefKeyCodes.LeftArrow, wordMods);
+            SendKeyWithRepeat(KeyCode.RightArrow, CefKeyCodes.RightArrow, wordMods);
         }
 
-        // 3) 非印字キー — GetKeyDown / GetKeyUp (RAWKEYDOWN / KEYUP のみ)
+        // 3) 非印字キー — 長押しリピート対応
         foreach (var (key, cef) in SpecialKeyTable)
         {
             if (suppressHArrows && (key == KeyCode.LeftArrow || key == KeyCode.RightArrow)) continue;
             if (suppressVArrows && (key == KeyCode.UpArrow || key == KeyCode.DownArrow)) continue;
 
-            if (Input.GetKeyDown(key))
-                _browser.SendKeyEvent(KeyEventType.RawKeyDown, cef, mods);
-            if (Input.GetKeyUp(key))
-                _browser.SendKeyEvent(KeyEventType.KeyUp, cef, mods);
+            SendKeyWithRepeat(key, cef, mods);
         }
 
         // 4) Cmd/Ctrl + 編集コマンド
@@ -428,12 +430,33 @@ public class SampleScript : MonoBehaviour
         }
     }
 
-    private void SendTranslatedKey(KeyCode from, CefKeyCode translated, uint translatedMods)
+    private void SendKeyWithRepeat(KeyCode unityKey, CefKeyCode cefKey, uint mods)
     {
-        if (Input.GetKeyDown(from))
-            _browser.SendKeyEvent(KeyEventType.RawKeyDown, translated, translatedMods);
-        if (Input.GetKeyUp(from))
-            _browser.SendKeyEvent(KeyEventType.KeyUp, translated, translatedMods);
+        if (Input.GetKeyDown(unityKey))
+        {
+            _browser.SendKeyEvent(KeyEventType.RawKeyDown, cefKey, mods);
+            _keyDownTime[unityKey] = Time.unscaledTime;
+            _keyLastRepeat[unityKey] = Time.unscaledTime;
+        }
+        else if (Input.GetKey(unityKey))
+        {
+            var now = Time.unscaledTime;
+            if (_keyDownTime.TryGetValue(unityKey, out var downTime)
+                && now - downTime >= KeyRepeatDelay
+                && _keyLastRepeat.TryGetValue(unityKey, out var lastRepeat)
+                && now - lastRepeat >= KeyRepeatRate)
+            {
+                _browser.SendKeyEvent(KeyEventType.RawKeyDown, cefKey, mods);
+                _keyLastRepeat[unityKey] = now;
+            }
+        }
+
+        if (Input.GetKeyUp(unityKey))
+        {
+            _browser.SendKeyEvent(KeyEventType.KeyUp, cefKey, mods);
+            _keyDownTime.Remove(unityKey);
+            _keyLastRepeat.Remove(unityKey);
+        }
     }
 
     private void CheckScreenResize()
