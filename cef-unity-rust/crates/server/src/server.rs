@@ -754,55 +754,9 @@ impl CefServer {
             if let Some(ref browser) = *state.browser.lock().unwrap()
                 && let Some(host) = Browser::host(browser)
             {
-                unsafe {
-                    let raw_ptr: *mut cef::sys::_cef_browser_host_t =
-                        *std::mem::transmute::<&BrowserHost, &*mut cef::sys::_cef_browser_host_t>(
-                            &host,
-                        );
-
-                    // Build cef_string_utf16_t manually
-                    let mut cef_str: cef::sys::_cef_string_utf16_t = std::mem::zeroed();
-                    let ret = cef::sys::cef_string_utf8_to_utf16(
-                        text.as_ptr().cast(),
-                        text.len(),
-                        &mut cef_str,
-                    );
-                    log(&format!(
-                        "DIAG raw: utf8_to_utf16 ret={}, str_ptr={:?}, len={}",
-                        ret,
-                        cef_str.str_,
-                        cef_str.length,
-                    ));
-
-                    if ret != 0 && !cef_str.str_.is_null() {
-                        // Log actual UTF-16 code units
-                        let utf16_slice =
-                            std::slice::from_raw_parts(cef_str.str_, cef_str.length);
-                        let code_units: Vec<String> =
-                            utf16_slice.iter().map(|u| format!("{:#06x}", u)).collect();
-                        log(&format!("DIAG raw: utf16 code units: [{}]", code_units.join(", ")));
-
-                        // Call the raw C function pointer directly
-                        if let Some(f) = (*raw_ptr).ime_commit_text {
-                            log("DIAG raw: calling ime_commit_text via raw fn ptr");
-                            f(
-                                raw_ptr,
-                                &cef_str as *const cef::sys::_cef_string_utf16_t,
-                                std::ptr::null(),  // replacement_range = NULL
-                                0,                 // relative_cursor_pos = 0
-                            );
-                            log("DIAG raw: ime_commit_text returned");
-                        } else {
-                            log("DIAG raw: ime_commit_text fn ptr is NULL!");
-                        }
-
-                        // Clean up
-                        cef::sys::cef_string_utf16_clear(&mut cef_str);
-                    } else {
-                        log("DIAG raw: cef_string_utf8_to_utf16 FAILED");
-                    }
-                }
-                log(format!("ime commit text done: text={}", text).as_str());
+                let cef_text = CefString::from(text);
+                BrowserHost::ime_commit_text(&host, Some(&cef_text), None, 0);
+                log(format!("ime commit text: text={}", text).as_str());
             }
             Response::Ok
         } else {
