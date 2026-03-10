@@ -80,12 +80,6 @@ public class SampleScript : MonoBehaviour
     private int _currentWidth;
     private float _diagTimer;
     private bool _imeActive;
-    private bool _imeCommitPending;
-    private Vector4 _imeDebugCefCaret;
-
-    private Vector2 _imeDebugMarkerPos;
-    private string _imeDebugScaleInfo = "";
-    private string _imeDebugText = "";
     private bool _imeSuppressKeys;
 
 
@@ -93,7 +87,6 @@ public class SampleScript : MonoBehaviour
     private float _lastClickTime;
     private int _lastClickX = -1;
     private int _lastClickY = -1;
-    private string _lastComposition = "";
     private int _lastMouseX = -1;
     private int _lastMouseY = -1;
     private Texture2D _texture;
@@ -160,21 +153,6 @@ public class SampleScript : MonoBehaviour
         Debug.Log("[CefUnity] Shutdown");
     }
 
-    private void OnGUI()
-    {
-        // compositionCursorPos の位置に赤い十字マーカー (OnGUI は Y=0 上端 = compositionCursorPos と同じ座標系)
-        var pos = _imeDebugMarkerPos;
-        var old = GUI.color;
-        GUI.color = Color.red;
-        GUI.Box(new Rect(pos.x - 15, pos.y, 30, 2), GUIContent.none); // 横線
-        GUI.Box(new Rect(pos.x, pos.y - 15, 2, 30), GUIContent.none); // 縦線
-        GUI.color = old;
-
-        var style = new GUIStyle(GUI.skin.label) { fontSize = 14, normal = { textColor = Color.yellow } };
-        var text = $"cursorPos: ({Input.compositionCursorPos.x:F0},{Input.compositionCursorPos.y:F0})  marker: ({pos.x:F0},{pos.y:F0})  {_imeDebugScaleInfo}";
-        GUI.Label(new Rect(10, Screen.height - 30, Screen.width, 30), text, style);
-    }
-
     // -----------------------------------------------------------------------
     // IME
     // -----------------------------------------------------------------------
@@ -190,9 +168,6 @@ public class SampleScript : MonoBehaviour
         var comp = Input.compositionString;
         var input = Input.inputString;
 
-        // デバッグ: 変化があるときだけログ出力
-        if (!string.IsNullOrEmpty(comp) || !string.IsNullOrEmpty(input) || _imeActive) Debug.Log($"[IME] comp=\"{comp}\" input=\"{EscapeForLog(input)}\" imeActive={_imeActive} commitPending={_imeCommitPending}");
-
         if (!string.IsNullOrEmpty(comp))
         {
             // IME が暗黙的に確定して新しい composition を開始した場合を検出
@@ -207,7 +182,6 @@ public class SampleScript : MonoBehaviour
                 if (commitSb.Length > 0)
                 {
                     var commitText = commitSb.ToString();
-                    Debug.Log($"[IME] → implicit commit: ImeCommitText(\"{commitText}\") before new composition");
                     _browser.ImeCommitText(commitText);
                 }
             }
@@ -215,7 +189,7 @@ public class SampleScript : MonoBehaviour
             // composition 開始/変更
             _browser.ImeSetComposition(comp, (uint)comp.Length, (uint)comp.Length);
             _imeActive = true;
-            _lastComposition = comp;
+
             _imeSuppressKeys = true;
         }
         else if (_imeActive)
@@ -237,17 +211,14 @@ public class SampleScript : MonoBehaviour
                     if (!char.IsControl(c))
                         sb.Append(c);
                 var text = sb.ToString();
-                Debug.Log($"[IME] → ImeCommitText(\"{text}\")");
                 _browser.ImeCommitText(text);
             }
             else
             {
-                Debug.Log("[IME] → ImeCancelComposition()");
                 _browser.ImeCancelComposition();
             }
 
             _imeActive = false;
-            _lastComposition = "";
             _imeSuppressKeys = true; // 終了フレームもキー抑制
         }
         else
@@ -255,18 +226,6 @@ public class SampleScript : MonoBehaviour
             // 通常状態: 次フレームからキー送信を許可
             _imeSuppressKeys = false;
         }
-    }
-
-    private static string EscapeForLog(string s)
-    {
-        if (string.IsNullOrEmpty(s)) return "";
-        var sb = new StringBuilder();
-        foreach (var c in s)
-            if (char.IsControl(c))
-                sb.Append($"\\x{(int)c:X2}");
-            else
-                sb.Append(c);
-        return sb.ToString();
     }
 
     private void UpdateCompositionCursorPos()
@@ -414,7 +373,7 @@ public class SampleScript : MonoBehaviour
 
         // 1) 印字可能文字 — Input.inputString 経由 (RAWKEYDOWN + CHAR + KEYUP)
         //    IME 変換中・commit 直後は抑制（preedit/commit は別経路で CEF に送信される）
-        if (string.IsNullOrEmpty(Input.compositionString) && !_imeCommitPending)
+        if (string.IsNullOrEmpty(Input.compositionString))
             foreach (var c in Input.inputString)
             {
                 if (char.IsControl(c)) continue;
