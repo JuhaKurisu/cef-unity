@@ -75,6 +75,7 @@ public class SampleScript : MonoBehaviour
     private int _currentWidth;
     private float _diagTimer;
     private bool _imeActive;
+    private bool _imeCommitPending;
 
     // IME proxy
     private TMP_InputField _imeProxy;
@@ -86,7 +87,6 @@ public class SampleScript : MonoBehaviour
     private string _lastComposition = "";
     private int _lastMouseX = -1;
     private int _lastMouseY = -1;
-    private int _imeTestPending;
     private Texture2D _texture;
 
     private void Start()
@@ -98,6 +98,7 @@ public class SampleScript : MonoBehaviour
             CefRuntime.Init();
             _browser = new Browser(_currentWidth, _currentHeight, _url);
             Debug.Log($"[CefUnity] Initialized ({_currentWidth}x{_currentHeight})");
+            SetupImeProxy();
         }
         catch (Exception e)
         {
@@ -122,58 +123,21 @@ public class SampleScript : MonoBehaviour
                 Debug.Log($"[CefServer] {line}");
         }
 
-        // IME テスト
-        // O: ImeCommitText 単独 (現状動かない)
-        // P: ImeSetComposition → 次フレームで ImeFinishComposingText
-        // L: ImeSetComposition → 次フレームで ImeCommitText
-        var imeTest = false;
-        if (Input.GetKeyDown(KeyCode.O))
-        {
-            imeTest = true;
-            _browser.ImeCommitText("貴方");
-            Debug.Log("[CefUnity] test O: ImeCommitText standalone");
-        }
-
-        if (Input.GetKeyDown(KeyCode.P))
-        {
-            imeTest = true;
-            _browser.ImeSetComposition("貴方", 2, 2);
-            _imeTestPending = 1; // 次フレームで FinishComposingText
-            Debug.Log("[CefUnity] test P: ImeSetComposition → next frame FinishComposingText");
-        }
-
-        if (Input.GetKeyDown(KeyCode.L))
-        {
-            imeTest = true;
-            _browser.ImeSetComposition("貴方", 2, 2);
-            _imeTestPending = 2; // 次フレームで ImeCommitText
-            Debug.Log("[CefUnity] test L: ImeSetComposition → next frame ImeCommitText");
-        }
-
-        if (_imeTestPending > 0 && !Input.GetKeyDown(KeyCode.P) && !Input.GetKeyDown(KeyCode.L))
-        {
-            imeTest = true;
-            if (_imeTestPending == 1)
-            {
-                _browser.ImeFinishComposingText();
-                Debug.Log("[CefUnity] → ImeFinishComposingText");
-            }
-            else
-            {
-                _browser.ImeCommitText("貴方");
-                Debug.Log("[CefUnity] → ImeCommitText (after composition)");
-            }
-            _imeTestPending = 0;
-        }
-
         CheckScreenResize();
         UpdateTexture();
         HandleMouseInput();
-        if (!imeTest) HandleKeyboardInput();
+        HandleImeInput();
+        HandleKeyboardInput();
     }
 
     private void OnDestroy()
     {
+        if (_imeProxy != null)
+        {
+            Destroy(_imeProxy.gameObject);
+            _imeProxy = null;
+        }
+
         _browser?.Dispose();
         _browser = null;
 
@@ -185,6 +149,105 @@ public class SampleScript : MonoBehaviour
 
         CefRuntime.Shutdown();
         Debug.Log("[CefUnity] Shutdown");
+    }
+
+    // -----------------------------------------------------------------------
+    // IME
+    // -----------------------------------------------------------------------
+    private void SetupImeProxy()
+    {
+        var canvas = _rawImage.canvas;
+
+        var go = new GameObject("ImeProxy");
+        go.transform.SetParent(canvas.transform, false);
+
+        var rt = go.AddComponent<RectTransform>();
+        rt.anchorMin = Vector2.zero;
+        rt.anchorMax = Vector2.zero;
+        rt.anchoredPosition = Vector2.zero;
+        rt.sizeDelta = new Vector2(1, 1);
+
+        var bg = go.AddComponent<Image>();
+        bg.color = Color.clear;
+        bg.raycastTarget = false;
+
+        var textGo = new GameObject("Text");
+        textGo.transform.SetParent(go.transform, false);
+
+        var textRt = textGo.AddComponent<RectTransform>();
+        textRt.anchorMin = Vector2.zero;
+        textRt.anchorMax = Vector2.one;
+        textRt.offsetMin = Vector2.zero;
+        textRt.offsetMax = Vector2.zero;
+
+        var tmp = textGo.AddComponent<TextMeshProUGUI>();
+        tmp.fontSize = 1;
+        tmp.color = Color.clear;
+        tmp.raycastTarget = false;
+
+        _imeProxy = go.AddComponent<TMP_InputField>();
+        _imeProxy.textComponent = tmp;
+        _imeProxy.ActivateInputField();
+
+        Input.imeCompositionMode = IMECompositionMode.On;
+        Input.compositionCursorPos = new Vector2(-1000, -1000);
+    }
+
+    private void HandleImeInput()
+    {
+        if (_browser == null) return;
+
+        // IME proxy のフォーカスを維持
+        if (_imeProxy != null && !_imeProxy.isFocused)
+            _imeProxy.ActivateInputField();
+
+        var comp = Input.compositionString;
+
+        if (!string.IsNullOrEmpty(comp))
+        {
+            // composition 開始/変更
+            _browser.ImeSetComposition(comp, (uint)comp.Length, (uint)comp.Length);
+            _imeActive = true;
+            _lastComposition = comp;
+        }
+        else if (_imeActive)
+        {
+            // composition 終了 (非空 → 空に変化)
+            var committed = false;
+            foreach (var c in Input.inputString)
+            {
+                if (!char.IsControl(c))
+                {
+                    committed = true;
+                    break;
+                }
+            }
+
+            if (committed)
+            {
+                // 制御文字を除いた確定テキストを取得
+                var sb = new System.Text.StringBuilder();
+                foreach (var c in Input.inputString)
+                {
+                    if (!char.IsControl(c))
+                        sb.Append(c);
+                }
+                _browser.ImeCommitText(sb.ToString());
+                _imeCommitPending = true;
+            }
+            else
+            {
+                _browser.ImeCancelComposition();
+            }
+
+            _imeActive = false;
+            _lastComposition = "";
+        }
+        else
+        {
+            // 通常状態
+            _imeCommitPending = false;
+        }
     }
 
     private uint GetCefModifiers()
@@ -222,6 +285,13 @@ public class SampleScript : MonoBehaviour
         HandleButton(bx, by, 0, MouseButton.Left, mods);
         HandleButton(bx, by, 1, MouseButton.Right, mods);
         HandleButton(bx, by, 2, MouseButton.Middle, mods);
+
+        // マウスクリック後に IME proxy のフォーカスを再取得
+        if (Input.GetMouseButtonDown(0) || Input.GetMouseButtonDown(1) || Input.GetMouseButtonDown(2))
+        {
+            if (_imeProxy != null)
+                _imeProxy.ActivateInputField();
+        }
 
         var scroll = Input.mouseScrollDelta;
         if (scroll.y != 0f || scroll.x != 0f)
@@ -300,11 +370,13 @@ public class SampleScript : MonoBehaviour
         var alt = (mods & (uint)CefEventFlags.AltDown) != 0;
 
         // 1) 印字可能文字 — Input.inputString 経由 (RAWKEYDOWN + CHAR + KEYUP)
-        //    IME 変換中は抑制（preedit/commit は別経路で CEF に送信される）
-        if (string.IsNullOrEmpty(Input.compositionString))
+        //    IME 変換中・commit 直後は抑制（preedit/commit は別経路で CEF に送信される）
+        if (string.IsNullOrEmpty(Input.compositionString) && !_imeCommitPending)
             foreach (var c in Input.inputString)
             {
                 if (char.IsControl(c)) continue;
+                // 英数/かなキーが生成する偽スペースをフィルタ
+                if (c == ' ' && !Input.GetKey(KeyCode.Space)) continue;
                 _browser.SendCharEvent(c, mods);
             }
 
