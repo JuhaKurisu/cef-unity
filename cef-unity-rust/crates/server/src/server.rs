@@ -140,26 +140,6 @@ wrap_render_handler! {
             self.shm.write_frame(src, width as u32, height as u32);
         }
 
-        fn on_virtual_keyboard_requested(
-            &self,
-            _browser: Option<&mut Browser>,
-            input_mode: TextInputMode,
-        ) {
-            log(&format!("on_virtual_keyboard_requested: mode={:?}", input_mode));
-        }
-
-        fn on_ime_composition_range_changed(
-            &self,
-            _browser: Option<&mut Browser>,
-            selected_range: Option<&Range>,
-            character_bounds: Option<&[Rect]>,
-        ) {
-            log(&format!(
-                "on_ime_composition_range_changed: range={:?}, bounds_count={}",
-                selected_range,
-                character_bounds.map_or(0, |b| b.len())
-            ));
-        }
     }
 }
 

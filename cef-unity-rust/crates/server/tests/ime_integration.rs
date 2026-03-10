@@ -19,12 +19,18 @@ use ipc_channel::ipc::{self, IpcOneShotServer};
 use cef_unity_ipc::{Bootstrap, Command, CommandEnvelope, Response};
 
 // ---------------------------------------------------------------------------
+// CEF サーバーは同時に 1 つしか起動できないため、テストを直列化する。
+// ---------------------------------------------------------------------------
+
+static TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+// ---------------------------------------------------------------------------
 // ローカル HTTP サーバー
 // ---------------------------------------------------------------------------
 
 /// テスト用の最小 HTTP サーバー。
 /// GET / → input フィールドを持つ HTML
-/// GET /value → JS から POST された input の値を返す
+/// POST /value → JS から POST された input の値を保持
 struct TestHttpServer {
     port: u16,
     value: Arc<Mutex<Option<String>>>,
@@ -63,16 +69,6 @@ impl TestHttpServer {
                     let html = r#"<!DOCTYPE html>
 <html><body>
 <input id="t" type="text" style="font-size:24px;width:400px;">
-<div id="log"></div>
-<script>
-var t = document.getElementById('t');
-var log = document.getElementById('log');
-['compositionstart','compositionupdate','compositionend','input','keydown','keypress','keyup'].forEach(function(ev){
-  t.addEventListener(ev, function(e){
-    log.textContent += ev + ':' + (e.data||e.key||'') + ' ';
-  });
-});
-</script>
 </body></html>"#;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
@@ -203,16 +199,14 @@ impl TestCefServer {
         browser_id
     }
 
-    /// JS で input の値と event log を HTTP サーバーへ POST する。
+    /// JS で input の値を HTTP サーバーへ POST する。
     fn post_input_value(&self, browser_id: u32, http_port: u16) {
         let js = format!(
             r#"(function(){{
                 var v = document.getElementById('t').value;
-                var logEl = document.getElementById('log');
-                var eventLog = logEl ? logEl.textContent : '';
                 var xhr = new XMLHttpRequest();
                 xhr.open('POST', 'http://127.0.0.1:{}/value', false);
-                xhr.send(v + '|EVENTS|' + eventLog);
+                xhr.send(v);
             }})()"#,
             http_port
         );
@@ -257,10 +251,11 @@ fn find_server_app() -> Option<PathBuf> {
 // テストケース
 // ---------------------------------------------------------------------------
 
-/// まず通常のキー入力が動くか確認（フォーカスの切り分け）。
+/// 通常のキー入力が動くか確認（フォーカスの切り分け）。
 #[test]
 #[ignore]
 fn key_event_sanity_check() {
+    let _lock = TEST_MUTEX.lock().unwrap();
     let http = TestHttpServer::start();
     let cef = TestCefServer::start();
     let bid = cef.setup_browser(&http.url());
@@ -287,12 +282,7 @@ fn key_event_sanity_check() {
     thread::sleep(Duration::from_millis(500));
 
     cef.post_input_value(bid, http.port);
-    let raw = http.take_value().unwrap_or_default();
-    let parts: Vec<&str> = raw.splitn(2, "|EVENTS|").collect();
-    let value = parts[0];
-    let events = if parts.len() > 1 { parts[1] } else { "" };
-    eprintln!("=== KEY INPUT VALUE: {:?} ===", value);
-    eprintln!("=== KEY EVENTS: {:?} ===", events);
+    let value = http.take_value().unwrap_or_default();
     assert_eq!(value, "a", "regular key input should work");
 
     cef.shutdown();
@@ -301,6 +291,7 @@ fn key_event_sanity_check() {
 #[test]
 #[ignore]
 fn ime_set_composition_then_commit() {
+    let _lock = TEST_MUTEX.lock().unwrap();
     let http = TestHttpServer::start();
     let cef = TestCefServer::start();
     let bid = cef.setup_browser(&http.url());
@@ -309,7 +300,6 @@ fn ime_set_composition_then_commit() {
         browser_id: bid, text: "漢字".to_string(),
         selection_start: 0, selection_end: 2,
     });
-    // CEF がコンポジションを処理するのを待つ
     thread::sleep(Duration::from_secs(1));
 
     cef.send(Command::ImeCommitText {
@@ -318,8 +308,7 @@ fn ime_set_composition_then_commit() {
     thread::sleep(Duration::from_secs(1));
 
     cef.post_input_value(bid, http.port);
-    let raw = http.take_value().unwrap_or_default();
-    let value = raw.split("|EVENTS|").next().unwrap_or("");
+    let value = http.take_value().unwrap_or_default();
     assert_eq!(value, "漢字", "SetComposition → CommitText");
 
     cef.shutdown();
@@ -328,6 +317,7 @@ fn ime_set_composition_then_commit() {
 #[test]
 #[ignore]
 fn ime_set_composition_then_finish() {
+    let _lock = TEST_MUTEX.lock().unwrap();
     let http = TestHttpServer::start();
     let cef = TestCefServer::start();
     let bid = cef.setup_browser(&http.url());
@@ -344,8 +334,7 @@ fn ime_set_composition_then_finish() {
     thread::sleep(Duration::from_millis(500));
 
     cef.post_input_value(bid, http.port);
-    let raw = http.take_value().unwrap_or_default();
-    let value = raw.split("|EVENTS|").next().unwrap_or("");
+    let value = http.take_value().unwrap_or_default();
     assert_eq!(value, "テスト", "SetComposition → FinishComposingText");
 
     cef.shutdown();
@@ -354,6 +343,7 @@ fn ime_set_composition_then_finish() {
 #[test]
 #[ignore]
 fn ime_set_composition_then_cancel() {
+    let _lock = TEST_MUTEX.lock().unwrap();
     let http = TestHttpServer::start();
     let cef = TestCefServer::start();
     let bid = cef.setup_browser(&http.url());
@@ -368,8 +358,7 @@ fn ime_set_composition_then_cancel() {
     thread::sleep(Duration::from_millis(500));
 
     cef.post_input_value(bid, http.port);
-    let raw = http.take_value().unwrap_or_default();
-    let value = raw.split("|EVENTS|").next().unwrap_or("");
+    let value = http.take_value().unwrap_or_default();
     assert_eq!(value, "", "cancel should leave input empty");
 
     cef.shutdown();
@@ -378,6 +367,7 @@ fn ime_set_composition_then_cancel() {
 #[test]
 #[ignore]
 fn ime_commit_text_standalone() {
+    let _lock = TEST_MUTEX.lock().unwrap();
     let http = TestHttpServer::start();
     let cef = TestCefServer::start();
     let bid = cef.setup_browser(&http.url());
@@ -388,12 +378,7 @@ fn ime_commit_text_standalone() {
     thread::sleep(Duration::from_millis(500));
 
     cef.post_input_value(bid, http.port);
-    let raw = http.take_value().unwrap_or_default();
-    let parts: Vec<&str> = raw.splitn(2, "|EVENTS|").collect();
-    let value = parts[0];
-    let events = if parts.len() > 1 { parts[1] } else { "" };
-    eprintln!("=== INPUT VALUE: {:?} ===", value);
-    eprintln!("=== EVENTS: {:?} ===", events);
+    let value = http.take_value().unwrap_or_default();
     assert_eq!(value, "直接入力", "standalone CommitText");
 
     cef.shutdown();
@@ -402,6 +387,7 @@ fn ime_commit_text_standalone() {
 #[test]
 #[ignore]
 fn ime_sequential_inputs() {
+    let _lock = TEST_MUTEX.lock().unwrap();
     let http = TestHttpServer::start();
     let cef = TestCefServer::start();
     let bid = cef.setup_browser(&http.url());
@@ -429,8 +415,7 @@ fn ime_sequential_inputs() {
     thread::sleep(Duration::from_millis(500));
 
     cef.post_input_value(bid, http.port);
-    let raw = http.take_value().unwrap_or_default();
-    let value = raw.split("|EVENTS|").next().unwrap_or("");
+    let value = http.take_value().unwrap_or_default();
     assert_eq!(value, "東京", "sequential inputs should concatenate");
 
     cef.shutdown();
