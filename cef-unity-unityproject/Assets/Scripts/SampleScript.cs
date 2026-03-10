@@ -245,6 +245,13 @@ public class SampleScript : MonoBehaviour
         var worldPoint = rt.TransformPoint(localPoint);
         var screenPos = RectTransformUtility.WorldToScreenPoint(cam, worldPoint);
 
+#if UNITY_EDITOR
+        // Editor の Game View Scale 補正: Scale 2x では表示が2倍ズームされるため
+        // compositionCursorPos もスケール倍する必要がある
+        var scale = GetEditorGameViewScale();
+        screenPos *= scale;
+#endif
+
         Input.compositionCursorPos = screenPos;
     }
 
@@ -495,4 +502,43 @@ public class SampleScript : MonoBehaviour
 
         _texture.Apply(false);
     }
+
+#if UNITY_EDITOR
+    private static System.Reflection.FieldInfo _zoomAreaField;
+    private static System.Reflection.FieldInfo _scaleField;
+    private static System.Type _gameViewType;
+    private static bool _reflectionInitialized;
+
+    private static float GetEditorGameViewScale()
+    {
+        if (!_reflectionInitialized)
+        {
+            _reflectionInitialized = true;
+            var assembly = typeof(UnityEditor.Editor).Assembly;
+            _gameViewType = assembly.GetType("UnityEditor.GameView");
+            if (_gameViewType != null)
+            {
+                _zoomAreaField = _gameViewType.GetField("m_ZoomArea",
+                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                if (_zoomAreaField != null)
+                {
+                    _scaleField = _zoomAreaField.FieldType.GetField("m_Scale",
+                        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                }
+            }
+        }
+
+        if (_gameViewType == null || _zoomAreaField == null || _scaleField == null)
+            return 1f;
+
+        var windows = Resources.FindObjectsOfTypeAll(_gameViewType);
+        if (windows.Length == 0) return 1f;
+
+        var zoomArea = _zoomAreaField.GetValue(windows[0]);
+        if (zoomArea == null) return 1f;
+
+        var scale = (Vector2)_scaleField.GetValue(zoomArea);
+        return scale.y;
+    }
+#endif
 }
