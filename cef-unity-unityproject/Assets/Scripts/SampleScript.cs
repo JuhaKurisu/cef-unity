@@ -128,15 +128,12 @@ public class SampleScript : MonoBehaviour
         CheckScreenResize();
         UpdateTexture();
         HandleMouseInput();
+        if (_imeActive)
+            UpdateCompositionCursorPos();
         HandleImeInput();
         HandleKeyboardInput();
     }
 
-    private void LateUpdate()
-    {
-        if (_imeActive)
-            UpdateCompositionCursorPos();
-    }
 
     private void OnDestroy()
     {
@@ -189,7 +186,6 @@ public class SampleScript : MonoBehaviour
             // composition 開始/変更
             _browser.ImeSetComposition(comp, (uint)comp.Length, (uint)comp.Length);
             _imeActive = true;
-
             _imeSuppressKeys = true;
         }
         else if (_imeActive)
@@ -237,7 +233,6 @@ public class SampleScript : MonoBehaviour
         var rt = _rawImage.rectTransform;
         var rect = rt.rect;
 
-        // CEF座標 → RawImage ローカル座標
         var nx = (float)cx / _currentWidth;
         var ny = (float)(cy + ch) / _currentHeight;
 
@@ -248,9 +243,6 @@ public class SampleScript : MonoBehaviour
         var canvas = _rawImage.canvas;
         var cam = canvas.renderMode == RenderMode.ScreenSpaceOverlay ? null : canvas.worldCamera;
         var worldPoint = rt.TransformPoint(localPoint);
-
-        // WorldToScreenPoint は Input.mousePosition と同じ座標系 (Y=0 が下端)
-        // compositionCursorPos も同じ座標系 → Y反転不要
         var screenPos = RectTransformUtility.WorldToScreenPoint(cam, worldPoint);
 
         Input.compositionCursorPos = screenPos;
