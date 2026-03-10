@@ -140,6 +140,19 @@ wrap_render_handler! {
             self.shm.write_frame(src, width as u32, height as u32);
         }
 
+        fn on_ime_composition_range_changed(
+            &self,
+            _browser: Option<&mut Browser>,
+            _selected_range: Option<&Range>,
+            character_bounds: Option<&[Rect]>,
+        ) {
+            if let Some(bounds) = character_bounds {
+                if let Some(first) = bounds.first() {
+                    self.shm.write_ime_caret(first.x, first.y, first.width, first.height);
+                }
+            }
+        }
+
     }
 }
 

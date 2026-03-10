@@ -657,6 +657,28 @@ pub extern "C" fn cef_unity_get_buffer(
     }
 }
 
+/// Read the IME caret rect from shared memory.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_get_ime_caret(
+    handle: *mut CefUnityBrowser,
+    out_x: *mut i32,
+    out_y: *mut i32,
+    out_w: *mut i32,
+    out_h: *mut i32,
+) {
+    if handle.is_null() {
+        return;
+    }
+    let instance = handle_to_ref(handle);
+    let (x, y, w, h) = instance.shm.read_ime_caret();
+    unsafe {
+        *out_x = x;
+        *out_y = y;
+        *out_w = w;
+        *out_h = h;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Blocking variants — wait for server response, return 0=ok / -1=error.
 // ---------------------------------------------------------------------------

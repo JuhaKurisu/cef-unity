@@ -376,6 +376,14 @@ public sealed class Browser : IDisposable
             }
         }
 
+        public unsafe void GetImeCaret(out int x, out int y, out int w, out int h)
+        {
+            ThrowIfDisposed();
+            int ox, oy, ow, oh;
+            NativeMethods.cef_unity_get_ime_caret(_handle, &ox, &oy, &ow, &oh);
+            x = ox; y = oy; w = ow; h = oh;
+        }
+
         // ----- Blocking variants -----
 
     public int LoadUrlBlocking(string url)

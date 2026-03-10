@@ -125,6 +125,12 @@ namespace CefUnity
         public static extern int cef_unity_get_buffer(CefUnityBrowser* handle, byte** out_buffer, int* out_width, int* out_height);
 
         /// <summary>
+        ///  Read the IME caret rect from shared memory.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_get_ime_caret", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_get_ime_caret(CefUnityBrowser* handle, int* out_x, int* out_y, int* out_w, int* out_h);
+
+        /// <summary>
         ///  Destroy a browser instance (blocking).
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_destroy_browser_blocking", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]

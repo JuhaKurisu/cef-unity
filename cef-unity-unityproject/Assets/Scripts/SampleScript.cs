@@ -209,7 +209,6 @@ public class SampleScript : MonoBehaviour
         _imeProxy.ActivateInputField();
 
         Input.imeCompositionMode = IMECompositionMode.On;
-        Input.compositionCursorPos = new Vector2(-1000, -1000);
     }
 
     private void HandleImeInput()
@@ -255,6 +254,9 @@ public class SampleScript : MonoBehaviour
             _imeActive = true;
             _lastComposition = comp;
             _imeSuppressKeys = true;
+
+            // CEF から通知されたキャレット位置を IME 候補ウィンドウ位置に反映
+            UpdateCompositionCursorPos();
         }
         else if (_imeActive)
         {
@@ -314,6 +316,39 @@ public class SampleScript : MonoBehaviour
                 sb.Append(c);
         }
         return sb.ToString();
+    }
+
+    private void UpdateCompositionCursorPos()
+    {
+        if (_browser == null || _rawImage == null) return;
+
+        _browser.GetImeCaret(out var cx, out var cy, out _, out var ch);
+
+        // CEF ブラウザ座標 → RawImage 上のスクリーン座標に変換
+        var rt = _rawImage.rectTransform;
+        var rect = rt.rect;
+        // ブラウザ座標を 0..1 正規化
+        var nx = (float)cx / _currentWidth;
+        var ny = (float)cy / _currentHeight;
+        // uvRect (0,1,1,-1) で Y 反転しているので補正
+        ny = 1f - ny;
+
+        // RawImage ローカル座標
+        var localX = rect.x + nx * rect.width;
+        var localY = rect.y + ny * rect.height;
+        var localPoint = new Vector3(localX, localY, 0);
+
+        // ローカル → スクリーン座標
+        var canvas = _rawImage.canvas;
+        var cam = canvas.renderMode == RenderMode.ScreenSpaceOverlay ? null : canvas.worldCamera;
+        var worldPoint = rt.TransformPoint(localPoint);
+        var screenPoint = cam != null
+            ? cam.WorldToScreenPoint(worldPoint)
+            : worldPoint;
+
+        // キャレットの下端に候補ウィンドウを表示
+        var caretScreenH = ch * (rect.height / _currentHeight);
+        Input.compositionCursorPos = new Vector2(screenPoint.x, Screen.height - screenPoint.y + caretScreenH);
     }
 
     private uint GetCefModifiers()

@@ -141,8 +141,15 @@ pub struct ShmHeader {
     pub height: AtomicU32,
     /// 0 or 1 — which buffer is currently readable
     pub active_buffer: AtomicU32,
-    pub _pad: [u8; 44],
+    /// IME caret rect (set by on_ime_composition_range_changed)
+    pub ime_caret_x: AtomicI32,
+    pub ime_caret_y: AtomicI32,
+    pub ime_caret_w: AtomicI32,
+    pub ime_caret_h: AtomicI32,
+    pub _pad: [u8; 28],
 }
+
+use std::sync::atomic::AtomicI32;
 
 const _: () = assert!(std::mem::size_of::<ShmHeader>() == SHM_HEADER_SIZE);
 
@@ -193,6 +200,15 @@ impl ShmWriter {
         unsafe { &*(self.shmem.as_ptr() as *const ShmHeader) }
     }
 
+    /// Write IME caret position into the shared memory header.
+    pub fn write_ime_caret(&self, x: i32, y: i32, w: i32, h: i32) {
+        let header = self.header();
+        header.ime_caret_x.store(x, Ordering::Release);
+        header.ime_caret_y.store(y, Ordering::Release);
+        header.ime_caret_w.store(w, Ordering::Release);
+        header.ime_caret_h.store(h, Ordering::Release);
+    }
+
     /// Write a frame. The buffer must be width*height*4 BGRA bytes.
     pub fn write_frame(&self, pixels: &[u8], width: u32, height: u32) {
         let size = (width * height * 4) as usize;
@@ -236,6 +252,17 @@ impl ShmReader {
             shmem,
             last_frame_id: 0,
         })
+    }
+
+    /// Read IME caret rect from the shared memory header.
+    pub fn read_ime_caret(&self) -> (i32, i32, i32, i32) {
+        let header = unsafe { &*(self.shmem.as_ptr() as *const ShmHeader) };
+        (
+            header.ime_caret_x.load(Ordering::Acquire),
+            header.ime_caret_y.load(Ordering::Acquire),
+            header.ime_caret_w.load(Ordering::Acquire),
+            header.ime_caret_h.load(Ordering::Acquire),
+        )
     }
 
     /// Zero-copy variant: returns a raw pointer into the shared memory active buffer
