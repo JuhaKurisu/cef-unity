@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using CefUnity;
 using CefUnity.Interop;
-using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
 
@@ -81,8 +80,6 @@ public class SampleScript : MonoBehaviour
     private bool _imeCommitPending;
     private bool _imeSuppressKeys;
 
-    // IME proxy
-    private TMP_InputField _imeProxy;
 
     // Double/triple click detection
     private float _lastClickTime;
@@ -137,14 +134,14 @@ public class SampleScript : MonoBehaviour
         HandleKeyboardInput();
     }
 
+    private void LateUpdate()
+    {
+        if (_imeActive)
+            UpdateCompositionCursorPos();
+    }
+
     private void OnDestroy()
     {
-        if (_imeProxy != null)
-        {
-            Destroy(_imeProxy.gameObject);
-            _imeProxy = null;
-        }
-
         _browser?.Dispose();
         _browser = null;
 
@@ -163,62 +160,12 @@ public class SampleScript : MonoBehaviour
     // -----------------------------------------------------------------------
     private void SetupImeProxy()
     {
-        var canvas = _rawImage.canvas;
-
-        var go = new GameObject("ImeProxy");
-        go.transform.SetParent(canvas.transform, false);
-
-        var rt = go.AddComponent<RectTransform>();
-        rt.anchorMin = Vector2.zero;
-        rt.anchorMax = Vector2.zero;
-        rt.anchoredPosition = Vector2.zero;
-        rt.sizeDelta = new Vector2(1, 1);
-
-        var bg = go.AddComponent<Image>();
-        bg.color = Color.clear;
-        bg.raycastTarget = false;
-
-        // Text Area (TMP_InputField がクリッピング領域として使う)
-        var textAreaGo = new GameObject("TextArea");
-        textAreaGo.transform.SetParent(go.transform, false);
-        var textAreaRt = textAreaGo.AddComponent<RectTransform>();
-        textAreaRt.anchorMin = Vector2.zero;
-        textAreaRt.anchorMax = Vector2.one;
-        textAreaRt.offsetMin = new Vector2(5, 0);
-        textAreaRt.offsetMax = new Vector2(-5, 0);
-        var textAreaMask = textAreaGo.AddComponent<RectMask2D>();
-
-        // Text
-        var textGo = new GameObject("Text");
-        textGo.transform.SetParent(textAreaGo.transform, false);
-
-        var textRt = textGo.AddComponent<RectTransform>();
-        textRt.anchorMin = Vector2.zero;
-        textRt.anchorMax = Vector2.one;
-        textRt.offsetMin = Vector2.zero;
-        textRt.offsetMax = Vector2.zero;
-
-        var tmp = textGo.AddComponent<TextMeshProUGUI>();
-        tmp.fontSize = 1;
-        tmp.color = Color.clear;
-        tmp.raycastTarget = false;
-
-        _imeProxy = go.AddComponent<TMP_InputField>();
-        _imeProxy.textViewport = textAreaRt;
-        _imeProxy.textComponent = tmp;
-        _imeProxy.onFocusSelectAll = false;
-        _imeProxy.ActivateInputField();
-
         Input.imeCompositionMode = IMECompositionMode.On;
     }
 
     private void HandleImeInput()
     {
         if (_browser == null) return;
-
-        // IME proxy のフォーカスを維持
-        if (_imeProxy != null && !_imeProxy.isFocused)
-            _imeProxy.ActivateInputField();
 
         var comp = Input.compositionString;
         var input = Input.inputString;
@@ -255,9 +202,6 @@ public class SampleScript : MonoBehaviour
             _imeActive = true;
             _lastComposition = comp;
             _imeSuppressKeys = true;
-
-            // CEF から通知されたキャレット位置を IME 候補ウィンドウ位置に反映
-            UpdateCompositionCursorPos();
         }
         else if (_imeActive)
         {
@@ -294,9 +238,6 @@ public class SampleScript : MonoBehaviour
             _imeActive = false;
             _lastComposition = "";
             _imeSuppressKeys = true; // 終了フレームもキー抑制
-
-            if (_imeProxy != null)
-                _imeProxy.text = "";
         }
         else
         {
@@ -401,13 +342,6 @@ public class SampleScript : MonoBehaviour
         HandleButton(bx, by, 0, MouseButton.Left, mods);
         HandleButton(bx, by, 1, MouseButton.Right, mods);
         HandleButton(bx, by, 2, MouseButton.Middle, mods);
-
-        // マウスクリック後に IME proxy のフォーカスを再取得
-        if (Input.GetMouseButtonDown(0) || Input.GetMouseButtonDown(1) || Input.GetMouseButtonDown(2))
-        {
-            if (_imeProxy != null)
-                _imeProxy.ActivateInputField();
-        }
 
         var scroll = Input.mouseScrollDelta;
         if (scroll.y != 0f || scroll.x != 0f)
