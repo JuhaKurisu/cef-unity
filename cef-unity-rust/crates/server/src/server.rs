@@ -744,6 +744,15 @@ impl CefServer {
                 && let Some(host) = Browser::host(browser)
             {
                 let cef_text = CefString::from(text);
+                let char_len = text.chars().count() as u32;
+                let underline = CompositionUnderline {
+                    size: std::mem::size_of::<CompositionUnderline>(),
+                    range: Range { from: 0, to: char_len },
+                    color: 0xFF000000,      // 黒の下線
+                    background_color: 0,    // 背景なし (透明)
+                    thick: 0,               // 細い下線
+                    style: CompositionUnderlineStyle::SOLID,
+                };
                 let selection_range = Range {
                     from: selection_start,
                     to: selection_end,
@@ -752,7 +761,7 @@ impl CefServer {
                 BrowserHost::ime_set_composition(
                     &host,
                     Some(&cef_text),
-                    None,
+                    Some(&[underline]),
                     Some(&invalid_range),
                     Some(&selection_range),
                 );
