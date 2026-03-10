@@ -79,6 +79,7 @@ public class SampleScript : MonoBehaviour
     private float _diagTimer;
     private bool _imeActive;
     private bool _imeCommitPending;
+    private bool _imeSuppressKeys;
 
     // IME proxy
     private TMP_InputField _imeProxy;
@@ -246,7 +247,6 @@ public class SampleScript : MonoBehaviour
                     var commitText = commitSb.ToString();
                     Debug.Log($"[IME] → implicit commit: ImeCommitText(\"{commitText}\") before new composition");
                     _browser.ImeCommitText(commitText);
-                    _imeCommitPending = true;
                 }
             }
 
@@ -254,6 +254,7 @@ public class SampleScript : MonoBehaviour
             _browser.ImeSetComposition(comp, (uint)comp.Length, (uint)comp.Length);
             _imeActive = true;
             _lastComposition = comp;
+            _imeSuppressKeys = true;
         }
         else if (_imeActive)
         {
@@ -280,7 +281,6 @@ public class SampleScript : MonoBehaviour
                 var text = sb.ToString();
                 Debug.Log($"[IME] → ImeCommitText(\"{text}\")");
                 _browser.ImeCommitText(text);
-                _imeCommitPending = true;
             }
             else
             {
@@ -290,14 +290,15 @@ public class SampleScript : MonoBehaviour
 
             _imeActive = false;
             _lastComposition = "";
+            _imeSuppressKeys = true; // 終了フレームもキー抑制
 
             if (_imeProxy != null)
                 _imeProxy.text = "";
         }
         else
         {
-            // 通常状態
-            _imeCommitPending = false;
+            // 通常状態: 次フレームからキー送信を許可
+            _imeSuppressKeys = false;
         }
     }
 
@@ -428,6 +429,9 @@ public class SampleScript : MonoBehaviour
     private void HandleKeyboardInput()
     {
         if (_browser == null) return;
+
+        // IME composition 中・終了直後は全キー入力を抑制 (OS の IME が処理する)
+        if (_imeSuppressKeys) return;
 
         var mods = GetCefModifiers();
         var cmd = (mods & (uint)CefEventFlags.CommandDown) != 0;
