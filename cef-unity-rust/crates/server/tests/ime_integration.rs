@@ -318,7 +318,8 @@ fn ime_set_composition_then_commit() {
     thread::sleep(Duration::from_secs(1));
 
     cef.post_input_value(bid, http.port);
-    let value = http.take_value().unwrap_or_default();
+    let raw = http.take_value().unwrap_or_default();
+    let value = raw.split("|EVENTS|").next().unwrap_or("");
     assert_eq!(value, "漢字", "SetComposition → CommitText");
 
     cef.shutdown();
@@ -343,7 +344,8 @@ fn ime_set_composition_then_finish() {
     thread::sleep(Duration::from_millis(500));
 
     cef.post_input_value(bid, http.port);
-    let value = http.take_value().unwrap_or_default();
+    let raw = http.take_value().unwrap_or_default();
+    let value = raw.split("|EVENTS|").next().unwrap_or("");
     assert_eq!(value, "テスト", "SetComposition → FinishComposingText");
 
     cef.shutdown();
@@ -366,7 +368,8 @@ fn ime_set_composition_then_cancel() {
     thread::sleep(Duration::from_millis(500));
 
     cef.post_input_value(bid, http.port);
-    let value = http.take_value().unwrap_or_default();
+    let raw = http.take_value().unwrap_or_default();
+    let value = raw.split("|EVENTS|").next().unwrap_or("");
     assert_eq!(value, "", "cancel should leave input empty");
 
     cef.shutdown();
@@ -426,7 +429,8 @@ fn ime_sequential_inputs() {
     thread::sleep(Duration::from_millis(500));
 
     cef.post_input_value(bid, http.port);
-    let value = http.take_value().unwrap_or_default();
+    let raw = http.take_value().unwrap_or_default();
+    let value = raw.split("|EVENTS|").next().unwrap_or("");
     assert_eq!(value, "東京", "sequential inputs should concatenate");
 
     cef.shutdown();
