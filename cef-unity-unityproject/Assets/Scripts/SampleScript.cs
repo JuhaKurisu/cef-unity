@@ -92,6 +92,7 @@ public class SampleScript : MonoBehaviour
     private int _lastMouseX = -1;
     private int _lastMouseY = -1;
     private readonly Dictionary<KeyCode, float> _keyDownTime = new();
+    private string _imeDebugText = "";
     private readonly Dictionary<KeyCode, float> _keyLastRepeat = new();
     private Texture2D _texture;
 
@@ -322,33 +323,47 @@ public class SampleScript : MonoBehaviour
     {
         if (_browser == null || _rawImage == null) return;
 
-        _browser.GetImeCaret(out var cx, out var cy, out _, out var ch);
+        _browser.GetImeCaret(out var cx, out var cy, out var cw, out var ch);
 
-        // CEF ブラウザ座標 → RawImage 上のスクリーン座標に変換
         var rt = _rawImage.rectTransform;
         var rect = rt.rect;
-        // ブラウザ座標を 0..1 正規化
-        var nx = (float)cx / _currentWidth;
-        var ny = (float)cy / _currentHeight;
-        // uvRect (0,1,1,-1) で Y 反転しているので補正
-        ny = 1f - ny;
 
-        // RawImage ローカル座標
+        var nx = (float)cx / _currentWidth;
+        var ny = (float)(cy + ch) / _currentHeight;
+
         var localX = rect.x + nx * rect.width;
-        var localY = rect.y + ny * rect.height;
+        var localY = rect.y + (1f - ny) * rect.height;
         var localPoint = new Vector3(localX, localY, 0);
 
-        // ローカル → スクリーン座標
         var canvas = _rawImage.canvas;
         var cam = canvas.renderMode == RenderMode.ScreenSpaceOverlay ? null : canvas.worldCamera;
         var worldPoint = rt.TransformPoint(localPoint);
-        var screenPoint = cam != null
-            ? cam.WorldToScreenPoint(worldPoint)
-            : worldPoint;
+        var screenPos = RectTransformUtility.WorldToScreenPoint(cam, worldPoint);
 
-        // キャレットの下端に候補ウィンドウを表示
-        var caretScreenH = ch * (rect.height / _currentHeight);
-        Input.compositionCursorPos = new Vector2(screenPoint.x, Screen.height - screenPoint.y + caretScreenH);
+        screenPos.y = Screen.height - screenPos.y;
+        Input.compositionCursorPos = screenPos;
+
+        // デバッグマーカー位置更新 (compositionCursorPos の座標)
+        _imeDebugMarkerPos = screenPos;
+        _imeDebugCefCaret = new Vector4(cx, cy, cw, ch);
+    }
+
+    private Vector2 _imeDebugMarkerPos;
+    private Vector4 _imeDebugCefCaret;
+
+    private void OnGUI()
+    {
+        // compositionCursorPos の位置に赤い十字マーカー (OnGUI は Y=0 上端 = compositionCursorPos と同じ座標系)
+        var pos = _imeDebugMarkerPos;
+        var old = GUI.color;
+        GUI.color = Color.red;
+        GUI.Box(new UnityEngine.Rect(pos.x - 15, pos.y, 30, 2), GUIContent.none);  // 横線
+        GUI.Box(new UnityEngine.Rect(pos.x, pos.y - 15, 2, 30), GUIContent.none);  // 縦線
+        GUI.color = old;
+
+        var style = new GUIStyle(GUI.skin.label) { fontSize = 14, normal = { textColor = Color.yellow } };
+        var text = $"compositionCursorPos: ({pos.x:F0},{pos.y:F0})  CEF: ({_imeDebugCefCaret.x},{_imeDebugCefCaret.y},{_imeDebugCefCaret.z},{_imeDebugCefCaret.w})  Screen: {Screen.width}x{Screen.height}";
+        GUI.Label(new UnityEngine.Rect(10, Screen.height - 30, Screen.width, 30), text, style);
     }
 
     private uint GetCefModifiers()
