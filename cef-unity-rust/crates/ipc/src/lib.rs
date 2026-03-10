@@ -605,6 +605,266 @@ mod tests {
     }
 
     #[test]
+    fn ime_set_composition_roundtrip() {
+        let (tx, rx) = ipc::channel::<Command>().unwrap();
+        tx.send(Command::ImeSetComposition {
+            browser_id: 1,
+            text: "かな".to_string(),
+            selection_start: 0,
+            selection_end: 2,
+        })
+        .unwrap();
+        let cmd = rx.recv().unwrap();
+        match cmd {
+            Command::ImeSetComposition {
+                browser_id,
+                text,
+                selection_start,
+                selection_end,
+            } => {
+                assert_eq!(browser_id, 1);
+                assert_eq!(text, "かな");
+                assert_eq!(selection_start, 0);
+                assert_eq!(selection_end, 2);
+            }
+            _ => panic!("expected ImeSetComposition"),
+        }
+    }
+
+    #[test]
+    fn ime_commit_text_roundtrip() {
+        let (tx, rx) = ipc::channel::<Command>().unwrap();
+        tx.send(Command::ImeCommitText {
+            browser_id: 1,
+            text: "漢字".to_string(),
+        })
+        .unwrap();
+        let cmd = rx.recv().unwrap();
+        match cmd {
+            Command::ImeCommitText { browser_id, text } => {
+                assert_eq!(browser_id, 1);
+                assert_eq!(text, "漢字");
+            }
+            _ => panic!("expected ImeCommitText"),
+        }
+    }
+
+    #[test]
+    fn ime_finish_composing_text_roundtrip() {
+        let (tx, rx) = ipc::channel::<Command>().unwrap();
+
+        // keep_selection = false
+        tx.send(Command::ImeFinishComposingText {
+            browser_id: 1,
+            keep_selection: false,
+        })
+        .unwrap();
+        let cmd = rx.recv().unwrap();
+        match cmd {
+            Command::ImeFinishComposingText {
+                browser_id,
+                keep_selection,
+            } => {
+                assert_eq!(browser_id, 1);
+                assert!(!keep_selection);
+            }
+            _ => panic!("expected ImeFinishComposingText"),
+        }
+
+        // keep_selection = true
+        tx.send(Command::ImeFinishComposingText {
+            browser_id: 2,
+            keep_selection: true,
+        })
+        .unwrap();
+        let cmd = rx.recv().unwrap();
+        match cmd {
+            Command::ImeFinishComposingText {
+                browser_id,
+                keep_selection,
+            } => {
+                assert_eq!(browser_id, 2);
+                assert!(keep_selection);
+            }
+            _ => panic!("expected ImeFinishComposingText"),
+        }
+    }
+
+    #[test]
+    fn ime_cancel_composition_roundtrip() {
+        let (tx, rx) = ipc::channel::<Command>().unwrap();
+        tx.send(Command::ImeCancelComposition { browser_id: 1 }).unwrap();
+        let cmd = rx.recv().unwrap();
+        match cmd {
+            Command::ImeCancelComposition { browser_id } => {
+                assert_eq!(browser_id, 1);
+            }
+            _ => panic!("expected ImeCancelComposition"),
+        }
+    }
+
+    #[test]
+    fn ime_full_composition_workflow() {
+        // 典型的なIMEワークフロー: SetComposition → (複数回更新) → CommitText
+        let (tx, rx) = ipc::channel::<Command>().unwrap();
+
+        // 1. ユーザーが「か」を入力 → コンポジション開始
+        tx.send(Command::ImeSetComposition {
+            browser_id: 1,
+            text: "か".to_string(),
+            selection_start: 0,
+            selection_end: 1,
+        })
+        .unwrap();
+        let cmd = rx.recv().unwrap();
+        assert!(matches!(
+            cmd,
+            Command::ImeSetComposition {
+                text,
+                selection_end: 1,
+                ..
+            } if text == "か"
+        ));
+
+        // 2. 「かん」に更新
+        tx.send(Command::ImeSetComposition {
+            browser_id: 1,
+            text: "かん".to_string(),
+            selection_start: 0,
+            selection_end: 2,
+        })
+        .unwrap();
+        let cmd = rx.recv().unwrap();
+        assert!(matches!(
+            cmd,
+            Command::ImeSetComposition {
+                text,
+                selection_end: 2,
+                ..
+            } if text == "かん"
+        ));
+
+        // 3. 「かんじ」に更新
+        tx.send(Command::ImeSetComposition {
+            browser_id: 1,
+            text: "かんじ".to_string(),
+            selection_start: 0,
+            selection_end: 3,
+        })
+        .unwrap();
+        let cmd = rx.recv().unwrap();
+        assert!(matches!(
+            cmd,
+            Command::ImeSetComposition {
+                text,
+                selection_end: 3,
+                ..
+            } if text == "かんじ"
+        ));
+
+        // 4. 変換確定 → 「漢字」
+        tx.send(Command::ImeCommitText {
+            browser_id: 1,
+            text: "漢字".to_string(),
+        })
+        .unwrap();
+        let cmd = rx.recv().unwrap();
+        assert!(matches!(
+            cmd,
+            Command::ImeCommitText { text, .. } if text == "漢字"
+        ));
+    }
+
+    #[test]
+    fn ime_composition_cancel_workflow() {
+        // コンポジション開始後にキャンセルするワークフロー
+        let (tx, rx) = ipc::channel::<Command>().unwrap();
+
+        // 1. コンポジション開始
+        tx.send(Command::ImeSetComposition {
+            browser_id: 1,
+            text: "あい".to_string(),
+            selection_start: 0,
+            selection_end: 2,
+        })
+        .unwrap();
+        let cmd = rx.recv().unwrap();
+        assert!(matches!(cmd, Command::ImeSetComposition { .. }));
+
+        // 2. キャンセル
+        tx.send(Command::ImeCancelComposition { browser_id: 1 }).unwrap();
+        let cmd = rx.recv().unwrap();
+        assert!(matches!(
+            cmd,
+            Command::ImeCancelComposition { browser_id: 1 }
+        ));
+    }
+
+    #[test]
+    fn ime_set_composition_empty_text() {
+        let (tx, rx) = ipc::channel::<Command>().unwrap();
+        tx.send(Command::ImeSetComposition {
+            browser_id: 1,
+            text: "".to_string(),
+            selection_start: 0,
+            selection_end: 0,
+        })
+        .unwrap();
+        let cmd = rx.recv().unwrap();
+        match cmd {
+            Command::ImeSetComposition {
+                text,
+                selection_start,
+                selection_end,
+                ..
+            } => {
+                assert!(text.is_empty());
+                assert_eq!(selection_start, 0);
+                assert_eq!(selection_end, 0);
+            }
+            _ => panic!("expected ImeSetComposition"),
+        }
+    }
+
+    #[test]
+    fn ime_commit_text_emoji() {
+        // 絵文字（サロゲートペアを含むUTF-8）のテスト
+        let (tx, rx) = ipc::channel::<Command>().unwrap();
+        tx.send(Command::ImeCommitText {
+            browser_id: 1,
+            text: "🎉".to_string(),
+        })
+        .unwrap();
+        let cmd = rx.recv().unwrap();
+        match cmd {
+            Command::ImeCommitText { text, .. } => {
+                assert_eq!(text, "🎉");
+            }
+            _ => panic!("expected ImeCommitText"),
+        }
+    }
+
+    #[test]
+    fn ime_envelope_no_response() {
+        // IMEコマンドは通常 expects_response=false で送信される
+        let (tx, rx) = ipc::channel::<CommandEnvelope>().unwrap();
+        tx.send(CommandEnvelope {
+            command: Command::ImeCommitText {
+                browser_id: 1,
+                text: "テスト".to_string(),
+            },
+            expects_response: false,
+        })
+        .unwrap();
+        let env = rx.recv().unwrap();
+        assert!(!env.expects_response);
+        assert!(matches!(
+            env.command,
+            Command::ImeCommitText { browser_id: 1, .. }
+        ));
+    }
+
+    #[test]
     fn ipc_bootstrap_roundtrip() {
         // IpcOneShotServer bootstrap requires separate processes on macOS (Mach ports).
         // Here we test the channel transfer pattern using regular IPC channels instead.

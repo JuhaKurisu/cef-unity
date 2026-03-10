@@ -86,6 +86,7 @@ public class SampleScript : MonoBehaviour
     private string _lastComposition = "";
     private int _lastMouseX = -1;
     private int _lastMouseY = -1;
+    private int _imeTestPending;
     private Texture2D _texture;
 
     private void Start()
@@ -121,17 +122,54 @@ public class SampleScript : MonoBehaviour
                 Debug.Log($"[CefServer] {line}");
         }
 
+        // IME テスト
+        // O: ImeCommitText 単独 (現状動かない)
+        // P: ImeSetComposition → 次フレームで ImeFinishComposingText
+        // L: ImeSetComposition → 次フレームで ImeCommitText
+        var imeTest = false;
         if (Input.GetKeyDown(KeyCode.O))
         {
-            _browser.ImeSetComposition("あなた", 3, 3);
+            imeTest = true;
             _browser.ImeCommitText("貴方");
-            Debug.Log($"send ime commit");
+            Debug.Log("[CefUnity] test O: ImeCommitText standalone");
+        }
+
+        if (Input.GetKeyDown(KeyCode.P))
+        {
+            imeTest = true;
+            _browser.ImeSetComposition("貴方", 2, 2);
+            _imeTestPending = 1; // 次フレームで FinishComposingText
+            Debug.Log("[CefUnity] test P: ImeSetComposition → next frame FinishComposingText");
+        }
+
+        if (Input.GetKeyDown(KeyCode.L))
+        {
+            imeTest = true;
+            _browser.ImeSetComposition("貴方", 2, 2);
+            _imeTestPending = 2; // 次フレームで ImeCommitText
+            Debug.Log("[CefUnity] test L: ImeSetComposition → next frame ImeCommitText");
+        }
+
+        if (_imeTestPending > 0 && !Input.GetKeyDown(KeyCode.P) && !Input.GetKeyDown(KeyCode.L))
+        {
+            imeTest = true;
+            if (_imeTestPending == 1)
+            {
+                _browser.ImeFinishComposingText();
+                Debug.Log("[CefUnity] → ImeFinishComposingText");
+            }
+            else
+            {
+                _browser.ImeCommitText("貴方");
+                Debug.Log("[CefUnity] → ImeCommitText (after composition)");
+            }
+            _imeTestPending = 0;
         }
 
         CheckScreenResize();
         UpdateTexture();
         HandleMouseInput();
-        HandleKeyboardInput();
+        if (!imeTest) HandleKeyboardInput();
     }
 
     private void OnDestroy()
