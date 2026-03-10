@@ -181,6 +181,13 @@ impl TestCefServer {
             browser_id, x: 200, y: 20, modifiers: 0,
             button: 0, mouse_up: true, click_count: 1,
         });
+        thread::sleep(Duration::from_millis(200));
+
+        // JS でも明示的にフォーカス
+        self.fire(Command::ExecuteJavaScript {
+            browser_id,
+            code: "document.getElementById('t').focus();".to_string(),
+        });
         thread::sleep(Duration::from_millis(500));
 
         browser_id
@@ -238,6 +245,42 @@ fn find_server_app() -> Option<PathBuf> {
 // テストケース
 // ---------------------------------------------------------------------------
 
+/// まず通常のキー入力が動くか確認（フォーカスの切り分け）。
+#[test]
+#[ignore]
+fn key_event_sanity_check() {
+    let http = TestHttpServer::start();
+    let cef = TestCefServer::start();
+    let bid = cef.setup_browser(&http.url());
+
+    // 'a' を KeyEvent で入力
+    cef.fire(Command::KeyEvent {
+        browser_id: bid, event_type: 0, // RAWKEYDOWN
+        modifiers: 0, windows_key_code: 0x41, native_key_code: 0,
+        character: 0x61, unmodified_character: 0x61,
+        is_system_key: 0, focus_on_editable_field: 0,
+    });
+    cef.fire(Command::KeyEvent {
+        browser_id: bid, event_type: 2, // CHAR
+        modifiers: 0, windows_key_code: 0x61, native_key_code: 0,
+        character: 0x61, unmodified_character: 0x61,
+        is_system_key: 0, focus_on_editable_field: 0,
+    });
+    cef.fire(Command::KeyEvent {
+        browser_id: bid, event_type: 1, // KEYUP
+        modifiers: 0, windows_key_code: 0x41, native_key_code: 0,
+        character: 0x61, unmodified_character: 0x61,
+        is_system_key: 0, focus_on_editable_field: 0,
+    });
+    thread::sleep(Duration::from_millis(500));
+
+    cef.post_input_value(bid, http.port);
+    let value = http.take_value().unwrap_or_default();
+    assert_eq!(value, "a", "regular key input should work");
+
+    cef.shutdown();
+}
+
 #[test]
 #[ignore]
 fn ime_set_composition_then_commit() {
@@ -245,16 +288,17 @@ fn ime_set_composition_then_commit() {
     let cef = TestCefServer::start();
     let bid = cef.setup_browser(&http.url());
 
-    cef.fire(Command::ImeSetComposition {
+    cef.send(Command::ImeSetComposition {
         browser_id: bid, text: "漢字".to_string(),
         selection_start: 0, selection_end: 2,
     });
-    thread::sleep(Duration::from_millis(200));
+    // CEF がコンポジションを処理するのを待つ
+    thread::sleep(Duration::from_secs(1));
 
-    cef.fire(Command::ImeCommitText {
+    cef.send(Command::ImeCommitText {
         browser_id: bid, text: "漢字".to_string(),
     });
-    thread::sleep(Duration::from_millis(500));
+    thread::sleep(Duration::from_secs(1));
 
     cef.post_input_value(bid, http.port);
     let value = http.take_value().unwrap_or_default();
