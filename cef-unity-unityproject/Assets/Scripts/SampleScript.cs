@@ -176,8 +176,19 @@ public class SampleScript : MonoBehaviour
         bg.color = Color.clear;
         bg.raycastTarget = false;
 
+        // Text Area (TMP_InputField がクリッピング領域として使う)
+        var textAreaGo = new GameObject("TextArea");
+        textAreaGo.transform.SetParent(go.transform, false);
+        var textAreaRt = textAreaGo.AddComponent<RectTransform>();
+        textAreaRt.anchorMin = Vector2.zero;
+        textAreaRt.anchorMax = Vector2.one;
+        textAreaRt.offsetMin = new Vector2(5, 0);
+        textAreaRt.offsetMax = new Vector2(-5, 0);
+        var textAreaMask = textAreaGo.AddComponent<RectMask2D>();
+
+        // Text
         var textGo = new GameObject("Text");
-        textGo.transform.SetParent(go.transform, false);
+        textGo.transform.SetParent(textAreaGo.transform, false);
 
         var textRt = textGo.AddComponent<RectTransform>();
         textRt.anchorMin = Vector2.zero;
@@ -191,7 +202,9 @@ public class SampleScript : MonoBehaviour
         tmp.raycastTarget = false;
 
         _imeProxy = go.AddComponent<TMP_InputField>();
+        _imeProxy.textViewport = textAreaRt;
         _imeProxy.textComponent = tmp;
+        _imeProxy.onFocusSelectAll = false;
         _imeProxy.ActivateInputField();
 
         Input.imeCompositionMode = IMECompositionMode.On;
@@ -207,9 +220,36 @@ public class SampleScript : MonoBehaviour
             _imeProxy.ActivateInputField();
 
         var comp = Input.compositionString;
+        var input = Input.inputString;
+
+        // デバッグ: 変化があるときだけログ出力
+        if (!string.IsNullOrEmpty(comp) || !string.IsNullOrEmpty(input) || _imeActive)
+        {
+            Debug.Log($"[IME] comp=\"{comp}\" input=\"{EscapeForLog(input)}\" imeActive={_imeActive} commitPending={_imeCommitPending}");
+        }
 
         if (!string.IsNullOrEmpty(comp))
         {
+            // IME が暗黙的に確定して新しい composition を開始した場合を検出
+            // (例: "嗚呼亜" → Enter なしで次の文字 → "あ")
+            // この場合 Input.inputString に確定テキストが入っている
+            if (_imeActive && !string.IsNullOrEmpty(input))
+            {
+                var commitSb = new System.Text.StringBuilder();
+                foreach (var c in input)
+                {
+                    if (!char.IsControl(c))
+                        commitSb.Append(c);
+                }
+                if (commitSb.Length > 0)
+                {
+                    var commitText = commitSb.ToString();
+                    Debug.Log($"[IME] → implicit commit: ImeCommitText(\"{commitText}\") before new composition");
+                    _browser.ImeCommitText(commitText);
+                    _imeCommitPending = true;
+                }
+            }
+
             // composition 開始/変更
             _browser.ImeSetComposition(comp, (uint)comp.Length, (uint)comp.Length);
             _imeActive = true;
@@ -219,7 +259,7 @@ public class SampleScript : MonoBehaviour
         {
             // composition 終了 (非空 → 空に変化)
             var committed = false;
-            foreach (var c in Input.inputString)
+            foreach (var c in input)
             {
                 if (!char.IsControl(c))
                 {
@@ -232,27 +272,47 @@ public class SampleScript : MonoBehaviour
             {
                 // 制御文字を除いた確定テキストを取得
                 var sb = new System.Text.StringBuilder();
-                foreach (var c in Input.inputString)
+                foreach (var c in input)
                 {
                     if (!char.IsControl(c))
                         sb.Append(c);
                 }
-                _browser.ImeCommitText(sb.ToString());
+                var text = sb.ToString();
+                Debug.Log($"[IME] → ImeCommitText(\"{text}\")");
+                _browser.ImeCommitText(text);
                 _imeCommitPending = true;
             }
             else
             {
+                Debug.Log("[IME] → ImeCancelComposition()");
                 _browser.ImeCancelComposition();
             }
 
             _imeActive = false;
             _lastComposition = "";
+
+            if (_imeProxy != null)
+                _imeProxy.text = "";
         }
         else
         {
             // 通常状態
             _imeCommitPending = false;
         }
+    }
+
+    private static string EscapeForLog(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        var sb = new System.Text.StringBuilder();
+        foreach (var c in s)
+        {
+            if (char.IsControl(c))
+                sb.Append($"\\x{(int)c:X2}");
+            else
+                sb.Append(c);
+        }
+        return sb.ToString();
     }
 
     private uint GetCefModifiers()
