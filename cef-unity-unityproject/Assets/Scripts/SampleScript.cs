@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using System.Text;
 using CefUnity;
 using CefUnity.Interop;
@@ -10,8 +11,9 @@ public class SampleScript : MonoBehaviour
 {
     private const float DoubleClickTime = 0.3f;
     private const int DoubleClickDistance = 4;
-    private const float KeyRepeatDelay = 0.5f;
-    private const float KeyRepeatRate = 0.035f;
+
+    private static readonly float KeyRepeatDelay = GetOSKeyRepeatDelay();
+    private static readonly float KeyRepeatRate = GetOSKeyRepeatRate();
 
 
     // -----------------------------------------------------------------------
