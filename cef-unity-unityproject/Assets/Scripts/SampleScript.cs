@@ -511,6 +511,48 @@ public class SampleScript : MonoBehaviour
         _texture.Apply(false);
     }
 
+    // -----------------------------------------------------------------------
+    // OS Settings
+    // -----------------------------------------------------------------------
+
+#if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
+    [DllImport("/usr/lib/libobjc.dylib", EntryPoint = "objc_getClass")]
+    private static extern IntPtr ObjcGetClass([MarshalAs(UnmanagedType.LPStr)] string name);
+
+    [DllImport("/usr/lib/libobjc.dylib", EntryPoint = "sel_registerName")]
+    private static extern IntPtr ObjcSelRegisterName([MarshalAs(UnmanagedType.LPStr)] string name);
+
+    [DllImport("/usr/lib/libobjc.dylib", EntryPoint = "objc_msgSend")]
+    private static extern double ObjcMsgSendDouble(IntPtr receiver, IntPtr selector);
+
+    private static float GetOSKeyRepeatDelay()
+    {
+        try
+        {
+            var nsEvent = ObjcGetClass("NSEvent");
+            var sel = ObjcSelRegisterName("keyRepeatDelay");
+            var val = ObjcMsgSendDouble(nsEvent, sel);
+            return val > 0 ? (float)val : 0.5f;
+        }
+        catch { return 0.5f; }
+    }
+
+    private static float GetOSKeyRepeatRate()
+    {
+        try
+        {
+            var nsEvent = ObjcGetClass("NSEvent");
+            var sel = ObjcSelRegisterName("keyRepeatInterval");
+            var val = ObjcMsgSendDouble(nsEvent, sel);
+            return val > 0 ? (float)val : 0.035f;
+        }
+        catch { return 0.035f; }
+    }
+#else
+    private static float GetOSKeyRepeatDelay() => 0.5f;
+    private static float GetOSKeyRepeatRate() => 0.035f;
+#endif
+
 #if UNITY_EDITOR
     private static System.Reflection.FieldInfo _zoomAreaField;
     private static System.Reflection.FieldInfo _scaleField;
