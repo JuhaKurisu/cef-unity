@@ -147,8 +147,9 @@ wrap_render_handler! {
             character_bounds: Option<&[Rect]>,
         ) {
             if let Some(bounds) = character_bounds {
-                if let Some(first) = bounds.first() {
-                    self.shm.write_ime_caret(first.x, first.y, first.width, first.height);
+                if let Some(last) = bounds.last() {
+                    // 最後の文字の右端 = 確定後の次のカーソル位置
+                    self.shm.write_ime_caret(last.x + last.width, last.y, last.width, last.height);
                 }
             }
         }
@@ -198,6 +199,103 @@ wrap_life_span_handler! {
     }
 }
 
+wrap_display_handler! {
+    struct ServerDisplayHandler {
+        shm: Arc<ShmWriter>,
+    }
+    impl DisplayHandler {
+        fn on_console_message(
+            &self,
+            _browser: Option<&mut Browser>,
+            _level: LogSeverity,
+            message: Option<&CefString>,
+            _source: Option<&CefString>,
+            _line: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            if let Some(msg) = message {
+                let s = msg.to_string();
+                if let Some(rest) = s.strip_prefix("__CARET__:") {
+                    let parts: Vec<&str> = rest.split(':').collect();
+                    if parts.len() == 4 {
+                        if let (Ok(x), Ok(y), Ok(w), Ok(h)) = (
+                            parts[0].parse::<i32>(),
+                            parts[1].parse::<i32>(),
+                            parts[2].parse::<i32>(),
+                            parts[3].parse::<i32>(),
+                        ) {
+                            self.shm.write_ime_caret(x, y, w, h);
+                            return 1; // suppress from console output
+                        }
+                    }
+                }
+            }
+            0
+        }
+    }
+}
+
+wrap_load_handler! {
+    struct ServerLoadHandler {
+        browser_slot: Arc<Mutex<Option<Browser>>>,
+    }
+    impl LoadHandler {
+        fn on_load_end(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _http_status_code: ::std::os::raw::c_int,
+        ) {
+            if let Some(f) = frame {
+                if f.is_main() != 0 {
+                    Frame::execute_java_script(
+                        f,
+                        Some(&CefString::from(CARET_TRACKING_JS)),
+                        Some(&CefString::from("cef-unity://caret-tracker")),
+                        0,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// JavaScript to track caret position via selectionchange and click events.
+/// Reports position as console.log("__CARET__:x:y:w:h").
+const CARET_TRACKING_JS: &str = r#"
+(function() {
+    if (window.__cefUnityCaretTracker) return;
+    window.__cefUnityCaretTracker = true;
+
+    function reportCaret() {
+        var sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0) return;
+        var range = sel.getRangeAt(0).cloneRange();
+        range.collapse(false);
+        var rect = range.getBoundingClientRect();
+        if (rect && rect.width === 0 && rect.height > 0) {
+            console.log("__CARET__:" +
+                Math.round(rect.x) + ":" +
+                Math.round(rect.y) + ":" +
+                Math.round(rect.width) + ":" +
+                Math.round(rect.height));
+        }
+    }
+
+    document.addEventListener("selectionchange", reportCaret);
+    document.addEventListener("click", function() {
+        setTimeout(reportCaret, 0);
+    });
+    document.addEventListener("keyup", function(e) {
+        if (["ArrowLeft","ArrowRight","ArrowUp","ArrowDown","Home","End"].includes(e.key)) {
+            reportCaret();
+        }
+    });
+    document.addEventListener("input", function() {
+        setTimeout(reportCaret, 0);
+    });
+})();
+"#;
+
 wrap_browser_process_handler! {
     struct ServerBrowserProcessHandler;
     impl BrowserProcessHandler {
@@ -235,6 +333,8 @@ wrap_client! {
     struct ServerClient {
         render_handler: RenderHandler,
         life_span_handler: LifeSpanHandler,
+        display_handler: DisplayHandler,
+        load_handler: LoadHandler,
     }
     impl Client {
         fn render_handler(&self) -> Option<RenderHandler> {
@@ -242,6 +342,12 @@ wrap_client! {
         }
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
             Some(self.life_span_handler.clone())
+        }
+        fn display_handler(&self) -> Option<DisplayHandler> {
+            Some(self.display_handler.clone())
+        }
+        fn load_handler(&self) -> Option<LoadHandler> {
+            Some(self.load_handler.clone())
         }
     }
 }
@@ -453,7 +559,9 @@ impl CefServer {
             Arc::clone(&viewport_h),
         );
         let life_span_handler = ServerLifeSpanHandler::new(Arc::clone(&browser_slot));
-        let mut client = ServerClient::new(render_handler, life_span_handler);
+        let display_handler = ServerDisplayHandler::new(Arc::clone(&shm));
+        let load_handler = ServerLoadHandler::new(Arc::clone(&browser_slot));
+        let mut client = ServerClient::new(render_handler, life_span_handler, display_handler, load_handler);
 
         let window_info = WindowInfo::default().set_as_windowless(std::ptr::null_mut());
         let ok = browser_host_create_browser(

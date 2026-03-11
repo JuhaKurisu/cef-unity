@@ -128,8 +128,7 @@ public class SampleScript : MonoBehaviour
         CheckScreenResize();
         UpdateTexture();
         HandleMouseInput();
-        if (_imeActive)
-            UpdateCompositionCursorPos();
+        UpdateCompositionCursorPos();
         HandleImeInput();
         HandleKeyboardInput();
     }
@@ -230,6 +229,9 @@ public class SampleScript : MonoBehaviour
 
         _browser.GetImeCaret(out var cx, out var cy, out var cw, out var ch);
 
+        // まだキャレット位置が報告されていない場合はスキップ
+        if (cx == 0 && cy == 0 && cw == 0 && ch == 0) return;
+
         var rt = _rawImage.rectTransform;
         var rect = rt.rect;
 
@@ -290,6 +292,10 @@ public class SampleScript : MonoBehaviour
         HandleButton(bx, by, 0, MouseButton.Left, mods);
         HandleButton(bx, by, 1, MouseButton.Right, mods);
         HandleButton(bx, by, 2, MouseButton.Middle, mods);
+
+        // クリック時にIME候補ウィンドウの初期位置をマウス位置に設定
+        if (Input.GetMouseButtonDown(0))
+            Input.compositionCursorPos = Input.mousePosition;
 
         var scroll = Input.mouseScrollDelta;
         if (scroll.y != 0f || scroll.x != 0f)
