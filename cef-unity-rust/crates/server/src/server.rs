@@ -561,7 +561,12 @@ impl CefServer {
         let life_span_handler = ServerLifeSpanHandler::new(Arc::clone(&browser_slot));
         let display_handler = ServerDisplayHandler::new(Arc::clone(&shm));
         let load_handler = ServerLoadHandler::new(Arc::clone(&browser_slot));
-        let mut client = ServerClient::new(render_handler, life_span_handler, display_handler, load_handler);
+        let mut client = ServerClient::new(
+            render_handler,
+            life_span_handler,
+            display_handler,
+            load_handler,
+        );
 
         let window_info = WindowInfo::default().set_as_windowless(std::ptr::null_mut());
         let ok = browser_host_create_browser(
@@ -569,7 +574,7 @@ impl CefServer {
             Some(&mut client),
             Some(&CefString::from(url)),
             Some(&BrowserSettings {
-                background_color: 0xFF000000,
+                background_color: 0x00000000,
                 windowless_frame_rate: 60,
                 ..Default::default()
             }),
@@ -868,17 +873,23 @@ impl CefServer {
                 let char_len = text.chars().count() as u32;
                 let underline = CompositionUnderline {
                     size: std::mem::size_of::<CompositionUnderline>(),
-                    range: Range { from: 0, to: char_len },
-                    color: 0xFF000000,      // 黒の下線
-                    background_color: 0,    // 背景なし (透明)
-                    thick: 0,               // 細い下線
+                    range: Range {
+                        from: 0,
+                        to: char_len,
+                    },
+                    color: 0xFF000000,   // 黒の下線
+                    background_color: 0, // 背景なし (透明)
+                    thick: 0,            // 細い下線
                     style: CompositionUnderlineStyle::SOLID,
                 };
                 let selection_range = Range {
                     from: selection_start,
                     to: selection_end,
                 };
-                let invalid_range = Range { from: u32::MAX, to: u32::MAX };
+                let invalid_range = Range {
+                    from: u32::MAX,
+                    to: u32::MAX,
+                };
                 BrowserHost::ime_set_composition(
                     &host,
                     Some(&cef_text),
@@ -908,7 +919,10 @@ impl CefServer {
                 let cef_text = CefString::from(text);
                 // macOS では replacement_range に InvalidRange ({UINT32_MAX, UINT32_MAX}) を渡す必要がある。
                 // None (null pointer) を渡すと CEF 内部で {0, 0} に変換され、正しく動作しない。
-                let invalid_range = Range { from: u32::MAX, to: u32::MAX };
+                let invalid_range = Range {
+                    from: u32::MAX,
+                    to: u32::MAX,
+                };
                 BrowserHost::ime_commit_text(&host, Some(&cef_text), Some(&invalid_range), 0);
                 log(format!("ime commit text: text={}", text).as_str());
             }
