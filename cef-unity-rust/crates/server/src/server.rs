@@ -129,7 +129,7 @@ wrap_render_handler! {
             height: ::std::os::raw::c_int,
         ) {
             let count = PAINT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            if count <= 3 || count % 100 == 0 {
+            if count <= 3 || count.is_multiple_of(100) {
                 log(&format!("on_paint #{}: {}x{}", count, width, height));
             }
             if type_.get_raw() != PaintElementType::VIEW.get_raw() {
@@ -146,12 +146,11 @@ wrap_render_handler! {
             _selected_range: Option<&Range>,
             character_bounds: Option<&[Rect]>,
         ) {
-            if let Some(bounds) = character_bounds {
-                if let Some(last) = bounds.last() {
+            if let Some(bounds) = character_bounds
+                && let Some(last) = bounds.last() {
                     // 最後の文字の右端 = 確定後の次のカーソル位置
                     self.shm.write_ime_caret(last.x + last.width, last.y, last.width, last.height);
                 }
-            }
         }
 
     }
@@ -181,11 +180,10 @@ wrap_life_span_handler! {
             // ポップアップをキャンセルし、現在のブラウザで URL を開く
             let url_str = target_url.map(|u| u.to_string()).unwrap_or_default();
             log(&format!("on_before_popup: url={}", url_str));
-            if let (Some(b), Some(url)) = (browser, target_url) {
-                if let Some(frame) = Browser::main_frame(b) {
+            if let (Some(b), Some(url)) = (browser, target_url)
+                && let Some(frame) = Browser::main_frame(b) {
                     Frame::load_url(&frame, Some(url));
                 }
-            }
             1 // キャンセル
         }
 
@@ -216,8 +214,8 @@ wrap_display_handler! {
                 let s = msg.to_string();
                 if let Some(rest) = s.strip_prefix("__CARET__:") {
                     let parts: Vec<&str> = rest.split(':').collect();
-                    if parts.len() == 4 {
-                        if let (Ok(x), Ok(y), Ok(w), Ok(h)) = (
+                    if parts.len() == 4
+                        && let (Ok(x), Ok(y), Ok(w), Ok(h)) = (
                             parts[0].parse::<i32>(),
                             parts[1].parse::<i32>(),
                             parts[2].parse::<i32>(),
@@ -226,7 +224,6 @@ wrap_display_handler! {
                             self.shm.write_ime_caret(x, y, w, h);
                             return 1; // suppress from console output
                         }
-                    }
                 }
             }
             0
@@ -245,8 +242,8 @@ wrap_load_handler! {
             frame: Option<&mut Frame>,
             _http_status_code: ::std::os::raw::c_int,
         ) {
-            if let Some(f) = frame {
-                if f.is_main() != 0 {
+            if let Some(f) = frame
+                && f.is_main() != 0 {
                     Frame::execute_java_script(
                         f,
                         Some(&CefString::from(CARET_TRACKING_JS)),
@@ -254,7 +251,6 @@ wrap_load_handler! {
                         0,
                     );
                 }
-            }
         }
     }
 }

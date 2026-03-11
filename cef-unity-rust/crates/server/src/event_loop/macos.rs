@@ -139,13 +139,12 @@ fn drain_commands(state: &mut ServerState) {
                     log(&format!("received command: {:?}", env.command));
                 }
                 let resp = state.cef_server.handle_command(env.command);
-                if env.expects_response {
-                    if let Err(e) = state.resp_tx.send(resp) {
+                if env.expects_response
+                    && let Err(e) = state.resp_tx.send(resp) {
                         log(&format!("send error: {}", e));
                         state.running = false;
                         break;
                     }
-                }
                 if is_shutdown {
                     state.running = false;
                     break;
