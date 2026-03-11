@@ -72,7 +72,8 @@ impl TestHttpServer {
 </body></html>"#;
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
-                        html.len(), html
+                        html.len(),
+                        html
                     );
                     let _ = stream.write_all(resp.as_bytes());
                 } else if request_line.starts_with("POST /value") {
@@ -179,13 +180,23 @@ impl TestCefServer {
 
         // input をクリックしてフォーカス
         self.fire(Command::MouseClick {
-            browser_id, x: 200, y: 20, modifiers: 0,
-            button: 0, mouse_up: false, click_count: 1,
+            browser_id,
+            x: 200,
+            y: 20,
+            modifiers: 0,
+            button: 0,
+            mouse_up: false,
+            click_count: 1,
         });
         thread::sleep(Duration::from_millis(50));
         self.fire(Command::MouseClick {
-            browser_id, x: 200, y: 20, modifiers: 0,
-            button: 0, mouse_up: true, click_count: 1,
+            browser_id,
+            x: 200,
+            y: 20,
+            modifiers: 0,
+            button: 0,
+            mouse_up: true,
+            click_count: 1,
         });
         thread::sleep(Duration::from_millis(200));
 
@@ -262,22 +273,37 @@ fn key_event_sanity_check() {
 
     // 'a' を KeyEvent で入力
     cef.fire(Command::KeyEvent {
-        browser_id: bid, event_type: 0, // RAWKEYDOWN
-        modifiers: 0, windows_key_code: 0x41, native_key_code: 0,
-        character: 0x61, unmodified_character: 0x61,
-        is_system_key: 0, focus_on_editable_field: 0,
+        browser_id: bid,
+        event_type: 0, // RAWKEYDOWN
+        modifiers: 0,
+        windows_key_code: 0x41,
+        native_key_code: 0,
+        character: 0x61,
+        unmodified_character: 0x61,
+        is_system_key: 0,
+        focus_on_editable_field: 0,
     });
     cef.fire(Command::KeyEvent {
-        browser_id: bid, event_type: 2, // CHAR
-        modifiers: 0, windows_key_code: 0x61, native_key_code: 0,
-        character: 0x61, unmodified_character: 0x61,
-        is_system_key: 0, focus_on_editable_field: 0,
+        browser_id: bid,
+        event_type: 2, // CHAR
+        modifiers: 0,
+        windows_key_code: 0x61,
+        native_key_code: 0,
+        character: 0x61,
+        unmodified_character: 0x61,
+        is_system_key: 0,
+        focus_on_editable_field: 0,
     });
     cef.fire(Command::KeyEvent {
-        browser_id: bid, event_type: 1, // KEYUP
-        modifiers: 0, windows_key_code: 0x41, native_key_code: 0,
-        character: 0x61, unmodified_character: 0x61,
-        is_system_key: 0, focus_on_editable_field: 0,
+        browser_id: bid,
+        event_type: 1, // KEYUP
+        modifiers: 0,
+        windows_key_code: 0x41,
+        native_key_code: 0,
+        character: 0x61,
+        unmodified_character: 0x61,
+        is_system_key: 0,
+        focus_on_editable_field: 0,
     });
     thread::sleep(Duration::from_millis(500));
 
@@ -297,13 +323,16 @@ fn ime_set_composition_then_commit() {
     let bid = cef.setup_browser(&http.url());
 
     cef.send(Command::ImeSetComposition {
-        browser_id: bid, text: "漢字".to_string(),
-        selection_start: 0, selection_end: 2,
+        browser_id: bid,
+        text: "漢字".to_string(),
+        selection_start: 0,
+        selection_end: 2,
     });
     thread::sleep(Duration::from_secs(1));
 
     cef.send(Command::ImeCommitText {
-        browser_id: bid, text: "漢字".to_string(),
+        browser_id: bid,
+        text: "漢字".to_string(),
     });
     thread::sleep(Duration::from_secs(1));
 
@@ -323,13 +352,16 @@ fn ime_set_composition_then_finish() {
     let bid = cef.setup_browser(&http.url());
 
     cef.fire(Command::ImeSetComposition {
-        browser_id: bid, text: "テスト".to_string(),
-        selection_start: 0, selection_end: 3,
+        browser_id: bid,
+        text: "テスト".to_string(),
+        selection_start: 0,
+        selection_end: 3,
     });
     thread::sleep(Duration::from_millis(200));
 
     cef.fire(Command::ImeFinishComposingText {
-        browser_id: bid, keep_selection: false,
+        browser_id: bid,
+        keep_selection: false,
     });
     thread::sleep(Duration::from_millis(500));
 
@@ -349,8 +381,10 @@ fn ime_set_composition_then_cancel() {
     let bid = cef.setup_browser(&http.url());
 
     cef.fire(Command::ImeSetComposition {
-        browser_id: bid, text: "入力中".to_string(),
-        selection_start: 0, selection_end: 3,
+        browser_id: bid,
+        text: "入力中".to_string(),
+        selection_start: 0,
+        selection_end: 3,
     });
     thread::sleep(Duration::from_millis(200));
 
@@ -373,7 +407,8 @@ fn ime_commit_text_standalone() {
     let bid = cef.setup_browser(&http.url());
 
     cef.fire(Command::ImeCommitText {
-        browser_id: bid, text: "直接入力".to_string(),
+        browser_id: bid,
+        text: "直接入力".to_string(),
     });
     thread::sleep(Duration::from_millis(500));
 
@@ -394,23 +429,29 @@ fn ime_sequential_inputs() {
 
     // 1回目
     cef.fire(Command::ImeSetComposition {
-        browser_id: bid, text: "東".to_string(),
-        selection_start: 0, selection_end: 1,
+        browser_id: bid,
+        text: "東".to_string(),
+        selection_start: 0,
+        selection_end: 1,
     });
     thread::sleep(Duration::from_millis(100));
     cef.fire(Command::ImeCommitText {
-        browser_id: bid, text: "東".to_string(),
+        browser_id: bid,
+        text: "東".to_string(),
     });
     thread::sleep(Duration::from_millis(300));
 
     // 2回目
     cef.fire(Command::ImeSetComposition {
-        browser_id: bid, text: "京".to_string(),
-        selection_start: 0, selection_end: 1,
+        browser_id: bid,
+        text: "京".to_string(),
+        selection_start: 0,
+        selection_end: 1,
     });
     thread::sleep(Duration::from_millis(100));
     cef.fire(Command::ImeCommitText {
-        browser_id: bid, text: "京".to_string(),
+        browser_id: bid,
+        text: "京".to_string(),
     });
     thread::sleep(Duration::from_millis(500));
 

@@ -337,10 +337,7 @@ pub extern "C" fn cef_unity_create_browser(
                     return std::ptr::null_mut();
                 }
             };
-            let instance = Box::new(ClientBrowserInstance {
-                browser_id,
-                shm,
-            });
+            let instance = Box::new(ClientBrowserInstance { browser_id, shm });
             Box::into_raw(instance) as *mut CefUnityBrowser
         }
         Response::Error { msg } => {
@@ -425,12 +422,15 @@ pub extern "C" fn cef_unity_send_mouse_move(
 
     let guard = CONNECTION.lock().unwrap();
     if let Some(conn) = guard.as_ref() {
-        send_command_no_wait(conn, Command::MouseMove {
-            browser_id: instance.browser_id,
-            x,
-            y,
-            modifiers,
-        });
+        send_command_no_wait(
+            conn,
+            Command::MouseMove {
+                browser_id: instance.browser_id,
+                x,
+                y,
+                modifiers,
+            },
+        );
     }
 }
 
@@ -452,15 +452,18 @@ pub extern "C" fn cef_unity_send_mouse_click(
 
     let guard = CONNECTION.lock().unwrap();
     if let Some(conn) = guard.as_ref() {
-        send_command_no_wait(conn, Command::MouseClick {
-            browser_id: instance.browser_id,
-            x,
-            y,
-            modifiers,
-            button,
-            mouse_up: mouse_up != 0,
-            click_count,
-        });
+        send_command_no_wait(
+            conn,
+            Command::MouseClick {
+                browser_id: instance.browser_id,
+                x,
+                y,
+                modifiers,
+                button,
+                mouse_up: mouse_up != 0,
+                click_count,
+            },
+        );
     }
 }
 
@@ -481,14 +484,17 @@ pub extern "C" fn cef_unity_send_mouse_wheel(
 
     let guard = CONNECTION.lock().unwrap();
     if let Some(conn) = guard.as_ref() {
-        send_command_no_wait(conn, Command::MouseWheel {
-            browser_id: instance.browser_id,
-            x,
-            y,
-            modifiers,
-            delta_x,
-            delta_y,
-        });
+        send_command_no_wait(
+            conn,
+            Command::MouseWheel {
+                browser_id: instance.browser_id,
+                x,
+                y,
+                modifiers,
+                delta_x,
+                delta_y,
+            },
+        );
     }
 }
 
@@ -934,10 +940,7 @@ pub extern "C" fn cef_unity_ime_set_composition(
 
 /// Commit IME text (finalize composition and insert text).
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_ime_commit_text(
-    handle: *mut CefUnityBrowser,
-    text: *const c_char,
-) {
+pub extern "C" fn cef_unity_ime_commit_text(handle: *mut CefUnityBrowser, text: *const c_char) {
     if handle.is_null() || text.is_null() {
         return;
     }

@@ -587,15 +587,60 @@ mod tests {
         }
 
         let keys = [
-            SpecialKey { name: "Backspace", vk: 0x08, native: 51, character: 0x7F },
-            SpecialKey { name: "Tab", vk: 0x09, native: 48, character: 0x09 },
-            SpecialKey { name: "Return", vk: 0x0D, native: 36, character: 0x0D },
-            SpecialKey { name: "Escape", vk: 0x1B, native: 53, character: 0x1B },
-            SpecialKey { name: "Delete", vk: 0x2E, native: 117, character: 0xF728 },
-            SpecialKey { name: "UpArrow", vk: 0x26, native: 126, character: 0xF700 },
-            SpecialKey { name: "DownArrow", vk: 0x28, native: 125, character: 0xF701 },
-            SpecialKey { name: "LeftArrow", vk: 0x25, native: 123, character: 0xF702 },
-            SpecialKey { name: "RightArrow", vk: 0x27, native: 124, character: 0xF703 },
+            SpecialKey {
+                name: "Backspace",
+                vk: 0x08,
+                native: 51,
+                character: 0x7F,
+            },
+            SpecialKey {
+                name: "Tab",
+                vk: 0x09,
+                native: 48,
+                character: 0x09,
+            },
+            SpecialKey {
+                name: "Return",
+                vk: 0x0D,
+                native: 36,
+                character: 0x0D,
+            },
+            SpecialKey {
+                name: "Escape",
+                vk: 0x1B,
+                native: 53,
+                character: 0x1B,
+            },
+            SpecialKey {
+                name: "Delete",
+                vk: 0x2E,
+                native: 117,
+                character: 0xF728,
+            },
+            SpecialKey {
+                name: "UpArrow",
+                vk: 0x26,
+                native: 126,
+                character: 0xF700,
+            },
+            SpecialKey {
+                name: "DownArrow",
+                vk: 0x28,
+                native: 125,
+                character: 0xF701,
+            },
+            SpecialKey {
+                name: "LeftArrow",
+                vk: 0x25,
+                native: 123,
+                character: 0xF702,
+            },
+            SpecialKey {
+                name: "RightArrow",
+                vk: 0x27,
+                native: 124,
+                character: 0xF703,
+            },
         ];
 
         let (tx, rx) = ipc::channel::<Command>().unwrap();
@@ -720,7 +765,8 @@ mod tests {
     #[test]
     fn ime_cancel_composition_roundtrip() {
         let (tx, rx) = ipc::channel::<Command>().unwrap();
-        tx.send(Command::ImeCancelComposition { browser_id: 1 }).unwrap();
+        tx.send(Command::ImeCancelComposition { browser_id: 1 })
+            .unwrap();
         let cmd = rx.recv().unwrap();
         match cmd {
             Command::ImeCancelComposition { browser_id } => {
@@ -819,7 +865,8 @@ mod tests {
         assert!(matches!(cmd, Command::ImeSetComposition { .. }));
 
         // 2. キャンセル
-        tx.send(Command::ImeCancelComposition { browser_id: 1 }).unwrap();
+        tx.send(Command::ImeCancelComposition { browser_id: 1 })
+            .unwrap();
         let cmd = rx.recv().unwrap();
         assert!(matches!(
             cmd,
