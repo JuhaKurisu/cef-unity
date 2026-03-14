@@ -6,6 +6,16 @@ use std::io::Write;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+// ---------------------------------------------------------------------------
+// IOSurface FFI (macOS only)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+#[link(name = "IOSurface", kind = "framework")]
+unsafe extern "C" {
+    fn IOSurfaceGetID(buffer: *mut std::os::raw::c_void) -> u32;
+}
+
 use cef_unity_ipc::{self as ipc, Command, Response, ShmWriter};
 
 // ---------------------------------------------------------------------------
@@ -138,6 +148,43 @@ wrap_render_handler! {
             let size = (width * height * 4) as usize;
             let src = unsafe { std::slice::from_raw_parts(buffer, size) };
             self.shm.write_frame(src, width as u32, height as u32);
+        }
+
+        fn on_accelerated_paint(
+            &self,
+            _browser: Option<&mut Browser>,
+            type_: PaintElementType,
+            _dirty_rects: Option<&[Rect]>,
+            info: Option<&AcceleratedPaintInfo>,
+        ) {
+            if type_.get_raw() != PaintElementType::VIEW.get_raw() {
+                return;
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(info) = info {
+                let io_surface = info.shared_texture_io_surface;
+                if io_surface.is_null() {
+                    return;
+                }
+                let surface_id = unsafe { IOSurfaceGetID(io_surface) };
+                let w = info.extra.coded_size.width as u32;
+                let h = info.extra.coded_size.height as u32;
+                let format = if info.format.get_raw() == ColorType::RGBA_8888.get_raw() {
+                    1u32
+                } else {
+                    0u32
+                };
+
+                let count = PAINT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if count <= 3 || count.is_multiple_of(100) {
+                    log(&format!(
+                        "on_accelerated_paint #{}: {}x{} surface_id={}",
+                        count, w, h, surface_id
+                    ));
+                }
+
+                self.shm.write_iosurface_info(surface_id, w, h, format);
+            }
         }
 
         fn on_ime_composition_range_changed(
@@ -317,6 +364,10 @@ wrap_app! {
                     Some(&CefString::from("autoplay-policy")),
                     Some(&CefString::from("no-user-gesture-required")),
                 );
+                // GPU サンドボックスを無効化 (shared_texture_enabled で GPU プロセスが正常に
+                // 動作するために必要。Unity プラグイン環境では CEF レベルのサンドボックスも
+                // 無効 (no_sandbox=1) なので、GPU サンドボックスも不要)
+                cl.append_switch(Some(&CefString::from("disable-gpu-sandbox")));
             }
         }
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
@@ -564,7 +615,10 @@ impl CefServer {
             load_handler,
         );
 
-        let window_info = WindowInfo::default().set_as_windowless(std::ptr::null_mut());
+        let mut window_info = WindowInfo::default().set_as_windowless(std::ptr::null_mut());
+        // GPU テクスチャ共有を有効化: on_accelerated_paint + IOSurface パス
+        // (--disable-gpu-sandbox と組み合わせて使用)
+        window_info.shared_texture_enabled = 1;
         let ok = browser_host_create_browser(
             Some(&window_info),
             Some(&mut client),

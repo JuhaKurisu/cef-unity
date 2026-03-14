@@ -6,5 +6,6 @@ fn main() {
             .flag("-fobjc-arc")
             .compile("cef_app_inject");
         println!("cargo:rustc-link-lib=framework=AppKit");
+        println!("cargo:rustc-link-lib=framework=IOSurface");
     }
 }

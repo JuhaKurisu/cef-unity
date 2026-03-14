@@ -1002,6 +1002,92 @@ pub extern "C" fn cef_unity_ime_cancel_composition(handle: *mut CefUnityBrowser)
 }
 
 // ---------------------------------------------------------------------------
+// IOSurface / Metal texture (macOS)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn cef_unity_create_metal_texture_objc(
+        surface_id: u32,
+        width: i32,
+        height: i32,
+        format: u32,
+    ) -> *mut std::ffi::c_void;
+
+    fn cef_unity_release_metal_texture_objc(texture_ptr: *mut std::ffi::c_void);
+}
+
+/// Check if a new accelerated paint frame is available via IOSurface.
+/// Returns 1 if new info, 0 if unchanged. Writes surface_id, width, height, format to out params.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_get_iosurface_info(
+    handle: *mut CefUnityBrowser,
+    out_surface_id: *mut u32,
+    out_width: *mut i32,
+    out_height: *mut i32,
+    out_format: *mut u32,
+) -> i32 {
+    if handle.is_null()
+        || out_surface_id.is_null()
+        || out_width.is_null()
+        || out_height.is_null()
+        || out_format.is_null()
+    {
+        return 0;
+    }
+    let instance = handle_to_ref(handle);
+
+    match instance.shm.get_iosurface_info() {
+        Some((surface_id, w, h, format)) => {
+            unsafe {
+                *out_surface_id = surface_id;
+                *out_width = w as i32;
+                *out_height = h as i32;
+                *out_format = format;
+            }
+            1
+        }
+        None => 0,
+    }
+}
+
+/// Create a Metal texture backed by an IOSurface.
+/// Uses the system default Metal device internally.
+/// Returns an opaque MTLTexture pointer, or null on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_create_metal_texture(
+    surface_id: u32,
+    width: i32,
+    height: i32,
+    format: u32,
+) -> *mut std::ffi::c_void {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { cef_unity_create_metal_texture_objc(surface_id, width, height, format) }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (surface_id, width, height, format);
+        std::ptr::null_mut()
+    }
+}
+
+/// Release a Metal texture previously created by cef_unity_create_metal_texture.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_release_metal_texture(texture: *mut std::ffi::c_void) {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe {
+            cef_unity_release_metal_texture_objc(texture);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = texture;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Log retrieval
 // ---------------------------------------------------------------------------
 

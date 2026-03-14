@@ -350,6 +350,44 @@ namespace CefUnity.Interop
             SendKeyEvent(KeyEventType.KeyUp, vk, modifiers: modifiers, character: c, unmodifiedCharacter: c);
         }
 
+        // ----- IOSurface / Metal texture -----
+
+        /// <summary>
+        /// IOSurface 経由の新しい accelerated paint フレームがあるか確認する。
+        /// 新フレームがあれば true を返し、surface_id/width/height/format を設定する。
+        /// </summary>
+        public unsafe bool TryGetIOSurfaceInfo(out uint surfaceId, out int width, out int height, out uint format)
+        {
+            ThrowIfDisposed();
+            uint sid;
+            int w, h;
+            uint fmt;
+            var result = NativeMethods.cef_unity_get_iosurface_info(_handle, &sid, &w, &h, &fmt);
+            surfaceId = sid;
+            width = w;
+            height = h;
+            format = fmt;
+            return result != 0;
+        }
+
+        /// <summary>
+        /// IOSurface から Metal テクスチャを作成する。
+        /// Metal デバイスは内部で自動取得される。成功時は MTLTexture ポインタを返す。
+        /// </summary>
+        public static unsafe IntPtr CreateMetalTexture(uint surfaceId, int width, int height, uint format)
+        {
+            return (IntPtr)NativeMethods.cef_unity_create_metal_texture(surfaceId, width, height, format);
+        }
+
+        /// <summary>
+        /// CreateMetalTexture で作成した Metal テクスチャを解放する。
+        /// </summary>
+        public static unsafe void ReleaseMetalTexture(IntPtr texture)
+        {
+            if (texture != IntPtr.Zero)
+                NativeMethods.cef_unity_release_metal_texture((void*)texture);
+        }
+
         // ----- IME -----
 
         public void ImeSetComposition(string text, uint selectionStart, uint selectionEnd)

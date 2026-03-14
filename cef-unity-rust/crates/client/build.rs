@@ -6,6 +6,18 @@ fn main() {
         .parent()
         .unwrap();
 
+    #[cfg(target_os = "macos")]
+    {
+        cc::Build::new()
+            .file("src/metal_texture.m")
+            .flag("-fobjc-arc")
+            .compile("metal_texture");
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=IOSurface");
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
+        println!("cargo:rustc-link-lib=dylib=objc");
+    }
+
     for dest in [
         workspace_root.join("../cef-unity-csharp/Interop/NativeMethods.g.cs"),
         workspace_root.join("../cef-unity-unityproject/Assets/CefUnity/Interop/NativeMethods.g.cs"),

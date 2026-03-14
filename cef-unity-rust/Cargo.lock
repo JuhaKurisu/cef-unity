@@ -203,6 +203,7 @@ dependencies = [
 name = "cef-unity-client"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "cef-unity-ipc",
  "csbindgen",
  "ipc-channel",

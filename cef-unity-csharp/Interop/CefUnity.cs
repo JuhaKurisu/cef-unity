@@ -332,6 +332,33 @@ public sealed class Browser : IDisposable
         }
     }
 
+    // ----- IOSurface / Metal texture -----
+
+    public unsafe bool TryGetIOSurfaceInfo(out uint surfaceId, out int width, out int height, out uint format)
+    {
+        ThrowIfDisposed();
+        uint sid;
+        int w, h;
+        uint fmt;
+        var result = NativeMethods.cef_unity_get_iosurface_info(_handle, &sid, &w, &h, &fmt);
+        surfaceId = sid;
+        width = w;
+        height = h;
+        format = fmt;
+        return result != 0;
+    }
+
+    public static unsafe IntPtr CreateMetalTexture(uint surfaceId, int width, int height, uint format)
+    {
+        return (IntPtr)NativeMethods.cef_unity_create_metal_texture(surfaceId, width, height, format);
+    }
+
+    public static unsafe void ReleaseMetalTexture(IntPtr texture)
+    {
+        if (texture != IntPtr.Zero)
+            NativeMethods.cef_unity_release_metal_texture((void*)texture);
+    }
+
     // ----- IME -----
 
         public void ImeSetComposition(string text, uint selectionStart, uint selectionEnd)

@@ -13,3 +13,4 @@ ipc-channel = "0.21"
 
 [build-dependencies]
 csbindgen = "1.9"
+cc = "1"

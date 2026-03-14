@@ -5,6 +5,7 @@ using System.Text;
 using CefUnity;
 using CefUnity.Interop;
 using UnityEngine;
+using UnityEngine.Rendering;
 using UnityEngine.UI;
 
 public class SampleScript : MonoBehaviour
@@ -85,6 +86,10 @@ public class SampleScript : MonoBehaviour
     private bool _imeActive;
     private bool _imeSuppressKeys;
 
+    // Accelerated paint (IOSurface / Metal)
+    private bool _useAcceleratedPaint;
+    private readonly Dictionary<uint, IntPtr> _metalTextureCache = new();
+    private uint _lastSurfaceId;
 
     // Double/triple click detection
     private float _lastClickTime;
@@ -100,9 +105,13 @@ public class SampleScript : MonoBehaviour
         {
             _currentWidth = Screen.width;
             _currentHeight = Screen.height;
+
+            // Metal デバイス検出
+            _useAcceleratedPaint = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Metal;
+
             CefRuntime.Init();
             _browser = new Browser(_currentWidth, _currentHeight, _url);
-            Debug.Log($"[CefUnity] Initialized ({_currentWidth}x{_currentHeight})");
+            Debug.Log($"[CefUnity] Initialized ({_currentWidth}x{_currentHeight}), acceleratedPaint={_useAcceleratedPaint}");
             SetupImeProxy();
         }
         catch (Exception e)
@@ -141,6 +150,11 @@ public class SampleScript : MonoBehaviour
     {
         _browser?.Dispose();
         _browser = null;
+
+        // Metal テクスチャキャッシュの解放
+        foreach (var kvp in _metalTextureCache)
+            Browser.ReleaseMetalTexture(kvp.Value);
+        _metalTextureCache.Clear();
 
         if (_texture != null)
         {
@@ -481,6 +495,83 @@ public class SampleScript : MonoBehaviour
     {
         if (_browser == null) return;
 
+        if (_useAcceleratedPaint)
+        {
+            UpdateTextureAccelerated();
+            return;
+        }
+
+        UpdateTextureSoftware();
+    }
+
+    private void UpdateTextureAccelerated()
+    {
+        if (!_browser.TryGetIOSurfaceInfo(out var surfaceId, out var w, out var h, out var format))
+            return;
+
+        if (w <= 0 || h <= 0 || surfaceId == 0) return;
+
+        // IOSurface ID が変わった場合のみ新しい MTLTexture を作成
+        if (surfaceId != _lastSurfaceId)
+        {
+            _lastSurfaceId = surfaceId;
+
+            if (!_metalTextureCache.TryGetValue(surfaceId, out var mtlTexPtr))
+            {
+                mtlTexPtr = Browser.CreateMetalTexture(surfaceId, w, h, format);
+                if (mtlTexPtr == IntPtr.Zero)
+                {
+                    // Metal テクスチャ作成失敗 → ソフトウェアフォールバック
+                    Debug.LogWarning("[CefUnity] Metal texture creation failed, falling back to software");
+                    _useAcceleratedPaint = false;
+                    return;
+                }
+                _metalTextureCache[surfaceId] = mtlTexPtr;
+
+                // 古いキャッシュエントリを削除 (double-buffer で最大2つ保持)
+                if (_metalTextureCache.Count > 2)
+                    CleanupOldMetalTextures(surfaceId);
+            }
+
+            var texFormat = format == 1 ? TextureFormat.RGBA32 : TextureFormat.BGRA32;
+
+            if (_texture == null || _texture.width != w || _texture.height != h)
+            {
+                if (_texture != null)
+                    Destroy(_texture);
+
+                _texture = Texture2D.CreateExternalTexture(w, h, texFormat, false, false, mtlTexPtr);
+                if (_rawImage != null)
+                {
+                    _rawImage.texture = _texture;
+                    _rawImage.uvRect = new Rect(0, 1, 1, -1);
+                }
+            }
+            else
+            {
+                _texture.UpdateExternalTexture(mtlTexPtr);
+            }
+        }
+        // surfaceId が同じ → IOSurface の内容が GPU 上で更新済みなので何もしない
+    }
+
+    private void CleanupOldMetalTextures(uint keepSurfaceId)
+    {
+        var toRemove = new List<uint>();
+        foreach (var kvp in _metalTextureCache)
+        {
+            if (kvp.Key != keepSurfaceId && kvp.Key != _lastSurfaceId)
+                toRemove.Add(kvp.Key);
+        }
+        foreach (var key in toRemove)
+        {
+            Browser.ReleaseMetalTexture(_metalTextureCache[key]);
+            _metalTextureCache.Remove(key);
+        }
+    }
+
+    private void UpdateTextureSoftware()
+    {
         // TryGetBuffer は新しいフレームがある場合のみ true を返す
         if (!_browser.TryGetBuffer(out var buffer, out var w, out var h))
             return;

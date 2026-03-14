@@ -146,7 +146,12 @@ pub struct ShmHeader {
     pub ime_caret_y: AtomicI32,
     pub ime_caret_w: AtomicI32,
     pub ime_caret_h: AtomicI32,
-    pub _pad: [u8; 28],
+    // ---- IOSurface accelerated paint ----
+    pub accel_frame_id: AtomicU64,
+    pub accel_surface_id: AtomicU32,
+    pub accel_width: AtomicU32,
+    pub accel_height: AtomicU32,
+    pub accel_format: AtomicU32, // 0=BGRA, 1=RGBA
 }
 
 use std::sync::atomic::AtomicI32;
@@ -209,6 +214,16 @@ impl ShmWriter {
         header.ime_caret_h.store(h, Ordering::Release);
     }
 
+    /// Write IOSurface info into the shared memory header.
+    pub fn write_iosurface_info(&self, surface_id: u32, width: u32, height: u32, format: u32) {
+        let header = self.header();
+        header.accel_surface_id.store(surface_id, Ordering::Release);
+        header.accel_width.store(width, Ordering::Release);
+        header.accel_height.store(height, Ordering::Release);
+        header.accel_format.store(format, Ordering::Release);
+        header.accel_frame_id.fetch_add(1, Ordering::Release);
+    }
+
     /// Write a frame. The buffer must be width*height*4 BGRA bytes.
     pub fn write_frame(&self, pixels: &[u8], width: u32, height: u32) {
         let size = (width * height * 4) as usize;
@@ -237,6 +252,7 @@ impl ShmWriter {
 pub struct ShmReader {
     shmem: Shmem,
     pub last_frame_id: u64,
+    pub last_accel_frame_id: u64,
 }
 
 unsafe impl Send for ShmReader {}
@@ -251,7 +267,28 @@ impl ShmReader {
         Ok(ShmReader {
             shmem,
             last_frame_id: 0,
+            last_accel_frame_id: 0,
         })
+    }
+
+    /// Read IOSurface info from the shared memory header.
+    /// Returns Some((surface_id, width, height, format)) if a new accelerated frame is available.
+    pub fn get_iosurface_info(&mut self) -> Option<(u32, u32, u32, u32)> {
+        let header = unsafe { &*(self.shmem.as_ptr() as *const ShmHeader) };
+        let frame_id = header.accel_frame_id.load(Ordering::Acquire);
+        if frame_id == self.last_accel_frame_id {
+            return None;
+        }
+        self.last_accel_frame_id = frame_id;
+
+        let surface_id = header.accel_surface_id.load(Ordering::Acquire);
+        let width = header.accel_width.load(Ordering::Acquire);
+        let height = header.accel_height.load(Ordering::Acquire);
+        let format = header.accel_format.load(Ordering::Acquire);
+        if surface_id == 0 || width == 0 || height == 0 {
+            return None;
+        }
+        Some((surface_id, width, height, format))
     }
 
     /// Read IME caret rect from the shared memory header.
