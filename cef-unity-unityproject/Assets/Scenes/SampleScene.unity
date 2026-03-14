@@ -269,10 +269,11 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: b266723374a144d27989f433d8f34cea, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::SampleScript
-  _width: 1920
-  _height: 1080
+  _width: 1710
+  _height: 1112
   _url: google.com
   _rawImage: {fileID: 1153544198}
+  _resolutionScale: 2
 --- !u!1 &410087039
 GameObject:
   m_ObjectHideFlags: 0
