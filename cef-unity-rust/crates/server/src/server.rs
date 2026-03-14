@@ -16,6 +16,18 @@ unsafe extern "C" {
     fn IOSurfaceGetID(buffer: *mut std::os::raw::c_void) -> u32;
 }
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn mach_iosurface_server_accept() -> i32;
+    fn mach_iosurface_server_send(
+        io_surface_ref: *mut std::os::raw::c_void,
+        width: u32,
+        height: u32,
+        format: u32,
+    ) -> i32;
+    fn mach_iosurface_server_has_client() -> i32;
+}
+
 use cef_unity_ipc::{self as ipc, Command, Response, ShmWriter};
 
 // ---------------------------------------------------------------------------
@@ -166,7 +178,6 @@ wrap_render_handler! {
                 if io_surface.is_null() {
                     return;
                 }
-                let surface_id = unsafe { IOSurfaceGetID(io_surface) };
                 let w = info.extra.coded_size.width as u32;
                 let h = info.extra.coded_size.height as u32;
                 let format = if info.format.get_raw() == ColorType::RGBA_8888.get_raw() {
@@ -176,13 +187,26 @@ wrap_render_handler! {
                 };
 
                 let count = PAINT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                if count <= 3 || count.is_multiple_of(100) {
+
+                // Accept pending client subscription (non-blocking)
+                unsafe { mach_iosurface_server_accept(); }
+
+                // Send IOSurface via Mach port to connected client
+                let ret = unsafe {
+                    mach_iosurface_server_send(io_surface, w, h, format)
+                };
+
+                if count <= 5 || count.is_multiple_of(100) {
+                    let surface_id = unsafe { IOSurfaceGetID(io_surface) };
+                    let has_client = unsafe { mach_iosurface_server_has_client() };
                     log(&format!(
-                        "on_accelerated_paint #{}: {}x{} surface_id={}",
-                        count, w, h, surface_id
+                        "on_accelerated_paint #{}: {}x{} surface_id={} mach_send={} client={}",
+                        count, w, h, surface_id, ret, has_client
                     ));
                 }
 
+                // Also write metadata to ShmHeader (for frame change detection)
+                let surface_id = unsafe { IOSurfaceGetID(io_surface) };
                 self.shm.write_iosurface_info(surface_id, w, h, format);
             }
         }
@@ -616,8 +640,9 @@ impl CefServer {
         );
 
         let mut window_info = WindowInfo::default().set_as_windowless(std::ptr::null_mut());
-        // GPU テクスチャ共有を有効化: on_accelerated_paint + IOSurface パス
-        // (--disable-gpu-sandbox と組み合わせて使用)
+        // IOSurface Mach port 転送を使用: on_accelerated_paint でゼロコピー GPU テクスチャ共有。
+        // IOSurfaceLookup (グローバル ID) は macOS 16 で動作しないため、
+        // IOSurfaceCreateMachPort + IOSurfaceLookupFromMachPort を使用。
         window_info.shared_texture_enabled = 1;
         let ok = browser_host_create_browser(
             Some(&window_info),

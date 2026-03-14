@@ -212,6 +212,20 @@ namespace CefUnity
         public static extern void* cef_unity_create_metal_texture(uint surface_id, int width, int height, uint format);
 
         /// <summary>
+        ///  Receive the latest IOSurface from the server via Mach port and create a Metal texture.
+        ///  Returns an opaque MTLTexture pointer, or null if no new frame.
+        ///  The caller must release the returned texture with cef_unity_release_metal_texture.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_recv_iosurface_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void* cef_unity_recv_iosurface_texture(int* out_width, int* out_height, uint* out_format);
+
+        /// <summary>
+        ///  Returns 1 if the Mach IOSurface port channel is connected, 0 otherwise.
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_is_iosurface_connected", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_is_iosurface_connected();
+
+        /// <summary>
         ///  Release a Metal texture previously created by cef_unity_create_metal_texture.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_release_metal_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]

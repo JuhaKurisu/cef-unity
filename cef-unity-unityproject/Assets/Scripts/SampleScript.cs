@@ -86,10 +86,9 @@ public class SampleScript : MonoBehaviour
     private bool _imeActive;
     private bool _imeSuppressKeys;
 
-    // Accelerated paint (IOSurface / Metal)
+    // Accelerated paint (IOSurface / Metal via Mach port)
     private bool _useAcceleratedPaint;
-    private readonly Dictionary<uint, IntPtr> _metalTextureCache = new();
-    private uint _lastSurfaceId;
+    private IntPtr _lastAccelTexture;
 
     // Double/triple click detection
     private float _lastClickTime;
@@ -106,8 +105,10 @@ public class SampleScript : MonoBehaviour
             _currentWidth = Screen.width;
             _currentHeight = Screen.height;
 
-            // Metal デバイス検出
-            _useAcceleratedPaint = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Metal;
+            // Mach port 経由の IOSurface 転送でゼロコピー GPU テクスチャ共有を使用。
+            // 接続に失敗した場合はソフトウェアレンダリングにフォールバック。
+            _useAcceleratedPaint = Browser.IsIOSurfaceConnected();
+            Debug.Log($"[CefUnity] IOSurface Mach port connected: {_useAcceleratedPaint}");
 
             CefRuntime.Init();
             _browser = new Browser(_currentWidth, _currentHeight, _url);
@@ -151,10 +152,12 @@ public class SampleScript : MonoBehaviour
         _browser?.Dispose();
         _browser = null;
 
-        // Metal テクスチャキャッシュの解放
-        foreach (var kvp in _metalTextureCache)
-            Browser.ReleaseMetalTexture(kvp.Value);
-        _metalTextureCache.Clear();
+        // Metal テクスチャの解放
+        if (_lastAccelTexture != IntPtr.Zero)
+        {
+            Browser.ReleaseMetalTexture(_lastAccelTexture);
+            _lastAccelTexture = IntPtr.Zero;
+        }
 
         if (_texture != null)
         {
@@ -506,67 +509,34 @@ public class SampleScript : MonoBehaviour
 
     private void UpdateTextureAccelerated()
     {
-        if (!_browser.TryGetIOSurfaceInfo(out var surfaceId, out var w, out var h, out var format))
+        // Mach port 経由で最新の IOSurface を受信し、Metal テクスチャを取得
+        if (!Browser.TryRecvIOSurfaceTexture(out var mtlTexPtr, out var w, out var h, out var format))
             return;
 
-        if (w <= 0 || h <= 0 || surfaceId == 0) return;
+        if (w <= 0 || h <= 0 || mtlTexPtr == IntPtr.Zero) return;
 
-        // IOSurface ID が変わった場合のみ新しい MTLTexture を作成
-        if (surfaceId != _lastSurfaceId)
+        // 前回の Metal テクスチャを解放 (新しいテクスチャに置き換え)
+        if (_lastAccelTexture != IntPtr.Zero)
+            Browser.ReleaseMetalTexture(_lastAccelTexture);
+        _lastAccelTexture = mtlTexPtr;
+
+        var texFormat = format == 1 ? TextureFormat.RGBA32 : TextureFormat.BGRA32;
+
+        if (_texture == null || _texture.width != w || _texture.height != h)
         {
-            _lastSurfaceId = surfaceId;
+            if (_texture != null)
+                Destroy(_texture);
 
-            if (!_metalTextureCache.TryGetValue(surfaceId, out var mtlTexPtr))
+            _texture = Texture2D.CreateExternalTexture(w, h, texFormat, false, false, mtlTexPtr);
+            if (_rawImage != null)
             {
-                mtlTexPtr = Browser.CreateMetalTexture(surfaceId, w, h, format);
-                if (mtlTexPtr == IntPtr.Zero)
-                {
-                    // Metal テクスチャ作成失敗 → ソフトウェアフォールバック
-                    Debug.LogWarning("[CefUnity] Metal texture creation failed, falling back to software");
-                    _useAcceleratedPaint = false;
-                    return;
-                }
-                _metalTextureCache[surfaceId] = mtlTexPtr;
-
-                // 古いキャッシュエントリを削除 (double-buffer で最大2つ保持)
-                if (_metalTextureCache.Count > 2)
-                    CleanupOldMetalTextures(surfaceId);
-            }
-
-            var texFormat = format == 1 ? TextureFormat.RGBA32 : TextureFormat.BGRA32;
-
-            if (_texture == null || _texture.width != w || _texture.height != h)
-            {
-                if (_texture != null)
-                    Destroy(_texture);
-
-                _texture = Texture2D.CreateExternalTexture(w, h, texFormat, false, false, mtlTexPtr);
-                if (_rawImage != null)
-                {
-                    _rawImage.texture = _texture;
-                    _rawImage.uvRect = new Rect(0, 1, 1, -1);
-                }
-            }
-            else
-            {
-                _texture.UpdateExternalTexture(mtlTexPtr);
+                _rawImage.texture = _texture;
+                _rawImage.uvRect = new Rect(0, 1, 1, -1);
             }
         }
-        // surfaceId が同じ → IOSurface の内容が GPU 上で更新済みなので何もしない
-    }
-
-    private void CleanupOldMetalTextures(uint keepSurfaceId)
-    {
-        var toRemove = new List<uint>();
-        foreach (var kvp in _metalTextureCache)
+        else
         {
-            if (kvp.Key != keepSurfaceId && kvp.Key != _lastSurfaceId)
-                toRemove.Add(kvp.Key);
-        }
-        foreach (var key in toRemove)
-        {
-            Browser.ReleaseMetalTexture(_metalTextureCache[key]);
-            _metalTextureCache.Remove(key);
+            _texture.UpdateExternalTexture(mtlTexPtr);
         }
     }
 

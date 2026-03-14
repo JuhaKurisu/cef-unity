@@ -42,6 +42,22 @@ fn main() {
     }
     log("CEF initialized successfully");
 
+    // Initialize Mach IOSurface port service (macOS only)
+    #[cfg(target_os = "macos")]
+    {
+        let service_name = cef_unity_ipc::iosurface_service_name(std::process::id());
+        let sname = std::ffi::CString::new(service_name.as_str()).unwrap();
+        unsafe extern "C" {
+            fn mach_iosurface_server_init(service_name: *const std::ffi::c_char) -> i32;
+        }
+        let ret = unsafe { mach_iosurface_server_init(sname.as_ptr()) };
+        if ret == 0 {
+            log(&format!("Mach IOSurface service registered: {}", service_name));
+        } else {
+            log(&format!("Mach IOSurface service init failed: {}", ret));
+        }
+    }
+
     // Create bidirectional channels
     let (cmd_tx, cmd_rx) =
         ipc_ch::channel::<CommandEnvelope>().expect("failed to create cmd channel");
@@ -51,7 +67,11 @@ fn main() {
     let bootstrap_tx =
         IpcSender::connect(ipc_server_name).expect("failed to connect to client one-shot server");
     bootstrap_tx
-        .send(Bootstrap { cmd_tx, resp_rx })
+        .send(Bootstrap {
+            cmd_tx,
+            resp_rx,
+            server_pid: std::process::id(),
+        })
         .expect("failed to send bootstrap");
     log("bootstrap sent to client");
 

@@ -121,6 +121,13 @@ pub enum Response {
 pub struct Bootstrap {
     pub cmd_tx: IpcSender<CommandEnvelope>,
     pub resp_rx: IpcReceiver<Response>,
+    /// Server PID — used to derive Mach service name for IOSurface port transfer.
+    pub server_pid: u32,
+}
+
+/// Derive the Mach bootstrap service name for IOSurface port transfer.
+pub fn iosurface_service_name(server_pid: u32) -> String {
+    format!("com.cef-unity.iosurface.{}", server_pid)
 }
 
 // ---------------------------------------------------------------------------
@@ -985,7 +992,7 @@ mod tests {
         let (resp_tx, resp_rx) = ipc::channel::<Response>().unwrap();
 
         // Simulate server sending bootstrap
-        bootstrap_tx.send(Bootstrap { cmd_tx, resp_rx }).unwrap();
+        bootstrap_tx.send(Bootstrap { cmd_tx, resp_rx, server_pid: 12345 }).unwrap();
 
         // Client receives bootstrap
         let bootstrap = bootstrap_rx.recv().unwrap();

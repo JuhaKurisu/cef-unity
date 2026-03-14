@@ -129,6 +129,7 @@ fn handle_to_ref<'a>(handle: *mut CefUnityBrowser) -> &'a mut ClientBrowserInsta
 // ---------------------------------------------------------------------------
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
+static IOSURFACE_CONNECTED: AtomicBool = AtomicBool::new(false);
 static PAINT_COUNT: AtomicU64 = AtomicU64::new(0);
 static PUMP_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -239,6 +240,21 @@ pub extern "C" fn cef_unity_init() -> i32 {
         cmd_tx: bootstrap.cmd_tx,
         resp_rx: bootstrap.resp_rx,
     });
+
+    // Connect to server's Mach IOSurface port service (macOS only)
+    #[cfg(target_os = "macos")]
+    {
+        let service_name = cef_unity_ipc::iosurface_service_name(bootstrap.server_pid);
+        log_to_file(&format!("connecting to Mach IOSurface service: {}", service_name));
+        let cname = std::ffi::CString::new(service_name.as_str()).unwrap();
+        let ret = unsafe { mach_iosurface_client_connect(cname.as_ptr()) };
+        if ret == 0 {
+            IOSURFACE_CONNECTED.store(true, Ordering::SeqCst);
+            log_to_file("Mach IOSurface service connected");
+        } else {
+            log_to_file(&format!("Mach IOSurface service connect failed: {}", ret));
+        }
+    }
 
     INITIALIZED.store(true, Ordering::SeqCst);
     log_to_file("initialized successfully (IPC client)");
@@ -1015,6 +1031,14 @@ unsafe extern "C" {
     ) -> *mut std::ffi::c_void;
 
     fn cef_unity_release_metal_texture_objc(texture_ptr: *mut std::ffi::c_void);
+
+    fn mach_iosurface_client_connect(service_name: *const std::ffi::c_char) -> i32;
+
+    fn mach_iosurface_recv_texture(
+        out_width: *mut i32,
+        out_height: *mut i32,
+        out_format: *mut u32,
+    ) -> *mut std::ffi::c_void;
 }
 
 /// Check if a new accelerated paint frame is available via IOSurface.
@@ -1027,6 +1051,8 @@ pub extern "C" fn cef_unity_get_iosurface_info(
     out_height: *mut i32,
     out_format: *mut u32,
 ) -> i32 {
+    static ACCEL_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+
     if handle.is_null()
         || out_surface_id.is_null()
         || out_width.is_null()
@@ -1039,6 +1065,13 @@ pub extern "C" fn cef_unity_get_iosurface_info(
 
     match instance.shm.get_iosurface_info() {
         Some((surface_id, w, h, format)) => {
+            let count = ACCEL_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if count <= 5 || count % 100 == 0 {
+                log_to_file(&format!(
+                    "get_iosurface_info #{}: surface_id={} {}x{} fmt={}",
+                    count, surface_id, w, h, format
+                ));
+            }
             unsafe {
                 *out_surface_id = surface_id;
                 *out_width = w as i32;
@@ -1070,6 +1103,40 @@ pub extern "C" fn cef_unity_create_metal_texture(
         let _ = (surface_id, width, height, format);
         std::ptr::null_mut()
     }
+}
+
+/// Receive the latest IOSurface from the server via Mach port and create a Metal texture.
+/// Returns an opaque MTLTexture pointer, or null if no new frame.
+/// The caller must release the returned texture with cef_unity_release_metal_texture.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_recv_iosurface_texture(
+    out_width: *mut i32,
+    out_height: *mut i32,
+    out_format: *mut u32,
+) -> *mut std::ffi::c_void {
+    if out_width.is_null() || out_height.is_null() || out_format.is_null() {
+        return std::ptr::null_mut();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if !IOSURFACE_CONNECTED.load(Ordering::SeqCst) {
+            return std::ptr::null_mut();
+        }
+        unsafe {
+            mach_iosurface_recv_texture(out_width, out_height, out_format)
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (out_width, out_height, out_format);
+        std::ptr::null_mut()
+    }
+}
+
+/// Returns 1 if the Mach IOSurface port channel is connected, 0 otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_is_iosurface_connected() -> i32 {
+    if IOSURFACE_CONNECTED.load(Ordering::SeqCst) { 1 } else { 0 }
 }
 
 /// Release a Metal texture previously created by cef_unity_create_metal_texture.

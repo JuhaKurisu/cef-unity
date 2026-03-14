@@ -388,6 +388,31 @@ namespace CefUnity.Interop
                 NativeMethods.cef_unity_release_metal_texture((void*)texture);
         }
 
+        /// <summary>
+        /// Mach port 経由で最新の IOSurface を受信し、Metal テクスチャを作成する。
+        /// 新フレームがあれば MTLTexture ポインタと寸法を返す。なければ IntPtr.Zero。
+        /// 返されたテクスチャは ReleaseMetalTexture で解放すること。
+        /// </summary>
+        public static unsafe bool TryRecvIOSurfaceTexture(out IntPtr texturePtr, out int width, out int height, out uint format)
+        {
+            int w, h;
+            uint fmt;
+            var ptr = NativeMethods.cef_unity_recv_iosurface_texture(&w, &h, &fmt);
+            texturePtr = (IntPtr)ptr;
+            width = w;
+            height = h;
+            format = fmt;
+            return ptr != null;
+        }
+
+        /// <summary>
+        /// Mach IOSurface port チャネルが接続済みかどうかを返す。
+        /// </summary>
+        public static bool IsIOSurfaceConnected()
+        {
+            return NativeMethods.cef_unity_is_iosurface_connected() != 0;
+        }
+
         // ----- IME -----
 
         public void ImeSetComposition(string text, uint selectionStart, uint selectionEnd)
