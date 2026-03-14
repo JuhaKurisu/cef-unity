@@ -97,18 +97,11 @@ int mach_iosurface_client_connect(const char* service_name) {
 /// On success, returns an MTLTexture pointer (retained, caller must release).
 /// On no message or error, returns NULL.
 void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint32_t* out_format) {
-    static int recv_call_count = 0;
-    recv_call_count++;
-
-    if (g_receive_port == MACH_PORT_NULL) {
-        if (recv_call_count <= 3) NSLog(@"[CefUnity-Mach] recv: g_receive_port is NULL");
-        return NULL;
-    }
+    if (g_receive_port == MACH_PORT_NULL) return NULL;
 
     // Drain all pending messages, keep only the latest
     IOSurfaceRef latest_surface = NULL;
     uint32_t latest_width = 0, latest_height = 0, latest_format = 0;
-    int msg_count = 0;
 
     for (;;) {
         // Receive buffer must include space for mach_msg_trailer_t (8 bytes)
@@ -128,15 +121,7 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
             MACH_PORT_NULL
         );
 
-        if (kr != MACH_MSG_SUCCESS) {
-            if (recv_call_count <= 5 && msg_count == 0) {
-                NSLog(@"[CefUnity-Mach] recv: mach_msg returned %d (%s), port=%u",
-                    kr, mach_error_string(kr), g_receive_port);
-            }
-            break;
-        }
-
-        msg_count++;
+        if (kr != MACH_MSG_SUCCESS) break;
 
         // Got a message — extract IOSurface
         mach_port_t surface_port = recv_buf.msg.surface_port.name;
@@ -144,25 +129,12 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
         mach_port_deallocate(mach_task_self(), surface_port);
 
         if (surface) {
-            // Release previous if we're replacing
             if (latest_surface) CFRelease(latest_surface);
             latest_surface = surface;
             latest_width = recv_buf.msg.width;
             latest_height = recv_buf.msg.height;
             latest_format = recv_buf.msg.format;
-            if (recv_call_count <= 5) {
-                NSLog(@"[CefUnity-Mach] recv: got IOSurface %dx%d fmt=%u port=%u",
-                    latest_width, latest_height, latest_format, surface_port);
-            }
-        } else {
-            if (recv_call_count <= 5) {
-                NSLog(@"[CefUnity-Mach] recv: IOSurfaceLookupFromMachPort returned NULL for port %u", surface_port);
-            }
         }
-    }
-
-    if (recv_call_count <= 5) {
-        NSLog(@"[CefUnity-Mach] recv call #%d: drained %d msgs, latest_surface=%p", recv_call_count, msg_count, latest_surface);
     }
 
     if (!latest_surface) return NULL;
@@ -179,8 +151,8 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
     }
 
     MTLPixelFormat pixelFormat = (latest_format == 1)
-        ? MTLPixelFormatRGBA8Unorm
-        : MTLPixelFormatBGRA8Unorm;
+        ? MTLPixelFormatRGBA8Unorm_sRGB
+        : MTLPixelFormatBGRA8Unorm_sRGB;
 
     MTLTextureDescriptor *desc = [MTLTextureDescriptor
         texture2DDescriptorWithPixelFormat:pixelFormat
@@ -227,8 +199,8 @@ void* cef_unity_create_metal_texture_objc(
     if (!surface) return NULL;
 
     MTLPixelFormat pixelFormat = (format == 1)
-        ? MTLPixelFormatRGBA8Unorm
-        : MTLPixelFormatBGRA8Unorm;
+        ? MTLPixelFormatRGBA8Unorm_sRGB
+        : MTLPixelFormatBGRA8Unorm_sRGB;
 
     MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
                                                                                    width:(NSUInteger)width

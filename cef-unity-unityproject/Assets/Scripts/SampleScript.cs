@@ -105,13 +105,12 @@ public class SampleScript : MonoBehaviour
             _currentWidth = Screen.width;
             _currentHeight = Screen.height;
 
-            // Mach port 経由の IOSurface 転送でゼロコピー GPU テクスチャ共有を使用。
-            // 接続に失敗した場合はソフトウェアレンダリングにフォールバック。
-            _useAcceleratedPaint = Browser.IsIOSurfaceConnected();
-            Debug.Log($"[CefUnity] IOSurface Mach port connected: {_useAcceleratedPaint}");
-
             CefRuntime.Init();
             _browser = new Browser(_currentWidth, _currentHeight, _url);
+
+            // Mach port 経由の IOSurface 転送でゼロコピー GPU テクスチャ共有を使用。
+            // Init() がサーバーを起動し Mach port 接続を行うため、その後にチェック。
+            _useAcceleratedPaint = Browser.IsIOSurfaceConnected();
             Debug.Log($"[CefUnity] Initialized ({_currentWidth}x{_currentHeight}), acceleratedPaint={_useAcceleratedPaint}");
             SetupImeProxy();
         }

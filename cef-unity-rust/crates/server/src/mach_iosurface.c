@@ -1,7 +1,7 @@
 // Mach port-based IOSurface transfer: server side.
 //
 // Protocol:
-//   1. Server registers a Mach service via bootstrap_check_in
+//   1. Server registers a Mach service via bootstrap_register
 //   2. Client looks up the service and sends a "subscribe" message with a reply port
 //   3. Server stores the client's send right
 //   4. On each on_accelerated_paint, server creates an IOSurface Mach port
@@ -65,7 +65,7 @@ int mach_iosurface_server_init(const char* service_name) {
     //  for dynamically registered services without a launchd plist.)
     #pragma clang diagnostic push
     #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    kr = bootstrap_register(bootstrap_port, service_name, g_server_port);
+    kr = bootstrap_register(bootstrap_port, (char*)service_name, g_server_port);
     #pragma clang diagnostic pop
     if (kr != KERN_SUCCESS) {
         fprintf(stderr, "[mach_iosurface] bootstrap_register('%s') failed: %s\n",
