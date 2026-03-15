@@ -39,6 +39,11 @@ static struct {
 } _surfaceCache[IOSURFACE_CACHE_SIZE];
 static int _surfaceCacheCount = 0;
 
+// Private テクスチャ (安定コピー先、ダブルバッファ)
+static id<MTLTexture> _privateTex[2] = {nil, nil};
+static int _privateWriteIdx = 0;
+static uint32_t _privateW = 0, _privateH = 0;
+static MTLPixelFormat _privateFormat = MTLPixelFormatInvalid;
 
 // ---------------------------------------------------------------------------
 // Mach port IOSurface client
@@ -243,18 +248,53 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
         _surfaceCache[slot].srgbView = srcSrgbView;
     }
 
-    // --- optimizeContentsForGPUAccess: Shared テクスチャにロスレス圧縮を適用 ---
-    // Private へコピーせず、IOSurface-backed Shared テクスチャに直接
-    // GPU ロスレス圧縮を適用する (WWDC 2021, macOS 12+)
-    // CEF が IOSurface の内容を更新するため、毎フレーム再適用が必要
+    // --- optimize + Private blit: ロスレス圧縮してから安定コピーを作成 ---
+    // 1. optimizeContentsForGPUAccess: Shared テクスチャの GPU 読み取りを高速化
+    // 2. copyFromTexture: 圧縮済み Shared → Private にコピー (安定スナップショット)
+    // Private コピーにより CEF が IOSurface を再利用しても Unity の描画に影響しない
+    MTLPixelFormat targetFormat = (latest_format == 1)
+        ? MTLPixelFormatRGBA8Unorm_sRGB
+        : MTLPixelFormatBGRA8Unorm_sRGB;
+
+    if (!_privateTex[0] || _privateW != latest_width || _privateH != latest_height || _privateFormat != targetFormat) {
+        MTLTextureDescriptor *privDesc = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:targetFormat
+                                         width:(NSUInteger)latest_width
+                                        height:(NSUInteger)latest_height
+                                     mipmapped:NO];
+        privDesc.usage = MTLTextureUsageShaderRead;
+        privDesc.storageMode = MTLStorageModePrivate;
+        _privateTex[0] = [_sharedDevice newTextureWithDescriptor:privDesc];
+        _privateTex[1] = [_sharedDevice newTextureWithDescriptor:privDesc];
+        _privateW = latest_width;
+        _privateH = latest_height;
+        _privateFormat = targetFormat;
+    }
+
     if (!_sharedQueue) {
         _sharedQueue = [_sharedDevice newCommandQueue];
     }
+
+    int writeIdx = 1 - _privateWriteIdx;
+    id<MTLTexture> dstTex = _privateTex[writeIdx];
+
     id<MTLCommandBuffer> cmdBuf = [_sharedQueue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
     [blit optimizeContentsForGPUAccess:srcSrgbView];
+    [blit copyFromTexture:srcSrgbView
+              sourceSlice:0
+              sourceLevel:0
+             sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(latest_width, latest_height, 1)
+                toTexture:dstTex
+         destinationSlice:0
+         destinationLevel:0
+        destinationOrigin:MTLOriginMake(0, 0, 0)];
     [blit endEncoding];
     [cmdBuf commit];
+    [cmdBuf waitUntilCompleted];
+
+    _privateWriteIdx = writeIdx;
 
     uint64_t t_end = mach_absolute_time();
     _prof_call_count++;
@@ -274,7 +314,7 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
     *out_width = (int32_t)latest_width;
     *out_height = (int32_t)latest_height;
     *out_format = latest_format;
-    return (__bridge_retained void*)srcSrgbView;
+    return (__bridge_retained void*)dstTex;
 }
 
 // ---------------------------------------------------------------------------

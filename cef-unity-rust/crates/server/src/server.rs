@@ -26,6 +26,12 @@ unsafe extern "C" {
         format: u32,
     ) -> i32;
     fn mach_iosurface_server_has_client() -> i32;
+    fn iosurface_pool_copy_and_get(
+        src: *mut std::os::raw::c_void,
+        w: u32,
+        h: u32,
+        format: u32,
+    ) -> *mut std::os::raw::c_void;
 }
 
 use cef_unity_ipc::{self as ipc, Command, Response, ShmWriter};
@@ -188,25 +194,37 @@ wrap_render_handler! {
 
                 let count = PAINT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
+                // GPU blit: CEF IOSurface → pool IOSurface (must complete before returning)
+                let pool_surface = unsafe {
+                    iosurface_pool_copy_and_get(io_surface, w, h, format)
+                };
+                if pool_surface.is_null() {
+                    if count <= 5 {
+                        log("on_accelerated_paint: pool copy failed");
+                    }
+                    return;
+                }
+
                 // Accept pending client subscription (non-blocking)
                 unsafe { mach_iosurface_server_accept(); }
 
-                // Send IOSurface via Mach port to connected client
+                // Send the copied pool IOSurface via Mach port to connected client
                 let ret = unsafe {
-                    mach_iosurface_server_send(io_surface, w, h, format)
+                    mach_iosurface_server_send(pool_surface, w, h, format)
                 };
 
                 if count <= 5 || count.is_multiple_of(100) {
-                    let surface_id = unsafe { IOSurfaceGetID(io_surface) };
+                    let src_id = unsafe { IOSurfaceGetID(io_surface) };
+                    let dst_id = unsafe { IOSurfaceGetID(pool_surface) };
                     let has_client = unsafe { mach_iosurface_server_has_client() };
                     log(&format!(
-                        "on_accelerated_paint #{}: {}x{} surface_id={} mach_send={} client={}",
-                        count, w, h, surface_id, ret, has_client
+                        "on_accelerated_paint #{}: {}x{} src_id={} pool_id={} mach_send={} client={}",
+                        count, w, h, src_id, dst_id, ret, has_client
                     ));
                 }
 
                 // Also write metadata to ShmHeader (for frame change detection)
-                let surface_id = unsafe { IOSurfaceGetID(io_surface) };
+                let surface_id = unsafe { IOSurfaceGetID(pool_surface) };
                 self.shm.write_iosurface_info(surface_id, w, h, format);
             }
         }
