@@ -87,6 +87,7 @@ public class SampleScript : MonoBehaviour
 
     // Accelerated paint (IOSurface / Metal via Mach port)
     private bool _useAcceleratedPaint;
+    private IntPtr _lastAccelTexPtr;
 
     // Double/triple click detection
     private float _lastClickTime;
@@ -148,6 +149,12 @@ public class SampleScript : MonoBehaviour
     {
         _browser?.Dispose();
         _browser = null;
+
+        if (_lastAccelTexPtr != IntPtr.Zero)
+        {
+            Browser.ReleaseMetalTexture(_lastAccelTexPtr);
+            _lastAccelTexPtr = IntPtr.Zero;
+        }
 
         if (_texture != null)
         {
@@ -499,33 +506,37 @@ public class SampleScript : MonoBehaviour
 
     private void UpdateTextureAccelerated()
     {
-        // Unity 管理テクスチャのネイティブポインタ（未作成なら Zero）
-        var texPtr = _texture != null ? _texture.GetNativeTexturePtr() : IntPtr.Zero;
+        // IOSurface を受信 → GPU blit → ダブルバッファ済み sRGB Metal テクスチャを取得
+        if (!Browser.TryRecvIOSurfaceTexture(out var newTexPtr, out var w, out var h, out var format))
+            return;
 
-        // IOSurface を受信し、テクスチャに直接 replaceRegion で書き込む
-        // replaceRegion は Unity テクスチャの sRGB フォーマットを保持するため正しい色になる
-        var result = Browser.BlitIOSurfaceToTexture(texPtr, out var w, out var h, out var format);
-
-        if (result < 0) return; // no new frame or error
-
-        if (result == 1 || result == 2)
+        if (w <= 0 || h <= 0)
         {
-            // テクスチャ作成/再作成が必要
-            if (_texture != null) Destroy(_texture);
-            _texture = new Texture2D(w, h, TextureFormat.BGRA32, false);
-            _texture.Apply(false); // GPU テクスチャを初期化
+            Browser.ReleaseMetalTexture(newTexPtr);
+            return;
+        }
 
+        if (_texture == null || _texture.width != w || _texture.height != h)
+        {
+            if (_texture != null) Destroy(_texture);
+            // ネイティブ sRGB Metal テクスチャを Unity テクスチャとしてラップ (GPU ゼロコピー)
+            _texture = Texture2D.CreateExternalTexture(w, h, TextureFormat.BGRA32, false, false, newTexPtr);
             if (_rawImage != null)
             {
                 _rawImage.texture = _texture;
                 _rawImage.uvRect = new Rect(0, 1, 1, -1);
             }
-
-            // ネイティブ側にキャッシュされた IOSurface で即座に blit（白フレーム防止）
-            texPtr = _texture.GetNativeTexturePtr();
-            Browser.BlitIOSurfaceToTexture(texPtr, out _, out _, out _);
         }
-        // result == 0: blit 成功（replaceRegion で直接書き込み済み）
+        else
+        {
+            // ダブルバッファの書き込み先が切り替わったので Unity に新ポインタを通知
+            _texture.UpdateExternalTexture(newTexPtr);
+        }
+
+        // 前フレームの retain を解放
+        if (_lastAccelTexPtr != IntPtr.Zero)
+            Browser.ReleaseMetalTexture(_lastAccelTexPtr);
+        _lastAccelTexPtr = newTexPtr;
     }
 
     private void UpdateTextureSoftware()

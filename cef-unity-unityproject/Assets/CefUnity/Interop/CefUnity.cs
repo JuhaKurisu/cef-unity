@@ -405,22 +405,6 @@ namespace CefUnity.Interop
             return ptr != null;
         }
 
-        /// <summary>
-        /// IOSurface のピクセルデータを Unity 管理テクスチャに直接 blit する。
-        /// texturePtr が IntPtr.Zero の場合は IOSurface 受信とサイズ報告のみ。
-        /// Returns: 0=成功, 1=サイズ報告のみ(テクスチャ未指定), 2=サイズ不一致, -3=新フレームなし
-        /// </summary>
-        public static unsafe int BlitIOSurfaceToTexture(IntPtr texturePtr, out int width, out int height, out uint format)
-        {
-            int w, h;
-            uint fmt;
-            var result = NativeMethods.cef_unity_blit_iosurface_to_texture(
-                (void*)texturePtr, &w, &h, &fmt);
-            width = w;
-            height = h;
-            format = fmt;
-            return result;
-        }
 
         /// <summary>
         /// Mach IOSurface port チャネルが接続済みかどうかを返す。

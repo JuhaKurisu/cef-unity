@@ -12,7 +12,9 @@
 
 static id<MTLDevice> _sharedDevice = nil;
 static id<MTLCommandQueue> _sharedQueue = nil;
-static id<MTLTexture> _srgbTexture = nil;
+// Double-buffered sRGB textures to avoid read-write race with Unity's GPU rendering
+static id<MTLTexture> _srgbTextures[2] = {nil, nil};
+static int _srgbWriteIndex = 0;
 static uint32_t _srgbTexW = 0, _srgbTexH = 0;
 
 // ---------------------------------------------------------------------------
@@ -176,8 +178,9 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
         return NULL;
     }
 
-    // sRGB 独立テクスチャを作成（IOSurface 非バックド）して GPU blit でコピー
-    // IOSurface バックドテクスチャは _sRGB フォーマットを強制できないため
+    // Double-buffered sRGB テクスチャに GPU blit でコピー
+    // IOSurface バックドテクスチャは _sRGB フォーマットを強制できないため、
+    // 独立した sRGB テクスチャを 2 枚使い、読み書きの競合を回避する
     if (!_sharedQueue) {
         _sharedQueue = [_sharedDevice newCommandQueue];
     }
@@ -186,7 +189,8 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
         ? MTLPixelFormatRGBA8Unorm_sRGB
         : MTLPixelFormatBGRA8Unorm_sRGB;
 
-    if (!_srgbTexture || _srgbTexW != latest_width || _srgbTexH != latest_height) {
+    // サイズ変更時は両バッファを再作成
+    if (!_srgbTextures[0] || _srgbTexW != latest_width || _srgbTexH != latest_height) {
         MTLTextureDescriptor *srgbDesc = [MTLTextureDescriptor
             texture2DDescriptorWithPixelFormat:srgbFormat
                                          width:(NSUInteger)latest_width
@@ -194,12 +198,17 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
                                      mipmapped:NO];
         srgbDesc.usage = MTLTextureUsageShaderRead;
         srgbDesc.storageMode = MTLStorageModeShared;
-        _srgbTexture = [_sharedDevice newTextureWithDescriptor:srgbDesc];
+        _srgbTextures[0] = [_sharedDevice newTextureWithDescriptor:srgbDesc];
+        _srgbTextures[1] = [_sharedDevice newTextureWithDescriptor:srgbDesc];
         _srgbTexW = latest_width;
         _srgbTexH = latest_height;
-        NSLog(@"[CefUnity-Mach] created sRGB texture %ux%u pixelFormat=%lu",
-              latest_width, latest_height, (unsigned long)_srgbTexture.pixelFormat);
+        NSLog(@"[CefUnity-Mach] created double-buffered sRGB textures %ux%u pixelFormat=%lu",
+              latest_width, latest_height, (unsigned long)_srgbTextures[0].pixelFormat);
     }
+
+    // 書き込み先を切り替え（Unity が前フレームで読んでいるバッファとは別）
+    int writeIdx = 1 - _srgbWriteIndex;
+    id<MTLTexture> writeTex = _srgbTextures[writeIdx];
 
     // GPU blit: バイトコピー（フォーマット変換なし、sRGB テクスチャにバイトを配置）
     id<MTLCommandBuffer> cmdBuf = [_sharedQueue commandBuffer];
@@ -209,7 +218,7 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
               sourceLevel:0
              sourceOrigin:MTLOriginMake(0, 0, 0)
                sourceSize:MTLSizeMake(latest_width, latest_height, 1)
-                toTexture:_srgbTexture
+                toTexture:writeTex
          destinationSlice:0
          destinationLevel:0
         destinationOrigin:MTLOriginMake(0, 0, 0)];
@@ -217,104 +226,13 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
     [cmdBuf commit];
     [cmdBuf waitUntilCompleted];
 
-    *out_width = (int32_t)latest_width;
-    *out_height = (int32_t)latest_height;
-    *out_format = latest_format;
-    // sRGB テクスチャは static で保持されるので retain する
-    return (__bridge_retained void*)_srgbTexture;
-}
-
-// Cached IOSurface for retry after texture recreation
-static IOSurfaceRef g_cached_surface = NULL;
-static uint32_t g_cached_width = 0, g_cached_height = 0, g_cached_format = 0;
-
-/// Blit IOSurface data to a Unity-managed texture via Metal replaceRegion.
-/// `unity_tex_ptr` is from Texture2D.GetNativeTexturePtr(), or NULL to just report dimensions.
-/// When blit can't proceed (null tex or size mismatch), the IOSurface is cached internally
-/// so the caller can retry immediately after recreating the texture.
-/// Returns: 0 = success, 1 = dimensions reported (no tex), 2 = size mismatch, -2 = not connected, -3 = no new frame.
-int mach_iosurface_blit_to_unity_texture(void* unity_tex_ptr,
-                                          int32_t* out_width,
-                                          int32_t* out_height,
-                                          uint32_t* out_format) {
-    if (g_receive_port == MACH_PORT_NULL) return -2;
-
-    // Start with cached surface from previous failed attempt
-    IOSurfaceRef latest_surface = g_cached_surface;
-    uint32_t latest_width = g_cached_width;
-    uint32_t latest_height = g_cached_height;
-    uint32_t latest_format = g_cached_format;
-    g_cached_surface = NULL;
-
-    // Drain all new messages, keep only the latest
-    for (;;) {
-        struct {
-            iosurface_msg_t msg;
-            mach_msg_trailer_t trailer;
-        } recv_buf;
-        __builtin_memset(&recv_buf, 0, sizeof(recv_buf));
-
-        kern_return_t kr = mach_msg(
-            &recv_buf.msg.header,
-            MACH_RCV_MSG | MACH_RCV_TIMEOUT,
-            0, sizeof(recv_buf), g_receive_port, 0, MACH_PORT_NULL);
-        if (kr != MACH_MSG_SUCCESS) break;
-
-        mach_port_t surface_port = recv_buf.msg.surface_port.name;
-        IOSurfaceRef surface = IOSurfaceLookupFromMachPort(surface_port);
-        mach_port_deallocate(mach_task_self(), surface_port);
-
-        if (surface) {
-            if (latest_surface) CFRelease(latest_surface);
-            latest_surface = surface;
-            latest_width = recv_buf.msg.width;
-            latest_height = recv_buf.msg.height;
-            latest_format = recv_buf.msg.format;
-        }
-    }
-
-    if (!latest_surface) return -3;
+    _srgbWriteIndex = writeIdx;
 
     *out_width = (int32_t)latest_width;
     *out_height = (int32_t)latest_height;
     *out_format = latest_format;
-
-    if (!unity_tex_ptr) {
-        // No target texture — cache surface for immediate retry
-        g_cached_surface = latest_surface;
-        g_cached_width = latest_width;
-        g_cached_height = latest_height;
-        g_cached_format = latest_format;
-        return 1;
-    }
-
-    id<MTLTexture> unityTex = (__bridge id<MTLTexture>)unity_tex_ptr;
-
-    // Size mismatch — cache surface for immediate retry
-    if (unityTex.width != latest_width || unityTex.height != latest_height) {
-        g_cached_surface = latest_surface;
-        g_cached_width = latest_width;
-        g_cached_height = latest_height;
-        g_cached_format = latest_format;
-        return 2;
-    }
-
-    // Lock IOSurface and copy bytes to Unity texture via replaceRegion.
-    // Unity-managed sRGB textures preserve their pixel format (BGRA8Unorm_sRGB),
-    // so raw byte writes are interpreted as sRGB data on GPU read.
-    IOSurfaceLock(latest_surface, kIOSurfaceLockReadOnly, NULL);
-    void *baseAddr = IOSurfaceGetBaseAddress(latest_surface);
-    size_t bytesPerRow = IOSurfaceGetBytesPerRow(latest_surface);
-
-    [unityTex replaceRegion:MTLRegionMake2D(0, 0, latest_width, latest_height)
-                mipmapLevel:0
-                  withBytes:baseAddr
-                bytesPerRow:bytesPerRow];
-
-    IOSurfaceUnlock(latest_surface, kIOSurfaceLockReadOnly, NULL);
-    CFRelease(latest_surface);
-
-    return 0;
+    // retain して返す（C# 側で ReleaseMetalTexture で解放）
+    return (__bridge_retained void*)writeTex;
 }
 
 // ---------------------------------------------------------------------------

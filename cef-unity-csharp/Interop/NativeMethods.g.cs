@@ -220,14 +220,6 @@ namespace CefUnity
         public static extern void* cef_unity_recv_iosurface_texture(int* out_width, int* out_height, uint* out_format);
 
         /// <summary>
-        ///  Blit IOSurface data into a Unity-managed texture (preserves Unity's sRGB format).
-        ///  unity_tex_ptr may be null to just receive IOSurface and report dimensions.
-        ///  Returns: 0=success, 1=dimensions only (null tex), 2=size mismatch, negative=error.
-        /// </summary>
-        [DllImport(__DllName, EntryPoint = "cef_unity_blit_iosurface_to_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern int cef_unity_blit_iosurface_to_texture(void* unity_tex_ptr, int* out_width, int* out_height, uint* out_format);
-
-        /// <summary>
         ///  Returns 1 if the Mach IOSurface port channel is connected, 0 otherwise.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_is_iosurface_connected", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
