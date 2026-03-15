@@ -725,6 +725,7 @@ impl CefServer {
                 && let Some(host) = Browser::host(browser)
             {
                 BrowserHost::was_resized(&host);
+                BrowserHost::invalidate(&host, PaintElementType::VIEW);
             }
             Response::Ok
         } else {
