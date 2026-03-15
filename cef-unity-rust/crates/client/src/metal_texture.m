@@ -11,11 +11,9 @@
 #import <servers/bootstrap.h>
 
 static id<MTLDevice> _sharedDevice = nil;
-static id<MTLCommandQueue> _sharedQueue = nil;
-// Double-buffered sRGB textures to avoid read-write race with Unity's GPU rendering
-static id<MTLTexture> _srgbTextures[2] = {nil, nil};
-static int _srgbWriteIndex = 0;
-static uint32_t _srgbTexW = 0, _srgbTexH = 0;
+// IOSurface テクスチャ + sRGB view キャッシュ (IOSurface が同一なら再利用)
+static IOSurfaceRef _cachedSurface = NULL;
+static id<MTLTexture> _cachedSrgbView = nil;
 
 // ---------------------------------------------------------------------------
 // Mach port IOSurface client
@@ -155,7 +153,16 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
         NSLog(@"[CefUnity-Mach] Metal device: %@", _sharedDevice.name);
     }
 
-    // IOSurface のネイティブフォーマット (Unorm) でテクスチャを作成
+    // IOSurface が前回と同じならキャッシュ済み sRGB view を再利用
+    if (latest_surface == _cachedSurface && _cachedSrgbView) {
+        CFRelease(latest_surface);
+        *out_width = (int32_t)latest_width;
+        *out_height = (int32_t)latest_height;
+        *out_format = latest_format;
+        return (__bridge_retained void*)_cachedSrgbView;
+    }
+
+    // IOSurface テクスチャを作成 (PixelFormatView 対応)
     MTLPixelFormat iosfFormat = (latest_format == 1)
         ? MTLPixelFormatRGBA8Unorm
         : MTLPixelFormatBGRA8Unorm;
@@ -165,74 +172,44 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
                                      width:(NSUInteger)latest_width
                                     height:(NSUInteger)latest_height
                                  mipmapped:NO];
-    desc.usage = MTLTextureUsageShaderRead;
+    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
     desc.storageMode = MTLStorageModeShared;
 
     id<MTLTexture> iosTex = [_sharedDevice newTextureWithDescriptor:desc
                                                           iosurface:latest_surface
                                                               plane:0];
-    CFRelease(latest_surface);
-
     if (!iosTex) {
         NSLog(@"[CefUnity-Mach] newTextureWithDescriptor:iosurface: returned nil");
+        CFRelease(latest_surface);
         return NULL;
     }
 
-    // Double-buffered sRGB テクスチャに GPU blit でコピー
-    // IOSurface バックドテクスチャは _sRGB フォーマットを強制できないため、
-    // 独立した sRGB テクスチャを 2 枚使い、読み書きの競合を回避する
-    if (!_sharedQueue) {
-        _sharedQueue = [_sharedDevice newCommandQueue];
-    }
-
+    // sRGB texture view: 同じメモリを sRGB として再解釈（GPU コピーなし）
     MTLPixelFormat srgbFormat = (latest_format == 1)
         ? MTLPixelFormatRGBA8Unorm_sRGB
         : MTLPixelFormatBGRA8Unorm_sRGB;
 
-    // サイズ変更時は両バッファを再作成
-    if (!_srgbTextures[0] || _srgbTexW != latest_width || _srgbTexH != latest_height) {
-        MTLTextureDescriptor *srgbDesc = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:srgbFormat
-                                         width:(NSUInteger)latest_width
-                                        height:(NSUInteger)latest_height
-                                     mipmapped:NO];
-        srgbDesc.usage = MTLTextureUsageShaderRead;
-        srgbDesc.storageMode = MTLStorageModeShared;
-        _srgbTextures[0] = [_sharedDevice newTextureWithDescriptor:srgbDesc];
-        _srgbTextures[1] = [_sharedDevice newTextureWithDescriptor:srgbDesc];
-        _srgbTexW = latest_width;
-        _srgbTexH = latest_height;
-        NSLog(@"[CefUnity-Mach] created double-buffered sRGB textures %ux%u pixelFormat=%lu",
-              latest_width, latest_height, (unsigned long)_srgbTextures[0].pixelFormat);
+    id<MTLTexture> srgbView = [iosTex newTextureViewWithPixelFormat:srgbFormat];
+    if (!srgbView) {
+        NSLog(@"[CefUnity-Mach] newTextureViewWithPixelFormat failed, falling back to base texture");
+        srgbView = iosTex;
     }
 
-    // 書き込み先を切り替え（Unity が前フレームで読んでいるバッファとは別）
-    int writeIdx = 1 - _srgbWriteIndex;
-    id<MTLTexture> writeTex = _srgbTextures[writeIdx];
+    // キャッシュ更新
+    if (_cachedSurface) CFRelease(_cachedSurface);
+    _cachedSurface = latest_surface;
+    CFRetain(_cachedSurface);
+    _cachedSrgbView = srgbView;
+    CFRelease(latest_surface);
 
-    // GPU blit: バイトコピー（フォーマット変換なし、sRGB テクスチャにバイトを配置）
-    id<MTLCommandBuffer> cmdBuf = [_sharedQueue commandBuffer];
-    id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
-    [blit copyFromTexture:iosTex
-              sourceSlice:0
-              sourceLevel:0
-             sourceOrigin:MTLOriginMake(0, 0, 0)
-               sourceSize:MTLSizeMake(latest_width, latest_height, 1)
-                toTexture:writeTex
-         destinationSlice:0
-         destinationLevel:0
-        destinationOrigin:MTLOriginMake(0, 0, 0)];
-    [blit endEncoding];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
-
-    _srgbWriteIndex = writeIdx;
+    NSLog(@"[CefUnity-Mach] sRGB view: %ux%u pixelFormat=%lu (base=%lu)",
+          latest_width, latest_height,
+          (unsigned long)srgbView.pixelFormat, (unsigned long)iosTex.pixelFormat);
 
     *out_width = (int32_t)latest_width;
     *out_height = (int32_t)latest_height;
     *out_format = latest_format;
-    // retain して返す（C# 側で ReleaseMetalTexture で解放）
-    return (__bridge_retained void*)writeTex;
+    return (__bridge_retained void*)srgbView;
 }
 
 // ---------------------------------------------------------------------------
