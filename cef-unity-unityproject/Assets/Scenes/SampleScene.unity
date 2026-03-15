@@ -271,9 +271,9 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::SampleScript
   _width: 1710
   _height: 1112
-  _url: google.com
+  _url: twigl.app
   _rawImage: {fileID: 1153544198}
-  _resolutionScale: 0.2
+  _resolutionScale: 1
 --- !u!1 &410087039
 GameObject:
   m_ObjectHideFlags: 0
