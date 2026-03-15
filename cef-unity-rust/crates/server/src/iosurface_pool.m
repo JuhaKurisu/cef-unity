@@ -90,50 +90,54 @@ void* iosurface_pool_copy_and_get(void* src_ref, uint32_t w, uint32_t h, uint32_
     IOSurfaceRef dst = g_pool[idx];
     g_pool_idx = (g_pool_idx + 1) % POOL_SIZE;
 
-    // Create Metal textures from IOSurfaces
-    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                   width:w
-                                                                                  height:h
-                                                                               mipmapped:NO];
-    desc.storageMode = MTLStorageModeShared;  // IOSurface-backed
-    desc.usage = MTLTextureUsageShaderRead;
+    // @autoreleasepool: Metal objects (commandBuffer, blitCommandEncoder, textures)
+    // are autoreleased. Without a pool, they accumulate until a periodic drain,
+    // causing frame-time spikes.
+    @autoreleasepool {
+        MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                       width:w
+                                                                                      height:h
+                                                                                   mipmapped:NO];
+        desc.storageMode = MTLStorageModeShared;  // IOSurface-backed
+        desc.usage = MTLTextureUsageShaderRead;
 
-    id<MTLTexture> srcTex = [g_device newTextureWithDescriptor:desc iosurface:src plane:0];
-    if (srcTex == nil) {
-        fprintf(stderr, "[iosurface_pool] newTextureWithDescriptor (src) failed\n");
-        return NULL;
-    }
+        id<MTLTexture> srcTex = [g_device newTextureWithDescriptor:desc iosurface:src plane:0];
+        if (srcTex == nil) {
+            fprintf(stderr, "[iosurface_pool] newTextureWithDescriptor (src) failed\n");
+            return NULL;
+        }
 
-    desc.usage = MTLTextureUsageShaderWrite;
-    id<MTLTexture> dstTex = [g_device newTextureWithDescriptor:desc iosurface:dst plane:0];
-    if (dstTex == nil) {
-        fprintf(stderr, "[iosurface_pool] newTextureWithDescriptor (dst) failed\n");
-        return NULL;
-    }
+        desc.usage = MTLTextureUsageShaderWrite;
+        id<MTLTexture> dstTex = [g_device newTextureWithDescriptor:desc iosurface:dst plane:0];
+        if (dstTex == nil) {
+            fprintf(stderr, "[iosurface_pool] newTextureWithDescriptor (dst) failed\n");
+            return NULL;
+        }
 
-    // Blit copy
-    id<MTLCommandBuffer> cmdBuf = [g_queue commandBuffer];
-    if (cmdBuf == nil) return NULL;
+        // Blit copy
+        id<MTLCommandBuffer> cmdBuf = [g_queue commandBuffer];
+        if (cmdBuf == nil) return NULL;
 
-    id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
-    [blit copyFromTexture:srcTex
-              sourceSlice:0
-              sourceLevel:0
-             sourceOrigin:(MTLOrigin){0, 0, 0}
-               sourceSize:(MTLSize){w, h, 1}
-                toTexture:dstTex
-         destinationSlice:0
-         destinationLevel:0
-        destinationOrigin:(MTLOrigin){0, 0, 0}];
-    [blit endEncoding];
+        id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
+        [blit copyFromTexture:srcTex
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:(MTLOrigin){0, 0, 0}
+                   sourceSize:(MTLSize){w, h, 1}
+                    toTexture:dstTex
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:(MTLOrigin){0, 0, 0}];
+        [blit endEncoding];
 
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
+        [cmdBuf commit];
+        [cmdBuf waitUntilCompleted];
 
-    if (cmdBuf.status == MTLCommandBufferStatusError) {
-        fprintf(stderr, "[iosurface_pool] Metal blit failed: %s\n",
-                [[cmdBuf.error localizedDescription] UTF8String]);
-        return NULL;
+        if (cmdBuf.status == MTLCommandBufferStatusError) {
+            fprintf(stderr, "[iosurface_pool] Metal blit failed: %s\n",
+                    [[cmdBuf.error localizedDescription] UTF8String]);
+            return NULL;
+        }
     }
 
     return (void*)dst;
