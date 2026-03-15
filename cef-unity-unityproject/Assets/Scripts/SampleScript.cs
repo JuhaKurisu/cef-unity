@@ -480,8 +480,8 @@ public class SampleScript : MonoBehaviour
 
     private void CheckScreenResize()
     {
-        var sw = Screen.width / _resolutionScale;
-        var sh = Screen.height / _resolutionScale;
+        var sw = Screen.width * _resolutionScale;
+        var sh = Screen.height * _resolutionScale;
         if (sw != _currentWidth || sh != _currentHeight)
         {
             _currentWidth = sw;
@@ -504,11 +504,21 @@ public class SampleScript : MonoBehaviour
         UpdateTextureSoftware();
     }
 
+    // Profiling for accelerated texture path
+    private int _accelProfCount;
+    private float _accelProfRecvTotal;
+    private float _accelProfUpdateTotal;
+    private float _accelProfReleaseTotal;
+
     private void UpdateTextureAccelerated()
     {
+        var t0 = Time.realtimeSinceStartup;
+
         // IOSurface を受信 → GPU blit → ダブルバッファ済み sRGB Metal テクスチャを取得
         if (!Browser.TryRecvIOSurfaceTexture(out var newTexPtr, out var w, out var h, out var format))
             return;
+
+        var t1 = Time.realtimeSinceStartup;
 
         if (w <= 0 || h <= 0)
         {
@@ -519,7 +529,6 @@ public class SampleScript : MonoBehaviour
         if (_texture == null || _texture.width != w || _texture.height != h)
         {
             if (_texture != null) Destroy(_texture);
-            // ネイティブ sRGB Metal テクスチャを Unity テクスチャとしてラップ (GPU ゼロコピー)
             _texture = Texture2D.CreateExternalTexture(w, h, TextureFormat.BGRA32, false, false, newTexPtr);
             if (_rawImage != null)
             {
@@ -529,14 +538,29 @@ public class SampleScript : MonoBehaviour
         }
         else
         {
-            // ダブルバッファの書き込み先が切り替わったので Unity に新ポインタを通知
             _texture.UpdateExternalTexture(newTexPtr);
         }
+
+        var t2 = Time.realtimeSinceStartup;
 
         // 前フレームの retain を解放
         if (_lastAccelTexPtr != IntPtr.Zero)
             Browser.ReleaseMetalTexture(_lastAccelTexPtr);
         _lastAccelTexPtr = newTexPtr;
+
+        var t3 = Time.realtimeSinceStartup;
+
+        _accelProfCount++;
+        _accelProfRecvTotal += (t1 - t0);
+        _accelProfUpdateTotal += (t2 - t1);
+        _accelProfReleaseTotal += (t3 - t2);
+
+        if (_accelProfCount >= 120)
+        {
+            Debug.Log($"[CefUnity-Prof] C# accel x{_accelProfCount}: recv={_accelProfRecvTotal * 1000f:F2}ms update={_accelProfUpdateTotal * 1000f:F2}ms release={_accelProfReleaseTotal * 1000f:F2}ms total={(_accelProfRecvTotal + _accelProfUpdateTotal + _accelProfReleaseTotal) * 1000f:F2}ms");
+            _accelProfCount = 0;
+            _accelProfRecvTotal = _accelProfUpdateTotal = _accelProfReleaseTotal = 0;
+        }
     }
 
     private void UpdateTextureSoftware()
