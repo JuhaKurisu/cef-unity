@@ -73,7 +73,7 @@ public class SampleScript : MonoBehaviour
     [SerializeField] private int _height = 720;
     [SerializeField] private string _url;
     [SerializeField] private RawImage _rawImage;
-    [SerializeField] private int _resolutionScale;
+    [SerializeField] private float _resolutionScale;
     private readonly Dictionary<KeyCode, float> _keyDownTime = new();
     private readonly Dictionary<KeyCode, float> _keyLastRepeat = new();
 
@@ -480,8 +480,8 @@ public class SampleScript : MonoBehaviour
 
     private void CheckScreenResize()
     {
-        var sw = Screen.width * _resolutionScale;
-        var sh = Screen.height * _resolutionScale;
+        var sw = Mathf.CeilToInt(Screen.width * _resolutionScale);
+        var sh = Mathf.CeilToInt(Screen.height * _resolutionScale);
         if (sw != _currentWidth || sh != _currentHeight)
         {
             _currentWidth = sw;
