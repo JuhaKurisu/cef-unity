@@ -520,7 +520,10 @@ public class SampleScript : MonoBehaviour
                 _rawImage.texture = _texture;
                 _rawImage.uvRect = new Rect(0, 1, 1, -1);
             }
-            // 次フレームで blit される
+
+            // ネイティブ側にキャッシュされた IOSurface で即座に blit（白フレーム防止）
+            texPtr = _texture.GetNativeTexturePtr();
+            Browser.BlitIOSurfaceToTexture(texPtr, out _, out _, out _);
         }
         // result == 0: blit 成功（replaceRegion で直接書き込み済み）
     }

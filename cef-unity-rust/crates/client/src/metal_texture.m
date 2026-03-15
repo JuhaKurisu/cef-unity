@@ -224,8 +224,14 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
     return (__bridge_retained void*)_srgbTexture;
 }
 
+// Cached IOSurface for retry after texture recreation
+static IOSurfaceRef g_cached_surface = NULL;
+static uint32_t g_cached_width = 0, g_cached_height = 0, g_cached_format = 0;
+
 /// Blit IOSurface data to a Unity-managed texture via Metal replaceRegion.
 /// `unity_tex_ptr` is from Texture2D.GetNativeTexturePtr(), or NULL to just report dimensions.
+/// When blit can't proceed (null tex or size mismatch), the IOSurface is cached internally
+/// so the caller can retry immediately after recreating the texture.
 /// Returns: 0 = success, 1 = dimensions reported (no tex), 2 = size mismatch, -2 = not connected, -3 = no new frame.
 int mach_iosurface_blit_to_unity_texture(void* unity_tex_ptr,
                                           int32_t* out_width,
@@ -233,10 +239,14 @@ int mach_iosurface_blit_to_unity_texture(void* unity_tex_ptr,
                                           uint32_t* out_format) {
     if (g_receive_port == MACH_PORT_NULL) return -2;
 
-    // Drain messages, keep latest
-    IOSurfaceRef latest_surface = NULL;
-    uint32_t latest_width = 0, latest_height = 0, latest_format = 0;
+    // Start with cached surface from previous failed attempt
+    IOSurfaceRef latest_surface = g_cached_surface;
+    uint32_t latest_width = g_cached_width;
+    uint32_t latest_height = g_cached_height;
+    uint32_t latest_format = g_cached_format;
+    g_cached_surface = NULL;
 
+    // Drain all new messages, keep only the latest
     for (;;) {
         struct {
             iosurface_msg_t msg;
@@ -270,16 +280,22 @@ int mach_iosurface_blit_to_unity_texture(void* unity_tex_ptr,
     *out_format = latest_format;
 
     if (!unity_tex_ptr) {
-        // No target texture — report dimensions only
-        CFRelease(latest_surface);
+        // No target texture — cache surface for immediate retry
+        g_cached_surface = latest_surface;
+        g_cached_width = latest_width;
+        g_cached_height = latest_height;
+        g_cached_format = latest_format;
         return 1;
     }
 
     id<MTLTexture> unityTex = (__bridge id<MTLTexture>)unity_tex_ptr;
 
-    // Size mismatch — caller needs to recreate texture
+    // Size mismatch — cache surface for immediate retry
     if (unityTex.width != latest_width || unityTex.height != latest_height) {
-        CFRelease(latest_surface);
+        g_cached_surface = latest_surface;
+        g_cached_width = latest_width;
+        g_cached_height = latest_height;
+        g_cached_format = latest_format;
         return 2;
     }
 
