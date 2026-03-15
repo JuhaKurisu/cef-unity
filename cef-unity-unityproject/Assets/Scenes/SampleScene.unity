@@ -273,7 +273,7 @@ MonoBehaviour:
   _height: 1112
   _url: google.com
   _rawImage: {fileID: 1153544198}
-  _resolutionScale: 2
+  _resolutionScale: 1
 --- !u!1 &410087039
 GameObject:
   m_ObjectHideFlags: 0

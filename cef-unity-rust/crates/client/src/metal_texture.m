@@ -11,6 +11,9 @@
 #import <servers/bootstrap.h>
 
 static id<MTLDevice> _sharedDevice = nil;
+static id<MTLCommandQueue> _sharedQueue = nil;
+static id<MTLTexture> _srgbTexture = nil;
+static uint32_t _srgbTexW = 0, _srgbTexH = 0;
 
 // ---------------------------------------------------------------------------
 // Mach port IOSurface client
@@ -150,32 +153,152 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
         NSLog(@"[CefUnity-Mach] Metal device: %@", _sharedDevice.name);
     }
 
-    MTLPixelFormat pixelFormat = (latest_format == 1)
-        ? MTLPixelFormatRGBA8Unorm_sRGB
-        : MTLPixelFormatBGRA8Unorm_sRGB;
+    // IOSurface のネイティブフォーマット (Unorm) でテクスチャを作成
+    MTLPixelFormat iosfFormat = (latest_format == 1)
+        ? MTLPixelFormatRGBA8Unorm
+        : MTLPixelFormatBGRA8Unorm;
 
     MTLTextureDescriptor *desc = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:pixelFormat
+        texture2DDescriptorWithPixelFormat:iosfFormat
                                      width:(NSUInteger)latest_width
                                     height:(NSUInteger)latest_height
                                  mipmapped:NO];
     desc.usage = MTLTextureUsageShaderRead;
     desc.storageMode = MTLStorageModeShared;
 
-    id<MTLTexture> texture = [_sharedDevice newTextureWithDescriptor:desc
-                                                           iosurface:latest_surface
-                                                               plane:0];
+    id<MTLTexture> iosTex = [_sharedDevice newTextureWithDescriptor:desc
+                                                          iosurface:latest_surface
+                                                              plane:0];
     CFRelease(latest_surface);
 
-    if (!texture) {
+    if (!iosTex) {
         NSLog(@"[CefUnity-Mach] newTextureWithDescriptor:iosurface: returned nil");
         return NULL;
     }
 
+    // sRGB 独立テクスチャを作成（IOSurface 非バックド）して GPU blit でコピー
+    // IOSurface バックドテクスチャは _sRGB フォーマットを強制できないため
+    if (!_sharedQueue) {
+        _sharedQueue = [_sharedDevice newCommandQueue];
+    }
+
+    MTLPixelFormat srgbFormat = (latest_format == 1)
+        ? MTLPixelFormatRGBA8Unorm_sRGB
+        : MTLPixelFormatBGRA8Unorm_sRGB;
+
+    if (!_srgbTexture || _srgbTexW != latest_width || _srgbTexH != latest_height) {
+        MTLTextureDescriptor *srgbDesc = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:srgbFormat
+                                         width:(NSUInteger)latest_width
+                                        height:(NSUInteger)latest_height
+                                     mipmapped:NO];
+        srgbDesc.usage = MTLTextureUsageShaderRead;
+        srgbDesc.storageMode = MTLStorageModeShared;
+        _srgbTexture = [_sharedDevice newTextureWithDescriptor:srgbDesc];
+        _srgbTexW = latest_width;
+        _srgbTexH = latest_height;
+        NSLog(@"[CefUnity-Mach] created sRGB texture %ux%u pixelFormat=%lu",
+              latest_width, latest_height, (unsigned long)_srgbTexture.pixelFormat);
+    }
+
+    // GPU blit: バイトコピー（フォーマット変換なし、sRGB テクスチャにバイトを配置）
+    id<MTLCommandBuffer> cmdBuf = [_sharedQueue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
+    [blit copyFromTexture:iosTex
+              sourceSlice:0
+              sourceLevel:0
+             sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(latest_width, latest_height, 1)
+                toTexture:_srgbTexture
+         destinationSlice:0
+         destinationLevel:0
+        destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    [cmdBuf commit];
+    [cmdBuf waitUntilCompleted];
+
     *out_width = (int32_t)latest_width;
     *out_height = (int32_t)latest_height;
     *out_format = latest_format;
-    return (__bridge_retained void*)texture;
+    // sRGB テクスチャは static で保持されるので retain する
+    return (__bridge_retained void*)_srgbTexture;
+}
+
+/// Blit IOSurface data to a Unity-managed texture via Metal replaceRegion.
+/// `unity_tex_ptr` is from Texture2D.GetNativeTexturePtr(), or NULL to just report dimensions.
+/// Returns: 0 = success, 1 = dimensions reported (no tex), 2 = size mismatch, -2 = not connected, -3 = no new frame.
+int mach_iosurface_blit_to_unity_texture(void* unity_tex_ptr,
+                                          int32_t* out_width,
+                                          int32_t* out_height,
+                                          uint32_t* out_format) {
+    if (g_receive_port == MACH_PORT_NULL) return -2;
+
+    // Drain messages, keep latest
+    IOSurfaceRef latest_surface = NULL;
+    uint32_t latest_width = 0, latest_height = 0, latest_format = 0;
+
+    for (;;) {
+        struct {
+            iosurface_msg_t msg;
+            mach_msg_trailer_t trailer;
+        } recv_buf;
+        __builtin_memset(&recv_buf, 0, sizeof(recv_buf));
+
+        kern_return_t kr = mach_msg(
+            &recv_buf.msg.header,
+            MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+            0, sizeof(recv_buf), g_receive_port, 0, MACH_PORT_NULL);
+        if (kr != MACH_MSG_SUCCESS) break;
+
+        mach_port_t surface_port = recv_buf.msg.surface_port.name;
+        IOSurfaceRef surface = IOSurfaceLookupFromMachPort(surface_port);
+        mach_port_deallocate(mach_task_self(), surface_port);
+
+        if (surface) {
+            if (latest_surface) CFRelease(latest_surface);
+            latest_surface = surface;
+            latest_width = recv_buf.msg.width;
+            latest_height = recv_buf.msg.height;
+            latest_format = recv_buf.msg.format;
+        }
+    }
+
+    if (!latest_surface) return -3;
+
+    *out_width = (int32_t)latest_width;
+    *out_height = (int32_t)latest_height;
+    *out_format = latest_format;
+
+    if (!unity_tex_ptr) {
+        // No target texture — report dimensions only
+        CFRelease(latest_surface);
+        return 1;
+    }
+
+    id<MTLTexture> unityTex = (__bridge id<MTLTexture>)unity_tex_ptr;
+
+    // Size mismatch — caller needs to recreate texture
+    if (unityTex.width != latest_width || unityTex.height != latest_height) {
+        CFRelease(latest_surface);
+        return 2;
+    }
+
+    // Lock IOSurface and copy bytes to Unity texture via replaceRegion.
+    // Unity-managed sRGB textures preserve their pixel format (BGRA8Unorm_sRGB),
+    // so raw byte writes are interpreted as sRGB data on GPU read.
+    IOSurfaceLock(latest_surface, kIOSurfaceLockReadOnly, NULL);
+    void *baseAddr = IOSurfaceGetBaseAddress(latest_surface);
+    size_t bytesPerRow = IOSurfaceGetBytesPerRow(latest_surface);
+
+    [unityTex replaceRegion:MTLRegionMake2D(0, 0, latest_width, latest_height)
+                mipmapLevel:0
+                  withBytes:baseAddr
+                bytesPerRow:bytesPerRow];
+
+    IOSurfaceUnlock(latest_surface, kIOSurfaceLockReadOnly, NULL);
+    CFRelease(latest_surface);
+
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -199,14 +322,14 @@ void* cef_unity_create_metal_texture_objc(
     if (!surface) return NULL;
 
     MTLPixelFormat pixelFormat = (format == 1)
-        ? MTLPixelFormatRGBA8Unorm_sRGB
-        : MTLPixelFormatBGRA8Unorm_sRGB;
+        ? MTLPixelFormatRGBA8Unorm
+        : MTLPixelFormatBGRA8Unorm;
 
     MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
                                                                                    width:(NSUInteger)width
                                                                                   height:(NSUInteger)height
                                                                                mipmapped:NO];
-    desc.usage = MTLTextureUsageShaderRead;
+    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
     desc.storageMode = MTLStorageModeShared;
 
     id<MTLTexture> texture = [_sharedDevice newTextureWithDescriptor:desc

@@ -5,7 +5,6 @@ using System.Text;
 using CefUnity;
 using CefUnity.Interop;
 using UnityEngine;
-using UnityEngine.Rendering;
 using UnityEngine.UI;
 
 public class SampleScript : MonoBehaviour
@@ -88,7 +87,6 @@ public class SampleScript : MonoBehaviour
 
     // Accelerated paint (IOSurface / Metal via Mach port)
     private bool _useAcceleratedPaint;
-    private IntPtr _lastAccelTexture;
 
     // Double/triple click detection
     private float _lastClickTime;
@@ -150,13 +148,6 @@ public class SampleScript : MonoBehaviour
     {
         _browser?.Dispose();
         _browser = null;
-
-        // Metal テクスチャの解放
-        if (_lastAccelTexture != IntPtr.Zero)
-        {
-            Browser.ReleaseMetalTexture(_lastAccelTexture);
-            _lastAccelTexture = IntPtr.Zero;
-        }
 
         if (_texture != null)
         {
@@ -508,35 +499,30 @@ public class SampleScript : MonoBehaviour
 
     private void UpdateTextureAccelerated()
     {
-        // Mach port 経由で最新の IOSurface を受信し、Metal テクスチャを取得
-        if (!Browser.TryRecvIOSurfaceTexture(out var mtlTexPtr, out var w, out var h, out var format))
-            return;
+        // Unity 管理テクスチャのネイティブポインタ（未作成なら Zero）
+        var texPtr = _texture != null ? _texture.GetNativeTexturePtr() : IntPtr.Zero;
 
-        if (w <= 0 || h <= 0 || mtlTexPtr == IntPtr.Zero) return;
+        // IOSurface を受信し、テクスチャに直接 replaceRegion で書き込む
+        // replaceRegion は Unity テクスチャの sRGB フォーマットを保持するため正しい色になる
+        var result = Browser.BlitIOSurfaceToTexture(texPtr, out var w, out var h, out var format);
 
-        // 前回の Metal テクスチャを解放 (新しいテクスチャに置き換え)
-        if (_lastAccelTexture != IntPtr.Zero)
-            Browser.ReleaseMetalTexture(_lastAccelTexture);
-        _lastAccelTexture = mtlTexPtr;
+        if (result < 0) return; // no new frame or error
 
-        var texFormat = format == 1 ? TextureFormat.RGBA32 : TextureFormat.BGRA32;
-
-        if (_texture == null || _texture.width != w || _texture.height != h)
+        if (result == 1 || result == 2)
         {
-            if (_texture != null)
-                Destroy(_texture);
+            // テクスチャ作成/再作成が必要
+            if (_texture != null) Destroy(_texture);
+            _texture = new Texture2D(w, h, TextureFormat.BGRA32, false);
+            _texture.Apply(false); // GPU テクスチャを初期化
 
-            _texture = Texture2D.CreateExternalTexture(w, h, texFormat, false, false, mtlTexPtr);
             if (_rawImage != null)
             {
                 _rawImage.texture = _texture;
                 _rawImage.uvRect = new Rect(0, 1, 1, -1);
             }
+            // 次フレームで blit される
         }
-        else
-        {
-            _texture.UpdateExternalTexture(mtlTexPtr);
-        }
+        // result == 0: blit 成功（replaceRegion で直接書き込み済み）
     }
 
     private void UpdateTextureSoftware()

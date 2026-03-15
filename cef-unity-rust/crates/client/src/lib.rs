@@ -1039,6 +1039,13 @@ unsafe extern "C" {
         out_height: *mut i32,
         out_format: *mut u32,
     ) -> *mut std::ffi::c_void;
+
+    fn mach_iosurface_blit_to_unity_texture(
+        unity_tex_ptr: *mut std::ffi::c_void,
+        out_width: *mut i32,
+        out_height: *mut i32,
+        out_format: *mut u32,
+    ) -> i32;
 }
 
 /// Check if a new accelerated paint frame is available via IOSurface.
@@ -1130,6 +1137,35 @@ pub extern "C" fn cef_unity_recv_iosurface_texture(
     {
         let _ = (out_width, out_height, out_format);
         std::ptr::null_mut()
+    }
+}
+
+/// Blit IOSurface data into a Unity-managed texture (preserves Unity's sRGB format).
+/// unity_tex_ptr may be null to just receive IOSurface and report dimensions.
+/// Returns: 0=success, 1=dimensions only (null tex), 2=size mismatch, negative=error.
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_blit_iosurface_to_texture(
+    unity_tex_ptr: *mut std::ffi::c_void,
+    out_width: *mut i32,
+    out_height: *mut i32,
+    out_format: *mut u32,
+) -> i32 {
+    if out_width.is_null() || out_height.is_null() || out_format.is_null() {
+        return -1;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if !IOSURFACE_CONNECTED.load(Ordering::SeqCst) {
+            return -2;
+        }
+        unsafe {
+            mach_iosurface_blit_to_unity_texture(unity_tex_ptr, out_width, out_height, out_format)
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (unity_tex_ptr, out_width, out_height, out_format);
+        -1
     }
 }
 
