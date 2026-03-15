@@ -14,7 +14,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define POOL_SIZE 3
+#define POOL_SIZE 5
 
 static id<MTLDevice> g_device = nil;
 static id<MTLCommandQueue> g_queue = nil;

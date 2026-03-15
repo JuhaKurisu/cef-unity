@@ -15,8 +15,7 @@
 static mach_timebase_info_data_t _timebase = {0, 0};
 static uint64_t _prof_call_count = 0;
 static double _prof_drain_total_ms = 0;
-static double _prof_lookup_total_ms = 0;
-static double _prof_tex_create_total_ms = 0;
+static double _prof_tex_total_ms = 0;
 static double _prof_total_ms = 0;
 static int _prof_drain_msg_total = 0;
 static int _prof_cache_hits = 0;
@@ -28,7 +27,6 @@ static double ticks_to_ms(uint64_t elapsed) {
 }
 
 static id<MTLDevice> _sharedDevice = nil;
-static id<MTLCommandQueue> _sharedQueue = nil;
 
 // IOSurface テクスチャ + sRGB view キャッシュ (IOSurfaceID で比較、マルチエントリ)
 #define IOSURFACE_CACHE_SIZE 4
@@ -38,12 +36,6 @@ static struct {
     id<MTLTexture> srgbView;
 } _surfaceCache[IOSURFACE_CACHE_SIZE];
 static int _surfaceCacheCount = 0;
-
-// Private テクスチャ (安定コピー先、ダブルバッファ)
-static id<MTLTexture> _privateTex[2] = {nil, nil};
-static int _privateWriteIdx = 0;
-static uint32_t _privateW = 0, _privateH = 0;
-static MTLPixelFormat _privateFormat = MTLPixelFormatInvalid;
 
 // ---------------------------------------------------------------------------
 // Mach port IOSurface client
@@ -129,6 +121,10 @@ int mach_iosurface_client_connect(const char* service_name) {
 /// Non-blocking receive of IOSurface from Mach port channel.
 /// On success, returns an MTLTexture pointer (retained, caller must release).
 /// On no message or error, returns NULL.
+///
+/// Server-side pool copy ensures the IOSurface content is stable (won't be
+/// overwritten by CEF). We just create a sRGB texture view and return it
+/// directly — no client-side GPU blit or waitUntilCompleted needed.
 void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint32_t* out_format) {
     if (g_receive_port == MACH_PORT_NULL) return NULL;
 
@@ -191,130 +187,84 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
 
     // マルチエントリキャッシュで IOSurfaceID を検索
     IOSurfaceID latestID = IOSurfaceGetID(latest_surface);
-    id<MTLTexture> srcSrgbView = nil;
+    id<MTLTexture> srgbView = nil;
     int cacheHit = 0;
 
     for (int i = 0; i < _surfaceCacheCount; i++) {
         if (_surfaceCache[i].surfaceID == latestID && _surfaceCache[i].srgbView) {
             CFRelease(latest_surface);
-            srcSrgbView = _surfaceCache[i].srgbView;
+            srgbView = _surfaceCache[i].srgbView;
             cacheHit = 1;
             break;
         }
     }
 
-    if (!srcSrgbView) {
-        // キャッシュミス: IOSurface テクスチャを作成
-        MTLPixelFormat iosfFormat = (latest_format == 1)
-            ? MTLPixelFormatRGBA8Unorm
-            : MTLPixelFormatBGRA8Unorm;
+    if (!srgbView) {
+        @autoreleasepool {
+            // キャッシュミス: IOSurface テクスチャを作成
+            MTLPixelFormat iosfFormat = (latest_format == 1)
+                ? MTLPixelFormatRGBA8Unorm
+                : MTLPixelFormatBGRA8Unorm;
 
-        MTLTextureDescriptor *desc = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:iosfFormat
-                                         width:(NSUInteger)latest_width
-                                        height:(NSUInteger)latest_height
-                                     mipmapped:NO];
-        desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-        desc.storageMode = MTLStorageModeShared;
+            MTLTextureDescriptor *desc = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:iosfFormat
+                                             width:(NSUInteger)latest_width
+                                            height:(NSUInteger)latest_height
+                                         mipmapped:NO];
+            desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+            desc.storageMode = MTLStorageModeShared;
 
-        id<MTLTexture> iosTex = [_sharedDevice newTextureWithDescriptor:desc
-                                                              iosurface:latest_surface
-                                                                  plane:0];
-        if (!iosTex) {
-            NSLog(@"[CefUnity-Mach] newTextureWithDescriptor:iosurface: returned nil");
-            CFRelease(latest_surface);
-            return NULL;
+            id<MTLTexture> iosTex = [_sharedDevice newTextureWithDescriptor:desc
+                                                                  iosurface:latest_surface
+                                                                      plane:0];
+            if (!iosTex) {
+                NSLog(@"[CefUnity-Mach] newTextureWithDescriptor:iosurface: returned nil");
+                CFRelease(latest_surface);
+                return NULL;
+            }
+
+            MTLPixelFormat srgbFormat = (latest_format == 1)
+                ? MTLPixelFormatRGBA8Unorm_sRGB
+                : MTLPixelFormatBGRA8Unorm_sRGB;
+
+            srgbView = [iosTex newTextureViewWithPixelFormat:srgbFormat];
+            if (!srgbView) srgbView = iosTex;
+
+            // キャッシュに追加
+            int slot;
+            if (_surfaceCacheCount < IOSURFACE_CACHE_SIZE) {
+                slot = _surfaceCacheCount++;
+            } else {
+                if (_surfaceCache[0].surface) CFRelease(_surfaceCache[0].surface);
+                for (int i = 0; i < IOSURFACE_CACHE_SIZE - 1; i++)
+                    _surfaceCache[i] = _surfaceCache[i + 1];
+                slot = IOSURFACE_CACHE_SIZE - 1;
+            }
+            _surfaceCache[slot].surfaceID = latestID;
+            _surfaceCache[slot].surface = latest_surface;
+            _surfaceCache[slot].srgbView = srgbView;
         }
-
-        MTLPixelFormat srgbFormat = (latest_format == 1)
-            ? MTLPixelFormatRGBA8Unorm_sRGB
-            : MTLPixelFormatBGRA8Unorm_sRGB;
-
-        srcSrgbView = [iosTex newTextureViewWithPixelFormat:srgbFormat];
-        if (!srcSrgbView) srcSrgbView = iosTex;
-
-        // キャッシュに追加
-        int slot;
-        if (_surfaceCacheCount < IOSURFACE_CACHE_SIZE) {
-            slot = _surfaceCacheCount++;
-        } else {
-            if (_surfaceCache[0].surface) CFRelease(_surfaceCache[0].surface);
-            for (int i = 0; i < IOSURFACE_CACHE_SIZE - 1; i++)
-                _surfaceCache[i] = _surfaceCache[i + 1];
-            slot = IOSURFACE_CACHE_SIZE - 1;
-        }
-        _surfaceCache[slot].surfaceID = latestID;
-        _surfaceCache[slot].surface = latest_surface;
-        _surfaceCache[slot].srgbView = srcSrgbView;
     }
-
-    // --- optimize + Private blit: ロスレス圧縮してから安定コピーを作成 ---
-    // 1. optimizeContentsForGPUAccess: Shared テクスチャの GPU 読み取りを高速化
-    // 2. copyFromTexture: 圧縮済み Shared → Private にコピー (安定スナップショット)
-    // Private コピーにより CEF が IOSurface を再利用しても Unity の描画に影響しない
-    MTLPixelFormat targetFormat = (latest_format == 1)
-        ? MTLPixelFormatRGBA8Unorm_sRGB
-        : MTLPixelFormatBGRA8Unorm_sRGB;
-
-    if (!_privateTex[0] || _privateW != latest_width || _privateH != latest_height || _privateFormat != targetFormat) {
-        MTLTextureDescriptor *privDesc = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:targetFormat
-                                         width:(NSUInteger)latest_width
-                                        height:(NSUInteger)latest_height
-                                     mipmapped:NO];
-        privDesc.usage = MTLTextureUsageShaderRead;
-        privDesc.storageMode = MTLStorageModePrivate;
-        _privateTex[0] = [_sharedDevice newTextureWithDescriptor:privDesc];
-        _privateTex[1] = [_sharedDevice newTextureWithDescriptor:privDesc];
-        _privateW = latest_width;
-        _privateH = latest_height;
-        _privateFormat = targetFormat;
-    }
-
-    if (!_sharedQueue) {
-        _sharedQueue = [_sharedDevice newCommandQueue];
-    }
-
-    int writeIdx = 1 - _privateWriteIdx;
-    id<MTLTexture> dstTex = _privateTex[writeIdx];
-
-    id<MTLCommandBuffer> cmdBuf = [_sharedQueue commandBuffer];
-    id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
-    [blit optimizeContentsForGPUAccess:srcSrgbView];
-    [blit copyFromTexture:srcSrgbView
-              sourceSlice:0
-              sourceLevel:0
-             sourceOrigin:MTLOriginMake(0, 0, 0)
-               sourceSize:MTLSizeMake(latest_width, latest_height, 1)
-                toTexture:dstTex
-         destinationSlice:0
-         destinationLevel:0
-        destinationOrigin:MTLOriginMake(0, 0, 0)];
-    [blit endEncoding];
-    [cmdBuf commit];
-    [cmdBuf waitUntilCompleted];
-
-    _privateWriteIdx = writeIdx;
 
     uint64_t t_end = mach_absolute_time();
     _prof_call_count++;
     if (cacheHit) _prof_cache_hits++; else _prof_cache_misses++;
     _prof_drain_total_ms += ticks_to_ms(t_drain_end - t_drain_start);
-    _prof_tex_create_total_ms += ticks_to_ms(t_end - t_tex_start);
+    _prof_tex_total_ms += ticks_to_ms(t_end - t_tex_start);
     _prof_drain_msg_total += drain_count;
     _prof_total_ms += ticks_to_ms(t_end - t_start);
     if (_prof_call_count % 120 == 0) {
-        NSLog(@"[CefUnity-Prof] calls=%llu hit=%d miss=%d drain_msgs=%d | drain=%.2fms tex+blit=%.2fms total=%.2fms (avg over 120)",
+        NSLog(@"[CefUnity-Prof] calls=%llu hit=%d miss=%d drain_msgs=%d | drain=%.2fms tex=%.2fms total=%.2fms (avg over 120)",
               _prof_call_count, _prof_cache_hits, _prof_cache_misses, _prof_drain_msg_total,
-              _prof_drain_total_ms, _prof_tex_create_total_ms, _prof_total_ms);
-        _prof_drain_total_ms = _prof_lookup_total_ms = _prof_tex_create_total_ms = _prof_total_ms = 0;
+              _prof_drain_total_ms, _prof_tex_total_ms, _prof_total_ms);
+        _prof_drain_total_ms = _prof_tex_total_ms = _prof_total_ms = 0;
         _prof_drain_msg_total = _prof_cache_hits = _prof_cache_misses = 0;
     }
 
     *out_width = (int32_t)latest_width;
     *out_height = (int32_t)latest_height;
     *out_format = latest_format;
-    return (__bridge_retained void*)dstTex;
+    return (__bridge_retained void*)srgbView;
 }
 
 // ---------------------------------------------------------------------------
