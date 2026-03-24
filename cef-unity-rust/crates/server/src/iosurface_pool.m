@@ -4,12 +4,8 @@
 // IOSurface to a pool surface via Metal blit so that CEF can safely reuse the
 // source for the next frame.
 //
-// Synchronization: pipeline pattern (return previous frame's surface).
-//   - Each callback: submit async blit for current frame, return PREVIOUS
-//     frame's pool surface (whose blit completed ~16ms ago).
-//   - Zero blocking, one frame of latency (~16ms at 60fps, imperceptible).
-//   - CEF rotates 3 source IOSurfaces; our async blit (<1ms GPU time)
-//     completes well before CEF reuses the source 2 frames later.
+// Synchronization: waitUntilCompleted ensures the blit is fully done before
+// returning the pool surface to the caller (for Mach IPC transfer).
 
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurface.h>
@@ -33,11 +29,6 @@ static struct {
     id<MTLTexture> texture;
 } g_src_cache[SRC_CACHE_SIZE];
 static int g_src_cache_count = 0;
-
-// Pipeline: previous frame's surface and command buffer
-static IOSurfaceRef g_prev_dst = NULL;
-static id<MTLCommandBuffer> g_prev_cmd = nil;
-
 
 /// Lazily initialize the Metal device and command queue.
 static int ensure_metal(void) {
@@ -82,11 +73,6 @@ static void invalidate_pool(void) {
     }
     g_src_cache_count = 0;
     g_pool_idx = 0;
-    g_prev_dst = NULL;
-    if (g_prev_cmd != nil) {
-        [g_prev_cmd waitUntilCompleted];
-        g_prev_cmd = nil;
-    }
 }
 
 /// Look up or create a Metal texture for an IOSurface (src side).
@@ -123,9 +109,8 @@ static id<MTLTexture> get_src_texture(IOSurfaceRef surface, uint32_t w, uint32_t
     return tex;
 }
 
-/// Copy src IOSurface → pool IOSurface via async Metal blit.
-/// Returns the PREVIOUS frame's pool IOSurfaceRef (whose blit is complete).
-/// Returns NULL on the first call (no previous frame yet).
+/// Copy src IOSurface → pool IOSurface via synchronous Metal blit.
+/// Returns the pool IOSurfaceRef with completed blit (safe for Mach IPC transfer).
 void* iosurface_pool_copy_and_get(void* src_ref, uint32_t w, uint32_t h, uint32_t format __attribute__((unused))) {
     if (src_ref == NULL || w == 0 || h == 0) return NULL;
     if (!ensure_metal()) return NULL;
@@ -168,17 +153,9 @@ void* iosurface_pool_copy_and_get(void* src_ref, uint32_t w, uint32_t h, uint32_
     }
     id<MTLTexture> dstTex = g_dst_tex[idx];
 
-    // Safety: ensure previous blit is complete before we return its surface.
-    // At steady-state 60fps (16ms between calls, blit <1ms), this is a no-op.
-    // Only blocks during CEF startup bursts or frame spikes.
-    if (g_prev_cmd != nil) {
-        if (g_prev_cmd.status < MTLCommandBufferStatusCompleted) {
-            [g_prev_cmd waitUntilCompleted];
-        }
-        g_prev_cmd = nil;
-    }
-
-    // Submit async blit for current frame
+    // Synchronous GPU blit: copy src → dst, wait for completion.
+    // Cost ~0.5ms on Apple Silicon (GPU blit <0.1ms + scheduling overhead).
+    // Required for cross-process IOSurface coherency.
     @autoreleasepool {
         id<MTLCommandBuffer> cmdBuf = [g_queue commandBuffer];
         if (cmdBuf == nil) return NULL;
@@ -196,11 +173,8 @@ void* iosurface_pool_copy_and_get(void* src_ref, uint32_t w, uint32_t h, uint32_
         [blit endEncoding];
 
         [cmdBuf commit];
-        g_prev_cmd = cmdBuf;  // retained by ARC, checked next call
+        [cmdBuf waitUntilCompleted];
     }
 
-    // Pipeline: return previous frame's surface (blit guaranteed complete above).
-    IOSurfaceRef result = g_prev_dst;
-    g_prev_dst = dst;
-    return (void*)result;  // NULL on first call
+    return (void*)dst;
 }
