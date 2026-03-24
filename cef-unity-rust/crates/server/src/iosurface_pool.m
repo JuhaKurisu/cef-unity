@@ -4,19 +4,17 @@
 // IOSurface to a pool surface via Metal blit so that CEF can safely reuse the
 // source for the next frame.
 //
-// Synchronization strategy (no waitUntilCompleted):
-//   - CEF rotates 3 source IOSurfaces, so a given source is reused only after
-//     2+ frames (~32ms). Our GPU blit executes in < 1ms, well before reuse.
-//   - The destination pool IOSurface has kernel-level GPU tracking. When the
-//     client creates a Metal texture from it, the GPU automatically waits for
-//     our blit to finish before reading (cross-process IOSurface sync).
-//   - This eliminates 1.5ms of thread blocking per frame vs waitUntilCompleted.
+// Synchronization: pipeline pattern (return previous frame's surface).
+//   - Each callback: submit async blit for current frame, return PREVIOUS
+//     frame's pool surface (whose blit completed ~16ms ago).
+//   - Zero blocking, one frame of latency (~16ms at 60fps, imperceptible).
+//   - CEF rotates 3 source IOSurfaces; our async blit (<1ms GPU time)
+//     completes well before CEF reuses the source 2 frames later.
 
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurface.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <mach/mach_time.h>
 
 #define POOL_SIZE 5
 #define SRC_CACHE_SIZE 4
@@ -36,15 +34,10 @@ static struct {
 } g_src_cache[SRC_CACHE_SIZE];
 static int g_src_cache_count = 0;
 
-// Profiling
-static mach_timebase_info_data_t g_timebase = {0, 0};
-static uint64_t g_blit_count = 0;
-static double g_total_ms = 0;
+// Pipeline: previous frame's surface and command buffer
+static IOSurfaceRef g_prev_dst = NULL;
+static id<MTLCommandBuffer> g_prev_cmd = nil;
 
-static double ticks_to_ms(uint64_t elapsed) {
-    if (g_timebase.denom == 0) mach_timebase_info(&g_timebase);
-    return (double)elapsed * g_timebase.numer / g_timebase.denom / 1e6;
-}
 
 /// Lazily initialize the Metal device and command queue.
 static int ensure_metal(void) {
@@ -89,6 +82,11 @@ static void invalidate_pool(void) {
     }
     g_src_cache_count = 0;
     g_pool_idx = 0;
+    g_prev_dst = NULL;
+    if (g_prev_cmd != nil) {
+        [g_prev_cmd waitUntilCompleted];
+        g_prev_cmd = nil;
+    }
 }
 
 /// Look up or create a Metal texture for an IOSurface (src side).
@@ -125,9 +123,9 @@ static id<MTLTexture> get_src_texture(IOSurfaceRef surface, uint32_t w, uint32_t
     return tex;
 }
 
-/// Copy src IOSurface → pool IOSurface via Metal blit.
-/// Returns the pool IOSurfaceRef (owned by the pool, do NOT release).
-/// Returns NULL on failure.
+/// Copy src IOSurface → pool IOSurface via async Metal blit.
+/// Returns the PREVIOUS frame's pool IOSurfaceRef (whose blit is complete).
+/// Returns NULL on the first call (no previous frame yet).
 void* iosurface_pool_copy_and_get(void* src_ref, uint32_t w, uint32_t h, uint32_t format __attribute__((unused))) {
     if (src_ref == NULL || w == 0 || h == 0) return NULL;
     if (!ensure_metal()) return NULL;
@@ -149,12 +147,12 @@ void* iosurface_pool_copy_and_get(void* src_ref, uint32_t w, uint32_t h, uint32_
             fprintf(stderr, "[iosurface_pool] create_pool_surface failed\n");
             return NULL;
         }
-        g_dst_tex[idx] = nil;  // invalidate cached texture
+        g_dst_tex[idx] = nil;
     }
     IOSurfaceRef dst = g_pool[idx];
     g_pool_idx = (g_pool_idx + 1) % POOL_SIZE;
 
-    // Get cached textures (avoids per-frame Obj-C allocations)
+    // Get cached textures
     id<MTLTexture> srcTex = get_src_texture(src, w, h);
     if (!srcTex) return NULL;
 
@@ -170,9 +168,17 @@ void* iosurface_pool_copy_and_get(void* src_ref, uint32_t w, uint32_t h, uint32_
     }
     id<MTLTexture> dstTex = g_dst_tex[idx];
 
-    // Blit + wait (only Obj-C allocs per frame: commandBuffer + blitEncoder)
-    uint64_t t0 = mach_absolute_time();
+    // Safety: ensure previous blit is complete before we return its surface.
+    // At steady-state 60fps (16ms between calls, blit <1ms), this is a no-op.
+    // Only blocks during CEF startup bursts or frame spikes.
+    if (g_prev_cmd != nil) {
+        if (g_prev_cmd.status < MTLCommandBufferStatusCompleted) {
+            [g_prev_cmd waitUntilCompleted];
+        }
+        g_prev_cmd = nil;
+    }
 
+    // Submit async blit for current frame
     @autoreleasepool {
         id<MTLCommandBuffer> cmdBuf = [g_queue commandBuffer];
         if (cmdBuf == nil) return NULL;
@@ -190,27 +196,11 @@ void* iosurface_pool_copy_and_get(void* src_ref, uint32_t w, uint32_t h, uint32_
         [blit endEncoding];
 
         [cmdBuf commit];
-        // No waitUntilCompleted:
-        // - src IOSurface: CEF rotates 3 sources; our blit (<1ms GPU) finishes
-        //   well before CEF reuses this source 2 frames later (~32ms).
-        // - dst IOSurface: kernel-level IOSurface tracking ensures the client's
-        //   GPU waits for our blit to complete before reading (cross-process sync).
+        g_prev_cmd = cmdBuf;  // retained by ARC, checked next call
     }
 
-    uint64_t t1 = mach_absolute_time();
-    g_blit_count++;
-    g_total_ms += ticks_to_ms(t1 - t0);
-    if (g_blit_count % 300 == 0) {
-        NSString *tmpDir = NSTemporaryDirectory();
-        NSString *logPath = [tmpDir stringByAppendingPathComponent:@"cef_unity_server.log"];
-        FILE *f = fopen([logPath UTF8String], "a");
-        if (f) {
-            fprintf(f, "[iosurface_pool] blit avg=%.3fms over 300 frames (total %.1fms)\n",
-                    g_total_ms / 300.0, g_total_ms);
-            fclose(f);
-        }
-        g_total_ms = 0;
-    }
-
-    return (void*)dst;
+    // Pipeline: return previous frame's surface (blit guaranteed complete above).
+    IOSurfaceRef result = g_prev_dst;
+    g_prev_dst = dst;
+    return (void*)result;  // NULL on first call
 }

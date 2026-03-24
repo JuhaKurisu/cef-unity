@@ -91,7 +91,10 @@ done
 # Unity が .app 内に .meta ファイルを作るので codesign 前に削除
 find "$SERVER_APP" -name '*.meta' -delete
 
-# Codesign server (helpers are already signed above)
+# Codesign CEF framework (別 Mac で dlopen が拒否されないよう ad-hoc 署名)
+codesign -s - --force "$SERVER_APP/Contents/Frameworks/Chromium Embedded Framework.framework"
+
+# Codesign server (helpers and framework are already signed above)
 codesign -s - --force --entitlements server.entitlements "$SERVER_APP"
 
 # 旧構成のファイルを削除

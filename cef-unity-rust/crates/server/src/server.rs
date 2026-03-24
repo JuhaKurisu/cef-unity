@@ -213,7 +213,7 @@ wrap_render_handler! {
                     mach_iosurface_server_send(pool_surface, w, h, format)
                 };
 
-                if count <= 5 || count.is_multiple_of(100) {
+                if count <= 5 || count.is_multiple_of(3000) {
                     let src_id = unsafe { IOSurfaceGetID(io_surface) };
                     let dst_id = unsafe { IOSurfaceGetID(pool_surface) };
                     let has_client = unsafe { mach_iosurface_server_has_client() };
