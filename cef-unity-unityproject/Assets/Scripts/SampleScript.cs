@@ -310,10 +310,6 @@ public class SampleScript : MonoBehaviour
         HandleButton(bx, by, 1, MouseButton.Right, mods);
         HandleButton(bx, by, 2, MouseButton.Middle, mods);
 
-        // クリック時にIME候補ウィンドウの初期位置をマウス位置に設定
-        if (Input.GetMouseButtonDown(0))
-            Input.compositionCursorPos = Input.mousePosition;
-
         var scroll = Input.mouseScrollDelta;
         if (scroll.y != 0f || scroll.x != 0f)
             _browser.SendMouseWheel(bx, by, (int)(scroll.x * 120), (int)(scroll.y * 120), mods);

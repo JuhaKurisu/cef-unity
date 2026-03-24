@@ -9,23 +9,6 @@
 #import <Foundation/Foundation.h>
 #import <mach/mach.h>
 #import <servers/bootstrap.h>
-#import <mach/mach_time.h>
-
-// Profiling
-static mach_timebase_info_data_t _timebase = {0, 0};
-static uint64_t _prof_call_count = 0;
-static double _prof_drain_total_ms = 0;
-static double _prof_tex_total_ms = 0;
-static double _prof_total_ms = 0;
-static int _prof_drain_msg_total = 0;
-static int _prof_cache_hits = 0;
-static int _prof_cache_misses = 0;
-
-static double ticks_to_ms(uint64_t elapsed) {
-    if (_timebase.denom == 0) mach_timebase_info(&_timebase);
-    return (double)elapsed * _timebase.numer / _timebase.denom / 1e6;
-}
-
 static id<MTLDevice> _sharedDevice = nil;
 
 // IOSurface テクスチャ + sRGB view キャッシュ (IOSurfaceID で比較、マルチエントリ)
@@ -128,14 +111,9 @@ int mach_iosurface_client_connect(const char* service_name) {
 void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint32_t* out_format) {
     if (g_receive_port == MACH_PORT_NULL) return NULL;
 
-    uint64_t t_start = mach_absolute_time();
-
     // Drain all pending messages, keep only the latest
     IOSurfaceRef latest_surface = NULL;
     uint32_t latest_width = 0, latest_height = 0, latest_format = 0;
-    int drain_count = 0;
-
-    uint64_t t_drain_start = mach_absolute_time();
     for (;;) {
         struct {
             iosurface_msg_t msg;
@@ -166,9 +144,7 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
             latest_height = recv_buf.msg.height;
             latest_format = recv_buf.msg.format;
         }
-        drain_count++;
     }
-    uint64_t t_drain_end = mach_absolute_time();
 
     if (!latest_surface) return NULL;
 
@@ -183,18 +159,14 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
         NSLog(@"[CefUnity-Mach] Metal device: %@", _sharedDevice.name);
     }
 
-    uint64_t t_tex_start = mach_absolute_time();
-
     // マルチエントリキャッシュで IOSurfaceID を検索
     IOSurfaceID latestID = IOSurfaceGetID(latest_surface);
     id<MTLTexture> srgbView = nil;
-    int cacheHit = 0;
 
     for (int i = 0; i < _surfaceCacheCount; i++) {
         if (_surfaceCache[i].surfaceID == latestID && _surfaceCache[i].srgbView) {
             CFRelease(latest_surface);
             srgbView = _surfaceCache[i].srgbView;
-            cacheHit = 1;
             break;
         }
     }
@@ -244,21 +216,6 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
             _surfaceCache[slot].surface = latest_surface;
             _surfaceCache[slot].srgbView = srgbView;
         }
-    }
-
-    uint64_t t_end = mach_absolute_time();
-    _prof_call_count++;
-    if (cacheHit) _prof_cache_hits++; else _prof_cache_misses++;
-    _prof_drain_total_ms += ticks_to_ms(t_drain_end - t_drain_start);
-    _prof_tex_total_ms += ticks_to_ms(t_end - t_tex_start);
-    _prof_drain_msg_total += drain_count;
-    _prof_total_ms += ticks_to_ms(t_end - t_start);
-    if (_prof_call_count % 120 == 0) {
-        NSLog(@"[CefUnity-Prof] calls=%llu hit=%d miss=%d drain_msgs=%d | drain=%.2fms tex=%.2fms total=%.2fms (avg over 120)",
-              _prof_call_count, _prof_cache_hits, _prof_cache_misses, _prof_drain_msg_total,
-              _prof_drain_total_ms, _prof_tex_total_ms, _prof_total_ms);
-        _prof_drain_total_ms = _prof_tex_total_ms = _prof_total_ms = 0;
-        _prof_drain_msg_total = _prof_cache_hits = _prof_cache_misses = 0;
     }
 
     *out_width = (int32_t)latest_width;
