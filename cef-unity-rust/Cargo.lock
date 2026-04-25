@@ -207,6 +207,7 @@ dependencies = [
  "cef-unity-ipc",
  "csbindgen",
  "ipc-channel",
+ "windows 0.61.3",
 ]
 
 [[package]]
@@ -234,6 +235,7 @@ dependencies = [
  "cef-unity-ipc",
  "ipc-channel",
  "serde_json",
+ "windows 0.61.3",
 ]
 
 [[package]]

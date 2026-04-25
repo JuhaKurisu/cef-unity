@@ -3,6 +3,9 @@
 // This is a pure IPC client — no CEF dependency.
 // Communicates with cef-unity-server via ipc-channel + shared memory.
 
+#[cfg(target_os = "windows")]
+mod d3d11;
+
 use std::ffi::{CStr, c_char};
 use std::io::Write;
 use std::path::PathBuf;
@@ -185,8 +188,7 @@ pub extern "C" fn cef_unity_init() -> i32 {
         return 0;
     }
 
-    let _ = std::fs::write(std::env::temp_dir().join("cef_unity_debug.log"), "");
-    log_to_file("cef_unity_init() called (IPC client mode)");
+    log_to_file("---- cef_unity_init() called (IPC client mode) ----");
 
     // Find server binary next to dylib
     let plugin_dir = dylib_dir();
@@ -210,10 +212,15 @@ pub extern "C" fn cef_unity_init() -> i32 {
     };
     log_to_file(&format!("one-shot server name = {}", server_name));
 
-    // Launch server process with --ipc-server argument
+    // Launch server process with --ipc-server argument。
+    // Windows では D3D11 共有テクスチャを DuplicateHandle で渡すために
+    // クライアント PID も渡す。
+    let client_pid = std::process::id();
     match std::process::Command::new(&server_app)
         .arg("--ipc-server")
         .arg(&server_name)
+        .arg("--client-pid")
+        .arg(client_pid.to_string())
         .spawn()
     {
         Ok(_child) => {
@@ -1235,5 +1242,95 @@ pub extern "C" fn cef_unity_execute_javascript_blocking(
         )
     } else {
         -1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows: D3D11 共有テクスチャ受信
+// ---------------------------------------------------------------------------
+
+/// Unity Native Plugin Interface のエントリポイント。Unity が DLL ロード時に呼ぶ。
+/// IUnityGraphicsD3D11 経由で Unity の ID3D11Device を取得し保持する。
+/// 非 Windows プラットフォームでは何もしない。
+#[unsafe(no_mangle)]
+pub extern "C" fn UnityPluginLoad(unity_interfaces: *mut std::ffi::c_void) {
+    log_to_file(&format!(
+        "UnityPluginLoad called (interfaces={:p})",
+        unity_interfaces
+    ));
+    #[cfg(target_os = "windows")]
+    {
+        d3d11::set_unity_interfaces(unity_interfaces as *mut d3d11::IUnityInterfaces);
+        log_to_file(&format!(
+            "UnityPluginLoad: d3d11 connected = {}",
+            d3d11::is_connected()
+        ));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = unity_interfaces;
+    }
+}
+
+/// Unity Native Plugin Interface のアンロード。Unity が DLL アンロード時に呼ぶ。
+#[unsafe(no_mangle)]
+pub extern "C" fn UnityPluginUnload() {
+    #[cfg(target_os = "windows")]
+    {
+        d3d11::clear_unity_interfaces();
+    }
+}
+
+/// Windows: Unity の D3D11 device に接続済みなら 1 を返す。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_is_d3d11_connected() -> i32 {
+    #[cfg(target_os = "windows")]
+    {
+        if d3d11::is_connected() { 1 } else { 0 }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        0
+    }
+}
+
+/// Windows: 共有メモリから最新の D3D11 共有 HANDLE を読み出し、
+/// Unity の D3D11Device で OpenSharedResource1 した ID3D11Texture2D* を返す。
+/// 新フレームが無い場合は null。
+///
+/// 戻り値ポインタは内部で AddRef 済みのキャッシュであり、次に handle が変わるか
+/// プラグイン unload までは Unity 側で再 AddRef せずに使ってよい。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_recv_d3d11_texture(
+    handle: *mut CefUnityBrowser,
+    out_width: *mut i32,
+    out_height: *mut i32,
+    out_format: *mut u32,
+) -> *mut std::ffi::c_void {
+    if handle.is_null() || out_width.is_null() || out_height.is_null() || out_format.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let instance = handle_to_ref(handle);
+        let Some((handle_value, w, h, format)) = instance.shm.get_d3d11_handle() else {
+            return std::ptr::null_mut();
+        };
+        let Some((tex_ptr, w_out, h_out)) = d3d11::open_or_cached(handle_value, w, h) else {
+            return std::ptr::null_mut();
+        };
+        unsafe {
+            *out_width = w_out as i32;
+            *out_height = h_out as i32;
+            *out_format = format;
+        }
+        PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
+        tex_ptr
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (handle, out_width, out_height, out_format);
+        std::ptr::null_mut()
     }
 }

@@ -137,10 +137,10 @@ pub fn iosurface_service_name(server_pid: u32) -> String {
 pub const MAX_W: u32 = 3840;
 pub const MAX_H: u32 = 2160;
 pub const BUFFER_SIZE: usize = (MAX_W * MAX_H * 4) as usize;
-pub const SHM_HEADER_SIZE: usize = 64;
+pub const SHM_HEADER_SIZE: usize = 128;
 pub const SHM_TOTAL_SIZE: usize = SHM_HEADER_SIZE + BUFFER_SIZE * 2;
 
-/// Header at offset 0 of shared memory. 64 bytes, cache-line aligned.
+/// Header at offset 0 of shared memory. 128 bytes, cache-line aligned.
 #[repr(C, align(64))]
 pub struct ShmHeader {
     pub frame_id: AtomicU64,
@@ -153,12 +153,18 @@ pub struct ShmHeader {
     pub ime_caret_y: AtomicI32,
     pub ime_caret_w: AtomicI32,
     pub ime_caret_h: AtomicI32,
-    // ---- IOSurface accelerated paint ----
+    // ---- Accelerated paint metadata (shared between macOS IOSurface and Windows D3D11) ----
     pub accel_frame_id: AtomicU64,
     pub accel_surface_id: AtomicU32,
     pub accel_width: AtomicU32,
     pub accel_height: AtomicU32,
     pub accel_format: AtomicU32, // 0=BGRA, 1=RGBA
+    // ---- Windows D3D11 accelerated paint ----
+    /// NT shared HANDLE (DuplicateHandle 済みの値) を 64bit で格納する。
+    /// macOS では未使用 (IOSurface の Mach port 経由で別チャネル送信)。
+    pub d3d11_handle: AtomicU64,
+    /// d3d11_handle に対応するフレーム ID (handle 値だけだと変化検出できないため用意)。
+    pub d3d11_frame_id: AtomicU64,
 }
 
 use std::sync::atomic::AtomicI32;
@@ -231,6 +237,18 @@ impl ShmWriter {
         header.accel_frame_id.fetch_add(1, Ordering::Release);
     }
 
+    /// Windows: NT 共有 HANDLE (client プロセスへ DuplicateHandle 済みの値) を書き込む。
+    /// width/height/format も同時に更新する。
+    pub fn write_d3d11_handle(&self, handle: u64, width: u32, height: u32, format: u32) {
+        let header = self.header();
+        header.accel_width.store(width, Ordering::Release);
+        header.accel_height.store(height, Ordering::Release);
+        header.accel_format.store(format, Ordering::Release);
+        header.d3d11_handle.store(handle, Ordering::Release);
+        // d3d11_frame_id は最後に更新する: クライアントは frame_id の変化を検出して読む
+        header.d3d11_frame_id.fetch_add(1, Ordering::Release);
+    }
+
     /// Write a frame. The buffer must be width*height*4 BGRA bytes.
     pub fn write_frame(&self, pixels: &[u8], width: u32, height: u32) {
         let size = (width * height * 4) as usize;
@@ -260,6 +278,7 @@ pub struct ShmReader {
     shmem: Shmem,
     pub last_frame_id: u64,
     pub last_accel_frame_id: u64,
+    pub last_d3d11_frame_id: u64,
 }
 
 unsafe impl Send for ShmReader {}
@@ -275,7 +294,28 @@ impl ShmReader {
             shmem,
             last_frame_id: 0,
             last_accel_frame_id: 0,
+            last_d3d11_frame_id: 0,
         })
+    }
+
+    /// Read Windows D3D11 shared handle info from the shared memory header.
+    /// Returns Some((handle, width, height, format)) if a new accelerated frame is available.
+    pub fn get_d3d11_handle(&mut self) -> Option<(u64, u32, u32, u32)> {
+        let header = unsafe { &*(self.shmem.as_ptr() as *const ShmHeader) };
+        let frame_id = header.d3d11_frame_id.load(Ordering::Acquire);
+        if frame_id == self.last_d3d11_frame_id {
+            return None;
+        }
+        self.last_d3d11_frame_id = frame_id;
+
+        let handle = header.d3d11_handle.load(Ordering::Acquire);
+        let width = header.accel_width.load(Ordering::Acquire);
+        let height = header.accel_height.load(Ordering::Acquire);
+        let format = header.accel_format.load(Ordering::Acquire);
+        if handle == 0 || width == 0 || height == 0 {
+            return None;
+        }
+        Some((handle, width, height, format))
     }
 
     /// Read IOSurface info from the shared memory header.

@@ -414,6 +414,52 @@ namespace CefUnity.Interop
             return NativeMethods.cef_unity_is_iosurface_connected() != 0;
         }
 
+        // ----- Windows D3D11 共有テクスチャ -----
+
+        /// <summary>
+        /// Unity の D3D11 device と接続済みかどうかを返す (Windows 用)。
+        /// </summary>
+        public static bool IsD3D11Connected()
+        {
+            return NativeMethods.cef_unity_is_d3d11_connected() != 0;
+        }
+
+        /// <summary>
+        /// Windows: 最新フレームの ID3D11Texture2D* を取得する (新フレームなら true)。
+        /// 返るポインタは Unity の D3D11 device で開かれており、
+        /// Texture2D.CreateExternalTexture / UpdateExternalTexture に直接渡せる。
+        /// クライアントライブラリ内で AddRef/Release 管理されるため、Unity 側で
+        /// 解放処理を書く必要はない (プラグイン unload 時に自動解放)。
+        /// </summary>
+        public unsafe bool TryRecvD3D11Texture(out IntPtr texturePtr, out int width, out int height, out uint format)
+        {
+            ThrowIfDisposed();
+            int w, h;
+            uint fmt;
+            var ptr = NativeMethods.cef_unity_recv_d3d11_texture(_handle, &w, &h, &fmt);
+            texturePtr = (IntPtr)ptr;
+            width = w;
+            height = h;
+            format = fmt;
+            return ptr != null;
+        }
+
+        // ----- 統一: Accelerated paint (macOS + Windows) -----
+
+        /// <summary>
+        /// 現在のプラットフォームで accelerated paint (GPU 経路) が利用可能か。
+        /// </summary>
+        public static bool IsAcceleratedConnected()
+        {
+#if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
+            return IsIOSurfaceConnected();
+#elif UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+            return IsD3D11Connected();
+#else
+            return false;
+#endif
+        }
+
         // ----- IME -----
 
         public void ImeSetComposition(string text, uint selectionStart, uint selectionEnd)

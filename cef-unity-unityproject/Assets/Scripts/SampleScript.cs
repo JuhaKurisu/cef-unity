@@ -107,9 +107,9 @@ public class SampleScript : MonoBehaviour
             CefRuntime.Init();
             _browser = new Browser(_currentWidth, _currentHeight, _url);
 
-            // Mach port 経由の IOSurface 転送でゼロコピー GPU テクスチャ共有を使用。
-            // Init() がサーバーを起動し Mach port 接続を行うため、その後にチェック。
-            _useAcceleratedPaint = Browser.IsIOSurfaceConnected();
+            // 共通: macOS は Mach port 経由の IOSurface、Windows は D3D11 共有テクスチャ。
+            // Init() がサーバーを起動し接続を行うため、その後にチェック。
+            _useAcceleratedPaint = Browser.IsAcceleratedConnected();
             Debug.Log($"[CefUnity] Initialized ({_currentWidth}x{_currentHeight}), acceleratedPaint={_useAcceleratedPaint}");
             SetupImeProxy();
         }
@@ -514,21 +514,38 @@ public class SampleScript : MonoBehaviour
     {
         var t0 = Time.realtimeSinceStartup;
 
-        // IOSurface を受信 → GPU blit → ダブルバッファ済み sRGB Metal テクスチャを取得
-        if (!Browser.TryRecvIOSurfaceTexture(out var newTexPtr, out var w, out var h, out var format))
+        IntPtr newTexPtr;
+        int w, h;
+        uint format;
+
+#if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
+        // macOS: IOSurface 経由で毎フレーム新しい Metal テクスチャを受信 → Release が必要
+        if (!Browser.TryRecvIOSurfaceTexture(out newTexPtr, out w, out h, out format))
             return;
+#elif UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+        // Windows: D3D11 共有テクスチャ経由。ポインタはサイズ変更時以外は安定
+        // (client lib 側でキャッシュ管理)、Release 不要。
+        if (_browser == null || !_browser.TryRecvD3D11Texture(out newTexPtr, out w, out h, out format))
+            return;
+#else
+        return;
+#endif
 
         var t1 = Time.realtimeSinceStartup;
 
         if (w <= 0 || h <= 0)
         {
+#if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
             Browser.ReleaseMetalTexture(newTexPtr);
+#endif
             return;
         }
 
         if (_texture == null || _texture.width != w || _texture.height != h)
         {
             if (_texture != null) Destroy(_texture);
+            // Windows: 共有テクスチャは DXGI_FORMAT_B8G8R8A8_UNORM_SRGB なので linear=false (sRGB)。
+            // macOS: Metal 経路も sRGB 解釈なので linear=false。
             _texture = Texture2D.CreateExternalTexture(w, h, TextureFormat.BGRA32, false, false, newTexPtr);
             if (_rawImage != null)
             {
@@ -543,10 +560,12 @@ public class SampleScript : MonoBehaviour
 
         var t2 = Time.realtimeSinceStartup;
 
-        // 前フレームの retain を解放
+#if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
+        // macOS のみ: 前フレームの retain を解放 (Windows は client lib 側で管理)
         if (_lastAccelTexPtr != IntPtr.Zero)
             Browser.ReleaseMetalTexture(_lastAccelTexPtr);
         _lastAccelTexPtr = newTexPtr;
+#endif
 
         var t3 = Time.realtimeSinceStartup;
 

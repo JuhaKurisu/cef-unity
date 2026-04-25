@@ -245,6 +245,37 @@ namespace CefUnity
         [DllImport(__DllName, EntryPoint = "cef_unity_execute_javascript_blocking", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern int cef_unity_execute_javascript_blocking(CefUnityBrowser* handle, byte* code);
 
+        /// <summary>
+        ///  Unity Native Plugin Interface のエントリポイント。Unity が DLL ロード時に呼ぶ。
+        ///  IUnityGraphicsD3D11 経由で Unity の ID3D11Device を取得し保持する。
+        ///  非 Windows プラットフォームでは何もしない。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "UnityPluginLoad", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void UnityPluginLoad(void* unity_interfaces);
+
+        /// <summary>
+        ///  Unity Native Plugin Interface のアンロード。Unity が DLL アンロード時に呼ぶ。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "UnityPluginUnload", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void UnityPluginUnload();
+
+        /// <summary>
+        ///  Windows: Unity の D3D11 device に接続済みなら 1 を返す。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_is_d3d11_connected", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_is_d3d11_connected();
+
+        /// <summary>
+        ///  Windows: 共有メモリから最新の D3D11 共有 HANDLE を読み出し、
+        ///  Unity の D3D11Device で OpenSharedResource1 した ID3D11Texture2D* を返す。
+        ///  新フレームが無い場合は null。
+        ///
+        ///  戻り値ポインタは内部で AddRef 済みのキャッシュであり、次に handle が変わるか
+        ///  プラグイン unload までは Unity 側で再 AddRef せずに使ってよい。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_recv_d3d11_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void* cef_unity_recv_d3d11_texture(CefUnityBrowser* handle, int* out_width, int* out_height, uint* out_format);
+
 
     }
 
