@@ -657,11 +657,20 @@ impl CefServer {
             load_handler,
         );
 
-        let mut window_info = WindowInfo::default().set_as_windowless(std::ptr::null_mut());
-        // IOSurface Mach port 転送を使用: on_accelerated_paint でゼロコピー GPU テクスチャ共有。
-        // IOSurfaceLookup (グローバル ID) は macOS 16 で動作しないため、
-        // IOSurfaceCreateMachPort + IOSurfaceLookupFromMachPort を使用。
-        window_info.shared_texture_enabled = 1;
+        // cef_window_handle_t はプラットフォーム依存:
+        //   macOS / Linux: *mut c_void
+        //   Windows: HWND (newtype wrapping *mut c_void)
+        #[cfg(target_os = "windows")]
+        let parent_handle = cef::sys::HWND(std::ptr::null_mut());
+        #[cfg(not(target_os = "windows"))]
+        let parent_handle = std::ptr::null_mut();
+        let mut window_info = WindowInfo::default().set_as_windowless(parent_handle);
+        // macOS: IOSurface Mach port 転送を使用 (on_accelerated_paint でゼロコピー GPU テクスチャ共有)。
+        // Windows / Linux: 現状 software paint (on_paint) のみ対応。
+        #[cfg(target_os = "macos")]
+        {
+            window_info.shared_texture_enabled = 1;
+        }
         let ok = browser_host_create_browser(
             Some(&window_info),
             Some(&mut client),
