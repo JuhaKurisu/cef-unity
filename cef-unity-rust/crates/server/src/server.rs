@@ -36,6 +36,8 @@ unsafe extern "C" {
 
 use cef_unity_ipc::{self as ipc, Command, Response, ShmWriter};
 
+use crate::d3d11_pool::D3D11Pool;
+
 // ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
@@ -102,6 +104,10 @@ struct BrowserState {
     browser: Arc<Mutex<Option<Browser>>>,
     viewport_w: Arc<AtomicI32>,
     viewport_h: Arc<AtomicI32>,
+    /// Windows: D3D11 共有テクスチャプール (on_accelerated_paint で使用)。
+    /// 非 Windows / 失敗時は None で software 経路にフォールバック。
+    #[allow(dead_code)]
+    d3d11_pool: Option<Arc<D3D11Pool>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +121,7 @@ wrap_render_handler! {
         shm: Arc<ShmWriter>,
         viewport_w: Arc<AtomicI32>,
         viewport_h: Arc<AtomicI32>,
+        d3d11_pool: Option<Arc<D3D11Pool>>,
     }
     impl RenderHandler {
         fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
@@ -226,6 +233,60 @@ wrap_render_handler! {
                 // Also write metadata to ShmHeader (for frame change detection)
                 let surface_id = unsafe { IOSurfaceGetID(pool_surface) };
                 self.shm.write_iosurface_info(surface_id, w, h, format);
+            }
+
+            #[cfg(target_os = "windows")]
+            if let Some(info) = info {
+                let Some(pool) = self.d3d11_pool.as_ref() else { return; };
+
+                let src_handle_raw = info.shared_texture_handle;
+                if src_handle_raw.is_null() {
+                    return;
+                }
+                let w = info.extra.coded_size.width as u32;
+                let h = info.extra.coded_size.height as u32;
+                if w == 0 || h == 0 { return; }
+
+                // CEF Windows OSR は通常 BGRA8 を出す。format フィールドで RGBA を判別する。
+                let format_tag: u32 = if info.format.get_raw() == ColorType::RGBA_8888.get_raw() {
+                    1
+                } else {
+                    0
+                };
+
+                let count = PAINT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+
+                // cef::sys::HANDLE = *mut c_void; windows::Win32::Foundation::HANDLE は newtype
+                use windows::Win32::Foundation::HANDLE as WinHandle;
+                use windows::Win32::Graphics::Dxgi::Common::{
+                    DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                };
+                // CEF はガンマエンコード済み (sRGB) のバイトを出すので、Unity に
+                // sRGB→linear 自動変換させるため _SRGB フォーマットでプールテクスチャを作る。
+                // CopyResource は同 family (UNORM ↔ UNORM_SRGB) なら通る。
+                let dxgi_format = if format_tag == 1 {
+                    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                } else {
+                    DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+                };
+                let src_handle = WinHandle(src_handle_raw as *mut _);
+
+                match pool.copy_from_source(src_handle, w, h, dxgi_format) {
+                    Ok(client_handle) => {
+                        if count <= 5 || count.is_multiple_of(300) {
+                            log(&format!(
+                                "on_accelerated_paint #{}: {}x{} fmt={} client_handle=0x{:x}",
+                                count, w, h, format_tag, client_handle
+                            ));
+                        }
+                        self.shm.write_d3d11_handle(client_handle, w, h, format_tag);
+                    }
+                    Err(e) => {
+                        if count <= 5 {
+                            log(&format!("on_accelerated_paint pool error: {}", e));
+                        }
+                    }
+                }
             }
         }
 
@@ -458,14 +519,18 @@ pub struct CefServer {
     browsers: HashMap<u32, BrowserState>,
     next_browser_id: AtomicU32,
     server_pid: u32,
+    /// Windows: クライアントプロセス PID (DuplicateHandle 用)。
+    #[allow(dead_code)]
+    client_pid: Option<u32>,
 }
 
 impl CefServer {
-    pub fn new() -> Self {
+    pub fn new(client_pid: Option<u32>) -> Self {
         CefServer {
             browsers: HashMap::new(),
             next_browser_id: AtomicU32::new(1),
             server_pid: std::process::id(),
+            client_pid,
         }
     }
 
@@ -642,10 +707,31 @@ impl CefServer {
         let viewport_h = Arc::new(AtomicI32::new(height));
         let browser_slot: Arc<Mutex<Option<Browser>>> = Arc::new(Mutex::new(None));
 
+        // Windows のみ: D3D11 共有テクスチャプールを作成 (失敗時は software 経路にフォールバック)。
+        // 非 Windows ではスタブ実装が常に Err を返すので None になる。
+        let d3d11_pool: Option<Arc<D3D11Pool>> = match D3D11Pool::new(self.client_pid) {
+            Ok(p) => {
+                log(&format!(
+                    "D3D11Pool created (client_pid={:?})",
+                    self.client_pid
+                ));
+                Some(Arc::new(p))
+            }
+            Err(_e) => {
+                #[cfg(target_os = "windows")]
+                log(&format!(
+                    "D3D11Pool::new failed, falling back to software paint: {}",
+                    _e
+                ));
+                None
+            }
+        };
+
         let render_handler = ServerRenderHandler::new(
             Arc::clone(&shm),
             Arc::clone(&viewport_w),
             Arc::clone(&viewport_h),
+            d3d11_pool.clone(),
         );
         let life_span_handler = ServerLifeSpanHandler::new(Arc::clone(&browser_slot));
         let display_handler = ServerDisplayHandler::new(Arc::clone(&shm));
@@ -657,11 +743,24 @@ impl CefServer {
             load_handler,
         );
 
-        let mut window_info = WindowInfo::default().set_as_windowless(std::ptr::null_mut());
-        // IOSurface Mach port 転送を使用: on_accelerated_paint でゼロコピー GPU テクスチャ共有。
-        // IOSurfaceLookup (グローバル ID) は macOS 16 で動作しないため、
-        // IOSurfaceCreateMachPort + IOSurfaceLookupFromMachPort を使用。
-        window_info.shared_texture_enabled = 1;
+        // cef_window_handle_t はプラットフォーム依存:
+        //   macOS / Linux: *mut c_void
+        //   Windows: HWND (newtype wrapping *mut c_void)
+        #[cfg(target_os = "windows")]
+        let parent_handle = cef::sys::HWND(std::ptr::null_mut());
+        #[cfg(not(target_os = "windows"))]
+        let parent_handle = std::ptr::null_mut();
+        let mut window_info = WindowInfo::default().set_as_windowless(parent_handle);
+        // macOS: IOSurface Mach port 転送を使用。
+        // Windows: D3D11 共有テクスチャプールが構築できた場合のみ accelerated paint を有効化。
+        #[cfg(target_os = "macos")]
+        {
+            window_info.shared_texture_enabled = 1;
+        }
+        #[cfg(target_os = "windows")]
+        if d3d11_pool.is_some() {
+            window_info.shared_texture_enabled = 1;
+        }
         let ok = browser_host_create_browser(
             Some(&window_info),
             Some(&mut client),
@@ -692,6 +791,7 @@ impl CefServer {
                 browser: browser_slot,
                 viewport_w,
                 viewport_h,
+                d3d11_pool,
             },
         );
 

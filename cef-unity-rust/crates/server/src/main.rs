@@ -3,6 +3,7 @@
 // Runs CEF in its own process, communicates with Unity via ipc-channel + shared memory.
 // Platform-specific event loop is in the event_loop module.
 
+mod d3d11_pool;
 mod event_loop;
 mod server;
 
@@ -34,8 +35,15 @@ fn main() {
         .expect("--ipc-server argument required");
     log(&format!("ipc_server_name = {}", ipc_server_name));
 
+    // Parse --client-pid (optional; Windows D3D11 共有のために使う)
+    let client_pid: Option<u32> = std::env::args()
+        .skip_while(|a| a != "--client-pid")
+        .nth(1)
+        .and_then(|s| s.parse().ok());
+    log(&format!("client_pid = {:?}", client_pid));
+
     // Initialize CEF first (server must be ready before accepting connections)
-    let cef_server = server::CefServer::new();
+    let cef_server = server::CefServer::new(client_pid);
     if !cef_server.init_cef() {
         log("CEF initialization failed");
         std::process::exit(1);
