@@ -1,5 +1,5 @@
 {
-    "name": "Script",
+    "name": "CefUnity.Runtime",
     "rootNamespace": "",
     "references": [
         "GUID:00fa91e90705d487e92024eb90b2bbfa",
