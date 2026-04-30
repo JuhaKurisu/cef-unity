@@ -7,7 +7,7 @@ using CefUnity.Interop;
 using UnityEngine;
 using UnityEngine.UI;
 
-public class SampleScript : MonoBehaviour
+public class CefUnityBrowserSample : MonoBehaviour
 {
     private const float DoubleClickTime = 0.3f;
     private const int DoubleClickDistance = 4;
