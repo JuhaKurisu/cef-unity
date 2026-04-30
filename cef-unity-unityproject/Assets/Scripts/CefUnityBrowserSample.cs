@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using CefUnity;
 using CefUnity.Interop;
+using UnityEditor;
 using UnityEngine;
 using UnityEngine.UI;
 
@@ -312,7 +314,7 @@ public class CefUnityBrowserSample : MonoBehaviour
 
         var scroll = Input.mouseScrollDelta;
         if (scroll.y != 0f || scroll.x != 0f)
-            _browser.SendMouseWheel(bx, by, (int)(scroll.x * 120), (int)(scroll.y * 120), mods);
+            _browser.SendMouseWheel(bx, by, (int)(scroll.x * 60), (int)(scroll.y * 60), mods);
     }
 
     private void HandleButton(int bx, int by, int unityButton, MouseButton cefButton, uint mods)
@@ -566,9 +568,9 @@ public class CefUnityBrowserSample : MonoBehaviour
         var t3 = Time.realtimeSinceStartup;
 
         _accelProfCount++;
-        _accelProfRecvTotal += (t1 - t0);
-        _accelProfUpdateTotal += (t2 - t1);
-        _accelProfReleaseTotal += (t3 - t2);
+        _accelProfRecvTotal += t1 - t0;
+        _accelProfUpdateTotal += t2 - t1;
+        _accelProfReleaseTotal += t3 - t2;
 
         if (_accelProfCount >= 120)
         {
@@ -634,7 +636,10 @@ public class CefUnityBrowserSample : MonoBehaviour
             var val = ObjcMsgSendDouble(nsEvent, sel);
             return val > 0 ? (float)val : 0.5f;
         }
-        catch { return 0.5f; }
+        catch
+        {
+            return 0.5f;
+        }
     }
 
     private static float GetOSKeyRepeatRate()
@@ -646,7 +651,10 @@ public class CefUnityBrowserSample : MonoBehaviour
             var val = ObjcMsgSendDouble(nsEvent, sel);
             return val > 0 ? (float)val : 0.035f;
         }
-        catch { return 0.035f; }
+        catch
+        {
+            return 0.035f;
+        }
     }
 #else
     private static float GetOSKeyRepeatDelay() => 0.5f;
@@ -654,9 +662,9 @@ public class CefUnityBrowserSample : MonoBehaviour
 #endif
 
 #if UNITY_EDITOR
-    private static System.Reflection.FieldInfo _zoomAreaField;
-    private static System.Reflection.FieldInfo _scaleField;
-    private static System.Type _gameViewType;
+    private static FieldInfo _zoomAreaField;
+    private static FieldInfo _scaleField;
+    private static Type _gameViewType;
     private static bool _reflectionInitialized;
 
     private static float GetEditorGameViewScale()
@@ -664,17 +672,15 @@ public class CefUnityBrowserSample : MonoBehaviour
         if (!_reflectionInitialized)
         {
             _reflectionInitialized = true;
-            var assembly = typeof(UnityEditor.Editor).Assembly;
+            var assembly = typeof(Editor).Assembly;
             _gameViewType = assembly.GetType("UnityEditor.GameView");
             if (_gameViewType != null)
             {
                 _zoomAreaField = _gameViewType.GetField("m_ZoomArea",
-                    System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                    BindingFlags.Instance | BindingFlags.NonPublic);
                 if (_zoomAreaField != null)
-                {
                     _scaleField = _zoomAreaField.FieldType.GetField("m_Scale",
-                        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-                }
+                        BindingFlags.Instance | BindingFlags.NonPublic);
             }
         }
 
