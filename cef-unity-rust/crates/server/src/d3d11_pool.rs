@@ -8,7 +8,11 @@
 // という流れが必要になる。
 //
 // 出力テクスチャはサイズ変更時のみ再作成する単一インスタンス構成。
-// テアリング対策はとりあえず行わない (要観察)。
+//
+// 同期: D3D12 クライアントは driver implicit sync が効かないため、shared ID3D11Fence で
+// 明示同期する。CopyResource + Flush 後に DeviceContext4::Signal(fence, ++value) を呼び、
+// 新しい value を shm に書く。クライアント (D3D11/D3D12) はその値を SetEventOnCompletion +
+// WaitForSingleObject (D3D11) または queue->Wait (D3D12) で待ってからサンプルする。
 //
 // 非 Windows ではビルドが通るように空のスタブを提供する
 // (wrap_render_handler! マクロが cfg-gated フィールドを許容しないため、
@@ -25,8 +29,9 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL};
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11DeviceContext, ID3D11Texture2D,
-    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11Device5, ID3D11DeviceContext,
+    ID3D11DeviceContext4, ID3D11Fence, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FENCE_FLAG_SHARED,
     D3D11_RESOURCE_MISC_SHARED, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
@@ -53,12 +58,23 @@ impl D3D11Pool {
     pub fn new(_client_pid: Option<u32>) -> Result<Self, String> {
         Err("D3D11Pool not supported on this platform".to_string())
     }
+
+    pub fn client_fence_handle(&self) -> u64 {
+        0
+    }
 }
 
 #[cfg(target_os = "windows")]
 pub struct D3D11Pool {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
+    /// shared fence。CopyResource + Flush 後に Signal(++value) する。
+    fence: ID3D11Fence,
+    /// fence のサーバ側ローカル NT 共有 HANDLE (Drop で CloseHandle)。
+    fence_local_handle: usize,
+    /// fence の DuplicateHandle 済みクライアント側 HANDLE 値。
+    /// `client_pid` 不明時は fence_local_handle と同値 (同一プロセス前提のテスト経路)。
+    fence_client_handle: u64,
     state: Mutex<PoolState>,
     /// クライアントプロセスへの DUP_HANDLE 用ハンドル。
     /// `client_pid` 不明時は None (このときは DuplicateHandle せず、
@@ -83,6 +99,8 @@ struct PoolState {
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
+    /// fence の次回 Signal で書き込む値 (常にインクリメントする)。
+    next_fence_value: u64,
 }
 
 #[cfg(target_os = "windows")]
@@ -92,6 +110,9 @@ impl Drop for D3D11Pool {
             if state.local_handle_value != 0 {
                 let _ = unsafe { CloseHandle(HANDLE(state.local_handle_value as *mut _)) };
             }
+        }
+        if self.fence_local_handle != 0 {
+            let _ = unsafe { CloseHandle(HANDLE(self.fence_local_handle as *mut _)) };
         }
         if let Some(p) = self.client_proc {
             let _ = unsafe { CloseHandle(HANDLE(p as *mut _)) };
@@ -133,9 +154,52 @@ impl D3D11Pool {
             None
         };
 
+        // shared fence を作成。D3D11.4 (Win10 1703+) 以降が必要。
+        let device5: ID3D11Device5 = device
+            .cast()
+            .map_err(|e| format!("cast ID3D11Device5: {:?}", e))?;
+        let mut fence_opt: Option<ID3D11Fence> = None;
+        unsafe {
+            device5
+                .CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence_opt)
+                .map_err(|e| format!("ID3D11Device5::CreateFence: {:?}", e))?;
+        }
+        let fence: ID3D11Fence =
+            fence_opt.ok_or_else(|| "CreateFence returned None".to_string())?;
+        // GENERIC_ALL = 0x10000000。ID3D11Fence::CreateSharedHandle は GENERIC_ALL のみ受け付ける。
+        const GENERIC_ALL: u32 = 0x10000000;
+        let fence_local_handle: HANDLE = unsafe {
+            fence
+                .CreateSharedHandle(None, GENERIC_ALL, None)
+                .map_err(|e| format!("ID3D11Fence::CreateSharedHandle: {:?}", e))?
+        };
+
+        let fence_client_handle: u64 = if let Some(client_proc_usize) = client_proc {
+            let mut dup = HANDLE::default();
+            let cp = HANDLE(client_proc_usize as *mut _);
+            unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    fence_local_handle,
+                    cp,
+                    &mut dup,
+                    0,
+                    false,
+                    DUPLICATE_HANDLE_OPTIONS(DUPLICATE_SAME_ACCESS.0),
+                )
+                .map_err(|e| format!("DuplicateHandle(fence): {:?}", e))?;
+            }
+            dup.0 as u64
+        } else {
+            fence_local_handle.0 as u64
+        };
+
         Ok(D3D11Pool {
             device,
             context,
+            fence,
+            fence_local_handle: fence_local_handle.0 as usize,
+            fence_client_handle,
             state: Mutex::new(PoolState {
                 texture: None,
                 client_handle_value: 0,
@@ -143,21 +207,30 @@ impl D3D11Pool {
                 width: 0,
                 height: 0,
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                next_fence_value: 0,
             }),
             client_proc,
         })
     }
 
+    /// クライアントプロセス内で有効な fence NT 共有 HANDLE 値を返す。
+    /// CreateBrowser response でクライアントに渡し、ID3D11Device5::OpenSharedFence
+    /// または ID3D12Device::OpenSharedHandle で開いてもらう。
+    pub fn client_fence_handle(&self) -> u64 {
+        self.fence_client_handle
+    }
+
     /// CEF が渡してきた source 共有 HANDLE をサーバ側 ID3D11Device で開き、
     /// 出力テクスチャに CopyResource で写し、出力テクスチャのクライアント側
-    /// HANDLE 値を返す。
+    /// HANDLE 値と、Signal 後の fence 値を返す。
+    /// クライアントは戻り値の fence_value 以上に到達するのを待ってからサンプルする。
     pub fn copy_from_source(
         &self,
         src_handle: HANDLE,
         width: u32,
         height: u32,
         format: DXGI_FORMAT,
-    ) -> Result<u64, String> {
+    ) -> Result<(u64, u64), String> {
         unsafe {
             // 1. CEF source を開く
             let device1: ID3D11Device1 = self
@@ -197,8 +270,7 @@ impl D3D11Pool {
                     BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
                     CPUAccessFlags: 0,
                     // NT shared handle は単独では使えず、SHARED または KEYEDMUTEX と組み合わせる必要がある。
-                    // KEYEDMUTEX なしでも同期は OK (ID3D11DeviceContext::Flush + Unity の読み取りタイミング差で
-                    // テアリングが起きる可能性は残るが、シンプルさを優先)。
+                    // 同期は別途 ID3D11Fence (D3D12 クライアント用) と D3D11 driver の implicit sync で行う。
                     MiscFlags: (D3D11_RESOURCE_MISC_SHARED.0 | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0)
                         as u32,
                 };
@@ -253,7 +325,18 @@ impl D3D11Pool {
             self.context.CopyResource(dst_tex, &src_tex);
             self.context.Flush();
 
-            Ok(state.client_handle_value)
+            // 4. fence Signal で「ここまでの GPU 作業完了時点」を通知
+            state.next_fence_value += 1;
+            let signal_value = state.next_fence_value;
+            let context4: ID3D11DeviceContext4 = self
+                .context
+                .cast()
+                .map_err(|e| format!("cast ID3D11DeviceContext4: {:?}", e))?;
+            context4
+                .Signal(&self.fence, signal_value)
+                .map_err(|e| format!("ID3D11DeviceContext4::Signal: {:?}", e))?;
+
+            Ok((state.client_handle_value, signal_value))
         }
     }
 }

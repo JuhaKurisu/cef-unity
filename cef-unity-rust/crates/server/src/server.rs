@@ -272,14 +272,15 @@ wrap_render_handler! {
                 let src_handle = WinHandle(src_handle_raw as *mut _);
 
                 match pool.copy_from_source(src_handle, w, h, dxgi_format) {
-                    Ok(client_handle) => {
+                    Ok((client_handle, fence_value)) => {
                         if count <= 5 || count.is_multiple_of(300) {
                             log(&format!(
-                                "on_accelerated_paint #{}: {}x{} fmt={} client_handle=0x{:x}",
-                                count, w, h, format_tag, client_handle
+                                "on_accelerated_paint #{}: {}x{} fmt={} client_handle=0x{:x} fence={}",
+                                count, w, h, format_tag, client_handle, fence_value
                             ));
                         }
-                        self.shm.write_d3d11_handle(client_handle, w, h, format_tag);
+                        self.shm
+                            .write_d3d11_handle(client_handle, w, h, format_tag, fence_value);
                     }
                     Err(e) => {
                         if count <= 5 {
@@ -784,6 +785,11 @@ impl CefServer {
             };
         }
 
+        let d3d11_fence_handle = d3d11_pool
+            .as_ref()
+            .map(|p| p.client_fence_handle())
+            .unwrap_or(0);
+
         self.browsers.insert(
             id,
             BrowserState {
@@ -798,6 +804,7 @@ impl CefServer {
         Response::BrowserCreated {
             browser_id: id,
             shm_flink,
+            d3d11_fence_handle,
         }
     }
 

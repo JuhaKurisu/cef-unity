@@ -5,6 +5,8 @@
 
 #[cfg(target_os = "windows")]
 mod d3d11;
+#[cfg(target_os = "windows")]
+mod d3d12;
 
 use std::ffi::{CStr, c_char};
 use std::io::Write;
@@ -348,10 +350,11 @@ pub extern "C" fn cef_unity_create_browser(
         Response::BrowserCreated {
             browser_id,
             shm_flink,
+            d3d11_fence_handle,
         } => {
             log_to_file(&format!(
-                "browser created: id={}, shm={}",
-                browser_id, shm_flink
+                "browser created: id={}, shm={}, fence_handle=0x{:x}",
+                browser_id, shm_flink, d3d11_fence_handle
             ));
             let shm = match ShmReader::open(&shm_flink) {
                 Ok(s) => s,
@@ -360,6 +363,25 @@ pub extern "C" fn cef_unity_create_browser(
                     return std::ptr::null_mut();
                 }
             };
+            #[cfg(target_os = "windows")]
+            {
+                if d3d11_fence_handle != 0 {
+                    // Unity の graphics backend に応じて開ける方を試す。
+                    // D3D11/D3D12 双方無接続でも fence_handle 自体は同じ NT 共有 HANDLE。
+                    if d3d11::is_connected() {
+                        if let Err(e) = d3d11::open_fence(d3d11_fence_handle) {
+                            log_to_file(&format!("d3d11::open_fence failed: {}", e));
+                        }
+                    }
+                    if d3d12::is_connected() {
+                        if let Err(e) = d3d12::open_fence(d3d11_fence_handle) {
+                            log_to_file(&format!("d3d12::open_fence failed: {}", e));
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            let _ = d3d11_fence_handle;
             let instance = Box::new(ClientBrowserInstance { browser_id, shm });
             Box::into_raw(instance) as *mut CefUnityBrowser
         }
@@ -1250,7 +1272,8 @@ pub extern "C" fn cef_unity_execute_javascript_blocking(
 // ---------------------------------------------------------------------------
 
 /// Unity Native Plugin Interface のエントリポイント。Unity が DLL ロード時に呼ぶ。
-/// IUnityGraphicsD3D11 経由で Unity の ID3D11Device を取得し保持する。
+/// IUnityGraphicsD3D11 / IUnityGraphicsD3D12v5 経由で Unity の Device を取得し保持する。
+/// 両方を試して、Unity の graphics backend に応じて生きている方が使われる。
 /// 非 Windows プラットフォームでは何もしない。
 #[unsafe(no_mangle)]
 pub extern "C" fn UnityPluginLoad(unity_interfaces: *mut std::ffi::c_void) {
@@ -1261,9 +1284,11 @@ pub extern "C" fn UnityPluginLoad(unity_interfaces: *mut std::ffi::c_void) {
     #[cfg(target_os = "windows")]
     {
         d3d11::set_unity_interfaces(unity_interfaces as *mut d3d11::IUnityInterfaces);
+        d3d12::set_unity_interfaces(unity_interfaces);
         log_to_file(&format!(
-            "UnityPluginLoad: d3d11 connected = {}",
-            d3d11::is_connected()
+            "UnityPluginLoad: d3d11_connected={} d3d12_connected={}",
+            d3d11::is_connected(),
+            d3d12::is_connected()
         ));
     }
     #[cfg(not(target_os = "windows"))]
@@ -1278,6 +1303,7 @@ pub extern "C" fn UnityPluginUnload() {
     #[cfg(target_os = "windows")]
     {
         d3d11::clear_unity_interfaces();
+        d3d12::clear_unity_interfaces();
     }
 }
 
@@ -1287,6 +1313,20 @@ pub extern "C" fn cef_unity_is_d3d11_connected() -> i32 {
     #[cfg(target_os = "windows")]
     {
         if d3d11::is_connected() { 1 } else { 0 }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        0
+    }
+}
+
+/// Windows: Unity の D3D12 device に接続済みなら 1 を返す。
+/// C# 側はこちらが 1 のとき `cef_unity_recv_d3d12_texture` を呼ぶ。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_is_d3d12_connected() -> i32 {
+    #[cfg(target_os = "windows")]
+    {
+        if d3d12::is_connected() { 1 } else { 0 }
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -1314,9 +1354,15 @@ pub extern "C" fn cef_unity_recv_d3d11_texture(
     #[cfg(target_os = "windows")]
     {
         let instance = handle_to_ref(handle);
-        let Some((handle_value, w, h, format)) = instance.shm.get_d3d11_handle() else {
+        let Some((handle_value, w, h, format, fence_value)) = instance.shm.get_d3d11_handle()
+        else {
             return std::ptr::null_mut();
         };
+        // GPU 書き込み完了を待機 (server が Signal 済みの fence_value 以上に到達するまで)。
+        // fence が未対応 (handle=0) の場合は no-op。
+        if let Err(e) = d3d11::wait_fence(fence_value) {
+            log_to_file(&format!("d3d11::wait_fence({}) failed: {}", fence_value, e));
+        }
         let Some((tex_ptr, w_out, h_out)) = d3d11::open_or_cached(handle_value, w, h) else {
             return std::ptr::null_mut();
         };
@@ -1327,6 +1373,50 @@ pub extern "C" fn cef_unity_recv_d3d11_texture(
         }
         PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
         tex_ptr
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (handle, out_width, out_height, out_format);
+        std::ptr::null_mut()
+    }
+}
+
+/// Windows: 共有メモリから最新の D3D11 共有 HANDLE を読み出し、
+/// Unity の D3D12Device で OpenSharedHandle した ID3D12Resource* を返す。
+/// 共有 ID3D11Fence (D3D12 から見ると ID3D12Fence) で書き込み完了を待ち、
+/// 初回のみ COMMON → PIXEL_SHADER_RESOURCE 状態遷移を Unity に宣言する。
+/// 新フレームが無い場合は null。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_recv_d3d12_texture(
+    handle: *mut CefUnityBrowser,
+    out_width: *mut i32,
+    out_height: *mut i32,
+    out_format: *mut u32,
+) -> *mut std::ffi::c_void {
+    if handle.is_null() || out_width.is_null() || out_height.is_null() || out_format.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let instance = handle_to_ref(handle);
+        let Some((handle_value, w, h, format, fence_value)) = instance.shm.get_d3d11_handle()
+        else {
+            return std::ptr::null_mut();
+        };
+        if let Err(e) = d3d12::wait_fence(fence_value) {
+            log_to_file(&format!("d3d12::wait_fence({}) failed: {}", fence_value, e));
+        }
+        let Some((res_ptr, w_out, h_out)) = d3d12::open_or_cached(handle_value, w, h) else {
+            return std::ptr::null_mut();
+        };
+        unsafe {
+            *out_width = w_out as i32;
+            *out_height = h_out as i32;
+            *out_format = format;
+        }
+        PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
+        res_ptr
     }
     #[cfg(not(target_os = "windows"))]
     {
