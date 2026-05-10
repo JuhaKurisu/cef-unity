@@ -1356,10 +1356,12 @@ pub extern "C" fn cef_unity_recv_d3d11_texture(
         let instance = handle_to_ref(handle);
         let Some((handle_value, w, h, format, fence_value)) = instance.shm.get_d3d11_handle()
         else {
+            // 新フレーム無し: tick で stale カウントを進めて、必要なら強制 Release する。
+            d3d11::tick();
             return std::ptr::null_mut();
         };
         // GPU 書き込み完了を待機 (server が Signal 済みの fence_value 以上に到達するまで)。
-        // fence が未対応 (handle=0) の場合は no-op。
+        // fence が未対応 (handle=0) の場合は no-op。KeyedMutex でも同期できるが冗長として残置。
         if let Err(e) = d3d11::wait_fence(fence_value) {
             log_to_file(&format!("d3d11::wait_fence({}) failed: {}", fence_value, e));
         }
@@ -1383,7 +1385,7 @@ pub extern "C" fn cef_unity_recv_d3d11_texture(
 
 /// Windows: 共有メモリから最新の D3D11 共有 HANDLE を読み出し、
 /// Unity の D3D12Device で OpenSharedHandle した ID3D12Resource* を返す。
-/// 共有 ID3D11Fence (D3D12 から見ると ID3D12Fence) で書き込み完了を待ち、
+/// KeyedMutex で server との排他とキャッシュコヒーレンスを取り、
 /// 初回のみ COMMON → PIXEL_SHADER_RESOURCE 状態遷移を Unity に宣言する。
 /// 新フレームが無い場合は null。
 #[unsafe(no_mangle)]
@@ -1402,6 +1404,7 @@ pub extern "C" fn cef_unity_recv_d3d12_texture(
         let instance = handle_to_ref(handle);
         let Some((handle_value, w, h, format, fence_value)) = instance.shm.get_d3d11_handle()
         else {
+            d3d12::tick();
             return std::ptr::null_mut();
         };
         if let Err(e) = d3d12::wait_fence(fence_value) {

@@ -14,12 +14,22 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11Device1, ID3D11Device5, ID3D11Fence, ID3D11Texture2D,
 };
+use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::Interface;
 
 /// fence Wait のタイムアウト (ms)。Unity を長時間ブロックさせないため有限値にする。
 /// 実機では数 ms 以内に signal されているはずなので 100ms あれば十分。
 const FENCE_WAIT_TIMEOUT_MS: u32 = 100;
+
+/// KeyedMutex Acquire(1) のタイムアウト (ms)。
+const KEYED_MUTEX_TIMEOUT_MS: u32 = 100;
+
+/// frame_id 不変中でも `tick()` がこの回数呼ばれたら強制 Release する閾値。
+/// 1 にすると stale 検出後即 release するので、サーバは Unity フレームの半分の頻度で
+/// ペイントできる (60fps Unity → 30fps server)。あまり大きくすると server が長時間
+/// ブロックされて見た目フリーズになるので低めに設定する。
+const STALE_FRAME_FORCE_RELEASE_THRESHOLD: u32 = 1;
 
 fn log_debug(msg: &str) {
     let path = std::env::temp_dir().join("cef_unity_debug.log");
@@ -82,6 +92,7 @@ static UNITY_INTERFACES: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut()
 struct OpenedTexture {
     handle: u64,
     texture: ID3D11Texture2D,
+    mutex: IDXGIKeyedMutex,
     width: u32,
     height: u32,
 }
@@ -92,11 +103,18 @@ struct OpenedTexture {
 struct OpenedState {
     current: Option<OpenedTexture>,
     previous: Option<OpenedTexture>,
+    /// 現在 current に対して `Acquire(1)` 済みなら true。
+    /// 次に Release/再 Acquire するときに参照する。
+    held: bool,
+    /// `tick()` が呼ばれた連続回数 (frame_id 不変中)。フレーム更新時に 0 リセット。
+    stale_count: u32,
 }
 
 static OPENED: Mutex<OpenedState> = Mutex::new(OpenedState {
     current: None,
     previous: None,
+    held: false,
+    stale_count: 0,
 });
 
 /// 共有 ID3D11Fence の保持状態。`open_fence` で初期化、`wait_fence` で利用。
@@ -135,6 +153,15 @@ pub fn clear_unity_interfaces() {
     UNITY_DEVICE.store(std::ptr::null_mut(), Ordering::Release);
     {
         let mut state = OPENED.lock().unwrap();
+        // held のまま終了するとサーバ側 Acquire(0) が永久ブロックする可能性があるので
+        // 念のため先に Release する。失敗してもプロセス終了するので無視。
+        if state.held
+            && let Some(c) = state.current.as_ref()
+        {
+            let _ = unsafe { c.mutex.ReleaseSync(0) };
+        }
+        state.held = false;
+        state.stale_count = 0;
         state.current = None;
         state.previous = None;
     }
@@ -262,7 +289,12 @@ pub fn wait_fence(target_value: u64) -> Result<(), String> {
 
 /// shm 上の HANDLE 値を Unity の D3D11Device で OpenSharedResource1 する。
 /// 同じ HANDLE 値なら cache 内のものを返す。
-/// 戻り値: (ID3D11Texture2D の生ポインタ, width, height)。
+/// 必ず frame_id が更新されたタイミングでのみ呼ぶこと (server が Release(1) 済みの想定)。
+///
+/// KeyedMutex プロトコル:
+///   - 前フレームで Acquire(1) 中なら先に Release(0) して server に渡す
+///   - 新 current に対して Acquire(1) で読み手のロックを取る
+///   - 以降 Unity の render thread が同じテクスチャをサンプルしている間も hold し続ける
 ///
 /// 返したポインタは次に open_or_cached が呼ばれて HANDLE が変わるか、
 /// clear_unity_interfaces が呼ばれるまで有効。
@@ -281,66 +313,120 @@ pub fn open_or_cached(
 
     let mut state = OPENED.lock().unwrap();
 
-    // cache hit?
-    if let Some(c) = state.current.as_ref() {
-        if c.handle == handle_value && c.width == width && c.height == height {
-            return Some((c.texture.as_raw(), width, height));
-        }
+    // 1. 前フレームで保持中なら Release(0) して server に書き込み権を渡す。
+    //    KeyedMutex は GPU レベル同期なので、Unity render thread が現在サンプル
+    //    しているコマンドは「Release 時点までに submit 済み」として暗黙の fence で
+    //    捕捉される。次の server Acquire(0) はそれを待つ。
+    if state.held
+        && let Some(c) = state.current.as_ref()
+        && let Err(e) = unsafe { c.mutex.ReleaseSync(0) }
+    {
+        log_debug(&format!("ReleaseSync(0) failed: {:?}", e));
     }
+    state.held = false;
+    state.stale_count = 0;
 
-    // 新規に開く
-    let device: ID3D11Device = unsafe {
-        let raw = device_ptr;
-        match ID3D11Device::from_raw_borrowed(&raw) {
-            Some(d) => d.clone(),
-            None => {
+    // 2. cache hit / miss の判定
+    let cache_hit = matches!(
+        state.current.as_ref(),
+        Some(c) if c.handle == handle_value && c.width == width && c.height == height
+    );
+
+    if !cache_hit {
+        // 新規に開く
+        let device: ID3D11Device = unsafe {
+            let raw = device_ptr;
+            match ID3D11Device::from_raw_borrowed(&raw) {
+                Some(d) => d.clone(),
+                None => {
+                    log_debug(&format!(
+                        "open_or_cached: from_raw_borrowed failed (device_ptr={:p})",
+                        device_ptr
+                    ));
+                    return None;
+                }
+            }
+        };
+        let device1: ID3D11Device1 = match device.cast() {
+            Ok(d) => d,
+            Err(e) => {
+                log_debug(&format!("cast to ID3D11Device1 failed: {:?}", e));
+                return None;
+            }
+        };
+
+        let handle = HANDLE(handle_value as *mut _);
+        let tex: ID3D11Texture2D = match unsafe { device1.OpenSharedResource1(handle) } {
+            Ok(t) => t,
+            Err(e) => {
                 log_debug(&format!(
-                    "open_or_cached: from_raw_borrowed failed (device_ptr={:p})",
-                    device_ptr
+                    "OpenSharedResource1 failed for handle=0x{:x}: {:?}",
+                    handle_value, e
                 ));
                 return None;
             }
-        }
-    };
-    let device1: ID3D11Device1 = match device.cast() {
-        Ok(d) => d,
-        Err(e) => {
-            log_debug(&format!("open_or_cached: cast to ID3D11Device1 failed: {:?}", e));
-            return None;
-        }
-    };
+        };
+        let mutex: IDXGIKeyedMutex = match tex.cast() {
+            Ok(m) => m,
+            Err(e) => {
+                log_debug(&format!("cast to IDXGIKeyedMutex failed: {:?}", e));
+                return None;
+            }
+        };
+        log_debug(&format!(
+            "opened handle=0x{:x} tex={:p} {}x{}",
+            handle_value,
+            tex.as_raw(),
+            width,
+            height
+        ));
 
-    let handle = HANDLE(handle_value as *mut _);
-    let tex: ID3D11Texture2D = match unsafe { device1.OpenSharedResource1(handle) } {
-        Ok(t) => t,
-        Err(e) => {
+        let new_entry = OpenedTexture {
+            handle: handle_value,
+            texture: tex,
+            mutex,
+            width,
+            height,
+        };
+        let old_current = state.current.take();
+        state.previous = old_current;
+        state.current = Some(new_entry);
+    }
+
+    // 3. 新 current を Acquire(1)
+    let (raw_tex, w_out, h_out) = {
+        let current = state.current.as_ref()?;
+        if let Err(e) = unsafe { current.mutex.AcquireSync(1, KEYED_MUTEX_TIMEOUT_MS) } {
             log_debug(&format!(
-                "open_or_cached: OpenSharedResource1 failed for handle=0x{:x}: {:?}",
-                handle_value, e
+                "AcquireSync(1) failed (timeout {}ms): {:?}",
+                KEYED_MUTEX_TIMEOUT_MS, e
             ));
+            // ロックなしで返すとサーバが書きながら Unity がサンプルする可能性があるが、
+            // 次のフレームで再試行できるので一時的なフォールバック扱いで null を返す。
             return None;
         }
+        (current.texture.as_raw(), current.width, current.height)
     };
-    log_debug(&format!(
-        "open_or_cached: opened handle=0x{:x} tex={:p} {}x{}",
-        handle_value,
-        tex.as_raw(),
-        width,
-        height
-    ));
+    state.held = true;
+    Some((raw_tex, w_out, h_out))
+}
 
-    let raw_tex = tex.as_raw();
-    let new_entry = OpenedTexture {
-        handle: handle_value,
-        texture: tex,
-        width,
-        height,
-    };
-
-    // current → previous, new → current
-    let old_current = state.current.take();
-    state.previous = old_current;
-    state.current = Some(new_entry);
-
-    Some((raw_tex, width, height))
+/// `cef_unity_recv_d3d11_texture` で frame_id が不変だった場合に呼ぶ。
+/// 静的コンテンツでサーバの次回ペイントを通すための強制 Release を発火する。
+pub fn tick() {
+    let mut state = OPENED.lock().unwrap();
+    if !state.held {
+        return;
+    }
+    state.stale_count = state.stale_count.saturating_add(1);
+    if state.stale_count >= STALE_FRAME_FORCE_RELEASE_THRESHOLD {
+        if let Some(c) = state.current.as_ref()
+            && let Err(e) = unsafe { c.mutex.ReleaseSync(0) }
+        {
+            log_debug(&format!("force ReleaseSync(0) failed: {:?}", e));
+        }
+        state.held = false;
+        state.stale_count = 0;
+        log_debug("tick: force-released after stale frames");
+    }
 }

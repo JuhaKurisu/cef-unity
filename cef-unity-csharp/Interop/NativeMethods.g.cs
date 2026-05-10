@@ -287,7 +287,7 @@ namespace CefUnity
         /// <summary>
         ///  Windows: 共有メモリから最新の D3D11 共有 HANDLE を読み出し、
         ///  Unity の D3D12Device で OpenSharedHandle した ID3D12Resource* を返す。
-        ///  共有 ID3D11Fence (D3D12 から見ると ID3D12Fence) で書き込み完了を待ち、
+        ///  KeyedMutex で server との排他とキャッシュコヒーレンスを取り、
         ///  初回のみ COMMON → PIXEL_SHADER_RESOURCE 状態遷移を Unity に宣言する。
         ///  新フレームが無い場合は null。
         /// </summary>

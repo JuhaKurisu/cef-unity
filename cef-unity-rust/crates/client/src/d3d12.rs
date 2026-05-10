@@ -18,7 +18,12 @@ use std::io::Write;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL};
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11Texture2D,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
     D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
@@ -26,10 +31,14 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER, ID3D12CommandAllocator,
     ID3D12Device, ID3D12Fence, ID3D12GraphicsCommandList, ID3D12Resource,
 };
+use windows::Win32::Graphics::Dxgi::IDXGIKeyedMutex;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::Interface;
 
 const FENCE_WAIT_TIMEOUT_MS: u32 = 100;
+const KEYED_MUTEX_TIMEOUT_MS: u32 = 100;
+/// 1 にすると stale 検出後即 release。server は Unity フレームの半分の頻度でペイントできる。
+const STALE_FRAME_FORCE_RELEASE_THRESHOLD: u32 = 1;
 
 fn log_debug(msg: &str) {
     let path = std::env::temp_dir().join("cef_unity_debug.log");
@@ -91,6 +100,11 @@ static UNITY_DEVICE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 struct OpenedTexture {
     handle: u64,
     resource: ID3D12Resource,
+    /// 同じ NT 共有ハンドルを D3D11 device で開いた view。`IDXGIKeyedMutex` を
+    /// 取り出すためだけに保持 (D3D12 resource からは直接 cast できないため)。
+    /// GPU 操作には使わない。alive にしておかないと mutex が無効化される。
+    _d3d11_tex: ID3D11Texture2D,
+    mutex: IDXGIKeyedMutex,
     width: u32,
     height: u32,
 }
@@ -98,6 +112,10 @@ struct OpenedTexture {
 struct OpenedState {
     current: Option<OpenedTexture>,
     previous: Option<OpenedTexture>,
+    /// 現在 current に対して `Acquire(1)` 済みなら true。
+    held: bool,
+    /// `tick()` が呼ばれた連続回数 (frame_id 不変中)。
+    stale_count: u32,
     /// Unity に状態を宣言済みのリソース集合 (pointer 値で識別)。
     /// 一度宣言した後は Unity が状態を踏襲するので追加の barrier は不要。
     declared: Vec<usize>,
@@ -110,6 +128,8 @@ struct OpenedState {
 static OPENED: Mutex<OpenedState> = Mutex::new(OpenedState {
     current: None,
     previous: None,
+    held: false,
+    stale_count: 0,
     declared: Vec::new(),
     cmd_allocator: None,
     cmd_list: None,
@@ -133,6 +153,12 @@ impl Drop for FenceState {
 
 static FENCE: Mutex<Option<FenceState>> = Mutex::new(None);
 
+/// D3D12 client 専用の補助 D3D11 device。
+/// `ID3D12Resource` から直接 `IDXGIKeyedMutex` に cast できないため、
+/// 同じ NT 共有 HANDLE を D3D11 で別途開いて mutex 経路を確保する。
+/// この device 上で GPU 操作はしない (mutex の Acquire/Release のみ)。
+static D3D11_DEVICE: Mutex<Option<ID3D11Device1>> = Mutex::new(None);
+
 // ---- Unity からのコールバック ----
 
 pub fn set_unity_interfaces(unity_interfaces: *mut c_void) {
@@ -146,6 +172,13 @@ pub fn clear_unity_interfaces() {
     UNITY_DEVICE.store(std::ptr::null_mut(), Ordering::Release);
     {
         let mut state = OPENED.lock().unwrap();
+        if state.held
+            && let Some(c) = state.current.as_ref()
+        {
+            let _ = unsafe { c.mutex.ReleaseSync(0) };
+        }
+        state.held = false;
+        state.stale_count = 0;
         state.current = None;
         state.previous = None;
         state.declared.clear();
@@ -153,6 +186,38 @@ pub fn clear_unity_interfaces() {
         state.cmd_allocator = None;
     }
     *FENCE.lock().unwrap() = None;
+    *D3D11_DEVICE.lock().unwrap() = None;
+}
+
+/// 補助 D3D11 device を遅延初期化する。
+fn ensure_d3d11_device() -> Result<ID3D11Device1, String> {
+    let mut guard = D3D11_DEVICE.lock().unwrap();
+    if let Some(d) = guard.as_ref() {
+        return Ok(d.clone());
+    }
+    let mut device: Option<ID3D11Device> = None;
+    let mut feat: D3D_FEATURE_LEVEL = D3D_FEATURE_LEVEL::default();
+    unsafe {
+        D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            None,
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            Some(&mut feat),
+            None,
+        )
+        .map_err(|e| format!("D3D11CreateDevice (mutex helper): {:?}", e))?;
+    }
+    let device = device.ok_or_else(|| "D3D11Device is None".to_string())?;
+    let device1: ID3D11Device1 = device
+        .cast()
+        .map_err(|e| format!("cast Device1: {:?}", e))?;
+    *guard = Some(device1.clone());
+    log_debug("ensure_d3d11_device: created mutex helper D3D11 device");
+    Ok(device1)
 }
 
 /// IUnityInterfaces から IUnityGraphicsD3D12v5 経由で ID3D12Device* を取得する。
@@ -223,12 +288,37 @@ fn ensure_cmd_objects(state: &mut OpenedState, device: &ID3D12Device) -> Result<
     Ok(())
 }
 
-/// Unity に「リソースを COMMON → PIXEL_SHADER_RESOURCE に遷移する」と宣言する。
-/// 同じリソースに対しては最初の 1 回だけ呼ぶ。以後 Unity が状態を踏襲してくれる。
-fn declare_initial_state(
+/// 1 個の transition barrier を作る。`pResource` は ManuallyDrop で COM ポインタを
+/// "借用" するだけなので AddRef/Release されない (`resource` 側が所有権を保持)。
+fn make_transition_barrier(
+    resource: &ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                pResource: unsafe {
+                    std::mem::transmute_copy::<ID3D12Resource, std::mem::ManuallyDrop<Option<ID3D12Resource>>>(resource)
+                },
+                Subresource: 0,
+                StateBefore: before,
+                StateAfter: after,
+            }),
+        },
+    }
+}
+
+/// barrier 群を Unity の active queue に乗せ、最終 state を Unity に宣言する共通処理。
+fn execute_barriers(
     state: &mut OpenedState,
     device: &ID3D12Device,
     resource: &ID3D12Resource,
+    barriers: &[D3D12_RESOURCE_BARRIER],
+    expected: D3D12_RESOURCE_STATES,
+    current: D3D12_RESOURCE_STATES,
 ) -> Result<(), String> {
     ensure_cmd_objects(state, device)?;
 
@@ -242,34 +332,16 @@ fn declare_initial_state(
         cmd_list
             .Reset(allocator, None)
             .map_err(|e| format!("CommandList.Reset: {:?}", e))?;
-    }
-
-    let barrier = D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                pResource: unsafe {
-                    std::mem::transmute_copy::<ID3D12Resource, std::mem::ManuallyDrop<Option<ID3D12Resource>>>(resource)
-                },
-                Subresource: 0,
-                StateBefore: D3D12_RESOURCE_STATE_COMMON,
-                StateAfter: D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-            }),
-        },
-    };
-    unsafe {
-        cmd_list.ResourceBarrier(&[barrier]);
+        cmd_list.ResourceBarrier(barriers);
         cmd_list
             .Close()
             .map_err(|e| format!("CommandList.Close: {:?}", e))?;
     }
 
-    // Unity の ExecuteCommandList へ。states[] で「期待 state = COMMON、実行後 state = PIXEL_SHADER_RESOURCE」を宣言。
     let state_decl = UnityGraphicsD3D12ResourceState {
         resource: resource.as_raw(),
-        expected: D3D12_RESOURCE_STATE_COMMON.0,
-        current: D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0,
+        expected: expected.0,
+        current: current.0,
     };
 
     let gfx_ptr = UNITY_GFX_D3D12.load(Ordering::Acquire);
@@ -280,7 +352,28 @@ fn declare_initial_state(
         let gfx = gfx_ptr as *mut IUnityGraphicsD3D12v5;
         ((*gfx).execute_command_list)(cmd_list.as_raw(), 1, &state_decl);
     }
+    Ok(())
+}
 
+/// 初回 OpenSharedHandle 後の状態宣言。`COMMON → PIXEL_SHADER_RESOURCE`。
+fn declare_initial_state(
+    state: &mut OpenedState,
+    device: &ID3D12Device,
+    resource: &ID3D12Resource,
+) -> Result<(), String> {
+    let barrier = make_transition_barrier(
+        resource,
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+    );
+    execute_barriers(
+        state,
+        device,
+        resource,
+        &[barrier],
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+    )?;
     state.declared.push(resource.as_raw() as usize);
     log_debug(&format!(
         "declare_initial_state: resource={:p} COMMON->PIXEL_SHADER_RESOURCE",
@@ -351,6 +444,10 @@ pub fn wait_fence(target_value: u64) -> Result<(), String> {
 
 // ---- HANDLE → ID3D12Resource ----
 
+/// frame_id が更新されたタイミングでのみ呼ぶこと (server が Release(1) 済みの想定)。
+/// KeyedMutex プロトコルで前フレームを Release(0) し、新フレームを Acquire(1) する。
+/// KeyedMutex は GPU レベルの implicit fence で cache coherence と書き込み排他を提供するので、
+/// 別途の `refresh_state` 往復遷移は不要。
 pub fn open_or_cached(
     handle_value: u64,
     width: u32,
@@ -363,54 +460,135 @@ pub fn open_or_cached(
 
     let mut state = OPENED.lock().unwrap();
 
-    // cache hit?
-    if let Some(c) = state.current.as_ref()
-        && c.handle == handle_value
-        && c.width == width
-        && c.height == height
+    // 1. 前フレームで保持中なら Release(0)。Unity render thread の前フレームの
+    //    サンプルコマンドは Release 時点までに submit 済みなので KeyedMutex の
+    //    implicit fence で捕捉される。
+    if state.held
+        && let Some(c) = state.current.as_ref()
+        && let Err(e) = unsafe { c.mutex.ReleaseSync(0) }
     {
-        return Some((c.resource.as_raw(), width, height));
+        log_debug(&format!("ReleaseSync(0) failed: {:?}", e));
     }
+    state.held = false;
+    state.stale_count = 0;
 
-    // 新規に開く
-    let mut res_opt: Option<ID3D12Resource> = None;
-    if let Err(e) = unsafe {
-        device.OpenSharedHandle(HANDLE(handle_value as *mut _), &mut res_opt)
-    } {
+    // 2. cache hit?
+    let cache_hit = matches!(
+        state.current.as_ref(),
+        Some(c) if c.handle == handle_value && c.width == width && c.height == height
+    );
+
+    let is_new = !cache_hit;
+    if is_new {
+        // D3D12 として開く (Unity サンプル用)
+        let mut res_opt: Option<ID3D12Resource> = None;
+        if let Err(e) = unsafe {
+            device.OpenSharedHandle(HANDLE(handle_value as *mut _), &mut res_opt)
+        } {
+            log_debug(&format!(
+                "OpenSharedHandle (D3D12) failed for handle=0x{:x}: {:?}",
+                handle_value, e
+            ));
+            return None;
+        }
+        let resource = res_opt?;
+
+        // 同じ HANDLE を D3D11 として開いて IDXGIKeyedMutex を取得 (D3D12 では cast 不可)。
+        let d3d11_device = match ensure_d3d11_device() {
+            Ok(d) => d,
+            Err(e) => {
+                log_debug(&format!("ensure_d3d11_device failed: {}", e));
+                return None;
+            }
+        };
+        let d3d11_tex: ID3D11Texture2D = match unsafe {
+            d3d11_device.OpenSharedResource1(HANDLE(handle_value as *mut _))
+        } {
+            Ok(t) => t,
+            Err(e) => {
+                log_debug(&format!(
+                    "D3D11 OpenSharedResource1 failed for handle=0x{:x}: {:?}",
+                    handle_value, e
+                ));
+                return None;
+            }
+        };
+        let mutex: IDXGIKeyedMutex = match d3d11_tex.cast() {
+            Ok(m) => m,
+            Err(e) => {
+                log_debug(&format!("cast D3D11 tex to IDXGIKeyedMutex failed: {:?}", e));
+                return None;
+            }
+        };
         log_debug(&format!(
-            "open_or_cached: OpenSharedHandle failed for handle=0x{:x}: {:?}",
-            handle_value, e
+            "opened handle=0x{:x} d3d12_resource={:p} d3d11_tex={:p} {}x{}",
+            handle_value,
+            resource.as_raw(),
+            d3d11_tex.as_raw(),
+            width,
+            height
         ));
-        return None;
-    }
-    let resource = res_opt?;
-    log_debug(&format!(
-        "open_or_cached: opened handle=0x{:x} resource={:p} {}x{}",
-        handle_value,
-        resource.as_raw(),
-        width,
-        height
-    ));
 
-    // Unity に初期状態を宣言 (COMMON → PIXEL_SHADER_RESOURCE)
-    if let Err(e) = declare_initial_state(&mut state, &device, &resource) {
-        log_debug(&format!("declare_initial_state failed: {}", e));
-        return None;
+        let new_entry = OpenedTexture {
+            handle: handle_value,
+            resource,
+            _d3d11_tex: d3d11_tex,
+            mutex,
+            width,
+            height,
+        };
+        let old_current = state.current.take();
+        state.previous = old_current;
+        state.current = Some(new_entry);
     }
 
-    let raw_res = resource.as_raw();
-    let new_entry = OpenedTexture {
-        handle: handle_value,
-        resource,
-        width,
-        height,
-    };
+    // 3. 新 current を Acquire(1) — server の Release(1) と GPU work 完了を待つ
+    {
+        let current = state.current.as_ref()?;
+        if let Err(e) = unsafe { current.mutex.AcquireSync(1, KEYED_MUTEX_TIMEOUT_MS) } {
+            log_debug(&format!(
+                "AcquireSync(1) failed (timeout {}ms): {:?}",
+                KEYED_MUTEX_TIMEOUT_MS, e
+            ));
+            return None;
+        }
+    }
+    state.held = true;
 
-    let old_current = state.current.take();
-    state.previous = old_current;
-    state.current = Some(new_entry);
+    // 4. 新規テクスチャの場合のみ初期状態を宣言 (COMMON → PIXEL_SHADER_RESOURCE)。
+    //    Acquire 後にやることで、server の GPU 書き込みが完了してから barrier が走る。
+    //    1 度宣言すれば以後 Unity が状態を踏襲するので追加 barrier は不要。
+    if is_new {
+        let resource = state.current.as_ref()?.resource.clone();
+        if let Err(e) = declare_initial_state(&mut state, &device, &resource) {
+            log_debug(&format!("declare_initial_state failed: {}", e));
+            // 初期状態が宣言できないと Unity のサンプルで validation error になりうる。
+            // とりあえずポインタは返すが、issue は ログに記録。
+        }
+    }
 
-    Some((raw_res, width, height))
+    let current = state.current.as_ref()?;
+    Some((current.resource.as_raw(), current.width, current.height))
+}
+
+/// frame_id 不変時に呼ぶ。一定回数連続で呼ばれたら強制 Release して
+/// 静的コンテンツでのデッドロックを防ぐ。
+pub fn tick() {
+    let mut state = OPENED.lock().unwrap();
+    if !state.held {
+        return;
+    }
+    state.stale_count = state.stale_count.saturating_add(1);
+    if state.stale_count >= STALE_FRAME_FORCE_RELEASE_THRESHOLD {
+        if let Some(c) = state.current.as_ref()
+            && let Err(e) = unsafe { c.mutex.ReleaseSync(0) }
+        {
+            log_debug(&format!("force ReleaseSync(0) failed: {:?}", e));
+        }
+        state.held = false;
+        state.stale_count = 0;
+        log_debug("tick: force-released after stale frames");
+    }
 }
 
 #[allow(dead_code)]
