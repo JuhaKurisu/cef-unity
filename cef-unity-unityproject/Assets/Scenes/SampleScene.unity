@@ -132,6 +132,7 @@ GameObject:
   - component: {fileID: 330585544}
   - component: {fileID: 330585547}
   - component: {fileID: 330585548}
+  - component: {fileID: 330585549}
   m_Layer: 0
   m_Name: Main Camera
   m_TagString: MainCamera
@@ -269,11 +270,22 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: b266723374a144d27989f433d8f34cea, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::SampleScript
-  _width: 1710
-  _height: 1112
   _url: google.com
   _rawImage: {fileID: 1153544198}
   _resolutionScale: 1
+--- !u!114 &330585549
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 330585543}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 32275c18045b34d11acb80336e175d55, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Assembly-CSharp::Sample
+  _browser: {fileID: 330585548}
 --- !u!1 &410087039
 GameObject:
   m_ObjectHideFlags: 0

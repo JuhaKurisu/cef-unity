@@ -72,8 +72,6 @@ namespace CefUnity.Runtime
             (KeyCode.CapsLock, CefKeyCodes.CapsLock)
         };
 
-        [SerializeField] private int _width = 1280;
-        [SerializeField] private int _height = 720;
         [SerializeField] private string _url;
         [SerializeField] private RawImage _rawImage;
         [SerializeField] private float _resolutionScale;
@@ -147,6 +145,10 @@ namespace CefUnity.Runtime
             HandleKeyboardInput();
         }
 
+        public void LoadUrl(string url)
+        {
+            _browser.LoadUrl(url);
+        }
 
         private void OnDestroy()
         {
