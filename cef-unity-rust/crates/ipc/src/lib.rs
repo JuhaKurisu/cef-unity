@@ -109,7 +109,13 @@ pub struct CommandEnvelope {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Response {
-    BrowserCreated { browser_id: u32, shm_flink: String },
+    BrowserCreated {
+        browser_id: u32,
+        shm_flink: String,
+        /// Windows D3D11/D3D12 同期用の shared ID3D11Fence の NT 共有 HANDLE 値。
+        /// クライアントプロセスへ DuplicateHandle 済み。0 の場合は fence 未対応 (非 Windows / pool 構築失敗)。
+        d3d11_fence_handle: u64,
+    },
     CurrentUrl { url: String },
     Logs { entries: Vec<String> },
     Ok,
@@ -165,6 +171,10 @@ pub struct ShmHeader {
     pub d3d11_handle: AtomicU64,
     /// d3d11_handle に対応するフレーム ID (handle 値だけだと変化検出できないため用意)。
     pub d3d11_frame_id: AtomicU64,
+    /// shared ID3D11Fence の最新 Signal 値。クライアントはこの値以上に到達するのを
+    /// 待ってからサンプルする。書き込み順は: フレームピクセル書き込み → Signal →
+    /// この値更新 → d3d11_frame_id 更新。
+    pub d3d11_fence_value: AtomicU64,
 }
 
 use std::sync::atomic::AtomicI32;
@@ -238,13 +248,23 @@ impl ShmWriter {
     }
 
     /// Windows: NT 共有 HANDLE (client プロセスへ DuplicateHandle 済みの値) を書き込む。
-    /// width/height/format も同時に更新する。
-    pub fn write_d3d11_handle(&self, handle: u64, width: u32, height: u32, format: u32) {
+    /// width/height/format/fence_value も同時に更新する。
+    /// 書き込み順は handle → fence_value → frame_id (クライアント側で frame_id 増分検出後に
+    /// fence_value を読む順番で整合させる)。
+    pub fn write_d3d11_handle(
+        &self,
+        handle: u64,
+        width: u32,
+        height: u32,
+        format: u32,
+        fence_value: u64,
+    ) {
         let header = self.header();
         header.accel_width.store(width, Ordering::Release);
         header.accel_height.store(height, Ordering::Release);
         header.accel_format.store(format, Ordering::Release);
         header.d3d11_handle.store(handle, Ordering::Release);
+        header.d3d11_fence_value.store(fence_value, Ordering::Release);
         // d3d11_frame_id は最後に更新する: クライアントは frame_id の変化を検出して読む
         header.d3d11_frame_id.fetch_add(1, Ordering::Release);
     }
@@ -299,8 +319,9 @@ impl ShmReader {
     }
 
     /// Read Windows D3D11 shared handle info from the shared memory header.
-    /// Returns Some((handle, width, height, format)) if a new accelerated frame is available.
-    pub fn get_d3d11_handle(&mut self) -> Option<(u64, u32, u32, u32)> {
+    /// Returns Some((handle, width, height, format, fence_value)) if a new accelerated frame
+    /// is available. クライアントは fence_value 以上に到達するのを待ってからサンプルする。
+    pub fn get_d3d11_handle(&mut self) -> Option<(u64, u32, u32, u32, u64)> {
         let header = unsafe { &*(self.shmem.as_ptr() as *const ShmHeader) };
         let frame_id = header.d3d11_frame_id.load(Ordering::Acquire);
         if frame_id == self.last_d3d11_frame_id {
@@ -312,10 +333,11 @@ impl ShmReader {
         let width = header.accel_width.load(Ordering::Acquire);
         let height = header.accel_height.load(Ordering::Acquire);
         let format = header.accel_format.load(Ordering::Acquire);
+        let fence_value = header.d3d11_fence_value.load(Ordering::Acquire);
         if handle == 0 || width == 0 || height == 0 {
             return None;
         }
-        Some((handle, width, height, format))
+        Some((handle, width, height, format, fence_value))
     }
 
     /// Read IOSurface info from the shared memory header.
@@ -507,6 +529,7 @@ mod tests {
         tx.send(Response::BrowserCreated {
             browser_id: 42,
             shm_flink: "/tmp/test-shm".to_string(),
+            d3d11_fence_handle: 0xdeadbeef,
         })
         .unwrap();
         let resp = rx.recv().unwrap();
@@ -514,9 +537,11 @@ mod tests {
             Response::BrowserCreated {
                 browser_id,
                 shm_flink,
+                d3d11_fence_handle,
             } => {
                 assert_eq!(browser_id, 42);
                 assert_eq!(shm_flink, "/tmp/test-shm");
+                assert_eq!(d3d11_fence_handle, 0xdeadbeef);
             }
             _ => panic!("unexpected response variant"),
         }

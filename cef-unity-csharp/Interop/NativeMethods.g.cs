@@ -247,7 +247,8 @@ namespace CefUnity
 
         /// <summary>
         ///  Unity Native Plugin Interface のエントリポイント。Unity が DLL ロード時に呼ぶ。
-        ///  IUnityGraphicsD3D11 経由で Unity の ID3D11Device を取得し保持する。
+        ///  IUnityGraphicsD3D11 / IUnityGraphicsD3D12v5 経由で Unity の Device を取得し保持する。
+        ///  両方を試して、Unity の graphics backend に応じて生きている方が使われる。
         ///  非 Windows プラットフォームでは何もしない。
         /// </summary>
         [DllImport(__DllName, EntryPoint = "UnityPluginLoad", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
@@ -266,6 +267,13 @@ namespace CefUnity
         public static extern int cef_unity_is_d3d11_connected();
 
         /// <summary>
+        ///  Windows: Unity の D3D12 device に接続済みなら 1 を返す。
+        ///  C# 側はこちらが 1 のとき `cef_unity_recv_d3d12_texture` を呼ぶ。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_is_d3d12_connected", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_is_d3d12_connected();
+
+        /// <summary>
         ///  Windows: 共有メモリから最新の D3D11 共有 HANDLE を読み出し、
         ///  Unity の D3D11Device で OpenSharedResource1 した ID3D11Texture2D* を返す。
         ///  新フレームが無い場合は null。
@@ -275,6 +283,16 @@ namespace CefUnity
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_recv_d3d11_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern void* cef_unity_recv_d3d11_texture(CefUnityBrowser* handle, int* out_width, int* out_height, uint* out_format);
+
+        /// <summary>
+        ///  Windows: 共有メモリから最新の D3D11 共有 HANDLE を読み出し、
+        ///  Unity の D3D12Device で OpenSharedHandle した ID3D12Resource* を返す。
+        ///  共有 ID3D11Fence (D3D12 から見ると ID3D12Fence) で書き込み完了を待ち、
+        ///  初回のみ COMMON → PIXEL_SHADER_RESOURCE 状態遷移を Unity に宣言する。
+        ///  新フレームが無い場合は null。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_recv_d3d12_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void* cef_unity_recv_d3d12_texture(CefUnityBrowser* handle, int* out_width, int* out_height, uint* out_format);
 
 
     }

@@ -524,10 +524,13 @@ namespace CefUnity.Runtime
             if (!Browser.TryRecvIOSurfaceTexture(out newTexPtr, out w, out h, out format))
                 return;
 #elif UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
-        // Windows: D3D11 共有テクスチャ経由。ポインタはサイズ変更時以外は安定
-        // (client lib 側でキャッシュ管理)、Release 不要。
-        if (_browser == null || !_browser.TryRecvD3D11Texture(out newTexPtr, out w, out h, out format))
-            return;
+        // Windows: Unity の graphics backend に応じて D3D11/D3D12 を使い分け。
+        // ポインタはサイズ変更時以外は安定 (client lib 側でキャッシュ管理)、Release 不要。
+        if (_browser == null) return;
+        bool gotFrame = SystemInfo.graphicsDeviceType == UnityEngine.Rendering.GraphicsDeviceType.Direct3D12
+            ? _browser.TryRecvD3D12Texture(out newTexPtr, out w, out h, out format)
+            : _browser.TryRecvD3D11Texture(out newTexPtr, out w, out h, out format);
+        if (!gotFrame) return;
 #else
         return;
 #endif

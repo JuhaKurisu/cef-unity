@@ -481,6 +481,33 @@ namespace CefUnity.Interop
             return ptr != null;
         }
 
+        /// <summary>
+        /// Unity の D3D12 device と接続済みかどうかを返す (Windows 用)。
+        /// </summary>
+        public static bool IsD3D12Connected()
+        {
+            return NativeMethods.cef_unity_is_d3d12_connected() != 0;
+        }
+
+        /// <summary>
+        /// Windows: 最新フレームの ID3D12Resource* を取得する (新フレームなら true)。
+        /// 返るポインタは Unity の D3D12 device で OpenSharedHandle され、
+        /// 状態は PIXEL_SHADER_RESOURCE に Unity に宣言済み。
+        /// Texture2D.CreateExternalTexture / UpdateExternalTexture にそのまま渡せる。
+        /// </summary>
+        public unsafe bool TryRecvD3D12Texture(out IntPtr texturePtr, out int width, out int height, out uint format)
+        {
+            ThrowIfDisposed();
+            int w, h;
+            uint fmt;
+            var ptr = NativeMethods.cef_unity_recv_d3d12_texture(_handle, &w, &h, &fmt);
+            texturePtr = (IntPtr)ptr;
+            width = w;
+            height = h;
+            format = fmt;
+            return ptr != null;
+        }
+
         // ----- 統一: Accelerated paint (macOS + Windows) -----
 
         /// <summary>
@@ -491,7 +518,7 @@ namespace CefUnity.Interop
 #if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
             return IsIOSurfaceConnected();
 #elif UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
-            return IsD3D11Connected();
+            return IsD3D11Connected() || IsD3D12Connected();
 #else
             return false;
 #endif

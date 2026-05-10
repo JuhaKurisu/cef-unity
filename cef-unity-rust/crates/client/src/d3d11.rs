@@ -10,9 +10,16 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 use std::io::Write;
 
-use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Device1, ID3D11Texture2D};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Device, ID3D11Device1, ID3D11Device5, ID3D11Fence, ID3D11Texture2D,
+};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::Interface;
+
+/// fence Wait のタイムアウト (ms)。Unity を長時間ブロックさせないため有限値にする。
+/// 実機では数 ms 以内に signal されているはずなので 100ms あれば十分。
+const FENCE_WAIT_TIMEOUT_MS: u32 = 100;
 
 fn log_debug(msg: &str) {
     let path = std::env::temp_dir().join("cef_unity_debug.log");
@@ -92,6 +99,28 @@ static OPENED: Mutex<OpenedState> = Mutex::new(OpenedState {
     previous: None,
 });
 
+/// 共有 ID3D11Fence の保持状態。`open_fence` で初期化、`wait_fence` で利用。
+struct FenceState {
+    fence: ID3D11Fence,
+    /// `WaitForSingleObject` 用の再利用イベント。fence の各 SetEventOnCompletion で
+    /// このイベントを reset 状態に切り替える。
+    event: HANDLE,
+    /// 直近の Wait 完了値。これ以下の target は no-op で済ませる。
+    last_waited: u64,
+}
+
+unsafe impl Send for FenceState {}
+
+impl Drop for FenceState {
+    fn drop(&mut self) {
+        if !self.event.is_invalid() {
+            let _ = unsafe { CloseHandle(self.event) };
+        }
+    }
+}
+
+static FENCE: Mutex<Option<FenceState>> = Mutex::new(None);
+
 // ---- Unity からのコールバック ----
 
 pub fn set_unity_interfaces(unity_interfaces: *mut IUnityInterfaces) {
@@ -104,9 +133,12 @@ pub fn set_unity_interfaces(unity_interfaces: *mut IUnityInterfaces) {
 pub fn clear_unity_interfaces() {
     UNITY_INTERFACES.store(std::ptr::null_mut(), Ordering::Release);
     UNITY_DEVICE.store(std::ptr::null_mut(), Ordering::Release);
-    let mut state = OPENED.lock().unwrap();
-    state.current = None;
-    state.previous = None;
+    {
+        let mut state = OPENED.lock().unwrap();
+        state.current = None;
+        state.previous = None;
+    }
+    *FENCE.lock().unwrap() = None;
 }
 
 /// 保持している IUnityInterfaces* から ID3D11Device を遅延取得する。
@@ -141,6 +173,89 @@ fn try_resolve_d3d11_device() -> *mut c_void {
 
 pub fn is_connected() -> bool {
     !try_resolve_d3d11_device().is_null()
+}
+
+// ---- shared fence (D3D12 クロス API 同期 兼 D3D11 明示同期) ----
+
+/// 共有 ID3D11Fence を Unity の D3D11Device で開いてグローバルに保持する。
+/// `cef_unity_create_browser` が成功した直後に 1 度だけ呼ばれる想定。
+/// 既に開いている場合は上書きする (browser 切替時)。
+pub fn open_fence(handle_value: u64) -> Result<(), String> {
+    if handle_value == 0 {
+        return Err("fence handle is 0".to_string());
+    }
+    let device_ptr = try_resolve_d3d11_device();
+    if device_ptr.is_null() {
+        return Err("Unity D3D11 device not yet available".to_string());
+    }
+
+    let device: ID3D11Device = unsafe {
+        let raw = device_ptr;
+        ID3D11Device::from_raw_borrowed(&raw)
+            .ok_or_else(|| "ID3D11Device::from_raw_borrowed failed".to_string())?
+            .clone()
+    };
+    let device5: ID3D11Device5 = device
+        .cast()
+        .map_err(|e| format!("cast ID3D11Device5 (Unity device): {:?}", e))?;
+    let mut fence_opt: Option<ID3D11Fence> = None;
+    unsafe {
+        device5
+            .OpenSharedFence(HANDLE(handle_value as *mut _), &mut fence_opt)
+            .map_err(|e| format!("OpenSharedFence: {:?}", e))?;
+    }
+    let fence: ID3D11Fence = fence_opt.ok_or_else(|| "OpenSharedFence returned None".to_string())?;
+
+    // Auto-reset, initially non-signaled。
+    let event: HANDLE = unsafe {
+        CreateEventW(None, false, false, None)
+            .map_err(|e| format!("CreateEventW: {:?}", e))?
+    };
+
+    *FENCE.lock().unwrap() = Some(FenceState {
+        fence,
+        event,
+        last_waited: 0,
+    });
+    log_debug(&format!(
+        "open_fence: opened handle=0x{:x}",
+        handle_value
+    ));
+    Ok(())
+}
+
+/// fence が `target_value` 以上に到達するまで CPU 待機する。
+/// fence 未対応 (open_fence 未呼び出し) の場合は no-op。
+/// `target_value` が 0 または既に到達済みの場合も no-op。
+pub fn wait_fence(target_value: u64) -> Result<(), String> {
+    if target_value == 0 {
+        return Ok(());
+    }
+    let mut guard = FENCE.lock().unwrap();
+    let Some(state) = guard.as_mut() else {
+        return Ok(()); // fence 未対応経路 (例: 同一プロセステストや非サポート)
+    };
+    if target_value <= state.last_waited {
+        return Ok(());
+    }
+
+    // 既に到達済みなら SetEventOnCompletion は即時シグナルになる。
+    unsafe {
+        state
+            .fence
+            .SetEventOnCompletion(target_value, state.event)
+            .map_err(|e| format!("SetEventOnCompletion({}): {:?}", target_value, e))?;
+    }
+    let wait_result = unsafe { WaitForSingleObject(state.event, FENCE_WAIT_TIMEOUT_MS) };
+    if wait_result.0 != 0 {
+        // 0 = WAIT_OBJECT_0; それ以外は timeout/abandoned/error。
+        return Err(format!(
+            "WaitForSingleObject returned 0x{:x} (target={})",
+            wait_result.0, target_value
+        ));
+    }
+    state.last_waited = target_value;
+    Ok(())
 }
 
 // ---- HANDLE → ID3D11Texture2D ----
