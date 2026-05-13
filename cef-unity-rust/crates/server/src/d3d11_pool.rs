@@ -9,10 +9,14 @@
 //
 // 出力テクスチャはサイズ変更時のみ再作成する単一インスタンス構成。
 //
-// 同期: D3D12 クライアントは driver implicit sync が効かないため、shared ID3D11Fence で
-// 明示同期する。CopyResource + Flush 後に DeviceContext4::Signal(fence, ++value) を呼び、
-// 新しい value を shm に書く。クライアント (D3D11/D3D12) はその値を SetEventOnCompletion +
-// WaitForSingleObject (D3D11) または queue->Wait (D3D12) で待ってからサンプルする。
+// 同期: 共有 ID3D11Fence で D3D11/D3D12 双方を一貫して同期する (Microsoft 公式アプローチ)。
+//   - server: CopyResource + Flush 後に DeviceContext4::Signal(fence, ++value)
+//   - D3D11 client: ID3D11DeviceContext4::Wait(fence, value)  (GPU-side wait)
+//   - D3D12 client: ID3D12CommandQueue::Wait(fence, value)    (GPU-side wait)
+// `ID3D11DeviceContext4::Wait` のドキュメントに "equivalent to the Direct3D 12
+// ID3D12CommandQueue::Wait" と明記されており、D3D11↔D3D12 interop の正規経路。
+// 出力テクスチャから IDXGIKeyedMutex を撤去 (D3D12 では helper device 経由でしか
+// 取れず implicit fence が cross-device に効かない問題があったため、Fence-only に統一)。
 //
 // 非 Windows ではビルドが通るように空のスタブを提供する
 // (wrap_render_handler! マクロが cfg-gated フィールドを許容しないため、
@@ -32,14 +36,14 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11Device5, ID3D11DeviceContext,
     ID3D11DeviceContext4, ID3D11Fence, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
     D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FENCE_FLAG_SHARED,
-    D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION,
+    D3D11_RESOURCE_MISC_SHARED, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIKeyedMutex, IDXGIResource1, DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE,
+    IDXGIResource1, DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE};
@@ -269,12 +273,19 @@ impl D3D11Pool {
                     Usage: D3D11_USAGE_DEFAULT,
                     BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
                     CPUAccessFlags: 0,
-                    // NT shared handle + KEYEDMUTEX。KeyedMutex は GPU レベル同期 (cross-API)
-                    // と暗黙のキャッシュコヒーレンスを提供するので、D3D11/D3D12 クライアントが
-                    // 安全に共有テクスチャを読むのに必須。
-                    // 同期プロトコル: server = Acquire(0)/Release(1)、client = Acquire(1)/Release(0)。
-                    MiscFlags: (D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0
-                        | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0) as u32,
+                    // SHARED + NT_HANDLE で NT 共有ハンドルとして他プロセスへ渡せるようにする。
+                    // 同期は外部の ID3D11Fence (CreateFence with D3D11_FENCE_FLAG_SHARED) のみで行う。
+                    // KeyedMutex は D3D12 client から使えない (D3D12 resource からは IDXGIKeyedMutex を
+                    // 取得できず、helper D3D11 device 経由だと implicit fence が cross-device に効かない)
+                    // ため撤去し、D3D11/D3D12 共通の Fence 経路に統一する。
+                    //
+                    // 注意: D3D11_RESOURCE_MISC_SHARED_NTHANDLE は単独使用不可で、
+                    // D3D11_RESOURCE_MISC_SHARED または D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX
+                    // のどちらかと組み合わせる必要がある (Microsoft docs)。ここでは KeyedMutex
+                    // を使わないので SHARED と組み合わせる。
+                    MiscFlags: (D3D11_RESOURCE_MISC_SHARED.0
+                        | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0)
+                        as u32,
                 };
                 let mut new_tex: Option<ID3D11Texture2D> = None;
                 self.device
@@ -319,25 +330,17 @@ impl D3D11Pool {
                 state.format = format;
             }
 
-            // 3. KeyedMutex で読み手 (client) と排他してから CopyResource。
-            //    初回 (誰もまだ Acquire していない) は state=key=0 avail なので Acquire(0) は即時成功。
-            //    以降は client の Release(0) を待つ。
+            // 3. CopyResource → Flush → Fence.Signal で client に "ここまで GPU 完了" を通知。
+            //    client (D3D11/D3D12) は signal_value を Wait してからサンプルすることで、
+            //    server の書き込み完了を待ってから読む。KeyedMutex は使わない。
             let dst_tex = state
                 .texture
                 .as_ref()
                 .ok_or_else(|| "dst texture is None".to_string())?;
-            let mutex: IDXGIKeyedMutex = dst_tex
-                .cast()
-                .map_err(|e| format!("cast IDXGIKeyedMutex (server): {:?}", e))?;
-            mutex
-                .AcquireSync(0, u32::MAX)
-                .map_err(|e| format!("AcquireSync(0) server: {:?}", e))?;
 
             self.context.CopyResource(dst_tex, &src_tex);
             self.context.Flush();
 
-            // 4. fence Signal (互換性のため残す。KeyedMutex で同期は完結するが、
-            //    将来 fence 経路に切り替える場合の preserve)。
             state.next_fence_value += 1;
             let signal_value = state.next_fence_value;
             let context4: ID3D11DeviceContext4 = self
@@ -347,11 +350,6 @@ impl D3D11Pool {
             context4
                 .Signal(&self.fence, signal_value)
                 .map_err(|e| format!("ID3D11DeviceContext4::Signal: {:?}", e))?;
-
-            // 5. KeyedMutex を key=1 で Release。Client は key=1 を Acquire して読める。
-            mutex
-                .ReleaseSync(1)
-                .map_err(|e| format!("ReleaseSync(1) server: {:?}", e))?;
 
             Ok((state.client_handle_value, signal_value))
         }

@@ -311,8 +311,12 @@ pub extern "C" fn cef_unity_shutdown() {
     log_to_file("cef_unity_shutdown()");
 
     if let Some(conn) = CONNECTION.lock().unwrap().take() {
-        let _ = send_command(&conn, Command::Shutdown);
-        // Server will exit after receiving Shutdown; give it a moment
+        // fire-and-forget: server プロセスが無応答でも Unity main thread を
+        // 永久ブロックさせないため、応答は待たない。server 側は
+        // expects_response=false でも Shutdown を正しく処理して running=false にする
+        // (event_loop/generic.rs の drain_commands 参照)。
+        send_command_no_wait(&conn, Command::Shutdown);
+        // Server が Shutdown を処理して cef::shutdown() を呼び終わるまで少し待つ。
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
@@ -1384,12 +1388,11 @@ pub extern "C" fn cef_unity_recv_d3d11_texture(
         let instance = handle_to_ref(handle);
         let Some((handle_value, w, h, format, fence_value)) = instance.shm.get_d3d11_handle()
         else {
-            // 新フレーム無し: tick で stale カウントを進めて、必要なら強制 Release する。
-            d3d11::tick();
+            // 新フレーム無し: 前回開いたテクスチャを Unity 側で使い続けてもらう (null 返却)。
             return std::ptr::null_mut();
         };
-        // GPU 書き込み完了を待機 (server が Signal 済みの fence_value 以上に到達するまで)。
-        // fence が未対応 (handle=0) の場合は no-op。KeyedMutex でも同期できるが冗長として残置。
+        // GPU-side wait: Unity の immediate context に fence_value 到達待ちを発行する。
+        // CPU はブロックせず、Unity の以降の描画コマンドが GPU 上で server.Copy 完了を待つ。
         if let Err(e) = d3d11::wait_fence(fence_value) {
             log_to_file(&format!("d3d11::wait_fence({}) failed: {}", fence_value, e));
         }
@@ -1432,9 +1435,11 @@ pub extern "C" fn cef_unity_recv_d3d12_texture(
         let instance = handle_to_ref(handle);
         let Some((handle_value, w, h, format, fence_value)) = instance.shm.get_d3d11_handle()
         else {
-            d3d12::tick();
+            // 新フレーム無し: 前回開いたテクスチャを Unity 側で使い続けてもらう (null 返却)。
             return std::ptr::null_mut();
         };
+        // GPU-side wait: Unity の D3D12 queue に fence_value 到達待ちを発行する。
+        // CPU はブロックせず、Unity の以降の queue 操作が GPU 上で server.Copy 完了を待つ。
         if let Err(e) = d3d12::wait_fence(fence_value) {
             log_to_file(&format!("d3d12::wait_fence({}) failed: {}", fence_value, e));
         }

@@ -107,7 +107,7 @@ namespace CefUnity.Runtime
                 _currentHeight = Screen.height;
 
                 var useGpu = !(SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12 || SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11);
-                CefRuntime.Init(useGpu);
+                CefRuntime.Init(true);
                 _browser = new Browser(_currentWidth, _currentHeight, _url);
 
                 // 共通: macOS は Mach port 経由の IOSurface、Windows は D3D11 共有テクスチャ。
