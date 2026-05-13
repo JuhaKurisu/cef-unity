@@ -455,6 +455,7 @@ wrap_browser_process_handler! {
 wrap_app! {
     struct ServerApp {
         browser_process_handler: BrowserProcessHandler,
+        use_gpu: bool,
     }
     impl App {
         fn on_before_command_line_processing(
@@ -472,6 +473,14 @@ wrap_app! {
                 // 動作するために必要。Unity プラグイン環境では CEF レベルのサンドボックスも
                 // 無効 (no_sandbox=1) なので、GPU サンドボックスも不要)
                 cl.append_switch(Some(&CefString::from("disable-gpu-sandbox")));
+
+                if !self.use_gpu {
+                    // CPU モード: Chromium に GPU を一切使わせない。
+                    // これにより on_paint 用の GPU→CPU readback が発生しなくなり、
+                    // Skia software pipeline のみで動く。
+                    cl.append_switch(Some(&CefString::from("disable-gpu")));
+                    cl.append_switch(Some(&CefString::from("disable-gpu-compositing")));
+                }
             }
         }
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
@@ -597,7 +606,7 @@ impl CefServer {
         settings.log_severity = LogSeverity::VERBOSE;
 
         let bph = ServerBrowserProcessHandler::new();
-        let mut app = ServerApp::new(bph);
+        let mut app = ServerApp::new(bph, self.use_gpu);
         let result = initialize(
             Some(args.as_main_args()),
             Some(&settings),
