@@ -135,6 +135,10 @@ fn handle_to_ref<'a>(handle: *mut CefUnityBrowser) -> &'a mut ClientBrowserInsta
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static IOSURFACE_CONNECTED: AtomicBool = AtomicBool::new(false);
+/// GPU (accelerated paint) を使うか。Init 時にセットされ、以降は不変。
+/// false の場合は server が software paint で動作し、client 側でも
+/// is_*_connected getter が 0 を返して C# が software 経路に入る。
+static USE_GPU_MODE: AtomicBool = AtomicBool::new(true);
 static PAINT_COUNT: AtomicU64 = AtomicU64::new(0);
 static PUMP_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -183,14 +187,21 @@ fn send_command_no_wait(conn: &ServerConnection, cmd: Command) {
 // ---------------------------------------------------------------------------
 
 /// Initialize: launch CEF server process and connect via ipc-channel.
+/// `use_gpu`: 非 0 で accelerated paint (GPU 共有テクスチャ / IOSurface) を使う。
+/// 0 で software paint (CPU 経由の shm BGRA 転送) を強制する。
 /// Returns 0 on success, non-zero on failure.
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_init() -> i32 {
+pub extern "C" fn cef_unity_init(use_gpu: i32) -> i32 {
     if INITIALIZED.load(Ordering::SeqCst) {
         return 0;
     }
 
-    log_to_file("---- cef_unity_init() called (IPC client mode) ----");
+    let use_gpu_bool = use_gpu != 0;
+    USE_GPU_MODE.store(use_gpu_bool, Ordering::SeqCst);
+    log_to_file(&format!(
+        "---- cef_unity_init(use_gpu={}) called (IPC client mode) ----",
+        use_gpu_bool
+    ));
 
     // Find server binary next to dylib
     let plugin_dir = dylib_dir();
@@ -223,6 +234,8 @@ pub extern "C" fn cef_unity_init() -> i32 {
         .arg(&server_name)
         .arg("--client-pid")
         .arg(client_pid.to_string())
+        .arg("--use-gpu")
+        .arg(if use_gpu_bool { "1" } else { "0" })
         .spawn()
     {
         Ok(_child) => {
@@ -251,8 +264,9 @@ pub extern "C" fn cef_unity_init() -> i32 {
     });
 
     // Connect to server's Mach IOSurface port service (macOS only)
+    // GPU モード時のみ接続する。CPU モードでは IOSURFACE_CONNECTED は false のまま。
     #[cfg(target_os = "macos")]
-    {
+    if use_gpu_bool {
         let service_name = cef_unity_ipc::iosurface_service_name(bootstrap.server_pid);
         log_to_file(&format!("connecting to Mach IOSurface service: {}", service_name));
         let cname = std::ffi::CString::new(service_name.as_str()).unwrap();
@@ -303,6 +317,8 @@ pub extern "C" fn cef_unity_shutdown() {
     }
 
     INITIALIZED.store(false, Ordering::SeqCst);
+    IOSURFACE_CONNECTED.store(false, Ordering::SeqCst);
+    USE_GPU_MODE.store(true, Ordering::SeqCst);
     log_to_file("shutdown complete");
 }
 
@@ -1165,8 +1181,12 @@ pub extern "C" fn cef_unity_recv_iosurface_texture(
 
 
 /// Returns 1 if the Mach IOSurface port channel is connected, 0 otherwise.
+/// CPU モード (Init で use_gpu=0) のときは常に 0 を返す。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_is_iosurface_connected() -> i32 {
+    if !USE_GPU_MODE.load(Ordering::SeqCst) {
+        return 0;
+    }
     if IOSURFACE_CONNECTED.load(Ordering::SeqCst) { 1 } else { 0 }
 }
 
@@ -1308,8 +1328,12 @@ pub extern "C" fn UnityPluginUnload() {
 }
 
 /// Windows: Unity の D3D11 device に接続済みなら 1 を返す。
+/// CPU モード (Init で use_gpu=0) のときは常に 0 を返す。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_is_d3d11_connected() -> i32 {
+    if !USE_GPU_MODE.load(Ordering::SeqCst) {
+        return 0;
+    }
     #[cfg(target_os = "windows")]
     {
         if d3d11::is_connected() { 1 } else { 0 }
@@ -1322,8 +1346,12 @@ pub extern "C" fn cef_unity_is_d3d11_connected() -> i32 {
 
 /// Windows: Unity の D3D12 device に接続済みなら 1 を返す。
 /// C# 側はこちらが 1 のとき `cef_unity_recv_d3d12_texture` を呼ぶ。
+/// CPU モード (Init で use_gpu=0) のときは常に 0 を返す。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_is_d3d12_connected() -> i32 {
+    if !USE_GPU_MODE.load(Ordering::SeqCst) {
+        return 0;
+    }
     #[cfg(target_os = "windows")]
     {
         if d3d12::is_connected() { 1 } else { 0 }

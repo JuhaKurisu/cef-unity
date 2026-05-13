@@ -20,10 +20,12 @@ namespace CefUnity
 
         /// <summary>
         ///  Initialize: launch CEF server process and connect via ipc-channel.
+        ///  `use_gpu`: 非 0 で accelerated paint (GPU 共有テクスチャ / IOSurface) を使う。
+        ///  0 で software paint (CPU 経由の shm BGRA 転送) を強制する。
         ///  Returns 0 on success, non-zero on failure.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_init", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern int cef_unity_init();
+        public static extern int cef_unity_init(int use_gpu);
 
         /// <summary>
         ///  Pump CEF message loop — no-op in IPC mode (server has its own loop).
@@ -221,6 +223,7 @@ namespace CefUnity
 
         /// <summary>
         ///  Returns 1 if the Mach IOSurface port channel is connected, 0 otherwise.
+        ///  CPU モード (Init で use_gpu=0) のときは常に 0 を返す。
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_is_iosurface_connected", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern int cef_unity_is_iosurface_connected();
@@ -262,6 +265,7 @@ namespace CefUnity
 
         /// <summary>
         ///  Windows: Unity の D3D11 device に接続済みなら 1 を返す。
+        ///  CPU モード (Init で use_gpu=0) のときは常に 0 を返す。
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_is_d3d11_connected", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern int cef_unity_is_d3d11_connected();
@@ -269,6 +273,7 @@ namespace CefUnity
         /// <summary>
         ///  Windows: Unity の D3D12 device に接続済みなら 1 を返す。
         ///  C# 側はこちらが 1 のとき `cef_unity_recv_d3d12_texture` を呼ぶ。
+        ///  CPU モード (Init で use_gpu=0) のときは常に 0 を返す。
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_is_d3d12_connected", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern int cef_unity_is_d3d12_connected();

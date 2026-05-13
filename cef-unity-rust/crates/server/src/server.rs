@@ -523,15 +523,19 @@ pub struct CefServer {
     /// Windows: クライアントプロセス PID (DuplicateHandle 用)。
     #[allow(dead_code)]
     client_pid: Option<u32>,
+    /// GPU (accelerated paint) を使うか。false の場合 D3D11Pool を作らず
+    /// shared_texture_enabled を立てないため、CEF は on_paint (software) のみ呼ぶ。
+    use_gpu: bool,
 }
 
 impl CefServer {
-    pub fn new(client_pid: Option<u32>) -> Self {
+    pub fn new(client_pid: Option<u32>, use_gpu: bool) -> Self {
         CefServer {
             browsers: HashMap::new(),
             next_browser_id: AtomicU32::new(1),
             server_pid: std::process::id(),
             client_pid,
+            use_gpu,
         }
     }
 
@@ -710,21 +714,27 @@ impl CefServer {
 
         // Windows のみ: D3D11 共有テクスチャプールを作成 (失敗時は software 経路にフォールバック)。
         // 非 Windows ではスタブ実装が常に Err を返すので None になる。
-        let d3d11_pool: Option<Arc<D3D11Pool>> = match D3D11Pool::new(self.client_pid) {
-            Ok(p) => {
-                log(&format!(
-                    "D3D11Pool created (client_pid={:?})",
-                    self.client_pid
-                ));
-                Some(Arc::new(p))
-            }
-            Err(_e) => {
-                #[cfg(target_os = "windows")]
-                log(&format!(
-                    "D3D11Pool::new failed, falling back to software paint: {}",
-                    _e
-                ));
-                None
+        // CPU モード (use_gpu=false) では作らず、software paint を強制する。
+        let d3d11_pool: Option<Arc<D3D11Pool>> = if !self.use_gpu {
+            log("use_gpu=false: skipping D3D11Pool, forcing software paint");
+            None
+        } else {
+            match D3D11Pool::new(self.client_pid) {
+                Ok(p) => {
+                    log(&format!(
+                        "D3D11Pool created (client_pid={:?})",
+                        self.client_pid
+                    ));
+                    Some(Arc::new(p))
+                }
+                Err(_e) => {
+                    #[cfg(target_os = "windows")]
+                    log(&format!(
+                        "D3D11Pool::new failed, falling back to software paint: {}",
+                        _e
+                    ));
+                    None
+                }
             }
         };
 
@@ -752,10 +762,11 @@ impl CefServer {
         #[cfg(not(target_os = "windows"))]
         let parent_handle = std::ptr::null_mut();
         let mut window_info = WindowInfo::default().set_as_windowless(parent_handle);
-        // macOS: IOSurface Mach port 転送を使用。
+        // macOS: IOSurface Mach port 転送を使用 (use_gpu=true のときのみ)。
         // Windows: D3D11 共有テクスチャプールが構築できた場合のみ accelerated paint を有効化。
+        // CPU モード (use_gpu=false) ではどのプラットフォームでも立てない。
         #[cfg(target_os = "macos")]
-        {
+        if self.use_gpu {
             window_info.shared_texture_enabled = 1;
         }
         #[cfg(target_os = "windows")]

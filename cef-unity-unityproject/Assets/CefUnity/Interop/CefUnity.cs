@@ -158,9 +158,15 @@ namespace CefUnity.Interop
 
     public static class CefRuntime
     {
-        public static void Init()
+        /// <summary>
+        ///     CEF サーバープロセスを起動し IPC を初期化する。
+        ///     <paramref name="useGpu" /> が true なら GPU 経路 (accelerated paint: macOS の IOSurface、
+        ///     Windows の D3D11/D3D12 共有テクスチャ) を使い、false なら CPU 経路 (software paint:
+        ///     共有メモリ経由の BGRA 転送) を強制する。
+        /// </summary>
+        public static void Init(bool useGpu = true)
         {
-            var result = NativeMethods.cef_unity_init();
+            var result = NativeMethods.cef_unity_init(useGpu ? 1 : 0);
             if (result != 0)
                 throw new InvalidOperationException($"CEF initialization failed (code {result})");
         }

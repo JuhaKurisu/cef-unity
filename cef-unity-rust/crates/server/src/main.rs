@@ -42,17 +42,26 @@ fn main() {
         .and_then(|s| s.parse().ok());
     log(&format!("client_pid = {:?}", client_pid));
 
+    // Parse --use-gpu (optional; default 1 = GPU). 0 で software paint を強制する。
+    let use_gpu: bool = std::env::args()
+        .skip_while(|a| a != "--use-gpu")
+        .nth(1)
+        .and_then(|s| s.parse::<i32>().ok())
+        .map(|v| v != 0)
+        .unwrap_or(true);
+    log(&format!("use_gpu = {}", use_gpu));
+
     // Initialize CEF first (server must be ready before accepting connections)
-    let cef_server = server::CefServer::new(client_pid);
+    let cef_server = server::CefServer::new(client_pid, use_gpu);
     if !cef_server.init_cef() {
         log("CEF initialization failed");
         std::process::exit(1);
     }
     log("CEF initialized successfully");
 
-    // Initialize Mach IOSurface port service (macOS only)
+    // Initialize Mach IOSurface port service (macOS only, GPU モード時のみ)
     #[cfg(target_os = "macos")]
-    {
+    if use_gpu {
         let service_name = cef_unity_ipc::iosurface_service_name(std::process::id());
         let sname = std::ffi::CString::new(service_name.as_str()).unwrap();
         unsafe extern "C" {
