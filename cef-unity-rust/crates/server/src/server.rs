@@ -480,6 +480,12 @@ wrap_app! {
                     // Skia software pipeline のみで動く。
                     cl.append_switch(Some(&CefString::from("disable-gpu")));
                     cl.append_switch(Some(&CefString::from("disable-gpu-compositing")));
+                    // Skia software raster の並列度を上げる (デフォルト 1-2 → 4)。
+                    // 4K で全画面ダーティなスクロール時に効く。
+                    cl.append_switch_with_value(
+                        Some(&CefString::from("num-raster-threads")),
+                        Some(&CefString::from("4")),
+                    );
                 }
             }
         }
