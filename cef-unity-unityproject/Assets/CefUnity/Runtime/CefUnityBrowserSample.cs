@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
-using System.Runtime.InteropServices;
 using System.Text;
 using CefUnity.Interop;
 using UnityEditor;
@@ -75,7 +74,8 @@ namespace CefUnity.Runtime
 
         [SerializeField] private string _url;
         [SerializeField] private RawImage _rawImage;
-        [SerializeField] private float _resolutionScale;
+        [SerializeField] private float _resolutionScale = 1;
+        [SerializeField] private bool _enableLog;
         private readonly Dictionary<KeyCode, float> _keyDownTime = new();
         private readonly Dictionary<KeyCode, float> _keyLastRepeat = new();
 
@@ -113,7 +113,7 @@ namespace CefUnity.Runtime
                 // 共通: macOS は Mach port 経由の IOSurface、Windows は D3D11 共有テクスチャ。
                 // Init() がサーバーを起動し接続を行うため、その後にチェック。
                 _useAcceleratedPaint = Browser.IsAcceleratedConnected();
-                Debug.Log($"[CefUnity] Initialized ({_currentWidth}x{_currentHeight}), acceleratedPaint={_useAcceleratedPaint}");
+                if (_enableLog) Debug.Log($"[CefUnity] Initialized ({_currentWidth}x{_currentHeight}), acceleratedPaint={_useAcceleratedPaint}");
                 SetupImeProxy();
             }
             catch (Exception e)
@@ -130,13 +130,16 @@ namespace CefUnity.Runtime
             if (_diagTimer >= 2f)
             {
                 _diagTimer = 0f;
-                var paintCount = NativeMethods.cef_unity_get_paint_count();
-                var pumpCount = NativeMethods.cef_unity_get_pump_count();
-                Debug.Log($"[CefUnity] diag: paint={paintCount} pump={pumpCount}");
 
-                var logs = CefRuntime.GetLogs();
-                foreach (var line in logs)
-                    Debug.Log($"[CefServer] {line}");
+                if (_enableLog)
+                {
+                    var paintCount = NativeMethods.cef_unity_get_paint_count();
+                    var pumpCount = NativeMethods.cef_unity_get_pump_count();
+                    Debug.Log($"[CefUnity] diag: paint={paintCount} pump={pumpCount}");
+                    var logs = CefRuntime.GetLogs();
+                    foreach (var line in logs)
+                        Debug.Log($"[CefServer] {line}");
+                }
             }
 
             CheckScreenResize();
@@ -170,7 +173,7 @@ namespace CefUnity.Runtime
             }
 
             CefRuntime.Shutdown();
-            Debug.Log("[CefUnity] Shutdown");
+            if (_enableLog) Debug.Log("[CefUnity] Shutdown");
         }
 
         // -----------------------------------------------------------------------
@@ -490,7 +493,7 @@ namespace CefUnity.Runtime
                 _currentWidth = sw;
                 _currentHeight = sh;
                 _browser?.Resize(_currentWidth, _currentHeight);
-                Debug.Log($"[CefUnity] Resized to {_currentWidth}x{_currentHeight}");
+                if (_enableLog) Debug.Log($"[CefUnity] Resized to {_currentWidth}x{_currentHeight}");
             }
         }
 
@@ -526,13 +529,13 @@ namespace CefUnity.Runtime
             if (!Browser.TryRecvIOSurfaceTexture(out newTexPtr, out w, out h, out format))
                 return;
 #elif UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
-        // Windows: Unity の graphics backend に応じて D3D11/D3D12 を使い分け。
-        // ポインタはサイズ変更時以外は安定 (client lib 側でキャッシュ管理)、Release 不要。
-        if (_browser == null) return;
-        bool gotFrame = SystemInfo.graphicsDeviceType == UnityEngine.Rendering.GraphicsDeviceType.Direct3D12
-            ? _browser.TryRecvD3D12Texture(out newTexPtr, out w, out h, out format)
-            : _browser.TryRecvD3D11Texture(out newTexPtr, out w, out h, out format);
-        if (!gotFrame) return;
+            // Windows: Unity の graphics backend に応じて D3D11/D3D12 を使い分け。
+            // ポインタはサイズ変更時以外は安定 (client lib 側でキャッシュ管理)、Release 不要。
+            if (_browser == null) return;
+            var gotFrame = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12
+                ? _browser.TryRecvD3D12Texture(out newTexPtr, out w, out h, out format)
+                : _browser.TryRecvD3D11Texture(out newTexPtr, out w, out h, out format);
+            if (!gotFrame) return;
 #else
         return;
 #endif
@@ -665,8 +668,15 @@ namespace CefUnity.Runtime
             }
         }
 #else
-    private static float GetOSKeyRepeatDelay() => 0.5f;
-    private static float GetOSKeyRepeatRate() => 0.035f;
+        private static float GetOSKeyRepeatDelay()
+        {
+            return 0.5f;
+        }
+
+        private static float GetOSKeyRepeatRate()
+        {
+            return 0.035f;
+        }
 #endif
 
 #if UNITY_EDITOR
