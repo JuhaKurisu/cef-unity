@@ -142,12 +142,19 @@ namespace CefUnity.Runtime
                 }
             }
 
+            // フレーム前半: 入力を server へ送る。LateUpdate のテクスチャ取得までに
+            // server が処理を終えていれば、同一フレーム内で反映される。
             CheckScreenResize();
-            UpdateTexture();
             HandleMouseInput();
             UpdateCompositionCursorPos();
             HandleImeInput();
             HandleKeyboardInput();
+        }
+
+        private void LateUpdate()
+        {
+            // フレーム後半: server が paint した最新フレームを取得する。
+            UpdateTexture();
         }
 
         public void LoadUrl(string url)

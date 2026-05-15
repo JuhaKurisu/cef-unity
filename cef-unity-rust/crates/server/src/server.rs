@@ -794,7 +794,7 @@ impl CefServer {
             Some(&CefString::from(url)),
             Some(&BrowserSettings {
                 background_color: 0x00000000,
-                windowless_frame_rate: 60,
+                windowless_frame_rate: 120,
                 ..Default::default()
             }),
             None,
