@@ -7,6 +7,9 @@ using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.UI;
+#if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
+using System.Runtime.InteropServices;
+#endif
 
 namespace CefUnity.Runtime
 {
@@ -107,7 +110,7 @@ namespace CefUnity.Runtime
                 _currentHeight = Screen.height;
 
                 var useGpu = !(SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12 || SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11);
-                CefRuntime.Init(true);
+                CefRuntime.Init();
                 _browser = new Browser(_currentWidth, _currentHeight, _url);
 
                 // 共通: macOS は Mach port 経由の IOSurface、Windows は D3D11 共有テクスチャ。
@@ -592,7 +595,7 @@ namespace CefUnity.Runtime
 
             if (_accelProfCount >= 120)
             {
-                Debug.Log($"[CefUnity-Prof] C# accel x{_accelProfCount}: recv={_accelProfRecvTotal * 1000f:F2}ms update={_accelProfUpdateTotal * 1000f:F2}ms release={_accelProfReleaseTotal * 1000f:F2}ms total={(_accelProfRecvTotal + _accelProfUpdateTotal + _accelProfReleaseTotal) * 1000f:F2}ms");
+                if (_enableLog) Debug.Log($"[CefUnity-Prof] C# accel x{_accelProfCount}: recv={_accelProfRecvTotal * 1000f:F2}ms update={_accelProfUpdateTotal * 1000f:F2}ms release={_accelProfReleaseTotal * 1000f:F2}ms total={(_accelProfRecvTotal + _accelProfUpdateTotal + _accelProfReleaseTotal) * 1000f:F2}ms");
                 _accelProfCount = 0;
                 _accelProfRecvTotal = _accelProfUpdateTotal = _accelProfReleaseTotal = 0;
             }
