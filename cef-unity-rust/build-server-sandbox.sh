@@ -29,8 +29,8 @@ mkdir -p "$SERVER_APP/Contents/Frameworks"
 # Server binary
 cp "$SCRIPT_DIR/target/debug/cef-unity-server" "$SERVER_APP/Contents/MacOS/"
 
-# CEF framework (symlink for dev speed)
-ln -sf "$CEF_FW" "$SERVER_APP/Contents/Frameworks/Chromium Embedded Framework.framework"
+# CEF framework (実コピー)
+rsync -a "$CEF_FW/" "$SERVER_APP/Contents/Frameworks/Chromium Embedded Framework.framework/"
 
 # Server Info.plist
 cat > "$SERVER_APP/Contents/Info.plist" <<PLIST

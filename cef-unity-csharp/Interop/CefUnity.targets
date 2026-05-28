@@ -4,13 +4,13 @@
         <_CefFrameworkDest>$(OutputPath)Chromium Embedded Framework.framework</_CefFrameworkDest>
     </PropertyGroup>
 
-    <Target Name="LinkCefFramework" AfterTargets="Build"
+    <Target Name="CopyCefFramework" AfterTargets="Build"
             Condition="!Exists('$(_CefFrameworkDest)')">
         <!-- macOS / Linux -->
         <Exec Condition="$([MSBuild]::IsOSPlatform('OSX')) Or $([MSBuild]::IsOSPlatform('Linux'))"
-              Command="ln -s `ls -dt &quot;$(_CefRustTargetDir)&quot;/build/cef-dll-sys-*/out/cef_macos_aarch64 | head -1`/&quot;Chromium Embedded Framework.framework&quot; &quot;$(_CefFrameworkDest)&quot;" />
+              Command="rsync -a `ls -dt &quot;$(_CefRustTargetDir)&quot;/build/cef-dll-sys-*/out/cef_macos_aarch64 | head -1`/&quot;Chromium Embedded Framework.framework/&quot; &quot;$(_CefFrameworkDest)/&quot;" />
         <!-- Windows -->
         <Exec Condition="$([MSBuild]::IsOSPlatform('Windows'))"
-              Command="for /f &quot;delims=&quot; %%D in ('dir /b /o-d &quot;$(_CefRustTargetDir)\build\cef-dll-sys-*\out\cef_windows_x86_64&quot; 2^&gt;nul') do (mklink /D &quot;$(_CefFrameworkDest)&quot; &quot;%%D&quot; &amp; goto :eof)" />
+              Command="for /f &quot;delims=&quot; %%D in ('dir /b /o-d &quot;$(_CefRustTargetDir)\build\cef-dll-sys-*\out\cef_windows_x86_64&quot; 2^&gt;nul') do (xcopy /E /I /Y &quot;%%D&quot; &quot;$(_CefFrameworkDest)&quot; &amp; goto :eof)" />
     </Target>
 </Project>
