@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(echo \"\")",
-      "Bash(uloop clear-console *)",
-      "Bash(uloop control-play-mode *)"
-    ]
-  }
-}
