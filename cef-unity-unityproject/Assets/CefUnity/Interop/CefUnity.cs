@@ -166,9 +166,25 @@ namespace CefUnity.Interop
         /// </summary>
         public static void Init(bool useGpu = true)
         {
-            var result = NativeMethods.cef_unity_init(useGpu ? 1 : 0);
+            int result;
+            try
+            {
+                result = NativeMethods.cef_unity_init(useGpu ? 1 : 0);
+            }
+            catch (DllNotFoundException)
+            {
+                throw new DllNotFoundException(
+                    "cef_unity_rust native library not found. Ensure the plugin is placed in the correct Plugins folder.");
+            }
+
             if (result != 0)
-                throw new InvalidOperationException($"CEF initialization failed (code {result})");
+                throw new InvalidOperationException(result switch
+                {
+                    -3 => "cef-unity-server binary not found.",
+                    -4 => "Failed to start cef-unity-server process. Check file permissions and console log for details.",
+                    -5 => "cef-unity-server started but failed to connect. The server may have crashed on startup — check the server log at $TMPDIR/cef_unity_debug.log.",
+                    _ => $"CEF initialization failed (code {result})"
+                });
         }
 
         public static void Shutdown()
