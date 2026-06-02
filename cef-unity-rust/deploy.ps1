@@ -97,8 +97,30 @@ foreach ($f in $ResourceFiles) {
 $LocalesSrc = Join-Path $CefDir 'locales'
 if (Test-Path $LocalesSrc) {
     $LocalesDst = Join-Path $Dest 'locales'
-    if (Test-Path $LocalesDst) { Remove-Item -Path $LocalesDst -Recurse -Force }
+
+    # Unity が生成した .meta ファイルを退避
+    $MetaTmp = $null
+    if (Test-Path $LocalesDst) {
+        $metas = Get-ChildItem -Path $LocalesDst -Filter '*.meta' -ErrorAction SilentlyContinue
+        if ($metas) {
+            $MetaTmp = Join-Path ([System.IO.Path]::GetTempPath()) "cef-unity-meta-$([System.Guid]::NewGuid())"
+            New-Item -ItemType Directory -Path $MetaTmp -Force | Out-Null
+            foreach ($m in $metas) {
+                Copy-Item -Path $m.FullName -Destination $MetaTmp -Force
+            }
+        }
+        Remove-Item -Path $LocalesDst -Recurse -Force
+    }
+
     Copy-Item -Path $LocalesSrc -Destination $LocalesDst -Recurse -Force
+
+    # 退避した .meta を復元
+    if ($MetaTmp -and (Test-Path $MetaTmp)) {
+        Get-ChildItem -Path $MetaTmp -Filter '*.meta' | ForEach-Object {
+            Copy-Item -Path $_.FullName -Destination $LocalesDst -Force
+        }
+        Remove-Item -Path $MetaTmp -Recurse -Force
+    }
 }
 
 Write-Host "[deploy] done -> $Dest"

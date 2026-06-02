@@ -24,6 +24,16 @@ fi
 
 # --- server .app bundle ---
 SERVER_APP="$DEST/cef-unity-server.app"
+
+# Unity が生成した .meta ファイルを退避
+META_TMP=$(mktemp -d)
+if [ -d "$SERVER_APP" ]; then
+    (cd "$SERVER_APP" && find . -name '*.meta' -print0 | while IFS= read -r -d '' f; do
+        mkdir -p "$META_TMP/$(dirname "$f")"
+        cp "$f" "$META_TMP/$f"
+    done)
+fi
+
 rm -rf "$SERVER_APP"
 mkdir -p "$SERVER_APP/Contents/MacOS"
 mkdir -p "$SERVER_APP/Contents/Frameworks"
@@ -88,14 +98,21 @@ PLIST
     codesign -s - --force --entitlements helper.entitlements "$HELPER_APP"
 done
 
-# Unity が .app 内に .meta ファイルを作るので codesign 前に削除
-find "$SERVER_APP" -name '*.meta' -delete
-
 # Codesign CEF framework (別 Mac で dlopen が拒否されないよう ad-hoc 署名)
 codesign -s - --force "$SERVER_APP/Contents/Frameworks/Chromium Embedded Framework.framework"
 
 # Codesign server (helpers and framework are already signed above)
 codesign -s - --force --entitlements server.entitlements "$SERVER_APP"
+
+# 退避した .meta ファイルを復元 (codesign 後に戻すことで署名を壊さない…
+# が ad-hoc 署名なので実害なし。Unity が警告を出さないよう .meta を保持する)
+if [ -d "$META_TMP" ]; then
+    (cd "$META_TMP" && find . -name '*.meta' -print0 | while IFS= read -r -d '' f; do
+        mkdir -p "$SERVER_APP/$(dirname "$f")"
+        cp "$f" "$SERVER_APP/$f"
+    done)
+    rm -rf "$META_TMP"
+fi
 
 # 旧構成のファイルを削除
 rm -rf "$DEST/cef-unity-rust-helper.app"
