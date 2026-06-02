@@ -1,16 +1,27 @@
-/// macOS: get_cef_dir() でフレームワークを探して動的ロードする。
+/// macOS: current_exe() からの相対パスで CEF フレームワークを動的ロードする。
+/// Helper バンドル構造:
+///   cef-unity-server.app/Contents/Frameworks/
+///     cef-unity-server Helper.app/Contents/MacOS/<helper exe>
+///     Chromium Embedded Framework.framework/
+/// → exe から ../../.. で Frameworks/ に到達。
 #[cfg(target_os = "macos")]
 fn load_cef_auto() {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let cef_dir = cef::sys::get_cef_dir().expect("CEF directory not found");
-    let framework_path = cef_dir.join(cef::sys::FRAMEWORK_PATH);
+    let exe = std::env::current_exe().expect("failed to get current_exe");
+    let frameworks_dir = exe
+        .parent().unwrap()   // MacOS
+        .parent().unwrap()   // Contents
+        .parent().unwrap()   // Helper.app
+        .parent().unwrap();  // Frameworks
+    let framework_path = frameworks_dir.join(cef::sys::FRAMEWORK_PATH);
     let cstr = CString::new(framework_path.as_os_str().as_bytes()).unwrap();
     assert_eq!(
         cef::load_library(Some(unsafe { &*cstr.as_ptr().cast() })),
         1,
-        "Failed to load CEF framework"
+        "Failed to load CEF framework: {}",
+        framework_path.display()
     );
     cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
 }

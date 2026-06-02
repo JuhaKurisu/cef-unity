@@ -70,19 +70,25 @@ fn drain_logs() -> Vec<String> {
 // CEF loader
 // ---------------------------------------------------------------------------
 
-/// macOS: get_cef_dir() でフレームワークを探して動的ロードする。
+/// macOS: current_exe() からの相対パスで CEF フレームワークを動的ロードする。
+/// バンドル構造: Contents/MacOS/<exe> → Contents/Frameworks/Chromium Embedded Framework.framework/
 #[cfg(target_os = "macos")]
 fn load_cef_auto() {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let cef_dir = cef::sys::get_cef_dir().expect("CEF directory not found");
-    let framework_path = cef_dir.join(cef::sys::FRAMEWORK_PATH);
+    let exe = std::env::current_exe().expect("failed to get current_exe");
+    let frameworks_dir = exe
+        .parent().unwrap()   // MacOS
+        .parent().unwrap()   // Contents
+        .join("Frameworks");
+    let framework_path = frameworks_dir.join(cef::sys::FRAMEWORK_PATH);
     let cstr = CString::new(framework_path.as_os_str().as_bytes()).unwrap();
     assert_eq!(
         cef::load_library(Some(unsafe { &*cstr.as_ptr().cast() })),
         1,
-        "Failed to load CEF framework"
+        "Failed to load CEF framework: {}",
+        framework_path.display()
     );
     cef::api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
 }
@@ -582,11 +588,13 @@ impl CefServer {
         settings.root_cache_path = CefString::from(cache_dir.to_str().unwrap());
         settings.browser_subprocess_path = CefString::from(helper_path.to_str().unwrap());
 
-        // macOS: Framework ベースのパス設定
+        // macOS: exe からの相対パスで Framework を解決
         #[cfg(target_os = "macos")]
         {
-            let cef_dir = cef::sys::get_cef_dir().expect("CEF directory not found");
-            let framework_dir = cef_dir.join("Chromium Embedded Framework.framework");
+            let frameworks_dir = exe_dir
+                .parent().unwrap()   // Contents
+                .join("Frameworks");
+            let framework_dir = frameworks_dir.join("Chromium Embedded Framework.framework");
             let resources_dir = framework_dir.join("Resources");
             settings.framework_dir_path = CefString::from(framework_dir.to_str().unwrap());
             settings.resources_dir_path = CefString::from(resources_dir.to_str().unwrap());
