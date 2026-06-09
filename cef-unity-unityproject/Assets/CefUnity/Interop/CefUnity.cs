@@ -590,6 +590,36 @@ namespace CefUnity.Interop
             }
         }
 
+        /// <summary>
+        /// CEF Viz Compositor に「次のフレームを描いてよい」と通知する。
+        /// Unity の Update 冒頭で毎フレーム呼ぶことで、CEF と Unity のフレーム周期が
+        /// 同期する (自発的 windowless_frame_rate 駆動の置き換え)。
+        /// <paramref name="unityFrame"/> には Time.frameCount を渡す。on_accelerated_paint
+        /// で shm に転送され、GetAccelPaintUnityFrame() で読むことで end-to-end の
+        /// 遅延フレーム数を測定できる。
+        /// </summary>
+        public void SendExternalBeginFrame(ulong unityFrame)
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                NativeMethods.cef_unity_send_external_begin_frame(_handle, unityFrame);
+            }
+        }
+
+        /// <summary>
+        /// 最後の on_accelerated_paint に対応する SendExternalBeginFrame の Time.frameCount を返す。
+        /// 現在の Time.frameCount との差が end-to-end の遅延フレーム数 (0 = 同一フレーム取得)。
+        /// </summary>
+        public ulong GetAccelPaintUnityFrame()
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                return NativeMethods.cef_unity_get_accel_paint_unity_frame(_handle);
+            }
+        }
+
         public unsafe void GetImeCaret(out int x, out int y, out int w, out int h)
         {
             ThrowIfDisposed();

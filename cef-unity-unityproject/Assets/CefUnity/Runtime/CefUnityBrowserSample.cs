@@ -94,6 +94,25 @@ namespace CefUnity.Runtime
         private bool _useAcceleratedPaint;
         private IntPtr _lastAccelTexPtr;
 
+        // End-to-end frame delay measurement (BeginFrame frame - paint frame)
+        private int _delaySampleCount;
+        private long _delaySumFrames;
+        private int _delayMaxFrames;
+        private int _delayMinFrames = int.MaxValue;
+        private readonly int[] _delayBuckets = new int[8]; // 0,1,2,3,4,5,6,7+ frames
+        private float _delayReportTimer;
+
+        // Spin/取得失敗の検証用メトリクス
+        private int _lateUpdateInvokeCount;     // LateUpdate 自体の呼び出し回数
+        private int _spinTimeoutCount;          // spin タイムアウトで諦めた回数
+        private int _recvFailCount;             // TryRecv*Texture が false で return した回数
+        private double _spinElapsedSumSec;       // spin 経過時間合計
+        private double _spinElapsedMaxSec;       // spin 最長
+        private int _spinZeroCount;             // spin に入った瞬間に既に条件成立していた回数
+        // 最近の生サンプルを保持 (frame_count, paint_unity_frame, delta) でログ出力
+        private readonly System.Collections.Generic.Queue<(int fc, ulong pf, int delta)> _recentSamples
+            = new System.Collections.Generic.Queue<(int, ulong, int)>();
+
         // Double/triple click detection
         private float _lastClickTime;
         private int _lastClickX = -1;
@@ -108,6 +127,12 @@ namespace CefUnity.Runtime
             {
                 _currentWidth = Screen.width;
                 _currentHeight = Screen.height;
+
+                // CEF Viz Compositor は VSync ロックで 60Hz paint。Unity の LateUpdate を
+                // それより高頻度にすると半分以上のフレームで paint が間に合わず取得失敗 →
+                // 1 フレーム遅延が発生する。Unity を 60fps に固定して CEF と同期させる。
+                QualitySettings.vSyncCount = 0;
+                Application.targetFrameRate = 60;
 
                 var useGpu = !(SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12 || SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11);
                 CefRuntime.Init();
@@ -129,6 +154,14 @@ namespace CefUnity.Runtime
         {
             CefRuntime.Pump();
 
+            // フレーム冒頭で BeginFrame を発行 → CEF が Update〜LateUpdate の間に paint。
+            // Time.frameCount を一緒に渡すことで、UpdateTexture 時に「何フレーム前の
+            // BeginFrame に対応するか」を測定できる。
+            if (_browser != null)
+            {
+                _browser.SendExternalBeginFrame((ulong)Time.frameCount);
+            }
+
             _diagTimer += Time.deltaTime;
             if (_diagTimer >= 2f)
             {
@@ -142,6 +175,41 @@ namespace CefUnity.Runtime
                     var logs = CefRuntime.GetLogs();
                     foreach (var line in logs)
                         Debug.Log($"[CefServer] {line}");
+
+                    if (_delaySampleCount > 0)
+                    {
+                        var avg = (float)_delaySumFrames / _delaySampleCount;
+                        var sb = new StringBuilder();
+                        sb.Append($"[CefUnity] end-to-end frame delay (n={_delaySampleCount}): avg={avg:F2} min={_delayMinFrames} max={_delayMaxFrames} buckets=[");
+                        for (int i = 0; i < _delayBuckets.Length; i++)
+                        {
+                            if (i > 0) sb.Append(' ');
+                            sb.Append($"{i}{(i == _delayBuckets.Length - 1 ? "+" : "")}:{_delayBuckets[i]}");
+                        }
+                        sb.Append(']');
+                        Debug.Log(sb.ToString());
+
+                        // 検証メトリクス: LateUpdate 全体に対する取得成功率、spin の挙動、生サンプル
+                        var spinAvg = _lateUpdateInvokeCount > 0 ? _spinElapsedSumSec / _lateUpdateInvokeCount * 1000.0 : 0.0;
+                        Debug.Log($"[CefUnity] verify: LateUpdate={_lateUpdateInvokeCount} recv_ok={_delaySampleCount} recv_fail={_recvFailCount} spin_zero={_spinZeroCount} spin_timeout={_spinTimeoutCount} spin_avg={spinAvg:F3}ms spin_max={_spinElapsedMaxSec * 1000.0:F3}ms");
+                        var sb2 = new StringBuilder("[CefUnity] verify samples (fc, paint_fc, delta):");
+                        foreach (var s in _recentSamples)
+                            sb2.Append($" ({s.fc},{s.pf},{s.delta})");
+                        Debug.Log(sb2.ToString());
+
+                        _delaySampleCount = 0;
+                        _delaySumFrames = 0;
+                        _delayMaxFrames = 0;
+                        _delayMinFrames = int.MaxValue;
+                        for (int i = 0; i < _delayBuckets.Length; i++) _delayBuckets[i] = 0;
+                        _lateUpdateInvokeCount = 0;
+                        _spinTimeoutCount = 0;
+                        _recvFailCount = 0;
+                        _spinElapsedSumSec = 0;
+                        _spinElapsedMaxSec = 0;
+                        _spinZeroCount = 0;
+                        _recentSamples.Clear();
+                    }
                 }
             }
 
@@ -156,7 +224,10 @@ namespace CefUnity.Runtime
 
         private void LateUpdate()
         {
+            _lateUpdateInvokeCount++;
             // フレーム後半: server が paint した最新フレームを取得する。
+            // Update 冒頭で投げた BeginFrame に対する paint がこのタイミングまでに
+            // 到着していれば、同一 Unity フレーム内で反映される (0 遅延)。
             UpdateTexture();
         }
 
@@ -534,10 +605,36 @@ namespace CefUnity.Runtime
             int w, h;
             uint format;
 
+            // 0 遅延を達成するため、Update で投げた BeginFrame (= 現在 Time.frameCount) に対応する
+            // paint が shm に届くまで短時間 spin で待つ。これにより BeginFrame 発行〜表示までを
+            // 同一 Unity フレーム内に押し込む。
+            // タイムアウト 8ms (Unity 120fps の 1 フレーム分)、超えたら諦めて取れる最新を使う。
+            // GetAccelPaintUnityFrame は FFI で shm の AtomicU64 を 1 回読むだけなので極めて軽量。
+            const float SpinBudgetSec = 0.008f;
+            var spinStart = Time.realtimeSinceStartup;
+            int currentFrame = Time.frameCount;
+            bool spinTimeout = false;
+            int spinIterations = 0;
+            while (true)
+            {
+                ulong p = _browser.GetAccelPaintUnityFrame();
+                if (p >= (ulong)currentFrame) break;
+                spinIterations++;
+                if (Time.realtimeSinceStartup - spinStart > SpinBudgetSec) { spinTimeout = true; break; }
+            }
+            var spinElapsed = Time.realtimeSinceStartup - spinStart;
+            _spinElapsedSumSec += spinElapsed;
+            if (spinElapsed > _spinElapsedMaxSec) _spinElapsedMaxSec = spinElapsed;
+            if (spinIterations == 0) _spinZeroCount++; // 一回も loop せず即 break = ほぼノーコスト
+            if (spinTimeout) _spinTimeoutCount++;
+
 #if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
             // macOS: IOSurface 経由で毎フレーム新しい Metal テクスチャを受信 → Release が必要
             if (!Browser.TryRecvIOSurfaceTexture(out newTexPtr, out w, out h, out format))
+            {
+                _recvFailCount++;
                 return;
+            }
 #elif UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
             // Windows: Unity の graphics backend に応じて D3D11/D3D12 を使い分け。
             // ポインタはサイズ変更時以外は安定 (client lib 側でキャッシュ管理)、Release 不要。
@@ -545,7 +642,7 @@ namespace CefUnity.Runtime
             var gotFrame = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12
                 ? _browser.TryRecvD3D12Texture(out newTexPtr, out w, out h, out format)
                 : _browser.TryRecvD3D11Texture(out newTexPtr, out w, out h, out format);
-            if (!gotFrame) return;
+            if (!gotFrame) { _recvFailCount++; return; }
 #else
         return;
 #endif
@@ -558,6 +655,28 @@ namespace CefUnity.Runtime
                 Browser.ReleaseMetalTexture(newTexPtr);
 #endif
                 return;
+            }
+
+            // End-to-end frame delay 計測: server が「この paint は Unity frame N の
+            // BeginFrame に対応する」とマークした N を読み、現在の frameCount との差で
+            // 何 Unity フレーム遅れて画面に出るかを測る。0 = 同一フレーム取得 = 0 遅延。
+            var paintUnityFrame = _browser.GetAccelPaintUnityFrame();
+            if (paintUnityFrame > 0)
+            {
+                long delta = Time.frameCount - (long)paintUnityFrame;
+                if (delta >= -10 && delta < 1000) // delta<0 は理論的にはあり得ないが念のため
+                {
+                    int d = (int)delta;
+                    _delaySumFrames += d;
+                    _delaySampleCount++;
+                    if (d > _delayMaxFrames) _delayMaxFrames = d;
+                    if (d < _delayMinFrames) _delayMinFrames = d;
+                    int bucket = d >= 0 && d < _delayBuckets.Length ? d : _delayBuckets.Length - 1;
+                    _delayBuckets[bucket]++;
+                    // 生サンプルを 5 件まで保持 (検証用)
+                    if (_recentSamples.Count >= 5) _recentSamples.Dequeue();
+                    _recentSamples.Enqueue((Time.frameCount, paintUnityFrame, d));
+                }
             }
 
             if (_texture == null || _texture.width != w || _texture.height != h)

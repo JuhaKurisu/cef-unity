@@ -193,6 +193,24 @@ namespace CefUnity
         public static extern void cef_unity_ime_finish_composing_text(CefUnityBrowser* handle, int keep_selection);
 
         /// <summary>
+        ///  External BeginFrame: CEF Viz Compositor に次フレームの描画許可を出す。
+        ///  Unity の Update 冒頭で呼ぶ。Init 時に WindowInfo::external_begin_frame_enabled=1
+        ///  が立っているブラウザに対してのみ意味を持つ。fire-and-forget。
+        ///  `unity_frame` には Time.frameCount を渡す。on_accelerated_paint 経由で shm に転送され、
+        ///  `cef_unity_get_accel_paint_unity_frame` で読み取ることで end-to-end の遅延フレーム数を測れる。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_send_external_begin_frame", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_send_external_begin_frame(CefUnityBrowser* handle, ulong unity_frame);
+
+        /// <summary>
+        ///  最後の on_accelerated_paint に対応する SendExternalBeginFrame 発行時の Unity frame
+        ///  番号を返す。Unity 側は `Time.frameCount - 戻り値` で end-to-end の遅延フレーム数
+        ///  (BeginFrame 発行から実際にテクスチャが使えるようになるまで) を計算できる。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_get_accel_paint_unity_frame", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern ulong cef_unity_get_accel_paint_unity_frame(CefUnityBrowser* handle);
+
+        /// <summary>
         ///  Cancel the current IME composition.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_ime_cancel_composition", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]

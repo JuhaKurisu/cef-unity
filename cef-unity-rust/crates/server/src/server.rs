@@ -4,7 +4,8 @@ use cef::*;
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 // ---------------------------------------------------------------------------
 // IOSurface FFI (macOS only)
@@ -122,6 +123,69 @@ struct BrowserState {
 
 static PAINT_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// ---------------------------------------------------------------------------
+// BeginFrame → on_accelerated_paint レイテンシ計測
+// ---------------------------------------------------------------------------
+
+/// プロセス起動からのモノトニック時刻基準点。
+fn epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+fn now_ns() -> u64 {
+    epoch().elapsed().as_nanos() as u64
+}
+
+/// 最後に send_external_begin_frame を呼んだ時刻 (ns since epoch)。
+/// 0 は未発行を意味する。
+static LAST_BEGIN_FRAME_NS: AtomicU64 = AtomicU64::new(0);
+
+/// 最後の SendExternalBeginFrame に載っていた Unity の Time.frameCount。
+/// on_accelerated_paint で shm に転送し、Unity 側で end-to-end の遅延フレーム数を測る。
+static LAST_BEGIN_FRAME_UNITY_FRAME: AtomicU64 = AtomicU64::new(0);
+
+/// 直近 N サンプルの BeginFrame → paint レイテンシ集計バッファ (μs 単位)。
+const LATENCY_WINDOW: usize = 60;
+static LATENCY_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// paint 到着時にレイテンシを記録し、N サンプル貯まったら統計をログに出す。
+fn record_paint_latency() {
+    let begin_ns = LAST_BEGIN_FRAME_NS.load(Ordering::Relaxed);
+    if begin_ns == 0 {
+        return; // BeginFrame 未発行 (初期化中の自発フレーム等)
+    }
+    let now = now_ns();
+    if now <= begin_ns {
+        return;
+    }
+    let elapsed_us = (now - begin_ns) / 1000;
+
+    let mut samples = LATENCY_SAMPLES.lock().unwrap();
+    samples.push(elapsed_us);
+    if samples.len() >= LATENCY_WINDOW {
+        let count = samples.len() as u64;
+        let sum: u64 = samples.iter().sum();
+        let avg = sum / count;
+        let min = *samples.iter().min().unwrap();
+        let max = *samples.iter().max().unwrap();
+        // 中央値も出す (外れ値の影響を見るため)
+        let mut sorted = samples.clone();
+        sorted.sort_unstable();
+        let median = sorted[sorted.len() / 2];
+        samples.clear();
+        drop(samples);
+        log(&format!(
+            "BeginFrame→paint latency (n={}): avg={}.{:03}ms median={}.{:03}ms min={}.{:03}ms max={}.{:03}ms",
+            count,
+            avg / 1000, avg % 1000,
+            median / 1000, median % 1000,
+            min / 1000, min % 1000,
+            max / 1000, max % 1000,
+        ));
+    }
+}
+
 wrap_render_handler! {
     struct ServerRenderHandler {
         shm: Arc<ShmWriter>,
@@ -205,6 +269,9 @@ wrap_render_handler! {
                     0u32
                 };
 
+                // BeginFrame → paint レイテンシを記録 (外的 BeginFrame モードでのみ意味あり)
+                record_paint_latency();
+
                 let count = PAINT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
                 // GPU blit: CEF IOSurface → pool IOSurface (must complete before returning)
@@ -226,7 +293,8 @@ wrap_render_handler! {
                     mach_iosurface_server_send(pool_surface, w, h, format)
                 };
 
-                if count <= 5 || count.is_multiple_of(3000) {
+                // 生存確認用ログ: 最初の 5 件 + 600 件ごと (≒10秒 @ 60fps)
+                if count <= 5 || count.is_multiple_of(600) {
                     let src_id = unsafe { IOSurfaceGetID(io_surface) };
                     let dst_id = unsafe { IOSurfaceGetID(pool_surface) };
                     let has_client = unsafe { mach_iosurface_server_has_client() };
@@ -238,6 +306,11 @@ wrap_render_handler! {
 
                 // Also write metadata to ShmHeader (for frame change detection)
                 let surface_id = unsafe { IOSurfaceGetID(pool_surface) };
+                // accel_frame_id 増分の前に Unity frame を書く: クライアントは frame_id 変化
+                // を検出してから他フィールドを読むため、これより前に書いてあれば read 時に
+                // 必ず観測される。
+                self.shm
+                    .write_paint_unity_frame(LAST_BEGIN_FRAME_UNITY_FRAME.load(Ordering::Relaxed));
                 self.shm.write_iosurface_info(surface_id, w, h, format);
             }
 
@@ -277,14 +350,21 @@ wrap_render_handler! {
                 };
                 let src_handle = WinHandle(src_handle_raw as *mut _);
 
+                // BeginFrame → paint レイテンシを記録 (外的 BeginFrame モードでのみ意味あり)
+                record_paint_latency();
+
                 match pool.copy_from_source(src_handle, w, h, dxgi_format) {
                     Ok((client_handle, fence_value)) => {
-                        if count <= 5 || count.is_multiple_of(300) {
+                        if count <= 5 || count.is_multiple_of(600) {
                             log(&format!(
                                 "on_accelerated_paint #{}: {}x{} fmt={} client_handle=0x{:x} fence={}",
                                 count, w, h, format_tag, client_handle, fence_value
                             ));
                         }
+                        // d3d11_frame_id 増分の前に Unity frame を書く。
+                        self.shm.write_paint_unity_frame(
+                            LAST_BEGIN_FRAME_UNITY_FRAME.load(Ordering::Relaxed),
+                        );
                         self.shm
                             .write_d3d11_handle(client_handle, w, h, format_tag, fence_value);
                     }
@@ -708,6 +788,10 @@ impl CefServer {
                 keep_selection,
             } => self.ime_finish_composing_text(browser_id, keep_selection),
             Command::ImeCancelComposition { browser_id } => self.ime_cancel_composition(browser_id),
+            Command::SendExternalBeginFrame {
+                browser_id,
+                unity_frame,
+            } => self.send_external_begin_frame(browser_id, unity_frame),
             Command::GetLogs => Response::Logs {
                 entries: drain_logs(),
             },
@@ -796,6 +880,11 @@ impl CefServer {
         if d3d11_pool.is_some() {
             window_info.shared_texture_enabled = 1;
         }
+        // External BeginFrame: Unity の LateUpdate から SendExternalBeginFrame で 1 フレーム
+        // ずつ駆動する。これにより CEF の Viz Compositor は自発的に paint せず、
+        // Unity のフレーム周期と完全に同期する (二重レート/位相ドリフトの解消)。
+        // windowless_frame_rate はこのモードでは無視される。
+        window_info.external_begin_frame_enabled = 1;
         let ok = browser_host_create_browser(
             Some(&window_info),
             Some(&mut client),
@@ -1190,6 +1279,29 @@ impl CefServer {
                 && let Some(host) = Browser::host(browser)
             {
                 BrowserHost::ime_cancel_composition(&host);
+            }
+            Response::Ok
+        } else {
+            Response::Error {
+                msg: format!("browser {} not found", browser_id),
+            }
+        }
+    }
+
+    /// External BeginFrame を発行する。WindowInfo::external_begin_frame_enabled=1 の
+    /// ブラウザに対してのみ意味を持ち、CEF Viz Compositor に「次のフレームを描いてよい」
+    /// と通知する。Unity の Update 冒頭で呼ぶ想定。
+    /// `unity_frame` は発行時の Time.frameCount。on_accelerated_paint で shm に転送され、
+    /// Unity 側が end-to-end の遅延フレーム数を計算する。
+    fn send_external_begin_frame(&self, browser_id: u32, unity_frame: u64) -> Response {
+        if let Some(state) = self.browsers.get(&browser_id) {
+            if let Some(ref browser) = *state.browser.lock().unwrap()
+                && let Some(host) = Browser::host(browser)
+            {
+                // 発行時刻 + Unity frame を記録 → on_accelerated_paint 側で読む。
+                LAST_BEGIN_FRAME_NS.store(now_ns(), Ordering::Relaxed);
+                LAST_BEGIN_FRAME_UNITY_FRAME.store(unity_frame, Ordering::Relaxed);
+                BrowserHost::send_external_begin_frame(&host);
             }
             Response::Ok
         } else {

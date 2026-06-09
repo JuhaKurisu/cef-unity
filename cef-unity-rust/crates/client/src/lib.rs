@@ -1047,6 +1047,45 @@ pub extern "C" fn cef_unity_ime_finish_composing_text(
     }
 }
 
+/// External BeginFrame: CEF Viz Compositor に次フレームの描画許可を出す。
+/// Unity の Update 冒頭で呼ぶ。Init 時に WindowInfo::external_begin_frame_enabled=1
+/// が立っているブラウザに対してのみ意味を持つ。fire-and-forget。
+/// `unity_frame` には Time.frameCount を渡す。on_accelerated_paint 経由で shm に転送され、
+/// `cef_unity_get_accel_paint_unity_frame` で読み取ることで end-to-end の遅延フレーム数を測れる。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_send_external_begin_frame(
+    handle: *mut CefUnityBrowser,
+    unity_frame: u64,
+) {
+    if handle.is_null() {
+        return;
+    }
+    let instance = handle_to_ref(handle);
+
+    let guard = CONNECTION.lock().unwrap();
+    if let Some(conn) = guard.as_ref() {
+        send_command_no_wait(
+            conn,
+            Command::SendExternalBeginFrame {
+                browser_id: instance.browser_id,
+                unity_frame,
+            },
+        );
+    }
+}
+
+/// 最後の on_accelerated_paint に対応する SendExternalBeginFrame 発行時の Unity frame
+/// 番号を返す。Unity 側は `Time.frameCount - 戻り値` で end-to-end の遅延フレーム数
+/// (BeginFrame 発行から実際にテクスチャが使えるようになるまで) を計算できる。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_get_accel_paint_unity_frame(handle: *mut CefUnityBrowser) -> u64 {
+    if handle.is_null() {
+        return 0;
+    }
+    let instance = handle_to_ref(handle);
+    instance.shm.read_paint_unity_frame()
+}
+
 /// Cancel the current IME composition.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_ime_cancel_composition(handle: *mut CefUnityBrowser) {

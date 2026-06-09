@@ -174,12 +174,14 @@ pub fn run_event_loop(state: ServerState) -> ServerState {
             release: std::ptr::null(),
             copy_description: std::ptr::null(),
         };
-        // Short fallback interval for responsive JS execution.
+        // Short fallback interval for responsive JS execution + low BeginFrame→paint latency.
         // CEF also controls timing via schedule_pump() for immediate work.
+        // 1ms (1000Hz) は External BeginFrame モードで Unity の同フレーム取得 (0 遅延) を狙う際に必要。
+        // CFRunLoopTimer は 1ms の精度を持つので CPU 負荷上昇は限定的。
         let timer = CFRunLoopTimerCreate(
             std::ptr::null(),
             CFAbsoluteTimeGetCurrent(),
-            0.004, // 4ms fallback interval (~250Hz)
+            0.001, // 1ms fallback interval (~1000Hz)
             0,
             0,
             timer_callback,

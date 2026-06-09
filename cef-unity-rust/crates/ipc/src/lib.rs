@@ -95,6 +95,14 @@ pub enum Command {
     ImeCancelComposition {
         browser_id: u32,
     },
+    /// External BeginFrame: Unity 側のフレーム冒頭で発行され、CEF Viz Compositor に
+    /// 「次のフレームを描いてよい」と通知する。WindowInfo::external_begin_frame_enabled=1
+    /// 時のみ意味を持ち、windowless_frame_rate に基づく自発フレーム生成を置き換える。
+    /// `unity_frame` は発行時の Time.frameCount。end-to-end フレーム遅延計測に使う。
+    SendExternalBeginFrame {
+        browser_id: u32,
+        unity_frame: u64,
+    },
     GetLogs,
     Shutdown,
 }
@@ -175,6 +183,10 @@ pub struct ShmHeader {
     /// 待ってからサンプルする。書き込み順は: フレームピクセル書き込み → Signal →
     /// この値更新 → d3d11_frame_id 更新。
     pub d3d11_fence_value: AtomicU64,
+    /// 直近の on_accelerated_paint に対応する SendExternalBeginFrame 発行時の
+    /// Unity フレーム番号 (Time.frameCount)。Unity 側はこれと現在の frameCount の
+    /// 差分で end-to-end のフレーム遅延を測れる。0 = 未設定。
+    pub accel_paint_unity_frame: AtomicU64,
 }
 
 use std::sync::atomic::AtomicI32;
@@ -245,6 +257,16 @@ impl ShmWriter {
         header.accel_height.store(height, Ordering::Release);
         header.accel_format.store(format, Ordering::Release);
         header.accel_frame_id.fetch_add(1, Ordering::Release);
+    }
+
+    /// この paint に対応する SendExternalBeginFrame 発行時の Unity frame 番号を書き込む。
+    /// accel_frame_id / d3d11_frame_id を更新する**前**に書くこと
+    /// (クライアントは frame_id 増分を検出してから他フィールドを読むため)。
+    pub fn write_paint_unity_frame(&self, unity_frame: u64) {
+        let header = self.header();
+        header
+            .accel_paint_unity_frame
+            .store(unity_frame, Ordering::Release);
     }
 
     /// Windows: NT 共有 HANDLE (client プロセスへ DuplicateHandle 済みの値) を書き込む。
@@ -358,6 +380,13 @@ impl ShmReader {
             return None;
         }
         Some((surface_id, width, height, format))
+    }
+
+    /// 最後の paint が対応する Unity frame 番号 (Time.frameCount) を読む。
+    /// Unity 側は current frame との差で end-to-end の遅延フレーム数を計算する。
+    pub fn read_paint_unity_frame(&self) -> u64 {
+        let header = unsafe { &*(self.shmem.as_ptr() as *const ShmHeader) };
+        header.accel_paint_unity_frame.load(Ordering::Acquire)
     }
 
     /// Read IME caret rect from the shared memory header.
