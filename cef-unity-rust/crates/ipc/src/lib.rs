@@ -389,6 +389,16 @@ impl ShmReader {
         header.accel_paint_unity_frame.load(Ordering::Acquire)
     }
 
+    /// accelerated paint の単調増加カウンタ (accel_frame_id) を消費せずに覗き見る。
+    /// server は on_accelerated_paint ごとに、IOSurface の Mach 送信が完了した**後**に
+    /// このカウンタを +1 する。したがって「このカウンタが進んだ」ことを観測できれば、
+    /// 対応する IOSurface の Mach メッセージは既にクライアントの受信ポートに enqueue 済みで、
+    /// 次の drain で確実に取得できる。double-pump で flush 後の新規 paint を待つ同期に使う。
+    pub fn peek_accel_frame_id(&self) -> u64 {
+        let header = unsafe { &*(self.shmem.as_ptr() as *const ShmHeader) };
+        header.accel_frame_id.load(Ordering::Acquire)
+    }
+
     /// Read IME caret rect from the shared memory header.
     pub fn read_ime_caret(&self) -> (i32, i32, i32, i32) {
         let header = unsafe { &*(self.shmem.as_ptr() as *const ShmHeader) };

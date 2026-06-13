@@ -1086,6 +1086,19 @@ pub extern "C" fn cef_unity_get_accel_paint_unity_frame(handle: *mut CefUnityBro
     instance.shm.read_paint_unity_frame()
 }
 
+/// accelerated paint の単調増加カウンタ (accel_frame_id) を消費せずに返す。
+/// double-pump 同期に使う: flush BeginFrame の直前にこの値を記録し、flush 後に
+/// この値を超えるまで待てば、flush が生成した最新 paint の IOSurface が
+/// 受信ポートに届いていることが保証される (server は Mach 送信完了後に +1 する)。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_peek_accel_frame_id(handle: *mut CefUnityBrowser) -> u64 {
+    if handle.is_null() {
+        return 0;
+    }
+    let instance = handle_to_ref(handle);
+    instance.shm.peek_accel_frame_id()
+}
+
 /// Cancel the current IME composition.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_ime_cancel_composition(handle: *mut CefUnityBrowser) {

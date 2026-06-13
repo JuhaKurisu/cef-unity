@@ -5,6 +5,8 @@ using System.Text;
 using CefUnity.Interop;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.LowLevel;
+using UnityEngine.PlayerLoop;
 using UnityEngine.Rendering;
 using UnityEngine.UI;
 #if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
@@ -13,6 +15,10 @@ using System.Runtime.InteropServices;
 
 namespace CefUnity.Runtime
 {
+    // PlayerLoop に挿入するサブシステムの識別用マーカー型
+    public struct CefUnityEarlyUpdate { }
+    public struct CefUnityPostLateUpdate { }
+
     public class CefUnityBrowserSample : MonoBehaviour
     {
         private const float DoubleClickTime = 0.3f;
@@ -102,13 +108,27 @@ namespace CefUnity.Runtime
         private readonly int[] _delayBuckets = new int[8]; // 0,1,2,3,4,5,6,7+ frames
         private float _delayReportTimer;
 
-        // Spin/取得失敗の検証用メトリクス
-        private int _lateUpdateInvokeCount;     // LateUpdate 自体の呼び出し回数
-        private int _spinTimeoutCount;          // spin タイムアウトで諦めた回数
-        private int _recvFailCount;             // TryRecv*Texture が false で return した回数
-        private double _spinElapsedSumSec;       // spin 経過時間合計
-        private double _spinElapsedMaxSec;       // spin 最長
-        private int _spinZeroCount;             // spin に入った瞬間に既に条件成立していた回数
+        // 実験: double-pump (PostLateUpdate で同フレームの BeginFrame をもう 1 発撃ち、
+        // renderer が submit 済みの最新 CompositorFrame を display に draw させる)。
+        // <temp_dir>/cef_unity_double_pump が存在すると有効。
+        private static readonly bool s_doublePump =
+            System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_unity_double_pump"));
+
+        // EarlyUpdate で BeginFrame#1 を送った時刻 (flush タイミング制御用)
+        private float _bfSentTime;
+
+        // PlayerLoop hook 用の singleton 参照 (現在のサンプル構成は単一 Browser のみ対応)
+        private static CefUnityBrowserSample s_instance;
+        // PlayerLoop hook を install したかどうか
+        private bool _playerLoopHooked;
+
+        // 同 Unity フレーム内で 1 回取得したらフレーム末まで再取得しないフラグ
+        private int _textureUpdatedFrame = -1;
+
+        // 検証用メトリクス
+        private int _postLateUpdateInvokeCount;  // PostLateUpdate hook の呼び出し回数
+        private int _gotInPostLateUpdateCount;   // PostLateUpdate で取得成功した回数
+        private int _recvFailCount;              // 取得失敗 (1 frame 遅延扱い)
         // 最近の生サンプルを保持 (frame_count, paint_unity_frame, delta) でログ出力
         private readonly System.Collections.Generic.Queue<(int fc, ulong pf, int delta)> _recentSamples
             = new System.Collections.Generic.Queue<(int, ulong, int)>();
@@ -138,6 +158,13 @@ namespace CefUnity.Runtime
                 CefRuntime.Init();
                 _browser = new Browser(_currentWidth, _currentHeight, _url);
 
+                // PlayerLoop に EarlyUpdate / PostLateUpdate の hook を挿入。
+                // EarlyUpdate 末尾で「入力送信 + BeginFrame」、PostLateUpdate 末尾で
+                // 「TryRecv」を行うことで、入力遅延 0 + 描画遅延ほぼ 0 + block ゼロを目指す。
+                s_instance = this;
+                InstallPlayerLoopHooks();
+                _playerLoopHooked = true;
+
                 // 共通: macOS は Mach port 経由の IOSurface、Windows は D3D11 共有テクスチャ。
                 // Init() がサーバーを起動し接続を行うため、その後にチェック。
                 _useAcceleratedPaint = Browser.IsAcceleratedConnected();
@@ -153,14 +180,8 @@ namespace CefUnity.Runtime
         private void Update()
         {
             CefRuntime.Pump();
-
-            // フレーム冒頭で BeginFrame を発行 → CEF が Update〜LateUpdate の間に paint。
-            // Time.frameCount を一緒に渡すことで、UpdateTexture 時に「何フレーム前の
-            // BeginFrame に対応するか」を測定できる。
-            if (_browser != null)
-            {
-                _browser.SendExternalBeginFrame((ulong)Time.frameCount);
-            }
+            // 入力処理 + BeginFrame 発行は PlayerLoop の EarlyUpdate 末尾 (OnEarlyUpdateLast)
+            // で行うため、ここからは削除した。MonoBehaviour.Update の役割は Pump と診断のみ。
 
             _diagTimer += Time.deltaTime;
             if (_diagTimer >= 2f)
@@ -189,9 +210,8 @@ namespace CefUnity.Runtime
                         sb.Append(']');
                         Debug.Log(sb.ToString());
 
-                        // 検証メトリクス: LateUpdate 全体に対する取得成功率、spin の挙動、生サンプル
-                        var spinAvg = _lateUpdateInvokeCount > 0 ? _spinElapsedSumSec / _lateUpdateInvokeCount * 1000.0 : 0.0;
-                        Debug.Log($"[CefUnity] verify: LateUpdate={_lateUpdateInvokeCount} recv_ok={_delaySampleCount} recv_fail={_recvFailCount} spin_zero={_spinZeroCount} spin_timeout={_spinTimeoutCount} spin_avg={spinAvg:F3}ms spin_max={_spinElapsedMaxSec * 1000.0:F3}ms");
+                        // 検証メトリクス: PostLateUpdate hook での取得統計
+                        Debug.Log($"[CefUnity] verify: PostLateUpdate={_postLateUpdateInvokeCount} recv_ok={_gotInPostLateUpdateCount} recv_fail={_recvFailCount}");
                         var sb2 = new StringBuilder("[CefUnity] verify samples (fc, paint_fc, delta):");
                         foreach (var s in _recentSamples)
                             sb2.Append($" ({s.fc},{s.pf},{s.delta})");
@@ -202,33 +222,33 @@ namespace CefUnity.Runtime
                         _delayMaxFrames = 0;
                         _delayMinFrames = int.MaxValue;
                         for (int i = 0; i < _delayBuckets.Length; i++) _delayBuckets[i] = 0;
-                        _lateUpdateInvokeCount = 0;
-                        _spinTimeoutCount = 0;
+                        _postLateUpdateInvokeCount = 0;
+                        _gotInPostLateUpdateCount = 0;
                         _recvFailCount = 0;
-                        _spinElapsedSumSec = 0;
-                        _spinElapsedMaxSec = 0;
-                        _spinZeroCount = 0;
                         _recentSamples.Clear();
                     }
                 }
             }
 
-            // フレーム前半: 入力を server へ送る。LateUpdate のテクスチャ取得までに
-            // server が処理を終えていれば、同一フレーム内で反映される。
-            CheckScreenResize();
-            HandleMouseInput();
-            UpdateCompositionCursorPos();
-            HandleImeInput();
-            HandleKeyboardInput();
+            // 入力処理 + BeginFrame 発行は EarlyUpdate hook へ移動。
+            // テクスチャ取得は PostLateUpdate hook へ移動。
+            // → MonoBehaviour.Update / LateUpdate は Pump + 診断ログのみを担当。
         }
 
-        private void LateUpdate()
+        /// <summary>同 Unity フレーム内で 1 回だけ取得試行 (spin なし、block なし)。</summary>
+        /// <returns>このフレームで初めて取得成功した時のみ true。それ以外は false。</returns>
+        private bool TryUpdateTextureOnce()
         {
-            _lateUpdateInvokeCount++;
-            // フレーム後半: server が paint した最新フレームを取得する。
-            // Update 冒頭で投げた BeginFrame に対する paint がこのタイミングまでに
-            // 到着していれば、同一 Unity フレーム内で反映される (0 遅延)。
-            UpdateTexture();
+            if (_browser == null) return false;
+            if (_textureUpdatedFrame == Time.frameCount) return false;
+            if (!_useAcceleratedPaint)
+            {
+                UpdateTextureSoftware();
+                _textureUpdatedFrame = Time.frameCount;
+                return true;
+            }
+            // accelerated paint: 取得できた時だけフラグを立てる
+            return TryUpdateTextureAcceleratedNonBlocking();
         }
 
         public void LoadUrl(string url)
@@ -238,6 +258,13 @@ namespace CefUnity.Runtime
 
         private void OnDestroy()
         {
+            if (_playerLoopHooked)
+            {
+                UninstallPlayerLoopHooks();
+                _playerLoopHooked = false;
+            }
+            if (s_instance == this) s_instance = null;
+
             _browser?.Dispose();
             _browser = null;
 
@@ -255,6 +282,113 @@ namespace CefUnity.Runtime
 
             CefRuntime.Shutdown();
             if (_enableLog) Debug.Log("[CefUnity] Shutdown");
+        }
+
+        // -----------------------------------------------------------------------
+        // PlayerLoop hooks
+        // -----------------------------------------------------------------------
+
+        /// <summary>
+        /// EarlyUpdate の末尾に挿入される hook。
+        /// Unity の Input は EarlyUpdate 内の `UpdateInputManager` / `NewInputUpdate`
+        /// で更新されるので、ここに差し込めば Input は既に取得済み。
+        /// 入力を CEF へ送って BeginFrame を発行 → MonoBehaviour.Update より前に CEF の
+        /// paint を開始させることで、PostLateUpdate での取得が確実に間に合う。
+        /// </summary>
+        private static void OnEarlyUpdateLast()
+        {
+            var self = s_instance;
+            if (self == null || self._browser == null) return;
+            self.CheckScreenResize();
+            self.HandleMouseInput();
+            self.UpdateCompositionCursorPos();
+            self.HandleImeInput();
+            self.HandleKeyboardInput();
+            self._browser.SendExternalBeginFrame((ulong)Time.frameCount);
+            self._bfSentTime = Time.realtimeSinceStartup;
+        }
+
+        /// <summary>
+        /// PostLateUpdate の末尾に挿入される hook。
+        /// 全 MonoBehaviour LateUpdate / Animator / Physics が完了した直後の Camera Render
+        /// 直前。この時点で CEF paint が Mach port に届いている確率が極めて高いので、
+        /// spin / block 無しの即時 TryRecv で同フレーム反映を狙う。
+        /// </summary>
+        private static void OnPostLateUpdateLast()
+        {
+            var self = s_instance;
+            if (self == null || self._browser == null) return;
+            self._postLateUpdateInvokeCount++;
+            // 実験: 2発目の BeginFrame (flush)。EarlyUpdate の BeginFrame#1 に応答して
+            // renderer が submit した最新 CompositorFrame を display compositor に draw させる。
+            // renderer の submit には BF#1 から ~3ms かかるため、4ms 経過を待ってから flush し、
+            // paint 着弾 (~3ms) までスピン受信する。
+            if (s_doublePump)
+            {
+                while (Time.realtimeSinceStartup - self._bfSentTime < 0.004f) { }
+                self._browser.SendExternalBeginFrame((ulong)Time.frameCount);
+                var deadline = Time.realtimeSinceStartup + 0.008f;
+                var got = false;
+                while (!got && Time.realtimeSinceStartup < deadline)
+                    got = self.TryUpdateTextureOnce();
+                if (got) self._gotInPostLateUpdateCount++;
+                else self._recvFailCount++;
+                return;
+            }
+            if (self.TryUpdateTextureOnce()) self._gotInPostLateUpdateCount++;
+            else if (self._textureUpdatedFrame != Time.frameCount) self._recvFailCount++;
+        }
+
+        private static void InstallPlayerLoopHooks()
+        {
+            var loop = PlayerLoop.GetCurrentPlayerLoop();
+            for (int i = 0; i < loop.subSystemList.Length; i++)
+            {
+                if (loop.subSystemList[i].type == typeof(EarlyUpdate))
+                    loop.subSystemList[i] = AppendSubsystem(loop.subSystemList[i], typeof(CefUnityEarlyUpdate), OnEarlyUpdateLast);
+                else if (loop.subSystemList[i].type == typeof(PostLateUpdate))
+                    loop.subSystemList[i] = AppendSubsystem(loop.subSystemList[i], typeof(CefUnityPostLateUpdate), OnPostLateUpdateLast);
+            }
+            PlayerLoop.SetPlayerLoop(loop);
+        }
+
+        private static void UninstallPlayerLoopHooks()
+        {
+            var loop = PlayerLoop.GetCurrentPlayerLoop();
+            for (int i = 0; i < loop.subSystemList.Length; i++)
+            {
+                if (loop.subSystemList[i].type == typeof(EarlyUpdate))
+                    loop.subSystemList[i] = RemoveSubsystem(loop.subSystemList[i], typeof(CefUnityEarlyUpdate));
+                else if (loop.subSystemList[i].type == typeof(PostLateUpdate))
+                    loop.subSystemList[i] = RemoveSubsystem(loop.subSystemList[i], typeof(CefUnityPostLateUpdate));
+            }
+            PlayerLoop.SetPlayerLoop(loop);
+        }
+
+        private static PlayerLoopSystem AppendSubsystem(PlayerLoopSystem parent, Type marker, PlayerLoopSystem.UpdateFunction update)
+        {
+            var oldList = parent.subSystemList ?? Array.Empty<PlayerLoopSystem>();
+            // 既に同 marker が入っていたら何もしない (二重 install 防止)
+            for (int i = 0; i < oldList.Length; i++)
+                if (oldList[i].type == marker) return parent;
+            var newList = new PlayerLoopSystem[oldList.Length + 1];
+            Array.Copy(oldList, newList, oldList.Length);
+            newList[oldList.Length] = new PlayerLoopSystem { type = marker, updateDelegate = update };
+            parent.subSystemList = newList;
+            return parent;
+        }
+
+        private static PlayerLoopSystem RemoveSubsystem(PlayerLoopSystem parent, Type marker)
+        {
+            var oldList = parent.subSystemList;
+            if (oldList == null) return parent;
+            var idx = Array.FindIndex(oldList, s => s.type == marker);
+            if (idx < 0) return parent;
+            var newList = new PlayerLoopSystem[oldList.Length - 1];
+            Array.Copy(oldList, 0, newList, 0, idx);
+            Array.Copy(oldList, idx + 1, newList, idx, oldList.Length - idx - 1);
+            parent.subSystemList = newList;
+            return parent;
         }
 
         // -----------------------------------------------------------------------
@@ -578,26 +712,15 @@ namespace CefUnity.Runtime
             }
         }
 
-        private void UpdateTexture()
-        {
-            if (_browser == null) return;
-
-            if (_useAcceleratedPaint)
-            {
-                UpdateTextureAccelerated();
-                return;
-            }
-
-            UpdateTextureSoftware();
-        }
-
         // Profiling for accelerated texture path
         private int _accelProfCount;
         private float _accelProfRecvTotal;
         private float _accelProfUpdateTotal;
         private float _accelProfReleaseTotal;
 
-        private void UpdateTextureAccelerated()
+        /// <summary>spin / block なしで accelerated texture の取得を試みる。
+        /// 取得成功 = 同フレーム内反映できた場合は true、その他 (新フレーム未到着等) は false。</summary>
+        private bool TryUpdateTextureAcceleratedNonBlocking()
         {
             var t0 = Time.realtimeSinceStartup;
 
@@ -605,46 +728,19 @@ namespace CefUnity.Runtime
             int w, h;
             uint format;
 
-            // 0 遅延を達成するため、Update で投げた BeginFrame (= 現在 Time.frameCount) に対応する
-            // paint が shm に届くまで短時間 spin で待つ。これにより BeginFrame 発行〜表示までを
-            // 同一 Unity フレーム内に押し込む。
-            // タイムアウト 8ms (Unity 120fps の 1 フレーム分)、超えたら諦めて取れる最新を使う。
-            // GetAccelPaintUnityFrame は FFI で shm の AtomicU64 を 1 回読むだけなので極めて軽量。
-            const float SpinBudgetSec = 0.008f;
-            var spinStart = Time.realtimeSinceStartup;
-            int currentFrame = Time.frameCount;
-            bool spinTimeout = false;
-            int spinIterations = 0;
-            while (true)
-            {
-                ulong p = _browser.GetAccelPaintUnityFrame();
-                if (p >= (ulong)currentFrame) break;
-                spinIterations++;
-                if (Time.realtimeSinceStartup - spinStart > SpinBudgetSec) { spinTimeout = true; break; }
-            }
-            var spinElapsed = Time.realtimeSinceStartup - spinStart;
-            _spinElapsedSumSec += spinElapsed;
-            if (spinElapsed > _spinElapsedMaxSec) _spinElapsedMaxSec = spinElapsed;
-            if (spinIterations == 0) _spinZeroCount++; // 一回も loop せず即 break = ほぼノーコスト
-            if (spinTimeout) _spinTimeoutCount++;
-
 #if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
             // macOS: IOSurface 経由で毎フレーム新しい Metal テクスチャを受信 → Release が必要
             if (!Browser.TryRecvIOSurfaceTexture(out newTexPtr, out w, out h, out format))
-            {
-                _recvFailCount++;
-                return;
-            }
+                return false;
 #elif UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
             // Windows: Unity の graphics backend に応じて D3D11/D3D12 を使い分け。
             // ポインタはサイズ変更時以外は安定 (client lib 側でキャッシュ管理)、Release 不要。
-            if (_browser == null) return;
             var gotFrame = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12
                 ? _browser.TryRecvD3D12Texture(out newTexPtr, out w, out h, out format)
                 : _browser.TryRecvD3D11Texture(out newTexPtr, out w, out h, out format);
-            if (!gotFrame) { _recvFailCount++; return; }
+            if (!gotFrame) return false;
 #else
-        return;
+            return false;
 #endif
 
             var t1 = Time.realtimeSinceStartup;
@@ -654,7 +750,7 @@ namespace CefUnity.Runtime
 #if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
                 Browser.ReleaseMetalTexture(newTexPtr);
 #endif
-                return;
+                return false;
             }
 
             // End-to-end frame delay 計測: server が「この paint は Unity frame N の
@@ -718,6 +814,8 @@ namespace CefUnity.Runtime
                 _accelProfCount = 0;
                 _accelProfRecvTotal = _accelProfUpdateTotal = _accelProfReleaseTotal = 0;
             }
+            _textureUpdatedFrame = Time.frameCount;
+            return true;
         }
 
         private void UpdateTextureSoftware()

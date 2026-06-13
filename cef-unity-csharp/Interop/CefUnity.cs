@@ -456,6 +456,21 @@ public sealed class Browser : IDisposable
             }
         }
 
+        /// <summary>
+        /// accelerated paint の単調増加カウンタ (accel_frame_id) を消費せずに返す。
+        /// double-pump で flush BeginFrame 後の新規 paint 到着を検出する同期に使う。
+        /// この値が増えた時点で、対応する IOSurface の Mach メッセージは受信ポートに
+        /// enqueue 済みなので、次の TryRecvIOSurfaceTexture で確実に取得できる。
+        /// </summary>
+        public ulong PeekAccelFrameId()
+        {
+            ThrowIfDisposed();
+            unsafe
+            {
+                return NativeMethods.cef_unity_peek_accel_frame_id(_handle);
+            }
+        }
+
         public unsafe void GetImeCaret(out int x, out int y, out int w, out int h)
         {
             ThrowIfDisposed();
