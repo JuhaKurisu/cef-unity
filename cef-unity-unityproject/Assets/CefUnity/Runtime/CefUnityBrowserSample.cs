@@ -108,14 +108,42 @@ namespace CefUnity.Runtime
         private readonly int[] _delayBuckets = new int[8]; // 0,1,2,3,4,5,6,7+ frames
         private float _delayReportTimer;
 
-        // 実験: double-pump (PostLateUpdate で同フレームの BeginFrame をもう 1 発撃ち、
-        // renderer が submit 済みの最新 CompositorFrame を display に draw させる)。
-        // <temp_dir>/cef_unity_double_pump が存在すると有効。
-        private static readonly bool s_doublePump =
-            System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_unity_double_pump"));
-
-        // EarlyUpdate で BeginFrame#1 を送った時刻 (flush タイミング制御用)
-        private float _bfSentTime;
+        // -----------------------------------------------------------------------
+        // Double-pump (0 frame 描画遅延)
+        // -----------------------------------------------------------------------
+        // CEF external BeginFrame は deadline=null で発行されるため、1 回の BeginFrame
+        // では display compositor が renderer の submit を待たず「前フレーム」を即 draw する
+        // (構造的 1F 遅延)。これを 1 Unity フレーム内で BeginFrame を 2 回発行して回避する:
+        //   1) EarlyUpdate: 入力送信 + BeginFrame#1 → renderer が当該フレームの内容を生成
+        //   2) PostLateUpdate: renderer submit を待って BeginFrame#2 (flush) → display が
+        //      最新内容を draw → その paint が届くまで待って同フレーム内にテクスチャ反映
+        // accel_frame_id (paint ごとに +1、Mach 送信完了後に増分) を同期カウンタに使い、
+        // 「flush 後に新しく到着した paint」だけを採用することで早着 paint (#1 由来の古い
+        // 内容) の誤取得を防ぐ。accelerated paint 経路でのみ有効。
+        [SerializeField] private bool _doublePump = true;
+        // #A (BeginFrame#1 の即時 draw) が accel_frame_id に計上されるのを待つ上限 (ms)。
+        // baseline に #A を確実に含めて、flush 後の最初の AFI 増分が必ず fresh paint (#B)
+        // になるようにするためのガード。アニメーション時は ~3ms で early-exit する。
+        [SerializeField] private float _doublePumpSettleMs = 4f;
+        // flush 後、fresh paint (#B) が届くのを待つ上限 (ms)。AFI 増分で early-exit する。
+        [SerializeField] private float _doublePumpRecvMs = 12f;
+        // recv 待ちの間、flush (BeginFrame#2) を撃ち直す間隔 (ms)。renderer の submit が
+        // 何 ms 後でも、次の flush が最新内容を draw するので fresh paint を取り逃さない。
+        [SerializeField] private float _doublePumpFlushIntervalMs = 2f;
+        // EarlyUpdate で BeginFrame#1 を撃つ直前の accel_frame_id (#A 計上待ちの基準)。
+        private ulong _afiAtBf1;
+        // 直近で fresh paint を取得してからの経過フレーム数。アクティブ判定に使う
+        // (静止ページで毎フレーム spin して main thread をブロックするのを防ぐ)。
+        private int _framesSinceFreshPaint = int.MaxValue;
+        private const int ActivityWindowFrames = 8;
+        // このフレームで CEF へ入力イベントを送ったか (アクティブ判定の即時トリガー)。
+        private bool _inputSentThisFrame;
+        // double-pump 検証メトリクス
+        private int _dpFreshCount;     // flush 後 0F で取得できた回数
+        private int _dpFallbackCount;  // タイムアウトで諦めた回数 (前フレーム内容を継続表示)
+        private int _dpIdleCount;      // 非アクティブで spin をスキップした回数
+        private double _dpBlockSumMs;  // PostLateUpdate でのブロック時間合計
+        private double _dpBlockMaxMs;
 
         // PlayerLoop hook 用の singleton 参照 (現在のサンプル構成は単一 Browser のみ対応)
         private static CefUnityBrowserSample s_instance;
@@ -153,6 +181,11 @@ namespace CefUnity.Runtime
                 // 1 フレーム遅延が発生する。Unity を 60fps に固定して CEF と同期させる。
                 QualitySettings.vSyncCount = 0;
                 Application.targetFrameRate = 60;
+
+                // double-pump 予算の防御的クランプ (0 だと常時 1F フォールバックに陥るため)
+                if (_doublePumpSettleMs <= 0f) _doublePumpSettleMs = 4f;
+                if (_doublePumpRecvMs <= 0f) _doublePumpRecvMs = 12f;
+                if (_doublePumpFlushIntervalMs <= 0f) _doublePumpFlushIntervalMs = 2f;
 
                 var useGpu = !(SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12 || SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11);
                 CefRuntime.Init();
@@ -227,6 +260,19 @@ namespace CefUnity.Runtime
                         _recvFailCount = 0;
                         _recentSamples.Clear();
                     }
+
+                    // double-pump 専用メトリクス (fresh=0F取得 / fallback=1F / idle=spinスキップ)。
+                    if (_doublePump && _useAcceleratedPaint)
+                    {
+                        var dpActive = _dpFreshCount + _dpFallbackCount;
+                        var blockAvg = dpActive > 0 ? _dpBlockSumMs / dpActive : 0.0;
+                        Debug.Log($"[CefUnity] double-pump: fresh(0F)={_dpFreshCount} fallback(1F)={_dpFallbackCount} idle={_dpIdleCount} block_avg={blockAvg:F2}ms block_max={_dpBlockMaxMs:F2}ms");
+                        _dpFreshCount = 0;
+                        _dpFallbackCount = 0;
+                        _dpIdleCount = 0;
+                        _dpBlockSumMs = 0;
+                        _dpBlockMaxMs = 0;
+                    }
                 }
             }
 
@@ -292,51 +338,122 @@ namespace CefUnity.Runtime
         /// EarlyUpdate の末尾に挿入される hook。
         /// Unity の Input は EarlyUpdate 内の `UpdateInputManager` / `NewInputUpdate`
         /// で更新されるので、ここに差し込めば Input は既に取得済み。
-        /// 入力を CEF へ送って BeginFrame を発行 → MonoBehaviour.Update より前に CEF の
-        /// paint を開始させることで、PostLateUpdate での取得が確実に間に合う。
+        /// 入力を CEF へ送って BeginFrame#1 を発行 → renderer に当該フレームの内容生成を
+        /// 開始させる。flush (BeginFrame#2) は PostLateUpdate で発行する。
         /// </summary>
         private static void OnEarlyUpdateLast()
         {
             var self = s_instance;
             if (self == null || self._browser == null) return;
+            self._inputSentThisFrame = false;
             self.CheckScreenResize();
             self.HandleMouseInput();
             self.UpdateCompositionCursorPos();
             self.HandleImeInput();
             self.HandleKeyboardInput();
+            // BeginFrame#1 直前の paint カウンタを記録 (#A 計上待ちの基準)。
+            if (self._useAcceleratedPaint)
+                self._afiAtBf1 = self._browser.PeekAccelFrameId();
+            // BeginFrame#1: renderer に「このフレームの入力を反映した内容」を作らせる。
             self._browser.SendExternalBeginFrame((ulong)Time.frameCount);
-            self._bfSentTime = Time.realtimeSinceStartup;
         }
 
         /// <summary>
-        /// PostLateUpdate の末尾に挿入される hook。
-        /// 全 MonoBehaviour LateUpdate / Animator / Physics が完了した直後の Camera Render
-        /// 直前。この時点で CEF paint が Mach port に届いている確率が極めて高いので、
-        /// spin / block 無しの即時 TryRecv で同フレーム反映を狙う。
+        /// PostLateUpdate の末尾に挿入される hook。全 MonoBehaviour LateUpdate / Animator /
+        /// Physics 完了直後、Camera Render 直前。ここで flush (BeginFrame#2) を発行して
+        /// display compositor に「renderer が submit した最新内容」を draw させ、その paint が
+        /// 届くまで待って同一フレーム内にテクスチャ反映する (0F)。
         /// </summary>
         private static void OnPostLateUpdateLast()
         {
             var self = s_instance;
             if (self == null || self._browser == null) return;
             self._postLateUpdateInvokeCount++;
-            // 実験: 2発目の BeginFrame (flush)。EarlyUpdate の BeginFrame#1 に応答して
-            // renderer が submit した最新 CompositorFrame を display compositor に draw させる。
-            // renderer の submit には BF#1 から ~3ms かかるため、4ms 経過を待ってから flush し、
-            // paint 着弾 (~3ms) までスピン受信する。
-            if (s_doublePump)
+
+            // accelerated paint 経路 + double-pump 有効時のみ flush 同期を行う。
+            // software 経路や double-pump 無効時は従来通り即時 1 回取得。
+            if (self._doublePump && self._useAcceleratedPaint)
+                self.PumpAndRecvAccelerated();
+            else if (self.TryUpdateTextureOnce())
+                self._gotInPostLateUpdateCount++;
+            else if (self._textureUpdatedFrame != Time.frameCount)
+                self._recvFailCount++;
+        }
+
+        /// <summary>
+        /// double-pump の flush + 受信本体。flush 前に baseline となる accel_frame_id を
+        /// 記録し、flush 後に「baseline を超える新規 paint」が届くまで待ってから取得する。
+        /// これにより BeginFrame#1 由来の古い paint (#A) ではなく flush 由来の最新 paint
+        /// (#B) を確実に掴む。静止フレーム (アクティブでない) では spin せずブロックを避ける。
+        /// </summary>
+        private void PumpAndRecvAccelerated()
+        {
+            var blockStart = Time.realtimeSinceStartup;
+
+            // アクティブ判定: 入力があった or 直近で paint が動いていれば flush 後の paint を
+            // 期待して spin する。完全静止状態では spin せず、前フレームの内容を継続表示する。
+            var expectPaint = _inputSentThisFrame || _framesSinceFreshPaint < ActivityWindowFrames;
+
+            if (!expectPaint)
             {
-                while (Time.realtimeSinceStartup - self._bfSentTime < 0.004f) { }
-                self._browser.SendExternalBeginFrame((ulong)Time.frameCount);
-                var deadline = Time.realtimeSinceStartup + 0.008f;
-                var got = false;
-                while (!got && Time.realtimeSinceStartup < deadline)
-                    got = self.TryUpdateTextureOnce();
-                if (got) self._gotInPostLateUpdateCount++;
-                else self._recvFailCount++;
+                // 非アクティブ: flush だけ発行し (内容変化があれば次フレーム以降で拾う)、
+                // すでに届いている paint があれば消費するが spin はしない。
+                _browser.SendExternalBeginFrame((ulong)Time.frameCount);
+                if (TryUpdateTextureOnce()) { _gotInPostLateUpdateCount++; _framesSinceFreshPaint = 0; }
+                else if (_framesSinceFreshPaint != int.MaxValue) _framesSinceFreshPaint++;
+                _dpIdleCount++;
                 return;
             }
-            if (self.TryUpdateTextureOnce()) self._gotInPostLateUpdateCount++;
-            else if (self._textureUpdatedFrame != Time.frameCount) self._recvFailCount++;
+
+            // 1) #A (BeginFrame#1 の即時 draw) が accel_frame_id に計上されるまで待つ。
+            //    これを baseline に含めないと、flush 後に遅れて届いた #A (古い内容) を
+            //    fresh paint と誤認してしまう。アニメーション時は ~3ms で抜ける。
+            //    #A に damage が無い (内容無変化) 場合は上限まで待って先に進む (その場合
+            //    そもそも古い stale paint が生成されないので baseline に #A が無くても安全)。
+            var settleDeadline = Time.realtimeSinceStartup + _doublePumpSettleMs * 0.001f;
+            while (Time.realtimeSinceStartup < settleDeadline
+                   && _browser.PeekAccelFrameId() == _afiAtBf1) { }
+
+            // 2) baseline 記録。この時点で #A は計上済み (または damage 無しで存在しない)。
+            var baseline = _browser.PeekAccelFrameId();
+
+            // 3) reflush ループ: 一定間隔で flush (BeginFrame#2) を撃ちつつ、baseline を
+            //    超える fresh paint (#B) が届くまで待つ。renderer の submit が flush より
+            //    遅れても、次の flush が最新内容を draw するので取り逃さない。
+            //    accel_frame_id の増分は Mach 送信完了後なので、増えた時点で IOSurface は
+            //    受信ポートに到達済み → drain で確実に取得できる。
+            var recvDeadline = Time.realtimeSinceStartup + _doublePumpRecvMs * 0.001f;
+            var flushInterval = _doublePumpFlushIntervalMs * 0.001f;
+            var nextFlush = 0f; // 即 flush
+            var arrived = false;
+            while (Time.realtimeSinceStartup < recvDeadline)
+            {
+                var t = Time.realtimeSinceStartup;
+                if (t >= nextFlush)
+                {
+                    _browser.SendExternalBeginFrame((ulong)Time.frameCount);
+                    nextFlush = t + flushInterval;
+                }
+                if (_browser.PeekAccelFrameId() != baseline) { arrived = true; break; }
+            }
+
+            if (arrived && TryUpdateTextureOnce())
+            {
+                _gotInPostLateUpdateCount++;
+                _dpFreshCount++;
+                _framesSinceFreshPaint = 0;
+            }
+            else
+            {
+                // タイムアウト: 新規 paint が間に合わなかった (renderer 遅延等)。
+                // 前フレームのテクスチャを継続表示し、次フレームで拾う (1F フォールバック)。
+                _dpFallbackCount++;
+                if (_framesSinceFreshPaint != int.MaxValue) _framesSinceFreshPaint++;
+            }
+
+            var blockMs = (Time.realtimeSinceStartup - blockStart) * 1000.0;
+            _dpBlockSumMs += blockMs;
+            if (blockMs > _dpBlockMaxMs) _dpBlockMaxMs = blockMs;
         }
 
         private static void InstallPlayerLoopHooks()
@@ -428,9 +545,11 @@ namespace CefUnity.Runtime
                 _browser.ImeSetComposition(comp, (uint)comp.Length, (uint)comp.Length);
                 _imeActive = true;
                 _imeSuppressKeys = true;
+                _inputSentThisFrame = true;
             }
             else if (_imeActive)
             {
+                _inputSentThisFrame = true;
                 // composition 終了 (非空 → 空に変化)
                 var committed = false;
                 foreach (var c in input)
@@ -529,6 +648,7 @@ namespace CefUnity.Runtime
                 _lastMouseX = bx;
                 _lastMouseY = by;
                 _browser.SendMouseMove(bx, by, mods);
+                _inputSentThisFrame = true;
             }
 
             HandleButton(bx, by, 0, MouseButton.Left, mods);
@@ -537,7 +657,10 @@ namespace CefUnity.Runtime
 
             var scroll = Input.mouseScrollDelta;
             if (scroll.y != 0f || scroll.x != 0f)
+            {
                 _browser.SendMouseWheel(bx, by, (int)(scroll.x * 60), (int)(scroll.y * 60), mods);
+                _inputSentThisFrame = true;
+            }
         }
 
         private void HandleButton(int bx, int by, int unityButton, MouseButton cefButton, uint mods)
@@ -563,10 +686,14 @@ namespace CefUnity.Runtime
                 }
 
                 _browser.SendMouseClick(bx, by, cefButton, false, _clickCount, mods);
+                _inputSentThisFrame = true;
             }
 
             if (Input.GetMouseButtonUp(unityButton))
+            {
                 _browser.SendMouseClick(bx, by, cefButton, true, _clickCount, mods);
+                _inputSentThisFrame = true;
+            }
         }
 
         /// <summary>
@@ -623,6 +750,7 @@ namespace CefUnity.Runtime
                     // 英数/かなキーが生成する偽スペースをフィルタ
                     if (c == ' ' && !Input.GetKey(KeyCode.Space)) continue;
                     _browser.SendCharEvent(c, mods);
+                    _inputSentThisFrame = true;
                 }
 
             // 2) macOS キー変換: CEF OSR は interpretKeyEvents: パイプラインが無いため手動変換
@@ -658,14 +786,15 @@ namespace CefUnity.Runtime
             //    CEF OSR では send_key_event でショートカットが処理されないため Frame の編集メソッドを直接呼ぶ
             if (cmd || ctrl)
             {
-                if (Input.GetKeyDown(KeyCode.C)) _browser.Copy();
-                if (Input.GetKeyDown(KeyCode.V)) _browser.Paste();
-                if (Input.GetKeyDown(KeyCode.X)) _browser.Cut();
-                if (Input.GetKeyDown(KeyCode.A)) _browser.SelectAll();
+                if (Input.GetKeyDown(KeyCode.C)) { _browser.Copy(); _inputSentThisFrame = true; }
+                if (Input.GetKeyDown(KeyCode.V)) { _browser.Paste(); _inputSentThisFrame = true; }
+                if (Input.GetKeyDown(KeyCode.X)) { _browser.Cut(); _inputSentThisFrame = true; }
+                if (Input.GetKeyDown(KeyCode.A)) { _browser.SelectAll(); _inputSentThisFrame = true; }
                 if (Input.GetKeyDown(KeyCode.Z))
                 {
                     if ((mods & (uint)CefEventFlags.ShiftDown) != 0) _browser.Redo();
                     else _browser.Undo();
+                    _inputSentThisFrame = true;
                 }
             }
         }
@@ -677,6 +806,7 @@ namespace CefUnity.Runtime
                 _browser.SendKeyEvent(KeyEventType.RawKeyDown, cefKey, mods);
                 _keyDownTime[unityKey] = Time.unscaledTime;
                 _keyLastRepeat[unityKey] = Time.unscaledTime;
+                _inputSentThisFrame = true;
             }
             else if (Input.GetKey(unityKey))
             {
@@ -688,6 +818,7 @@ namespace CefUnity.Runtime
                 {
                     _browser.SendKeyEvent(KeyEventType.RawKeyDown, cefKey, mods);
                     _keyLastRepeat[unityKey] = now;
+                    _inputSentThisFrame = true;
                 }
             }
 
@@ -696,6 +827,7 @@ namespace CefUnity.Runtime
                 _browser.SendKeyEvent(KeyEventType.KeyUp, cefKey, mods);
                 _keyDownTime.Remove(unityKey);
                 _keyLastRepeat.Remove(unityKey);
+                _inputSentThisFrame = true;
             }
         }
 
