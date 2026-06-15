@@ -125,6 +125,10 @@ fn timer_callback_inner() {
         return;
     }
 
+    // server-side flush: 保留中の BeginFrame#2 (flush) を発行時刻が来ていれば撃つ。
+    // do_message_loop_work の前に行い、同じ pump サイクルで compositor が draw する。
+    state.cef_server.process_pending_flushes();
+
     cef::do_message_loop_work();
     state.pump_count += 1;
 }

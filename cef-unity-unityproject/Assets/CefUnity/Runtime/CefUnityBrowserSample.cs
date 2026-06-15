@@ -158,6 +158,7 @@ namespace CefUnity.Runtime
         private float _lastFreshRealtime = -1f;
         private double _ciSum, _ciSumSq, _ciMax;
         private int _ciCount;
+        private bool _navTestDone; // 計測用
 
         // PlayerLoop hook 用の singleton 参照 (現在のサンプル構成は単一 Browser のみ対応)
         private static CefUnityBrowserSample s_instance;
@@ -229,6 +230,20 @@ namespace CefUnity.Runtime
             CefRuntime.Pump();
             // 入力処理 + BeginFrame 発行は PlayerLoop の EarlyUpdate 末尾 (OnEarlyUpdateLast)
             // で行うため、ここからは削除した。MonoBehaviour.Update の役割は Pump と診断のみ。
+
+            // 計測用 (一時): temp ファイルで testufo 遷移 + 擬似ゲーム負荷 (8ms 空回し)。
+            var tmpDir = System.IO.Path.GetTempPath();
+            if (!_navTestDone && System.IO.File.Exists(System.IO.Path.Combine(tmpDir, "cef_load_testufo")))
+            {
+                _navTestDone = true;
+                LoadUrl("https://testufo.com/mouserate");
+            }
+            if (System.IO.File.Exists(System.IO.Path.Combine(tmpDir, "cef_fake_work")))
+            {
+                var until = Time.realtimeSinceStartup + 0.008f;
+                while (Time.realtimeSinceStartup < until) { }
+            }
+
 
             // 機構1 計装: フレーム時間 (present 間隔) の分布を毎フレーム集計。
             var ft = Time.unscaledDeltaTime;
@@ -408,11 +423,11 @@ namespace CefUnity.Runtime
             if (self == null || self._browser == null) return;
             self._postLateUpdateInvokeCount++;
 
-            // accelerated paint 経路 + double-pump 有効時のみ flush 同期を行う。
-            // software 経路や double-pump 無効時は従来通り即時 1 回取得。
-            if (self._doublePump && self._useAcceleratedPaint)
-                self.PumpAndRecvAccelerated();
-            else if (self.TryUpdateTextureOnce())
+            // server-side flush 方式: flush (BeginFrame#2) はサーバーが内部で発行するため、
+            // クライアントは spin も追加 BeginFrame も無しで「最新を 1 回ノンブロッキング受信」
+            // するだけ。これで Unity をブロックせず、サーバーが間に合えば同フレームの最新内容
+            // (0F) を、間に合わなければ前フレーム内容 (1F) を表示する (どちらもブロック 0)。
+            if (self.TryUpdateTextureOnce())
             {
                 self._gotInPostLateUpdateCount++;
                 self.RecordContentInterval();

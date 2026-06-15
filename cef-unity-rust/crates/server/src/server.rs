@@ -617,6 +617,32 @@ unsafe extern "C" {
 // Server
 // ---------------------------------------------------------------------------
 
+/// Server-side double-pump (flush) の保留状態。
+/// クライアントから 1 回 SendExternalBeginFrame (BF#1) を受けると、サーバーは event loop
+/// の 1ms tick 上で数 ms 後に追加の BeginFrame (flush) を内部発行する。これにより
+/// 「BF#1 で renderer が生成 → flush で display が最新内容を draw」を **クライアントを
+/// ブロックせずに** 完結させ、Unity 側はノンブロッキング受信だけで 0F を得る。
+struct PendingFlush {
+    browser_id: u32,
+    unity_frame: u64,
+    /// BF#1 を発行した時刻。flush のスケジュール基準。
+    bf1: Instant,
+    /// これまでに発行した flush 回数。
+    flushes_done: u32,
+}
+
+/// flush を発行する経過時間しきい値 (ms)。renderer submit (実測 ~1.5-3ms) を跨ぐよう
+/// +3ms と +5ms の 2 段で撃ち、遅い submit も取り逃さない。すべてサーバースレッド上で
+/// 行われ Unity をブロックしない。
+const FLUSH_THRESHOLDS_MS: [f64; 2] = [3.0, 5.0];
+
+/// 計測用トグル: `<temp_dir>/cef_no_server_flush` が在ると server-side flush を無効化
+/// (BF#1 のみ = 1F baseline)。プロセス起動時に 1 回だけ判定 (server は Play ごとに再起動)。
+fn server_flush_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !std::env::temp_dir().join("cef_no_server_flush").exists())
+}
+
 pub struct CefServer {
     browsers: HashMap<u32, BrowserState>,
     next_browser_id: AtomicU32,
@@ -627,6 +653,8 @@ pub struct CefServer {
     /// GPU (accelerated paint) を使うか。false の場合 D3D11Pool を作らず
     /// shared_texture_enabled を立てないため、CEF は on_paint (software) のみ呼ぶ。
     use_gpu: bool,
+    /// Server-side flush の保留状態 (現状は単一 Browser 構成を想定)。
+    pending_flush: Option<PendingFlush>,
 }
 
 impl CefServer {
@@ -637,6 +665,7 @@ impl CefServer {
             server_pid: std::process::id(),
             client_pid,
             use_gpu,
+            pending_flush: None,
         }
     }
 
@@ -1288,26 +1317,76 @@ impl CefServer {
         }
     }
 
-    /// External BeginFrame を発行する。WindowInfo::external_begin_frame_enabled=1 の
-    /// ブラウザに対してのみ意味を持ち、CEF Viz Compositor に「次のフレームを描いてよい」
-    /// と通知する。Unity の Update 冒頭で呼ぶ想定。
-    /// `unity_frame` は発行時の Time.frameCount。on_accelerated_paint で shm に転送され、
-    /// Unity 側が end-to-end の遅延フレーム数を計算する。
-    fn send_external_begin_frame(&self, browser_id: u32, unity_frame: u64) -> Response {
-        if let Some(state) = self.browsers.get(&browser_id) {
-            if let Some(ref browser) = *state.browser.lock().unwrap()
-                && let Some(host) = Browser::host(browser)
-            {
-                // 発行時刻 + Unity frame を記録 → on_accelerated_paint 側で読む。
-                LAST_BEGIN_FRAME_NS.store(now_ns(), Ordering::Relaxed);
-                LAST_BEGIN_FRAME_UNITY_FRAME.store(unity_frame, Ordering::Relaxed);
-                BrowserHost::send_external_begin_frame(&host);
-            }
-            Response::Ok
-        } else {
-            Response::Error {
+    /// 指定ブラウザに External BeginFrame を 1 回発行する低レベルヘルパ。
+    /// 発行時刻 + unity_frame を記録 (on_accelerated_paint 側で読む)。
+    /// host が取得できた (= 実際に発行した) 場合 true。
+    fn issue_begin_frame(&self, browser_id: u32, unity_frame: u64) -> bool {
+        if let Some(state) = self.browsers.get(&browser_id)
+            && let Some(ref browser) = *state.browser.lock().unwrap()
+            && let Some(host) = Browser::host(browser)
+        {
+            LAST_BEGIN_FRAME_NS.store(now_ns(), Ordering::Relaxed);
+            LAST_BEGIN_FRAME_UNITY_FRAME.store(unity_frame, Ordering::Relaxed);
+            BrowserHost::send_external_begin_frame(&host);
+            return true;
+        }
+        false
+    }
+
+    /// External BeginFrame (BF#1) を発行し、server-side flush を予約する。
+    /// クライアント (Unity) は 1 フレームに 1 回だけこれを呼べばよい。flush (BF#2..) は
+    /// サーバーが event loop の tick 上で内部発行するため、クライアントは追加の BeginFrame を
+    /// 撃つ必要がなく (IPC フラッディング無し)、PostLateUpdate でノンブロッキング受信するだけで
+    /// 同フレーム内の最新内容 (0F) を得られる。
+    /// `unity_frame` は発行時の Time.frameCount。
+    fn send_external_begin_frame(&mut self, browser_id: u32, unity_frame: u64) -> Response {
+        if !self.browsers.contains_key(&browser_id) {
+            return Response::Error {
                 msg: format!("browser {} not found", browser_id),
+            };
+        }
+        if self.issue_begin_frame(browser_id, unity_frame) && server_flush_enabled() {
+            // flush を予約 (tick で +3ms, +5ms に発行)。
+            self.pending_flush = Some(PendingFlush {
+                browser_id,
+                unity_frame,
+                bf1: Instant::now(),
+                flushes_done: 0,
+            });
+        }
+        Response::Ok
+    }
+
+    /// event loop の tick (macOS は 1ms 間隔) から毎回呼ばれる。保留中の flush の発行時刻が
+    /// 来ていれば BeginFrame (flush) を発行する。サーバースレッド上で動くため Unity を
+    /// ブロックしない。BF#1 由来の renderer submit を跨ぐタイミングで撃つことで、display が
+    /// 最新内容を draw → on_accelerated_paint が fresh #B を Mach 送信する。
+    pub fn process_pending_flushes(&mut self) {
+        let action = {
+            let Some(pf) = self.pending_flush.as_mut() else {
+                return;
+            };
+            let idx = pf.flushes_done as usize;
+            if idx >= FLUSH_THRESHOLDS_MS.len() {
+                None // すべて発行済み → クリア
+            } else {
+                let elapsed_ms = pf.bf1.elapsed().as_secs_f64() * 1000.0;
+                if elapsed_ms >= FLUSH_THRESHOLDS_MS[idx] {
+                    pf.flushes_done += 1;
+                    Some((pf.browser_id, pf.unity_frame, pf.flushes_done))
+                } else {
+                    return; // まだ発行時刻でない (保留継続)
+                }
             }
+        };
+        match action {
+            Some((bid, uf, done)) => {
+                self.issue_begin_frame(bid, uf);
+                if done as usize >= FLUSH_THRESHOLDS_MS.len() {
+                    self.pending_flush = None;
+                }
+            }
+            None => self.pending_flush = None,
         }
     }
 
