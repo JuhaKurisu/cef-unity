@@ -270,10 +270,14 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: b266723374a144d27989f433d8f34cea, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::SampleScript
-  _url: https://testufo.com/mouserate
+  _url: google.com
   _rawImage: {fileID: 1153544198}
   _resolutionScale: 1
   _enableLog: 1
+  _doublePump: 1
+  _doublePumpSettleMs: 4
+  _doublePumpRecvMs: 50
+  _doublePumpFlushIntervalMs: 2
 --- !u!114 &330585549
 MonoBehaviour:
   m_ObjectHideFlags: 0

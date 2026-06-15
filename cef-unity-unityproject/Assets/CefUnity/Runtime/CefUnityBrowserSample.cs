@@ -145,6 +145,20 @@ namespace CefUnity.Runtime
         private double _dpBlockSumMs;  // PostLateUpdate でのブロック時間合計
         private double _dpBlockMaxMs;
 
+        // -----------------------------------------------------------------------
+        // Jitter 計装 (機構切り分け用)
+        // -----------------------------------------------------------------------
+        // 機構1: フレーム時間 (present 間隔) の分布。double-pump のブロックが present 直前に
+        //        入るため、ブロック量のジッタがそのままフレーム間隔のジッタ = ジャダーになる。
+        private double _ftSum, _ftSumSq, _ftMax;
+        private int _ftCount, _ftOver18, _ftOver20, _ftOver25; // 18=16.67ms+余裕,20,25ms 超過数
+        // 機構2: コンテンツ更新間隔 (fresh paint を取得した実時刻の連続差) の分布。
+        //        Chromium のスクロール曲線はこの実時刻でサンプルされるので、間隔のジッタが
+        //        見かけのスクロール速度のジッタ = judder に直結する。
+        private float _lastFreshRealtime = -1f;
+        private double _ciSum, _ciSumSq, _ciMax;
+        private int _ciCount;
+
         // PlayerLoop hook 用の singleton 参照 (現在のサンプル構成は単一 Browser のみ対応)
         private static CefUnityBrowserSample s_instance;
         // PlayerLoop hook を install したかどうか
@@ -216,6 +230,16 @@ namespace CefUnity.Runtime
             // 入力処理 + BeginFrame 発行は PlayerLoop の EarlyUpdate 末尾 (OnEarlyUpdateLast)
             // で行うため、ここからは削除した。MonoBehaviour.Update の役割は Pump と診断のみ。
 
+            // 機構1 計装: フレーム時間 (present 間隔) の分布を毎フレーム集計。
+            var ft = Time.unscaledDeltaTime;
+            _ftSum += ft;
+            _ftSumSq += (double)ft * ft;
+            _ftCount++;
+            if (ft > _ftMax) _ftMax = ft;
+            if (ft > 0.018) _ftOver18++;
+            if (ft > 0.020) _ftOver20++;
+            if (ft > 0.025) _ftOver25++;
+
             _diagTimer += Time.deltaTime;
             if (_diagTimer >= 2f)
             {
@@ -273,6 +297,20 @@ namespace CefUnity.Runtime
                         _dpBlockSumMs = 0;
                         _dpBlockMaxMs = 0;
                     }
+
+                    // jitter 計装: 機構1 (フレーム時間=present 間隔) と 機構2 (content 更新間隔)。
+                    // double-pump ON/OFF どちらでも出力して比較できるようにする。
+                    var dp = (_doublePump && _useAcceleratedPaint) ? "ON " : "OFF";
+                    var ftMean = _ftCount > 0 ? _ftSum / _ftCount : 0.0;
+                    var ftStd = _ftCount > 0 ? Math.Sqrt(Math.Max(0, _ftSumSq / _ftCount - ftMean * ftMean)) : 0.0;
+                    var ciMean = _ciCount > 0 ? _ciSum / _ciCount : 0.0;
+                    var ciStd = _ciCount > 0 ? Math.Sqrt(Math.Max(0, _ciSumSq / _ciCount - ciMean * ciMean)) : 0.0;
+                    Debug.Log(
+                        $"[CefUnity] jitter dp={dp}: " +
+                        $"frame(n={_ftCount}) mean={ftMean * 1000:F2}ms std={ftStd * 1000:F2}ms max={_ftMax * 1000:F1}ms over18/20/25={_ftOver18}/{_ftOver20}/{_ftOver25} | " +
+                        $"content(n={_ciCount}) mean={ciMean * 1000:F2}ms std={ciStd * 1000:F2}ms max={_ciMax * 1000:F1}ms");
+                    _ftSum = _ftSumSq = _ftMax = 0; _ftCount = _ftOver18 = _ftOver20 = _ftOver25 = 0;
+                    _ciSum = _ciSumSq = _ciMax = 0; _ciCount = 0;
                 }
             }
 
@@ -375,9 +413,29 @@ namespace CefUnity.Runtime
             if (self._doublePump && self._useAcceleratedPaint)
                 self.PumpAndRecvAccelerated();
             else if (self.TryUpdateTextureOnce())
+            {
                 self._gotInPostLateUpdateCount++;
+                self.RecordContentInterval();
+            }
             else if (self._textureUpdatedFrame != Time.frameCount)
                 self._recvFailCount++;
+        }
+
+        /// <summary>機構2 計装: 新テクスチャを適用した実時刻の連続差 (= コンテンツがカバーする
+        /// 実時間幅) を集計する。Chromium のスクロール曲線はこの実時刻でサンプルされるため、
+        /// この間隔のジッタが見かけのスクロール速度のジッタ (judder) に直結する。</summary>
+        private void RecordContentInterval()
+        {
+            var nowRt = Time.realtimeSinceStartup;
+            if (_lastFreshRealtime >= 0f)
+            {
+                double ci = nowRt - _lastFreshRealtime;
+                _ciSum += ci;
+                _ciSumSq += ci * ci;
+                _ciCount++;
+                if (ci > _ciMax) _ciMax = ci;
+            }
+            _lastFreshRealtime = nowRt;
         }
 
         /// <summary>
@@ -442,6 +500,7 @@ namespace CefUnity.Runtime
                 _gotInPostLateUpdateCount++;
                 _dpFreshCount++;
                 _framesSinceFreshPaint = 0;
+                RecordContentInterval();
             }
             else
             {
