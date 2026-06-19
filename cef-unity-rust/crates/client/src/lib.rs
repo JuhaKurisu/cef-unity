@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ipc_channel::ipc::{IpcOneShotServer, IpcReceiver, IpcSender};
 
-use cef_unity_ipc::{Bootstrap, Command, CommandEnvelope, Response, ShmReader};
+use cef_unity_ipc::{AudioShmReader, Bootstrap, Command, CommandEnvelope, Response, ShmReader};
 
 // ---------------------------------------------------------------------------
 // dylib location helpers
@@ -123,6 +123,9 @@ pub struct CefUnityBrowser {
 struct ClientBrowserInstance {
     browser_id: u32,
     shm: ShmReader,
+    /// 音声リングバッファのリーダー。サーバーが flink を返さなかった場合や
+    /// open に失敗した場合は None (音声無効)。
+    audio_shm: Option<AudioShmReader>,
 }
 
 fn handle_to_ref<'a>(handle: *mut CefUnityBrowser) -> &'a mut ClientBrowserInstance {
@@ -371,16 +374,25 @@ pub extern "C" fn cef_unity_create_browser(
             browser_id,
             shm_flink,
             d3d11_fence_handle,
+            audio_shm_flink,
         } => {
             log_to_file(&format!(
-                "browser created: id={}, shm={}, fence_handle=0x{:x}",
-                browser_id, shm_flink, d3d11_fence_handle
+                "browser created: id={}, shm={}, fence_handle=0x{:x}, audio_shm={}",
+                browser_id, shm_flink, d3d11_fence_handle, audio_shm_flink
             ));
             let shm = match ShmReader::open(&shm_flink) {
                 Ok(s) => s,
                 Err(e) => {
                     log_to_file(&format!("shm_open failed: {}", e));
                     return std::ptr::null_mut();
+                }
+            };
+            let audio_shm = match AudioShmReader::open(&audio_shm_flink) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    // 音声は必須ではないので open 失敗時は警告のみ。
+                    log_to_file(&format!("audio_shm_open failed (audio disabled): {}", e));
+                    None
                 }
             };
             #[cfg(target_os = "windows")]
@@ -402,7 +414,11 @@ pub extern "C" fn cef_unity_create_browser(
             }
             #[cfg(not(target_os = "windows"))]
             let _ = d3d11_fence_handle;
-            let instance = Box::new(ClientBrowserInstance { browser_id, shm });
+            let instance = Box::new(ClientBrowserInstance {
+                browser_id,
+                shm,
+                audio_shm,
+            });
             Box::into_raw(instance) as *mut CefUnityBrowser
         }
         Response::Error { msg } => {
@@ -748,6 +764,77 @@ pub extern "C" fn cef_unity_get_ime_caret(
         *out_w = w;
         *out_h = h;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Audio: CEF → Unity PCM ストリーム
+// ---------------------------------------------------------------------------
+
+/// 現在の音声ストリームフォーマットを取得する。
+/// 戻り値: ストリーム再生中なら 1、停止中/音声無効なら 0。
+/// `out_sample_rate` / `out_channels` には最新のフォーマットを書き込む
+/// (停止中でも直近の値が残る)。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_get_audio_format(
+    handle: *mut CefUnityBrowser,
+    out_sample_rate: *mut u32,
+    out_channels: *mut u32,
+) -> i32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let instance = handle_to_ref(handle);
+    let Some(reader) = instance.audio_shm.as_ref() else {
+        return 0;
+    };
+    let (sample_rate, channels, active) = reader.format();
+    unsafe {
+        if !out_sample_rate.is_null() {
+            *out_sample_rate = sample_rate;
+        }
+        if !out_channels.is_null() {
+            *out_channels = channels;
+        }
+    }
+    if active { 1 } else { 0 }
+}
+
+/// 音声リングバッファから未読の PCM を読み出す。
+///
+/// `out_samples` には interleaved な f32 サンプル (LRLR... 順) を書き込む。
+/// バッファは少なくとも `max_frames * channels` 個の f32 を保持できること
+/// (channels は最大 [`cef_unity_ipc::AUDIO_MAX_CHANNELS`])。安全のため呼び出し側は
+/// `max_frames * AUDIO_MAX_CHANNELS` 確保することを推奨。
+///
+/// `out_channels` には実際のチャネル数を書き込む。
+/// 戻り値: 実際に読み出したフレーム数 (新規データが無ければ 0)。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_read_audio(
+    handle: *mut CefUnityBrowser,
+    out_samples: *mut f32,
+    max_frames: i32,
+    out_channels: *mut u32,
+) -> i32 {
+    if handle.is_null() || out_samples.is_null() || max_frames <= 0 {
+        return 0;
+    }
+    let instance = handle_to_ref(handle);
+    let Some(reader) = instance.audio_shm.as_mut() else {
+        return 0;
+    };
+    let max_frames = max_frames as usize;
+    // 出力スライス長は最悪ケース (AUDIO_MAX_CHANNELS) を仮定して構築する。
+    // read() は実 channels に基づき max_frames*channels までしか書き込まない。
+    let out = unsafe {
+        std::slice::from_raw_parts_mut(out_samples, max_frames * cef_unity_ipc::AUDIO_MAX_CHANNELS)
+    };
+    let (frames, channels) = reader.read(out, max_frames);
+    unsafe {
+        if !out_channels.is_null() {
+            *out_channels = channels as u32;
+        }
+    }
+    frames as i32
 }
 
 // ---------------------------------------------------------------------------

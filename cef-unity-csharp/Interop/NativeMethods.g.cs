@@ -133,6 +133,23 @@ namespace CefUnity
         public static extern void cef_unity_get_ime_caret(CefUnityBrowser* handle, int* out_x, int* out_y, int* out_w, int* out_h);
 
         /// <summary>
+        ///  現在の音声ストリームフォーマットを取得する。
+        ///  戻り値: ストリーム再生中なら 1、停止中/音声無効なら 0。
+        ///  out_sample_rate / out_channels には最新のフォーマットを書き込む。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_get_audio_format", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_get_audio_format(CefUnityBrowser* handle, uint* out_sample_rate, uint* out_channels);
+
+        /// <summary>
+        ///  音声リングバッファから未読の PCM (interleaved f32, LRLR...) を読み出す。
+        ///  out_samples は max_frames * channels 個以上の f32 を保持できること
+        ///  (安全のため max_frames * 8 確保を推奨)。
+        ///  out_channels に実チャネル数を書き込み、戻り値は読み出したフレーム数 (新規なし=0)。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_read_audio", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_read_audio(CefUnityBrowser* handle, float* out_samples, int max_frames, uint* out_channels);
+
+        /// <summary>
         ///  Destroy a browser instance (blocking).
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_destroy_browser_blocking", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]

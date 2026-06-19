@@ -85,6 +85,12 @@ namespace CefUnity.Runtime
         [SerializeField] private RawImage _rawImage;
         [SerializeField] private float _resolutionScale = 1;
         [SerializeField] private bool _enableLog;
+
+        [Header("Audio")]
+        [Tooltip("CEF の音声を Unity の AudioSource で再生する (CEF/ブラウザ側では鳴らさない)")]
+        [SerializeField] private bool _enableAudio = true;
+        private CefAudioOutput _audioOutput;
+
         private readonly Dictionary<KeyCode, float> _keyDownTime = new();
         private readonly Dictionary<KeyCode, float> _keyLastRepeat = new();
 
@@ -159,6 +165,7 @@ namespace CefUnity.Runtime
         private double _ciSum, _ciSumSq, _ciMax;
         private int _ciCount;
         private bool _navTestDone; // 計測用
+        private bool _audioTestDone; // 音声テスト用 (cef_load_url トリガー)
 
         // PlayerLoop hook 用の singleton 参照 (現在のサンプル構成は単一 Browser のみ対応)
         private static CefUnityBrowserSample s_instance;
@@ -218,6 +225,7 @@ namespace CefUnity.Runtime
                 _useAcceleratedPaint = Browser.IsAcceleratedConnected();
                 if (_enableLog) Debug.Log($"[CefUnity] Initialized ({_currentWidth}x{_currentHeight}), acceleratedPaint={_useAcceleratedPaint}");
                 SetupImeProxy();
+                SetupAudioOutput();
             }
             catch (Exception e)
             {
@@ -237,6 +245,15 @@ namespace CefUnity.Runtime
             {
                 _navTestDone = true;
                 LoadUrl("https://testufo.com/mouserate");
+            }
+            // 計測用 (一時): cef_load_url にファイル内容の URL を書くとそこへ遷移する。
+            // 音声テスト (440Hz トーンの data: URI 等) を実行中の PlayMode へ渡すために使う。
+            var navUrlFile = System.IO.Path.Combine(tmpDir, "cef_load_url");
+            if (!_audioTestDone && System.IO.File.Exists(navUrlFile))
+            {
+                _audioTestDone = true;
+                var u = System.IO.File.ReadAllText(navUrlFile).Trim();
+                if (!string.IsNullOrEmpty(u)) LoadUrl(u);
             }
             if (System.IO.File.Exists(System.IO.Path.Combine(tmpDir, "cef_fake_work")))
             {
@@ -363,6 +380,13 @@ namespace CefUnity.Runtime
                 _playerLoopHooked = false;
             }
             if (s_instance == this) s_instance = null;
+
+            // 音声出力を先に止めてから browser を破棄する (破棄済みハンドルへのアクセス防止)。
+            if (_audioOutput != null)
+            {
+                _audioOutput.Browser = null;
+                _audioOutput.enabled = false;
+            }
 
             _browser?.Dispose();
             _browser = null;
@@ -588,6 +612,22 @@ namespace CefUnity.Runtime
         private void SetupImeProxy()
         {
             Input.imeCompositionMode = IMECompositionMode.On;
+        }
+
+        // -----------------------------------------------------------------------
+        // Audio
+        // -----------------------------------------------------------------------
+        /// <summary>
+        ///     CEF の音声を Unity 側で再生するために CefAudioOutput を用意し、
+        ///     現在のブラウザを割り当てる。
+        /// </summary>
+        private void SetupAudioOutput()
+        {
+            if (!_enableAudio || _browser == null) return;
+
+            _audioOutput = GetComponent<CefAudioOutput>();
+            if (_audioOutput == null) _audioOutput = gameObject.AddComponent<CefAudioOutput>();
+            _audioOutput.Browser = _browser;
         }
 
         private void HandleImeInput()

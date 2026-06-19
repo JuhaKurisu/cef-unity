@@ -35,7 +35,7 @@ unsafe extern "C" {
     ) -> *mut std::os::raw::c_void;
 }
 
-use cef_unity_ipc::{self as ipc, Command, Response, ShmWriter};
+use cef_unity_ipc::{self as ipc, AudioShmWriter, Command, Response, ShmWriter};
 
 use crate::d3d11_pool::D3D11Pool;
 
@@ -108,6 +108,9 @@ struct BrowserState {
     /// Kept alive so ShmWriter::drop cleans up shared memory on browser destroy.
     #[allow(dead_code)]
     shm: Arc<ShmWriter>,
+    /// 音声リングバッファ。AudioHandler が PCM を書き込む。ブラウザ破棄まで生かす。
+    #[allow(dead_code)]
+    audio_shm: Arc<AudioShmWriter>,
     browser: Arc<Mutex<Option<Browser>>>,
     viewport_w: Arc<AtomicI32>,
     viewport_h: Arc<AtomicI32>,
@@ -529,6 +532,78 @@ const CARET_TRACKING_JS: &str = r#"
 })();
 "#;
 
+wrap_audio_handler! {
+    struct ServerAudioHandler {
+        audio_shm: Arc<AudioShmWriter>,
+    }
+    impl AudioHandler {
+        /// CEF が要求する音声出力フォーマットを指定する。1 を返すと OSR の音声が
+        /// このハンドラへルーティングされ、ブラウザプロセス側では再生されなくなる。
+        /// channel_layout / sample_rate は CEF (ページ) の出力に合わせ、frames_per_buffer
+        /// のみ指定する。
+        fn audio_parameters(
+            &self,
+            _browser: Option<&mut Browser>,
+            params: Option<&mut AudioParameters>,
+        ) -> ::std::os::raw::c_int {
+            if let Some(p) = params {
+                p.channel_layout = ChannelLayout::LAYOUT_STEREO;
+                p.sample_rate = 48_000;
+                // 1 コールバックあたりのフレーム数。小さいほど低遅延だがコールバック頻度↑。
+                p.frames_per_buffer = 1024;
+            }
+            1
+        }
+
+        fn on_audio_stream_started(
+            &self,
+            _browser: Option<&mut Browser>,
+            params: Option<&AudioParameters>,
+            channels: ::std::os::raw::c_int,
+        ) {
+            let sample_rate = params.map(|p| p.sample_rate).unwrap_or(48_000);
+            let ch = channels.max(0) as u32;
+            log(&format!(
+                "on_audio_stream_started: sample_rate={} channels={}",
+                sample_rate, ch
+            ));
+            self.audio_shm.start_stream(sample_rate as u32, ch);
+        }
+
+        fn on_audio_stream_packet(
+            &self,
+            _browser: Option<&mut Browser>,
+            data: *mut *const f32,
+            frames: ::std::os::raw::c_int,
+            _pts: i64,
+        ) {
+            if data.is_null() || frames <= 0 {
+                return;
+            }
+            // チャネル数は on_audio_stream_started でヘッダに記録済み。
+            let channels = self.audio_shm.channels();
+            if channels == 0 {
+                return;
+            }
+            unsafe {
+                self.audio_shm
+                    .write_packet(data as *const *const f32, frames as usize, channels);
+            }
+        }
+
+        fn on_audio_stream_stopped(&self, _browser: Option<&mut Browser>) {
+            log("on_audio_stream_stopped");
+            self.audio_shm.stop_stream();
+        }
+
+        fn on_audio_stream_error(&self, _browser: Option<&mut Browser>, message: Option<&CefString>) {
+            let msg = message.map(|m| m.to_string()).unwrap_or_default();
+            log(&format!("on_audio_stream_error: {}", msg));
+            self.audio_shm.stop_stream();
+        }
+    }
+}
+
 wrap_browser_process_handler! {
     struct ServerBrowserProcessHandler;
     impl BrowserProcessHandler {
@@ -587,6 +662,7 @@ wrap_client! {
         life_span_handler: LifeSpanHandler,
         display_handler: DisplayHandler,
         load_handler: LoadHandler,
+        audio_handler: AudioHandler,
     }
     impl Client {
         fn render_handler(&self) -> Option<RenderHandler> {
@@ -600,6 +676,9 @@ wrap_client! {
         }
         fn load_handler(&self) -> Option<LoadHandler> {
             Some(self.load_handler.clone())
+        }
+        fn audio_handler(&self) -> Option<AudioHandler> {
+            Some(self.audio_handler.clone())
         }
     }
 }
@@ -844,6 +923,16 @@ impl CefServer {
             }
         };
 
+        let audio_shm_flink = ipc::audio_shm_flink_path(self.server_pid, id);
+        let audio_shm = match AudioShmWriter::new(&audio_shm_flink) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                return Response::Error {
+                    msg: format!("audio_shm_create failed: {}", e),
+                };
+            }
+        };
+
         let viewport_w = Arc::new(AtomicI32::new(width));
         let viewport_h = Arc::new(AtomicI32::new(height));
         let browser_slot: Arc<Mutex<Option<Browser>>> = Arc::new(Mutex::new(None));
@@ -883,11 +972,13 @@ impl CefServer {
         let life_span_handler = ServerLifeSpanHandler::new(Arc::clone(&browser_slot));
         let display_handler = ServerDisplayHandler::new(Arc::clone(&shm));
         let load_handler = ServerLoadHandler::new(Arc::clone(&browser_slot));
+        let audio_handler = ServerAudioHandler::new(Arc::clone(&audio_shm));
         let mut client = ServerClient::new(
             render_handler,
             life_span_handler,
             display_handler,
             load_handler,
+            audio_handler,
         );
 
         // cef_window_handle_t はプラットフォーム依存:
@@ -946,6 +1037,7 @@ impl CefServer {
             id,
             BrowserState {
                 shm,
+                audio_shm,
                 browser: browser_slot,
                 viewport_w,
                 viewport_h,
@@ -957,6 +1049,7 @@ impl CefServer {
             browser_id: id,
             shm_flink,
             d3d11_fence_handle,
+            audio_shm_flink,
         }
     }
 

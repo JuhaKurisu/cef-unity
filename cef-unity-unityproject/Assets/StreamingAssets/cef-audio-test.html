@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>CEF Audio Test</title>
+  <style>
+    body { background:#102030; color:#fff; font-family:sans-serif; padding:24px; }
+    h1 { font-size:28px; }
+    #state { font-size:22px; margin-top:16px; }
+  </style>
+</head>
+<body>
+  <h1>440Hz サイン波テスト信号</h1>
+  <div id="state">starting...</div>
+  <script>
+    // CEF → Unity 音声経路の検証用に、既知の 440Hz サイン波を自動再生する。
+    // autoplay-policy=no-user-gesture-required が設定済みなので無操作で鳴る。
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = 440;
+    const gain = ctx.createGain();
+    gain.gain.value = 0.2;
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+
+    function update() {
+      document.getElementById('state').textContent = 'AudioContext: ' + ctx.state;
+    }
+    ctx.onstatechange = update;
+    ctx.resume().then(update).catch(update);
+    update();
+  </script>
+</body>
+</html>

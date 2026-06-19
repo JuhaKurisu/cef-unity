@@ -382,6 +382,44 @@ public sealed class Browser : IDisposable
         return NativeMethods.cef_unity_is_iosurface_connected() != 0;
     }
 
+    // ----- Audio (CEF → Unity PCM ストリーム) -----
+
+        /// <summary>
+        ///     現在の音声ストリームフォーマットを取得する。
+        ///     戻り値は再生中なら true。停止中/音声無効なら false (それでも直近の
+        ///     sampleRate / channels は設定される)。
+        /// </summary>
+        public unsafe bool TryGetAudioFormat(out int sampleRate, out int channels)
+        {
+            ThrowIfDisposed();
+            uint sr, ch;
+            var active = NativeMethods.cef_unity_get_audio_format(_handle, &sr, &ch);
+            sampleRate = (int)sr;
+            channels = (int)ch;
+            return active != 0;
+        }
+
+        /// <summary>
+        ///     音声リングバッファから未読の PCM を読み出す。
+        ///     <paramref name="buffer" /> には interleaved f32 (LRLR... 順) が書き込まれる。
+        ///     バッファ長は <paramref name="maxFrames" /> * channels 以上必要
+        ///     (安全のため maxFrames * 8 を推奨)。
+        ///     戻り値は実際に読み出したフレーム数 (新規データが無ければ 0)。
+        ///     <paramref name="channels" /> に実チャネル数を返す。
+        /// </summary>
+        public unsafe int ReadAudio(float[] buffer, int maxFrames, out int channels)
+        {
+            ThrowIfDisposed();
+            uint ch = 0;
+            int frames;
+            fixed (float* ptr = buffer)
+            {
+                frames = NativeMethods.cef_unity_read_audio(_handle, ptr, maxFrames, &ch);
+            }
+            channels = (int)ch;
+            return frames;
+        }
+
     // ----- IME -----
 
         public void ImeSetComposition(string text, uint selectionStart, uint selectionEnd)
