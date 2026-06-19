@@ -210,7 +210,10 @@ namespace CefUnity.Runtime
                 if (_doublePumpFlushIntervalMs <= 0f) _doublePumpFlushIntervalMs = 2f;
 
                 var useGpu = !(SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12 || SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11);
-                CefRuntime.Init();
+                // ログのマスタースイッチ: Unity 側 (CefLog) と Rust 側 (client/server)
+                // の両方を _enableLog 一つで制御する。
+                CefLog.Enabled = _enableLog;
+                CefRuntime.Init(enableLog: _enableLog);
                 _browser = new Browser(_currentWidth, _currentHeight, _url);
 
                 // PlayerLoop に EarlyUpdate / PostLateUpdate の hook を挿入。
@@ -223,13 +226,13 @@ namespace CefUnity.Runtime
                 // 共通: macOS は Mach port 経由の IOSurface、Windows は D3D11 共有テクスチャ。
                 // Init() がサーバーを起動し接続を行うため、その後にチェック。
                 _useAcceleratedPaint = Browser.IsAcceleratedConnected();
-                if (_enableLog) Debug.Log($"[CefUnity] Initialized ({_currentWidth}x{_currentHeight}), acceleratedPaint={_useAcceleratedPaint}");
+                if (_enableLog) CefLog.Log($"[CefUnity] Initialized ({_currentWidth}x{_currentHeight}), acceleratedPaint={_useAcceleratedPaint}");
                 SetupImeProxy();
                 SetupAudioOutput();
             }
             catch (Exception e)
             {
-                Debug.LogError($"[CefUnity] Init failed: {e}");
+                CefLog.LogError($"[CefUnity] Init failed: {e}");
             }
         }
 
@@ -281,10 +284,10 @@ namespace CefUnity.Runtime
                 {
                     var paintCount = NativeMethods.cef_unity_get_paint_count();
                     var pumpCount = NativeMethods.cef_unity_get_pump_count();
-                    Debug.Log($"[CefUnity] diag: paint={paintCount} pump={pumpCount}");
+                    CefLog.Log($"[CefUnity] diag: paint={paintCount} pump={pumpCount}");
                     var logs = CefRuntime.GetLogs();
                     foreach (var line in logs)
-                        Debug.Log($"[CefServer] {line}");
+                        CefLog.Log($"[CefServer] {line}");
 
                     if (_delaySampleCount > 0)
                     {
@@ -297,14 +300,14 @@ namespace CefUnity.Runtime
                             sb.Append($"{i}{(i == _delayBuckets.Length - 1 ? "+" : "")}:{_delayBuckets[i]}");
                         }
                         sb.Append(']');
-                        Debug.Log(sb.ToString());
+                        CefLog.Log(sb.ToString());
 
                         // 検証メトリクス: PostLateUpdate hook での取得統計
-                        Debug.Log($"[CefUnity] verify: PostLateUpdate={_postLateUpdateInvokeCount} recv_ok={_gotInPostLateUpdateCount} recv_fail={_recvFailCount}");
+                        CefLog.Log($"[CefUnity] verify: PostLateUpdate={_postLateUpdateInvokeCount} recv_ok={_gotInPostLateUpdateCount} recv_fail={_recvFailCount}");
                         var sb2 = new StringBuilder("[CefUnity] verify samples (fc, paint_fc, delta):");
                         foreach (var s in _recentSamples)
                             sb2.Append($" ({s.fc},{s.pf},{s.delta})");
-                        Debug.Log(sb2.ToString());
+                        CefLog.Log(sb2.ToString());
 
                         _delaySampleCount = 0;
                         _delaySumFrames = 0;
@@ -322,7 +325,7 @@ namespace CefUnity.Runtime
                     {
                         var dpActive = _dpFreshCount + _dpFallbackCount;
                         var blockAvg = dpActive > 0 ? _dpBlockSumMs / dpActive : 0.0;
-                        Debug.Log($"[CefUnity] double-pump: fresh(0F)={_dpFreshCount} fallback(1F)={_dpFallbackCount} idle={_dpIdleCount} block_avg={blockAvg:F2}ms block_max={_dpBlockMaxMs:F2}ms");
+                        CefLog.Log($"[CefUnity] double-pump: fresh(0F)={_dpFreshCount} fallback(1F)={_dpFallbackCount} idle={_dpIdleCount} block_avg={blockAvg:F2}ms block_max={_dpBlockMaxMs:F2}ms");
                         _dpFreshCount = 0;
                         _dpFallbackCount = 0;
                         _dpIdleCount = 0;
@@ -337,7 +340,7 @@ namespace CefUnity.Runtime
                     var ftStd = _ftCount > 0 ? Math.Sqrt(Math.Max(0, _ftSumSq / _ftCount - ftMean * ftMean)) : 0.0;
                     var ciMean = _ciCount > 0 ? _ciSum / _ciCount : 0.0;
                     var ciStd = _ciCount > 0 ? Math.Sqrt(Math.Max(0, _ciSumSq / _ciCount - ciMean * ciMean)) : 0.0;
-                    Debug.Log(
+                    CefLog.Log(
                         $"[CefUnity] jitter dp={dp}: " +
                         $"frame(n={_ftCount}) mean={ftMean * 1000:F2}ms std={ftStd * 1000:F2}ms max={_ftMax * 1000:F1}ms over18/20/25={_ftOver18}/{_ftOver20}/{_ftOver25} | " +
                         $"content(n={_ciCount}) mean={ciMean * 1000:F2}ms std={ciStd * 1000:F2}ms max={_ciMax * 1000:F1}ms");
@@ -404,7 +407,7 @@ namespace CefUnity.Runtime
             }
 
             CefRuntime.Shutdown();
-            if (_enableLog) Debug.Log("[CefUnity] Shutdown");
+            if (_enableLog) CefLog.Log("[CefUnity] Shutdown");
         }
 
         // -----------------------------------------------------------------------
@@ -954,7 +957,7 @@ namespace CefUnity.Runtime
                 _currentWidth = sw;
                 _currentHeight = sh;
                 _browser?.Resize(_currentWidth, _currentHeight);
-                if (_enableLog) Debug.Log($"[CefUnity] Resized to {_currentWidth}x{_currentHeight}");
+                if (_enableLog) CefLog.Log($"[CefUnity] Resized to {_currentWidth}x{_currentHeight}");
             }
         }
 
@@ -1056,7 +1059,7 @@ namespace CefUnity.Runtime
 
             if (_accelProfCount >= 120)
             {
-                if (_enableLog) Debug.Log($"[CefUnity-Prof] C# accel x{_accelProfCount}: recv={_accelProfRecvTotal * 1000f:F2}ms update={_accelProfUpdateTotal * 1000f:F2}ms release={_accelProfReleaseTotal * 1000f:F2}ms total={(_accelProfRecvTotal + _accelProfUpdateTotal + _accelProfReleaseTotal) * 1000f:F2}ms");
+                if (_enableLog) CefLog.Log($"[CefUnity-Prof] C# accel x{_accelProfCount}: recv={_accelProfRecvTotal * 1000f:F2}ms update={_accelProfUpdateTotal * 1000f:F2}ms release={_accelProfReleaseTotal * 1000f:F2}ms total={(_accelProfRecvTotal + _accelProfUpdateTotal + _accelProfReleaseTotal) * 1000f:F2}ms");
                 _accelProfCount = 0;
                 _accelProfRecvTotal = _accelProfUpdateTotal = _accelProfReleaseTotal = 0;
             }

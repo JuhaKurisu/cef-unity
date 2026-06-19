@@ -33,12 +33,6 @@ namespace CefUnity.Runtime
         /// <summary>リングバッファの長さ (秒)。フレームレートのジッタを吸収する。</summary>
         [SerializeField] private float _bufferSeconds = 0.5f;
 
-        /// <summary>
-        ///     診断ログを有効にする。1 秒ごとに受信量・RMS・出力スペクトルの
-        ///     ピーク周波数を Debug.Log へ出力する (音声経路の定量確認用)。
-        /// </summary>
-        [SerializeField] private bool _logDiagnostics = true;
-
         /// <summary>再生対象のブラウザ。外部から設定する。</summary>
         public Browser Browser { get; set; }
 
@@ -96,15 +90,16 @@ namespace CefUnity.Runtime
 
             PullFromBrowser();
 
-            if (_logDiagnostics) LogDiagnostics();
+            LogDiagnostics();
         }
 
-        // 1 秒ごとに音声経路の状態をログ出力する診断。
+        // 1 秒ごとに音声経路の状態をログ出力する診断 (マスターログフラグ CefLog.Enabled に従う)。
         private float _diagTimer;
         private float[] _spectrum;
 
         private void LogDiagnostics()
         {
+            if (!CefLog.Enabled) return;
             _diagTimer += Time.unscaledDeltaTime;
             if (_diagTimer < 1f) return;
             _diagTimer = 0f;
@@ -125,7 +120,7 @@ namespace CefUnity.Runtime
                 }
             }
 
-            Debug.Log(
+            CefLog.Log(
                 $"[CefAudio] active stream {_srcSampleRate}Hz x{_srcChannels}ch | " +
                 $"recvFrames={TotalFramesReceived} pulledRms={LastPulledRms:F4} pulledPeak={LastPulledPeak:F4} | " +
                 $"outSpectrumPeak={peakFreq:F0}Hz(mag={peakMag:F4}) outRate={outRate}");

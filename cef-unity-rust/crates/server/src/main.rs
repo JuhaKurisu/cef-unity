@@ -13,7 +13,15 @@ use ipc_channel::ipc::{self as ipc_ch, IpcSender};
 
 use cef_unity_ipc::{Bootstrap, CommandEnvelope, Response};
 
+/// main 内ローカルログの有効/無効。--logging で設定。server::log とは別系統だが
+/// 同じフラグに従わせる。
+static MAIN_LOG_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn log(msg: &str) {
+    if !MAIN_LOG_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let path = std::env::temp_dir().join("cef_unity_server.log");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -25,7 +33,19 @@ fn log(msg: &str) {
 }
 
 fn main() {
-    let _ = std::fs::write(std::env::temp_dir().join("cef_unity_server.log"), "");
+    // 最初に --logging を確定させ、以降の log() (main / server 双方) を従わせる。
+    let logging: bool = std::env::args()
+        .skip_while(|a| a != "--logging")
+        .nth(1)
+        .and_then(|s| s.parse::<i32>().ok())
+        .map(|v| v != 0)
+        .unwrap_or(false);
+    MAIN_LOG_ENABLED.store(logging, std::sync::atomic::Ordering::Relaxed);
+    server::set_logging(logging);
+
+    if logging {
+        let _ = std::fs::write(std::env::temp_dir().join("cef_unity_server.log"), "");
+    }
     log(&format!("server started, pid={}", std::process::id()));
 
     // Parse --ipc-server argument

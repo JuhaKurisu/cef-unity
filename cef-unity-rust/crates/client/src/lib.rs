@@ -137,6 +137,9 @@ fn handle_to_ref<'a>(handle: *mut CefUnityBrowser) -> &'a mut ClientBrowserInsta
 // ---------------------------------------------------------------------------
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// ログ出力の有効/無効。Init で Unity 側のマスターフラグに従って設定される。
+/// false の場合 log_to_file は何もしない (ファイルログ抑制)。
+static LOG_ENABLED: AtomicBool = AtomicBool::new(false);
 static IOSURFACE_CONNECTED: AtomicBool = AtomicBool::new(false);
 /// GPU (accelerated paint) を使うか。Init 時にセットされ、以降は不変。
 /// false の場合は server が software paint で動作し、client 側でも
@@ -153,6 +156,9 @@ struct ServerConnection {
 static CONNECTION: Mutex<Option<ServerConnection>> = Mutex::new(None);
 
 fn log_to_file(msg: &str) {
+    if !LOG_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
     let path = std::env::temp_dir().join("cef_unity_debug.log");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -192,9 +198,14 @@ fn send_command_no_wait(conn: &ServerConnection, cmd: Command) {
 /// Initialize: launch CEF server process and connect via ipc-channel.
 /// `use_gpu`: 非 0 で accelerated paint (GPU 共有テクスチャ / IOSurface) を使う。
 /// 0 で software paint (CPU 経由の shm BGRA 転送) を強制する。
+/// `enable_log`: 非 0 で client/server のファイルログを有効にする。0 で全ログ抑制。
+/// Unity 側のマスターログフラグから渡す。
 /// Returns 0 on success, non-zero on failure.
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_init(use_gpu: i32) -> i32 {
+pub extern "C" fn cef_unity_init(use_gpu: i32, enable_log: i32) -> i32 {
+    // ログ有効/無効を最初に確定させる (以降の log_to_file がこれに従う)。
+    LOG_ENABLED.store(enable_log != 0, Ordering::SeqCst);
+
     if INITIALIZED.load(Ordering::SeqCst) {
         return 0;
     }
@@ -239,6 +250,8 @@ pub extern "C" fn cef_unity_init(use_gpu: i32) -> i32 {
         .arg(client_pid.to_string())
         .arg("--use-gpu")
         .arg(if use_gpu_bool { "1" } else { "0" })
+        .arg("--logging")
+        .arg(if enable_log != 0 { "1" } else { "0" })
         .spawn()
     {
         Ok(_child) => {

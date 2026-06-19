@@ -22,10 +22,11 @@ namespace CefUnity
         ///  Initialize: launch CEF server process and connect via ipc-channel.
         ///  `use_gpu`: 非 0 で accelerated paint (GPU 共有テクスチャ / IOSurface) を使う。
         ///  0 で software paint (CPU 経由の shm BGRA 転送) を強制する。
+        ///  `enable_log`: 非 0 で client/server のファイルログを有効にする。0 で全ログ抑制。
         ///  Returns 0 on success, non-zero on failure.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_init", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern int cef_unity_init(int use_gpu);
+        public static extern int cef_unity_init(int use_gpu, int enable_log);
 
         /// <summary>
         ///  Pump CEF message loop — no-op in IPC mode (server has its own loop).

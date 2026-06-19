@@ -164,12 +164,12 @@ namespace CefUnity.Interop
         ///     Windows の D3D11/D3D12 共有テクスチャ) を使い、false なら CPU 経路 (software paint:
         ///     共有メモリ経由の BGRA 転送) を強制する。
         /// </summary>
-        public static void Init(bool useGpu = true)
+        public static void Init(bool useGpu = true, bool enableLog = false)
         {
             int result;
             try
             {
-                result = NativeMethods.cef_unity_init(useGpu ? 1 : 0);
+                result = NativeMethods.cef_unity_init(useGpu ? 1 : 0, enableLog ? 1 : 0);
             }
             catch (DllNotFoundException)
             {

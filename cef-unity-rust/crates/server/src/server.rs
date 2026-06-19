@@ -45,8 +45,19 @@ use crate::d3d11_pool::D3D11Pool;
 
 const MAX_LOG_ENTRIES: usize = 1000;
 static LOG_BUFFER: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// ログ有効/無効。main で --logging に従って設定される。false で全ログ抑制
+/// (ファイル書き込み・バッファ蓄積の双方を行わない → GetLogs も空を返す)。
+static LOG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// ログ出力の有効/無効を設定する。CEF 初期化前に呼ぶこと。
+pub fn set_logging(enabled: bool) {
+    LOG_ENABLED.store(enabled, Ordering::Relaxed);
+}
 
 fn log(msg: &str) {
+    if !LOG_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
     let path = std::env::temp_dir().join("cef_unity_server.log");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
