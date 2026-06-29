@@ -89,6 +89,12 @@ namespace CefUnity.Runtime
         [Header("Audio")]
         [Tooltip("CEF の音声を Unity の AudioSource で再生する (CEF/ブラウザ側では鳴らさない)")]
         [SerializeField] private bool _enableAudio = true;
+
+        [Tooltip("音声出力の DSP バッファサイズ (フレーム/段)。小さいほど低遅延だが負荷増。" +
+                 "256=Best latency, 512=Good, 1024=Best performance。0 でプロジェクト設定のまま。" +
+                 "ProjectSettings/Audio と同値だがエディタ実行時に確実に反映させるため実行時にも適用する。")]
+        [SerializeField] private int _audioDspBufferSize = 256;
+
         private CefAudioOutput _audioOutput;
 
         private readonly Dictionary<KeyCode, float> _keyDownTime = new();
@@ -228,6 +234,7 @@ namespace CefUnity.Runtime
                 _useAcceleratedPaint = Browser.IsAcceleratedConnected();
                 if (_enableLog) CefLog.Log($"[CefUnity] Initialized ({_currentWidth}x{_currentHeight}), acceleratedPaint={_useAcceleratedPaint}");
                 SetupImeProxy();
+                ApplyAudioDspBufferSize();
                 SetupAudioOutput();
             }
             catch (Exception e)
@@ -631,6 +638,31 @@ namespace CefUnity.Runtime
             _audioOutput = GetComponent<CefAudioOutput>();
             if (_audioOutput == null) _audioOutput = gameObject.AddComponent<CefAudioOutput>();
             _audioOutput.Browser = _browser;
+        }
+
+        /// <summary>
+        ///     音声出力の DSP バッファサイズを実行時に適用して遅延 (⑧ Unity DSP ミキサ) を詰める。
+        ///     ProjectSettings/Audio の DSP Buffer Size と同値だが、エディタ実行中はプロジェクト設定の
+        ///     変更が起動時にしか反映されないため、ここで <see cref="AudioSettings.Reset" /> して確実に適用する。
+        ///     音声シンク生成前 (SetupAudioOutput より前) に呼ぶこと (Reset は全 AudioSource を停止するため)。
+        /// </summary>
+        private void ApplyAudioDspBufferSize()
+        {
+            if (!_enableAudio || _audioDspBufferSize <= 0) return;
+
+            var cfg = AudioSettings.GetConfiguration();
+            if (cfg.dspBufferSize == _audioDspBufferSize) return;
+
+            int before = cfg.dspBufferSize;
+            cfg.dspBufferSize = _audioDspBufferSize;
+            if (AudioSettings.Reset(cfg))
+            {
+                if (_enableLog) CefLog.Log($"[CefUnity] DSP buffer {before} -> {_audioDspBufferSize}");
+            }
+            else
+            {
+                CefLog.LogError($"[CefUnity] AudioSettings.Reset({_audioDspBufferSize}) failed");
+            }
         }
 
         private void HandleImeInput()

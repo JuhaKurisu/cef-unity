@@ -15,9 +15,9 @@ namespace CefUnity.Runtime
     ///     仕組み:
     ///     1. メインスレッド (<see cref="Update" />) で <see cref="Browser.ReadAudio" /> を
     ///        ポーリングし、PCM を <see cref="CefAudioRing" /> へ蓄積する (producer)。
-    ///     2. 出力レートで生成したストリーミング <see cref="AudioClip" /> の PCM read
-    ///        コールバック (オーディオスレッド) が <see cref="CefAudioRing.Read" /> を呼び、
-    ///        CEF レート → Unity 出力レートの変換と滞留量補正を行いながら排出する (consumer)。
+    ///     2. 専用の子 GameObject 上の <see cref="CefAudioSink" /> が <c>OnAudioFilterRead</c>
+    ///        (オーディオスレッド) で <see cref="CefAudioRing.Read" /> を呼び、CEF レート →
+    ///        Unity 出力レートの変換と滞留量補正を行いながら排出して出力ミックスへ加算する (consumer)。
     ///     </para>
     ///     <para>
     ///     CEF と Unity はオーディオクロックが独立しているためレートがわずかにずれる。
@@ -26,11 +26,16 @@ namespace CefUnity.Runtime
     ///     <see cref="CefAudioRing" /> に集約してある (詳細はそちらを参照)。
     ///     </para>
     ///     <para>
+    ///     消費に <see cref="AudioClip" /> のストリーミング (PCMReaderCallback) を使うと
+    ///     先読みバッファ管理の都合で消費レートが波打ち (実測 800〜1200ms/s)、滞留量が振動して
+    ///     アンダーランの原因になる。そのため一定ペースで呼ばれる <c>OnAudioFilterRead</c> を
+    ///     <see cref="CefAudioSink" /> 経由で使う。
+    ///     </para>
+    ///     <para>
     ///     PCM を自前で扱いたい (録音・解析・独自ミキサ等) 場合は、本コンポーネントを
     ///     使わず <see cref="Browser.ReadAudio" /> を直接呼べばストリームをそのまま取得できる。
     ///     </para>
     /// </summary>
-    [RequireComponent(typeof(AudioSource))]
     public class CefAudioOutput : MonoBehaviour
     {
         /// <summary>1 回の Update でブラウザから取り込む最大フレーム数。</summary>
@@ -79,17 +84,15 @@ namespace CefUnity.Runtime
         /// <summary>累積オーバーフロー (破棄) フレーム数。0 以外なら容量超過。</summary>
         public long OverflowDropFrames => _ring?.OverflowDropFrames ?? 0;
 
-        private AudioSource _audioSource;
-
         // ReadAudio 用のスクラッチ (interleaved, 最大 AUDIO_MAX_CHANNELS=8 ストライド)。
         private float[] _pullScratch;
 
         // CEF→Unity レート変換つきリング (メインスレッドが書き、オーディオスレッドが読む)。
         private CefAudioRing _ring;
 
-        // OnAudioFilterRead 用スクラッチ (src チャネル interleaved)。オーディオスレッドでの
-        // 確保を避けるためメインスレッドで事前確保する。
-        private float[] _filterScratch;
+        // 出力ミックスへ流す consumer。AudioListener と OnAudioFilterRead が競合しないよう
+        // 専用の子 GameObject 上に分離する。
+        private CefAudioSink _sink;
 
         private int _srcSampleRate;
         private int _srcChannels;
@@ -98,10 +101,6 @@ namespace CefUnity.Runtime
 
         private void Awake()
         {
-            _audioSource = GetComponent<AudioSource>();
-            _audioSource.playOnAwake = false;
-            _audioSource.loop = true;
-            _audioSource.spatialBlend = 0f; // 2D (UI ブラウザ音声を想定)
             _pullScratch = new float[MaxPullFrames * 8];
         }
 
@@ -207,20 +206,17 @@ namespace CefUnity.Runtime
             _pullMax = 0;
             _pullMin = int.MaxValue;
 
-            // consumer (OnPcmRead) のバースト性。calls/s が不安定 / maxFrames が大きく振れるなら
-            // Unity ストリーミングクリップの先読みがバースト消費している (滞留量振動の原因)。
-            int pcmCalls = System.Threading.Interlocked.Exchange(ref _pcmCalls, 0);
-            int pcmFrames = System.Threading.Interlocked.Exchange(ref _pcmFrames, 0);
-            int pcmMax = System.Threading.Interlocked.Exchange(ref _pcmMaxFrames, 0);
-            float pcmAvg = pcmCalls > 0 ? (float)pcmFrames / pcmCalls : 0f;
-            double outSumSq = _pcmOutSumSq;
-            long outSamples = _pcmOutSamples;
-            _pcmOutSumSq = 0.0;
-            _pcmOutSamples = 0;
-            float outRms = outSamples > 0 ? (float)Math.Sqrt(outSumSq / outSamples) : 0f;
-            CefLog.Log(
-                $"[CefAudio-CONS] calls/s={pcmCalls} framesOut/s={pcmFrames} (~{(outRate > 0 ? pcmFrames / (float)outRate * 1000f : 0f):F0}ms/s) " +
-                $"avg={pcmAvg:F0} maxBlock={pcmMax} | outRms={outRms:F3} (ミックスへ加算した音声; 0なら出力経路断)");
+            // consumer (CefAudioSink.OnAudioFilterRead) の安定性。calls/s が一定・maxBlock が
+            // 固定なら一定ペースで消費できている。outRms>0 ならミックスへ音声が出ている。
+            if (_sink != null)
+            {
+                _sink.SnapshotStats(out int pcmCalls, out int pcmFrames, out int pcmMax, out double outSumSq, out long outSamples);
+                float pcmAvg = pcmCalls > 0 ? (float)pcmFrames / pcmCalls : 0f;
+                float outRms = outSamples > 0 ? (float)Math.Sqrt(outSumSq / outSamples) : 0f;
+                CefLog.Log(
+                    $"[CefAudio-CONS] calls/s={pcmCalls} framesOut/s={pcmFrames} (~{(outRate > 0 ? pcmFrames / (float)outRate * 1000f : 0f):F0}ms/s) " +
+                    $"avg={pcmAvg:F0} maxBlock={pcmMax} | outRms={outRms:F3} (ミックスへ加算した音声; 0なら出力経路断)");
+            }
         }
 
         /// <summary>
@@ -253,19 +249,18 @@ namespace CefUnity.Runtime
             int capFrames = Mathf.Max(2, Mathf.CeilToInt(_bufferSeconds * sampleRate));
             int targetFrames = Mathf.Clamp(Mathf.CeilToInt(_targetLatencySeconds * sampleRate), 1, capFrames - 1);
             _ring = new CefAudioRing(capFrames, channels, targetFrames, _maxRateAdjust);
-            _filterScratch = new float[MaxPullFrames * channels];
 
-            // 消費は OnAudioFilterRead で行う (DSP ブロックごとに一定ペースで呼ばれる)。
-            // ストリーミング AudioClip の PCMReaderCallback は先読みバッファ管理の都合で
-            // 消費レートが波打ち (実測 800〜1200ms/s)、滞留量が振動してアンダーランの原因に
-            // なるため使わない。代わりに無音のループクリップを鳴らして AudioSource を
-            // アクティブに保ち、OnAudioFilterRead で最終ミックスへ自前の音声を加算する。
-            int carrierLen = Mathf.Max(256, outRate / 10);
-            var carrier = AudioClip.Create("CefAudioCarrier", carrierLen, channels, outRate, false);
+            // 消費は専用子 GameObject 上の CefAudioSink (OnAudioFilterRead) が行う。
+            // AudioListener を持つ本 GameObject 上に OnAudioFilterRead を置くとバインド先が
+            // 非決定的になり動作が不安定になるため、AudioSource とだけ同居する子に分離する。
+            if (_sink == null)
+            {
+                var go = new GameObject("CefAudioSink");
+                go.transform.SetParent(transform, false);
+                _sink = go.AddComponent<CefAudioSink>();
+            }
 
-            _audioSource.clip = carrier;
-            _audioSource.loop = true;
-            _audioSource.Play();
+            _sink.Configure(_ring, _baseStep, channels, outRate, MaxPullFrames);
             _streamReady = true;
             return true;
         }
@@ -303,6 +298,7 @@ namespace CefUnity.Runtime
             {
                 _streamReady = false;
                 _ring = null;
+                if (_sink != null) _sink.StopOutput();
                 return;
             }
 
@@ -326,76 +322,9 @@ namespace CefUnity.Runtime
             _ring?.Write(_pullScratch, 0, got);
         }
 
-        /// <summary>
-        ///     オーディオスレッド (DSP): リングからレート変換した音声を最終ミックスへ加算する
-        ///     (consumer)。DSP ブロックごとに一定ペースで呼ばれるため、ストリーミングクリップの
-        ///     ような先読みの波が無く、消費レートが安定する。
-        ///     <para>
-        ///     <paramref name="data" /> は出力スピーカーの interleaved (長さ = フレーム数 *
-        ///     <paramref name="channels" />)。src チャネル数と異なる場合はチャネルを写像する。
-        ///     </para>
-        /// </summary>
-        private void OnAudioFilterRead(float[] data, int channels)
-        {
-            var ring = _ring;
-            var scratch = _filterScratch;
-            if (ring == null || _srcChannels <= 0 || scratch == null || channels <= 0)
-                return; // 何もしない = 無音 (キャリアクリップの 0) のまま
-
-            int frames = data.Length / channels;
-            int need = frames * _srcChannels;
-            if (need > scratch.Length) return; // 想定外の巨大ブロックは安全側でスキップ
-
-            // src チャネルで補間しつつ取り出す。
-            ring.Read(scratch, frames, _baseStep);
-
-            // 安定性・出力検証の計装 (診断ログ有効時のみ。per-sample の二乗和は
-            // オーディオスレッドのコストになるため CefLog.Enabled でゲートする)。
-            if (CefLog.Enabled)
-            {
-                System.Threading.Interlocked.Increment(ref _pcmCalls);
-                System.Threading.Interlocked.Add(ref _pcmFrames, frames);
-                int prevMax = _pcmMaxFrames;
-                while (frames > prevMax)
-                    prevMax = System.Threading.Interlocked.CompareExchange(ref _pcmMaxFrames, frames, prevMax);
-
-                // 実際にミックスへ加算する音声の RMS (Mute やスペクトルタップの順序に
-                // 依存せず、パイプラインが非ゼロ音声を出力しているか確認できる)。
-                double sumSq = 0.0;
-                for (int i = 0; i < need; i++)
-                {
-                    float s = scratch[i];
-                    sumSq += (double)s * s;
-                }
-
-                _pcmOutSumSq += sumSq;
-                _pcmOutSamples += need;
-            }
-
-            // 最終ミックスへ加算。src と出力のチャネル数が同じなら直接、違えば写像する。
-            if (channels == _srcChannels)
-            {
-                int nSamples = frames * channels;
-                for (int i = 0; i < nSamples; i++) data[i] += scratch[i];
-            }
-            else
-            {
-                for (int f = 0; f < frames; f++)
-                for (int c = 0; c < channels; c++)
-                    data[f * channels + c] += scratch[f * _srcChannels + c % _srcChannels];
-            }
-        }
-
-        // consumer (OnPcmRead) 計装。理想は毎 DSP ブロック ~1024 frames で calls/s ≈ outRate/1024。
-        private int _pcmCalls;
-        private int _pcmFrames;
-        private int _pcmMaxFrames;
-        private double _pcmOutSumSq; // ミックスへ加算した音声の二乗和 (出力 RMS 算出用)
-        private long _pcmOutSamples;
-
         private void OnDisable()
         {
-            if (_audioSource != null) _audioSource.Stop();
+            if (_sink != null) _sink.StopOutput();
         }
     }
 }
