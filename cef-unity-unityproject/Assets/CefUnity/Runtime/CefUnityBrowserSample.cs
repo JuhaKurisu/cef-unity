@@ -121,40 +121,62 @@ namespace CefUnity.Runtime
         private float _delayReportTimer;
 
         // -----------------------------------------------------------------------
-        // Double-pump (0 frame 描画遅延)
+        // 0F 描画遅延 (server-side flush + 描画発行前 recv + 予算適応待ち)
         // -----------------------------------------------------------------------
         // CEF external BeginFrame は deadline=null で発行されるため、1 回の BeginFrame
         // では display compositor が renderer の submit を待たず「前フレーム」を即 draw する
-        // (構造的 1F 遅延)。これを 1 Unity フレーム内で BeginFrame を 2 回発行して回避する:
-        //   1) EarlyUpdate: 入力送信 + BeginFrame#1 → renderer が当該フレームの内容を生成
-        //   2) PostLateUpdate: renderer submit を待って BeginFrame#2 (flush) → display が
-        //      最新内容を draw → その paint が届くまで待って同フレーム内にテクスチャ反映
-        // accel_frame_id (paint ごとに +1、Mach 送信完了後に増分) を同期カウンタに使い、
-        // 「flush 後に新しく到着した paint」だけを採用することで早着 paint (#1 由来の古い
-        // 内容) の誤取得を防ぐ。accelerated paint 経路でのみ有効。
-        [SerializeField] private bool _doublePump = true;
-        // #A (BeginFrame#1 の即時 draw) が accel_frame_id に計上されるのを待つ上限 (ms)。
-        // baseline に #A を確実に含めて、flush 後の最初の AFI 増分が必ず fresh paint (#B)
-        // になるようにするためのガード。アニメーション時は ~3ms で early-exit する。
-        [SerializeField] private float _doublePumpSettleMs = 4f;
-        // flush 後、fresh paint (#B) が届くのを待つ上限 (ms)。AFI 増分で early-exit する。
-        [SerializeField] private float _doublePumpRecvMs = 12f;
-        // recv 待ちの間、flush (BeginFrame#2) を撃ち直す間隔 (ms)。renderer の submit が
-        // 何 ms 後でも、次の flush が最新内容を draw するので fresh paint を取り逃さない。
-        [SerializeField] private float _doublePumpFlushIntervalMs = 2f;
-        // EarlyUpdate で BeginFrame#1 を撃つ直前の accel_frame_id (#A 計上待ちの基準)。
+        // (構造的 1F 遅延)。サーバーが BF#1 の +3/+6ms に内部 flush (BF#2) を発行して
+        // 最新内容を draw させる (server-side flush、server.rs)。クライアントは描画発行前の
+        // recv 位置で flush 結果の到着 (accel_frame_id 増分) を短時間だけ待ち、同フレームの
+        // present に乗せる (0F)。待ちの上限は BF#1 (EarlyUpdate) からの経過時間で cap する
+        // ため、ゲーム処理が重いフレームでは自動的に待ちゼロになる (その場合 flush 結果は
+        // 自然に到着済み)。間に合わなければ従来通り 1F フォールバック。
+        [SerializeField, Tooltip("BF#1 発行からこの時間 (ms) までは flush 結果の到着を待って 0F 化する " +
+            "(0 で待ち無効 = 常にノンブロッキング受信)。60fps 予算 16.7ms 内に収まる 10ms 程度を推奨。")]
+        private float _zeroFrameWaitMs = 10f;
+        // server-side flush#1 は BF#1+3ms に発行される (server.rs FLUSH_THRESHOLDS_MS[0])。
+        // その draw 由来 paint が accel_frame_id に計上され得る最短時刻のマージン。これより
+        // 前の増分は BF#1 由来の stale paint (#A) とみなして読み捨て、fresh (#B) を待つ。
+        private const float FreshPaintMinDelayMs = 4.5f;
+        // damage の有無は「flush#1 の draw 由来 paint が届き得る時刻」まで分からない
+        // (renderer のタイマー/rAF 発火 → submit +2-4ms → flush#1 draw → paint +5-6ms)。
+        // BF#1 からこの時間まで増分ゼロなら「このフレームに damage なし」と判断して
+        // 待ちを打ち切る (5Hz 更新ページ等で damage の無いフレームの空回りを短縮)。
+        private const float NoDamageGiveUpMs = 7f;
+        // 早着 paint (#A、freshMinTime より前の増分) を読み捨てた後、この時刻までに
+        // flush 由来 (#B) が来なければ #A の内容を採用して抜ける。#A がタイマー発火由来の
+        // fresh な内容 (damage を #A が消費し #B が生成されない) ケースで、絶対上限まで
+        // 粘る無駄を防ぐ。#B の標準到着 (+5-6.5ms) を跨ぐ位置に置く。
+        private const float EarlyPaintAdoptMs = 7.5f;
+        // server は「paint 発生フレーム」が 3 連続すると flush を抑止する (damage streak、
+        // server.rs DAMAGE_STREAK_SUPPRESS_FLUSH)。抑止中は fresh (#B) が来ないため、
+        // クライアント側でもスコアで同じ状態を推定し、最初の AFI 増分 (BF#1 由来 paint)
+        // で即座に待ちを抜けて空回りを防ぐ。スコアは fresh 受信 +1 / 受信なし -2 の
+        // ヒステリシス: 連続スクロール中に 1 フレームだけ受信を取り逃しても抑止推定を
+        // 維持する (即 0 リセットにすると、取り逃しの直後 3 フレームが「非抑止」誤推定と
+        // なり、来ない #B を待って earlyAdopt まで空回りする振動が起きる。実測で
+        // スクロール時 block_avg 5.5ms・コンテンツ供給 85-92% に劣化した)。
+        private const int StreakScoreSuppress = 3; // これ以上で抑止推定
+        private const int StreakScoreMax = 6;      // 天井 (解除応答性のため小さく保つ)
+        private int _streakScore;
+        // BF#1 送信直前の実時刻 (待ちデッドラインと fresh 判定時刻の基準)。
+        private float _bf1Time;
+        // EarlyUpdate で BeginFrame#1 を撃つ直前の accel_frame_id (増分検知の基準)。
         private ulong _afiAtBf1;
-        // 直近で fresh paint を取得してからの経過フレーム数。アクティブ判定に使う
-        // (静止ページで毎フレーム spin して main thread をブロックするのを防ぐ)。
+        // 直近で fresh paint を取得してからの経過フレーム数。プローブ判定に使う:
+        // この窓の間はページが動いている可能性があるとみなして damage プローブ待ちを行い、
+        // 窓を超えたら完全静止とみなして待ちを止める (busy-wait コストをゼロにする)。
+        // ページ内タイマー起点の低頻度更新 (例: 5Hz = 12 フレーム間隔) を捕捉できるよう
+        // 1 秒 (60 フレーム) に設定。静止→再開の最初の 1 paint だけは 1F で拾う。
         private int _framesSinceFreshPaint = int.MaxValue;
-        private const int ActivityWindowFrames = 8;
+        private const int ProbeWindowFrames = 60;
         // このフレームで CEF へ入力イベントを送ったか (アクティブ判定の即時トリガー)。
         private bool _inputSentThisFrame;
-        // double-pump 検証メトリクス
-        private int _dpFreshCount;     // flush 後 0F で取得できた回数
-        private int _dpFallbackCount;  // タイムアウトで諦めた回数 (前フレーム内容を継続表示)
-        private int _dpIdleCount;      // 非アクティブで spin をスキップした回数
-        private double _dpBlockSumMs;  // PostLateUpdate でのブロック時間合計
+        // 0F 待ち検証メトリクス
+        private int _dpFreshCount;     // 待ちの後 (or 待ちゼロで) 新 paint を取得できた回数
+        private int _dpFallbackCount;  // デッドラインまでに届かず諦めた回数 (前フレーム内容を継続表示)
+        private int _dpIdleCount;      // 非アクティブで待ちをスキップした回数
+        private double _dpBlockSumMs;  // recv hook でのブロック時間合計
         private double _dpBlockMaxMs;
 
         // -----------------------------------------------------------------------
@@ -210,11 +232,6 @@ namespace CefUnity.Runtime
                 QualitySettings.vSyncCount = 0;
                 Application.targetFrameRate = 60;
 
-                // double-pump 予算の防御的クランプ (0 だと常時 1F フォールバックに陥るため)
-                if (_doublePumpSettleMs <= 0f) _doublePumpSettleMs = 4f;
-                if (_doublePumpRecvMs <= 0f) _doublePumpRecvMs = 12f;
-                if (_doublePumpFlushIntervalMs <= 0f) _doublePumpFlushIntervalMs = 2f;
-
                 var useGpu = !(SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12 || SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11);
                 // ログのマスタースイッチ: Unity 側 (CefLog) と Rust 側 (client/server)
                 // の両方を _enableLog 一つで制御する。
@@ -223,8 +240,9 @@ namespace CefUnity.Runtime
                 _browser = new Browser(_currentWidth, _currentHeight, _url);
 
                 // PlayerLoop に EarlyUpdate / PostLateUpdate の hook を挿入。
-                // EarlyUpdate 末尾で「入力送信 + BeginFrame」、PostLateUpdate 末尾で
-                // 「TryRecv」を行うことで、入力遅延 0 + 描画遅延ほぼ 0 + block ゼロを目指す。
+                // EarlyUpdate 末尾で「入力送信 + BeginFrame」、PostLateUpdate 内の描画発行前
+                // (Canvas 更新前) で「recv + 短い 0F 待ち」を行うことで、入力遅延 0 +
+                // 描画遅延 0F (同フレーム present 反映) を目指す。
                 s_instance = this;
                 InstallPlayerLoopHooks();
                 _playerLoopHooked = true;
@@ -337,12 +355,12 @@ namespace CefUnity.Runtime
                         _recentSamples.Clear();
                     }
 
-                    // double-pump 専用メトリクス (fresh=0F取得 / fallback=1F / idle=spinスキップ)。
-                    if (_doublePump && _useAcceleratedPaint)
+                    // 0F 待ち専用メトリクス (fresh=新paint取得 / fallback=届かず1F / idle=待ちスキップ)。
+                    if (_zeroFrameWaitMs > 0f && _useAcceleratedPaint)
                     {
                         var dpActive = _dpFreshCount + _dpFallbackCount;
                         var blockAvg = dpActive > 0 ? _dpBlockSumMs / dpActive : 0.0;
-                        CefLog.Log($"[CefUnity] double-pump: fresh(0F)={_dpFreshCount} fallback(1F)={_dpFallbackCount} idle={_dpIdleCount} block_avg={blockAvg:F2}ms block_max={_dpBlockMaxMs:F2}ms");
+                        CefLog.Log($"[CefUnity] 0F-wait: fresh={_dpFreshCount} fallback(1F)={_dpFallbackCount} idle={_dpIdleCount} block_avg={blockAvg:F2}ms block_max={_dpBlockMaxMs:F2}ms");
                         _dpFreshCount = 0;
                         _dpFallbackCount = 0;
                         _dpIdleCount = 0;
@@ -351,8 +369,8 @@ namespace CefUnity.Runtime
                     }
 
                     // jitter 計装: 機構1 (フレーム時間=present 間隔) と 機構2 (content 更新間隔)。
-                    // double-pump ON/OFF どちらでも出力して比較できるようにする。
-                    var dp = (_doublePump && _useAcceleratedPaint) ? "ON " : "OFF";
+                    // 0F 待ち ON/OFF どちらでも出力して比較できるようにする。
+                    var dp = (_zeroFrameWaitMs > 0f && _useAcceleratedPaint) ? "ON " : "OFF";
                     var ftMean = _ftCount > 0 ? _ftSum / _ftCount : 0.0;
                     var ftStd = _ftCount > 0 ? Math.Sqrt(Math.Max(0, _ftSumSq / _ftCount - ftMean * ftMean)) : 0.0;
                     var ciMean = _ciCount > 0 ? _ciSum / _ciCount : 0.0;
@@ -448,36 +466,129 @@ namespace CefUnity.Runtime
             self.UpdateCompositionCursorPos();
             self.HandleImeInput();
             self.HandleKeyboardInput();
-            // BeginFrame#1 直前の paint カウンタを記録 (#A 計上待ちの基準)。
+            // BeginFrame#1 直前の paint カウンタと時刻を記録 (recv 側の増分検知・待ち基準)。
             if (self._useAcceleratedPaint)
                 self._afiAtBf1 = self._browser.PeekAccelFrameId();
+            self._bf1Time = Time.realtimeSinceStartup;
             // BeginFrame#1: renderer に「このフレームの入力を反映した内容」を作らせる。
             self._browser.SendExternalBeginFrame((ulong)Time.frameCount);
         }
 
         /// <summary>
-        /// PostLateUpdate の末尾に挿入される hook。全 MonoBehaviour LateUpdate / Animator /
-        /// Physics 完了直後、Camera Render 直前。ここで flush (BeginFrame#2) を発行して
-        /// display compositor に「renderer が submit した最新内容」を draw させ、その paint が
-        /// 届くまで待って同一フレーム内にテクスチャ反映する (0F)。
+        /// PostLateUpdate 内の描画発行前 (Canvas 更新 = PlayerUpdateCanvases より前) に
+        /// 挿入される hook。全 MonoBehaviour LateUpdate / Animator 完了直後。ここで受信した
+        /// テクスチャは同フレームの FinishFrameRendering → present に乗る (0F 条件)。
+        /// リスト末尾への Append は PresentAfterDraw より後になり反映が次フレームへずれる
+        /// (実画面 +1F) ため不可。
         /// </summary>
-        private static void OnPostLateUpdateLast()
+        private static void OnPostLateUpdateRecv()
         {
             var self = s_instance;
             if (self == null || self._browser == null) return;
             self._postLateUpdateInvokeCount++;
+            self.RecvBeforeRender();
+        }
 
-            // server-side flush 方式: flush (BeginFrame#2) はサーバーが内部で発行するため、
-            // クライアントは spin も追加 BeginFrame も無しで「最新を 1 回ノンブロッキング受信」
-            // するだけ。これで Unity をブロックせず、サーバーが間に合えば同フレームの最新内容
-            // (0F) を、間に合わなければ前フレーム内容 (1F) を表示する (どちらもブロック 0)。
-            if (self.TryUpdateTextureOnce())
+        /// <summary>
+        /// 描画発行前の recv 本体。server-side flush の結果 (accel_frame_id 増分) を
+        /// _zeroFrameWaitMs (BF#1 からの経過時間 cap) まで待ち、届いた最新 paint を
+        /// 同フレームの present に乗せる (0F)。ゲーム処理が重いフレームではここへの到達が
+        /// 遅く cap を過ぎているため自動的に待ちゼロ (flush 結果は自然に到着済み)。
+        /// デッドラインまでに届かなければ従来通り 1F フォールバック。待ちは SHM カウンタの
+        /// busy-wait のみで IPC を発行しない (旧 client-side double-pump の reflush による
+        /// IPC フラッディング → 46ms ブロック問題は構造的に発生しない)。
+        /// </summary>
+        private void RecvBeforeRender()
+        {
+            // software 経路 / 待ち無効時は従来のノンブロッキング受信のみ。
+            if (!_useAcceleratedPaint || _zeroFrameWaitMs <= 0f)
             {
-                self._gotInPostLateUpdateCount++;
-                self.RecordContentInterval();
+                if (TryUpdateTextureOnce()) OnFreshPaint();
+                else OnNoPaint();
+                return;
             }
-            else if (self._textureUpdatedFrame != Time.frameCount)
-                self._recvFailCount++;
+
+            var blockStart = Time.realtimeSinceStartup;
+
+            // プローブ判定: 入力を送った or 直近 1 秒以内にページが動いていた時だけ待つ。
+            // 完全静止ページでは paint 自体が来ないため待たない (ブロック 0)。
+            var expectPaint = _inputSentThisFrame || _framesSinceFreshPaint < ProbeWindowFrames;
+            if (!expectPaint)
+            {
+                if (TryUpdateTextureOnce()) OnFreshPaint();
+                else OnNoPaint();
+                _dpIdleCount++;
+                return;
+            }
+
+            var deadline = _bf1Time + _zeroFrameWaitMs * 0.001f;
+            var freshMinTime = _bf1Time + FreshPaintMinDelayMs * 0.001f;
+            var noDamageGiveUp = _bf1Time + NoDamageGiveUpMs * 0.001f;
+            var earlyAdopt = _bf1Time + EarlyPaintAdoptMs * 0.001f;
+            // サーバーの damage streak 抑止 (flush 無し) をクライアント側で推定。
+            // 抑止中に fresh (#B) を待つと毎フレーム上限まで空回りするため、最初の増分
+            // (BF#1 由来 paint、内容 1F) で即抜けて同フレームの present に乗せる。
+            var flushSuppressed = _streakScore >= StreakScoreSuppress;
+
+            var baseline = _afiAtBf1;
+            var sawEarlyPaint = false;
+            while (true)
+            {
+                var now = Time.realtimeSinceStartup;
+                if (now >= deadline) break;
+                var afi = _browser.PeekAccelFrameId();
+                if (afi != baseline)
+                {
+                    // 増分検知。flush 抑止中は BF#1 paint しか来ないので即採用。非抑止時は
+                    // flush#1 の draw があり得る時刻 (freshMinTime) より前の増分を BF#1 由来
+                    // stale (#A) とみなして読み捨て、fresh (#B) を待ち続ける。
+                    if (flushSuppressed || now >= freshMinTime) break;
+                    baseline = afi;
+                    sawEarlyPaint = true;
+                    continue;
+                }
+                if (sawEarlyPaint)
+                {
+                    // 早着 (#A) は届いたが #B が来ない: タイマー発火由来の damage を #A が
+                    // 消費したケース。#B の標準到着時刻を跨いだら #A を採用して抜ける。
+                    if (now >= earlyAdopt) break;
+                }
+                else if (now >= noDamageGiveUp)
+                {
+                    // 増分ゼロのまま判定時刻超え = このフレームに damage なし。
+                    break;
+                }
+                // Peek (FFI + SHM read) のフル回転を避けて CPU/メモリバス圧を下げる。
+                // SpinWait はデスケジュールされない (Thread.Sleep(1) は macOS で 10ms+
+                // オーバースリープするため使用不可)。時間精度は ~µs で十分。
+                System.Threading.Thread.SpinWait(64);
+            }
+
+            // 増分で抜けた場合はその paint を、デッドライン切れでも直前に届いた分があれば拾う
+            // (TryRecv は queue を drain して最新を返すため、どちらでも最新が取れる)。
+            if (TryUpdateTextureOnce()) { OnFreshPaint(); _dpFreshCount++; }
+            else { OnNoPaint(); _dpFallbackCount++; }
+
+            var blockMs = (Time.realtimeSinceStartup - blockStart) * 1000.0;
+            _dpBlockSumMs += blockMs;
+            if (blockMs > _dpBlockMaxMs) _dpBlockMaxMs = blockMs;
+        }
+
+        /// <summary>recv 成功時の共通処理 (verify 計装 + activity/streak カウンタ更新)。</summary>
+        private void OnFreshPaint()
+        {
+            _gotInPostLateUpdateCount++;
+            _framesSinceFreshPaint = 0;
+            if (_streakScore < StreakScoreMax) _streakScore++;
+            RecordContentInterval();
+        }
+
+        /// <summary>recv 失敗 (新 paint なし) 時の共通処理。</summary>
+        private void OnNoPaint()
+        {
+            if (_textureUpdatedFrame != Time.frameCount) _recvFailCount++;
+            if (_framesSinceFreshPaint != int.MaxValue) _framesSinceFreshPaint++;
+            _streakScore = Math.Max(0, _streakScore - 2);
         }
 
         /// <summary>機構2 計装: 新テクスチャを適用した実時刻の連続差 (= コンテンツがカバーする
@@ -497,82 +608,17 @@ namespace CefUnity.Runtime
             _lastFreshRealtime = nowRt;
         }
 
-        /// <summary>
-        /// double-pump の flush + 受信本体。flush 前に baseline となる accel_frame_id を
-        /// 記録し、flush 後に「baseline を超える新規 paint」が届くまで待ってから取得する。
-        /// これにより BeginFrame#1 由来の古い paint (#A) ではなく flush 由来の最新 paint
-        /// (#B) を確実に掴む。静止フレーム (アクティブでない) では spin せずブロックを避ける。
-        /// </summary>
-        private void PumpAndRecvAccelerated()
+        // recv フックの挿入先アンカー (優先順)。受信テクスチャを同フレームの present に
+        // 乗せるには Canvas ジオメトリ更新 (PlayerUpdateCanvases) より前に RawImage の
+        // テクスチャを差し替える必要がある。Unity 6000.3 では描画発行 (FinishFrameRendering)
+        // と present (PresentAfterDraw) が PostLateUpdate 内にあるため、リスト末尾への
+        // Append は present より後 = 反映が次フレームの描画にずれる (実画面 +1F)。
+        private static readonly Type[] RecvAnchorTypes =
         {
-            var blockStart = Time.realtimeSinceStartup;
-
-            // アクティブ判定: 入力があった or 直近で paint が動いていれば flush 後の paint を
-            // 期待して spin する。完全静止状態では spin せず、前フレームの内容を継続表示する。
-            var expectPaint = _inputSentThisFrame || _framesSinceFreshPaint < ActivityWindowFrames;
-
-            if (!expectPaint)
-            {
-                // 非アクティブ: flush だけ発行し (内容変化があれば次フレーム以降で拾う)、
-                // すでに届いている paint があれば消費するが spin はしない。
-                _browser.SendExternalBeginFrame((ulong)Time.frameCount);
-                if (TryUpdateTextureOnce()) { _gotInPostLateUpdateCount++; _framesSinceFreshPaint = 0; }
-                else if (_framesSinceFreshPaint != int.MaxValue) _framesSinceFreshPaint++;
-                _dpIdleCount++;
-                return;
-            }
-
-            // 1) #A (BeginFrame#1 の即時 draw) が accel_frame_id に計上されるまで待つ。
-            //    これを baseline に含めないと、flush 後に遅れて届いた #A (古い内容) を
-            //    fresh paint と誤認してしまう。アニメーション時は ~3ms で抜ける。
-            //    #A に damage が無い (内容無変化) 場合は上限まで待って先に進む (その場合
-            //    そもそも古い stale paint が生成されないので baseline に #A が無くても安全)。
-            var settleDeadline = Time.realtimeSinceStartup + _doublePumpSettleMs * 0.001f;
-            while (Time.realtimeSinceStartup < settleDeadline
-                   && _browser.PeekAccelFrameId() == _afiAtBf1) { }
-
-            // 2) baseline 記録。この時点で #A は計上済み (または damage 無しで存在しない)。
-            var baseline = _browser.PeekAccelFrameId();
-
-            // 3) reflush ループ: 一定間隔で flush (BeginFrame#2) を撃ちつつ、baseline を
-            //    超える fresh paint (#B) が届くまで待つ。renderer の submit が flush より
-            //    遅れても、次の flush が最新内容を draw するので取り逃さない。
-            //    accel_frame_id の増分は Mach 送信完了後なので、増えた時点で IOSurface は
-            //    受信ポートに到達済み → drain で確実に取得できる。
-            var recvDeadline = Time.realtimeSinceStartup + _doublePumpRecvMs * 0.001f;
-            var flushInterval = _doublePumpFlushIntervalMs * 0.001f;
-            var nextFlush = 0f; // 即 flush
-            var arrived = false;
-            while (Time.realtimeSinceStartup < recvDeadline)
-            {
-                var t = Time.realtimeSinceStartup;
-                if (t >= nextFlush)
-                {
-                    _browser.SendExternalBeginFrame((ulong)Time.frameCount);
-                    nextFlush = t + flushInterval;
-                }
-                if (_browser.PeekAccelFrameId() != baseline) { arrived = true; break; }
-            }
-
-            if (arrived && TryUpdateTextureOnce())
-            {
-                _gotInPostLateUpdateCount++;
-                _dpFreshCount++;
-                _framesSinceFreshPaint = 0;
-                RecordContentInterval();
-            }
-            else
-            {
-                // タイムアウト: 新規 paint が間に合わなかった (renderer 遅延等)。
-                // 前フレームのテクスチャを継続表示し、次フレームで拾う (1F フォールバック)。
-                _dpFallbackCount++;
-                if (_framesSinceFreshPaint != int.MaxValue) _framesSinceFreshPaint++;
-            }
-
-            var blockMs = (Time.realtimeSinceStartup - blockStart) * 1000.0;
-            _dpBlockSumMs += blockMs;
-            if (blockMs > _dpBlockMaxMs) _dpBlockMaxMs = blockMs;
-        }
+            typeof(PostLateUpdate.PlayerUpdateCanvases),
+            typeof(PostLateUpdate.PlayerEmitCanvasGeometry),
+            typeof(PostLateUpdate.FinishFrameRendering),
+        };
 
         private static void InstallPlayerLoopHooks()
         {
@@ -582,7 +628,7 @@ namespace CefUnity.Runtime
                 if (loop.subSystemList[i].type == typeof(EarlyUpdate))
                     loop.subSystemList[i] = AppendSubsystem(loop.subSystemList[i], typeof(CefUnityEarlyUpdate), OnEarlyUpdateLast);
                 else if (loop.subSystemList[i].type == typeof(PostLateUpdate))
-                    loop.subSystemList[i] = AppendSubsystem(loop.subSystemList[i], typeof(CefUnityPostLateUpdate), OnPostLateUpdateLast);
+                    loop.subSystemList[i] = InsertSubsystemBeforeAnchor(loop.subSystemList[i], RecvAnchorTypes, typeof(CefUnityPostLateUpdate), OnPostLateUpdateRecv);
             }
             PlayerLoop.SetPlayerLoop(loop);
         }
@@ -609,6 +655,35 @@ namespace CefUnity.Runtime
             var newList = new PlayerLoopSystem[oldList.Length + 1];
             Array.Copy(oldList, newList, oldList.Length);
             newList[oldList.Length] = new PlayerLoopSystem { type = marker, updateDelegate = update };
+            parent.subSystemList = newList;
+            return parent;
+        }
+
+        /// <summary>anchors のうち最初に見つかったサブシステムの直前に marker を挿入する。
+        /// どのアンカーも見つからない場合は先頭に挿入する (描画発行前であることを優先)。</summary>
+        private static PlayerLoopSystem InsertSubsystemBeforeAnchor(PlayerLoopSystem parent, Type[] anchors, Type marker, PlayerLoopSystem.UpdateFunction update)
+        {
+            var oldList = parent.subSystemList ?? Array.Empty<PlayerLoopSystem>();
+            // 既に同 marker が入っていたら何もしない (二重 install 防止)
+            for (int i = 0; i < oldList.Length; i++)
+                if (oldList[i].type == marker) return parent;
+
+            int insertAt = -1;
+            foreach (var anchor in anchors)
+            {
+                insertAt = Array.FindIndex(oldList, s => s.type == anchor);
+                if (insertAt >= 0) break;
+            }
+            if (insertAt < 0)
+            {
+                CefLog.LogError("[CefUnity] recv anchor subsystem not found in PostLateUpdate; inserting at head");
+                insertAt = 0;
+            }
+
+            var newList = new PlayerLoopSystem[oldList.Length + 1];
+            Array.Copy(oldList, newList, insertAt);
+            newList[insertAt] = new PlayerLoopSystem { type = marker, updateDelegate = update };
+            Array.Copy(oldList, insertAt, newList, insertAt + 1, oldList.Length - insertAt);
             parent.subSystemList = newList;
             return parent;
         }
