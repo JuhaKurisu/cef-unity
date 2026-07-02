@@ -159,6 +159,14 @@ namespace CefUnity.Runtime
         private const int StreakScoreSuppress = 3; // これ以上で抑止推定
         private const int StreakScoreMax = 6;      // 天井 (解除応答性のため小さく保つ)
         private int _streakScore;
+        // 直近何フレーム連続で CEF へ入力を送ったか。連続入力 (スクロール/ドラッグ/
+        // キーリピート) は server 側で damage streak 抑止に入りがち = 待ちの価値が無い。
+        // streak スコアだけだと CEF のヒッチ (2 フレーム paint 欠落) で推定が外れて
+        // 待ちが再発し、busy-wait の CPU 競合が荒れを増幅する振動が起きるため (実測)、
+        // 連続入力そのものも待ちスキップの条件にする。単発入力 (クリック・単打鍵) は
+        // 連続にならないので従来通り待って 0F を取る。
+        private const int SustainedInputFrames = 3;
+        private int _consecutiveInputFrames;
         // BF#1 送信直前の実時刻 (待ちデッドラインと fresh 判定時刻の基準)。
         private float _bf1Time;
         // EarlyUpdate で BeginFrame#1 を撃つ直前の accel_frame_id (増分検知の基準)。
@@ -232,6 +240,12 @@ namespace CefUnity.Runtime
                 QualitySettings.vSyncCount = 0;
                 Application.targetFrameRate = 60;
 
+                // 計測用 (一時): cef_no_zero_wait マーカーで 0F 待ちを無効化 (baseline 比較用)。
+                // シーンの serialized 値は Editor が外部変更を再読込しないため、既存の計測
+                // トグル群と同じ temp ファイル方式で切り替える。
+                if (System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_no_zero_wait")))
+                    _zeroFrameWaitMs = 0f;
+
                 var useGpu = !(SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12 || SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11);
                 // ログのマスタースイッチ: Unity 側 (CefLog) と Rust 側 (client/server)
                 // の両方を _enableLog 一つで制御する。
@@ -290,15 +304,6 @@ namespace CefUnity.Runtime
                 var until = Time.realtimeSinceStartup + 0.008f;
                 while (Time.realtimeSinceStartup < until) { }
             }
-            // 計測用 (一時): cef_scroll_test が在るあいだ、実ユーザーのホイール操作を模して
-            // 毎フレーム ±60px のスクロールを注入する (3 秒ごとに方向反転)。
-            if (_browser != null
-                && System.IO.File.Exists(System.IO.Path.Combine(tmpDir, "cef_scroll_test")))
-            {
-                var dir = ((int)(Time.realtimeSinceStartup / 3f)) % 2 == 0 ? -1 : 1;
-                _browser.SendMouseWheel(_currentWidth / 2, _currentHeight / 2, 0, dir * 60);
-            }
-
 
             // 機構1 計装: フレーム時間 (present 間隔) の分布を毎フレーム集計。
             var ft = Time.unscaledDeltaTime;
@@ -319,7 +324,11 @@ namespace CefUnity.Runtime
                 {
                     var paintCount = NativeMethods.cef_unity_get_paint_count();
                     var pumpCount = NativeMethods.cef_unity_get_pump_count();
-                    CefLog.Log($"[CefUnity] diag: paint={paintCount} pump={pumpCount}");
+                    // afi = accel_frame_id (server が Mach 送信を完了した paint の累積数)。
+                    // 2 秒窓の増分が「CEF が Unity へ届けた paint レート」= CEF 出力 fps。
+                    // paint= は software 経路のカウンタなので GPU 経路では常に 0。
+                    var afi = _useAcceleratedPaint ? _browser.PeekAccelFrameId() : 0;
+                    CefLog.Log($"[CefUnity] diag: paint={paintCount} pump={pumpCount} afi={afi}");
                     var logs = CefRuntime.GetLogs();
                     foreach (var line in logs)
                         CefLog.Log($"[CefServer] {line}");
@@ -463,9 +472,23 @@ namespace CefUnity.Runtime
             self._inputSentThisFrame = false;
             self.CheckScreenResize();
             self.HandleMouseInput();
+            // 計測用 (一時): cef_scroll_test が在るあいだ、実ユーザーのホイール操作を模して
+            // 毎フレーム ±60px のスクロールを注入する (3 秒ごとに方向反転)。実ホイールと
+            // 同じ EarlyUpdate 内で送ること (Update 内だと _inputSentThisFrame がこの hook
+            // 冒頭のリセットで消え、連続入力判定・アクティブ判定に乗らない)。
+            if (System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_scroll_test")))
+            {
+                var dir = ((int)(Time.realtimeSinceStartup / 3f)) % 2 == 0 ? -1 : 1;
+                self._browser.SendMouseWheel(self._currentWidth / 2, self._currentHeight / 2, 0, dir * 60);
+                self._inputSentThisFrame = true;
+            }
             self.UpdateCompositionCursorPos();
             self.HandleImeInput();
             self.HandleKeyboardInput();
+            // 連続入力カウンタ更新 (入力ハンドラ群の後なので _inputSentThisFrame は確定済み)。
+            self._consecutiveInputFrames = self._inputSentThisFrame
+                ? Math.Min(self._consecutiveInputFrames + 1, 1000)
+                : 0;
             // BeginFrame#1 直前の paint カウンタと時刻を記録 (recv 側の増分検知・待ち基準)。
             if (self._useAcceleratedPaint)
                 self._afiAtBf1 = self._browser.PeekAccelFrameId();
@@ -521,14 +544,23 @@ namespace CefUnity.Runtime
                 return;
             }
 
+            // サーバーの damage streak 抑止 (flush 無し) をクライアント側で推定。
+            // 抑止中 = 連続描画中はコンテンツがどのみち 1F (BF#1 の即時 draw は前フレーム
+            // 内容) なので、待っても鮮度は上がらない。さらに busy-wait の CPU が CEF
+            // プロセス群の paint 生成と競合し、スクロール中の供給を 2-7% 落とす (実測:
+            // 待ち OFF 99-100% / ON 92-98%)。よって抑止中・連続入力中は待ちをスキップして
+            // CPU を返し、ノンブロッキング受信のみ行う (待ち OFF と同じ挙動 = 供給 ~100%)。
+            if (_streakScore >= StreakScoreSuppress || _consecutiveInputFrames >= SustainedInputFrames)
+            {
+                if (TryUpdateTextureOnce()) { OnFreshPaint(); _dpFreshCount++; }
+                else { OnNoPaint(); _dpFallbackCount++; }
+                return;
+            }
+
             var deadline = _bf1Time + _zeroFrameWaitMs * 0.001f;
             var freshMinTime = _bf1Time + FreshPaintMinDelayMs * 0.001f;
             var noDamageGiveUp = _bf1Time + NoDamageGiveUpMs * 0.001f;
             var earlyAdopt = _bf1Time + EarlyPaintAdoptMs * 0.001f;
-            // サーバーの damage streak 抑止 (flush 無し) をクライアント側で推定。
-            // 抑止中に fresh (#B) を待つと毎フレーム上限まで空回りするため、最初の増分
-            // (BF#1 由来 paint、内容 1F) で即抜けて同フレームの present に乗せる。
-            var flushSuppressed = _streakScore >= StreakScoreSuppress;
 
             var baseline = _afiAtBf1;
             var sawEarlyPaint = false;
@@ -539,10 +571,9 @@ namespace CefUnity.Runtime
                 var afi = _browser.PeekAccelFrameId();
                 if (afi != baseline)
                 {
-                    // 増分検知。flush 抑止中は BF#1 paint しか来ないので即採用。非抑止時は
-                    // flush#1 の draw があり得る時刻 (freshMinTime) より前の増分を BF#1 由来
-                    // stale (#A) とみなして読み捨て、fresh (#B) を待ち続ける。
-                    if (flushSuppressed || now >= freshMinTime) break;
+                    // 増分検知。flush#1 の draw があり得る時刻 (freshMinTime) より前の増分は
+                    // BF#1 由来 stale (#A) とみなして読み捨て、fresh (#B) を待ち続ける。
+                    if (now >= freshMinTime) break;
                     baseline = afi;
                     sawEarlyPaint = true;
                     continue;
