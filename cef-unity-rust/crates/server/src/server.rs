@@ -719,12 +719,24 @@ struct PendingFlush {
     bf1: Instant,
     /// これまでに発行した flush 回数。
     flushes_done: u32,
+    /// BF#1 発行時点の PAINT_COUNT。このフレーム内に届いた paint 数の基準。
+    paints_at_bf1: u64,
 }
 
 /// flush を発行する経過時間しきい値 (ms)。renderer submit (実測 ~1.5-3ms) を跨ぐよう
-/// +3ms と +5ms の 2 段で撃ち、遅い submit も取り逃さない。すべてサーバースレッド上で
+/// +3ms と +6ms の 2 段で撃ち、遅い submit も取り逃さない。すべてサーバースレッド上で
 /// 行われ Unity をブロックしない。
-const FLUSH_THRESHOLDS_MS: [f64; 2] = [3.0, 5.0];
+/// 2 段目は paint 到着済みチェック (process_pending_flushes) でスキップされ得る。
+/// +6ms なのは flush#1 (+3ms) の draw → GPU → on_accelerated_paint 実行 (~2-3ms、
+/// tick 内で process_pending_flushes より後の do_message_loop_work で走る) を跨いで
+/// スキップ判定を効かせるため。
+const FLUSH_THRESHOLDS_MS: [f64; 2] = [3.0, 6.0];
+
+/// この回数以上「paint が発生したフレーム」が連続したら、ページは連続描画中
+/// (スクロール/アニメーション) とみなして flush を抑止し BF#1 のみの 60Hz 駆動にする。
+/// 小さすぎると離散入力の連打 (キーリピート等) で誤検出し 0F が失われ、大きすぎると
+/// スクロール開始直後の飽和期間が延びる。3 = 50ms 連続で描画が続いたら抑止。
+const DAMAGE_STREAK_SUPPRESS_FLUSH: u32 = 3;
 
 /// 計測用トグル: `<temp_dir>/cef_no_server_flush` が在ると server-side flush を無効化
 /// (BF#1 のみ = 1F baseline)。プロセス起動時に 1 回だけ判定 (server は Play ごとに再起動)。
@@ -745,6 +757,11 @@ pub struct CefServer {
     use_gpu: bool,
     /// Server-side flush の保留状態 (現状は単一 Browser 構成を想定)。
     pending_flush: Option<PendingFlush>,
+    /// 前回 BF#1 発行時点の PAINT_COUNT (フレーム間 paint 有無の判定基準)。
+    paints_at_last_bf1: u64,
+    /// 「paint が発生したフレーム」の連続数。スクロールや rAF アニメーション中は
+    /// 毎フレーム damage が出るためこの値が伸び続ける。
+    damage_streak: u32,
 }
 
 impl CefServer {
@@ -756,6 +773,8 @@ impl CefServer {
             client_pid,
             use_gpu,
             pending_flush: None,
+            paints_at_last_bf1: 0,
+            damage_streak: 0,
         }
     }
 
@@ -1449,14 +1468,39 @@ impl CefServer {
                 msg: format!("browser {} not found", browser_id),
             };
         }
-        if self.issue_begin_frame(browser_id, unity_frame) && server_flush_enabled() {
-            // flush を予約 (tick で +3ms, +5ms に発行)。
+        // damage streak 判定: 前フレームに paint があったか (= ページが連続描画中か)。
+        // スクロール/アニメーション中は毎フレーム damage が出るため streak が伸びる。
+        // その間 flush (BF#2..) を撃つと draw/blit/送信が倍増して renderer/GPU が飽和し、
+        // begin_frame_pending_ ガードの BF drop でコンテンツが欠落する (実測: Wikipedia
+        // スクロールで 52fps + ジッタ、flush 無しなら完全な 60fps)。よって連続描画中は
+        // BF#1 のみの 60Hz 駆動に切り替える (コンテンツは 1F 遅延になるが連続アニメでは
+        // 知覚されず、滑らかさが優先される)。孤立した入力 (単発のキー/クリック) は直後の
+        // フレームで streak が途切れて 0 に戻るため、従来通り flush による 0F 反映が
+        // 維持される。毎フレーム paint を生む持続入力 (キーリピート等) は streak が伸びて
+        // 抑止対象になるが、これも連続アニメと同様 1F 遅延は知覚されない。
+        let paints_now = PAINT_COUNT.load(Ordering::Relaxed);
+        let painted_last_frame = paints_now > self.paints_at_last_bf1;
+        self.paints_at_last_bf1 = paints_now;
+        self.damage_streak = if painted_last_frame {
+            self.damage_streak.saturating_add(1)
+        } else {
+            0
+        };
+
+        if self.issue_begin_frame(browser_id, unity_frame)
+            && server_flush_enabled()
+            && self.damage_streak < DAMAGE_STREAK_SUPPRESS_FLUSH
+        {
+            // flush を予約 (tick で +3ms, +6ms に発行)。
             self.pending_flush = Some(PendingFlush {
                 browser_id,
                 unity_frame,
                 bf1: Instant::now(),
                 flushes_done: 0,
+                paints_at_bf1: paints_now,
             });
+        } else {
+            self.pending_flush = None;
         }
         Response::Ok
     }
@@ -1473,6 +1517,17 @@ impl CefServer {
             let idx = pf.flushes_done as usize;
             if idx >= FLUSH_THRESHOLDS_MS.len() {
                 None // すべて発行済み → クリア
+            } else if PAINT_COUNT
+                .load(Ordering::Relaxed)
+                .wrapping_sub(pf.paints_at_bf1)
+                >= 2
+            {
+                // BF#1 以降に既に 2 paint (#A stale + flush 由来 fresh #B) が届いている
+                // = このフレームの最新内容は配信済み。以降の flush は冗長な draw を増やす
+                // だけで、スクロール等 damage が毎 BF 発生する状況では renderer/GPU を
+                // 飽和させて begin_frame_pending_ による BF drop → コンテンツ欠落を招く
+                // (実測: Wikipedia スクロールで 60→52fps) ため撃たずに終了する。
+                None
             } else {
                 let elapsed_ms = pf.bf1.elapsed().as_secs_f64() * 1000.0;
                 if elapsed_ms >= FLUSH_THRESHOLDS_MS[idx] {

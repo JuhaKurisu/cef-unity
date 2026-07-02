@@ -1,13 +1,76 @@
 ---
 name: cef-external-begin-frame
-description: CEF OSR external BeginFrame の 1F 遅延は double-pump (BeginFrame 二度撃ち) で 0F 化できることを実証済み (2026-06-13)。手法・計測方法・効かない手法の記録
+description: CEF OSR external BeginFrame の設計記録。0F 化は server-side flush (2026-06-15)。スクロール低下は damage-streak 検出による flush 動的抑止で解決 (2026-07-02)。rAF 138Hz バースト・testufo pause 誤検知も同時解消。recv フック位置 (present より後) の課題は未解決。
 metadata: 
   node_type: memory
   type: project
   originSessionId: 8d272a18-5d91-4b70-b273-6efdda2db861
 ---
 
-# CEF OSR external BeginFrame: double-pump による 0F 達成 (実証済み)
+# CEF OSR external BeginFrame: 0F 化 (server-side flush が最新の最適解)
+
+## 1F 遅延 再調査 (2026-07-02): recv フックは present より後 = 実画面は delta+1
+
+- 実測 (SampleScene): delta ほぼ全サンプル 1F (avg=1.00-1.02, buckets[1:] 支配的)、recv_ok は 86-115/120 と高い。「取得失敗」ではなく「常に 1 フレーム前の BF に対応する paint を受信」する定常 1F。原因は既知の通り軽シーンで PostLateUpdate recv (~+2-3ms) < paint 到着 (~+5-9ms、renderer submit 1.5-3ms + flush +3ms + draw/blit/Mach が物理下限)
+- **新発見: recv フックは PostLateUpdate サブシステムリスト末尾に Append されており、Unity 6000.3 の PostLateUpdate 内には `FinishFrameRendering` (描画発行) と `PresentAfterDraw` (present) がある → 現在の recv/UpdateExternalTexture は present の後に実行され、次フレームの描画にしか乗らない。実画面遅延は計測 delta より 1F 悪い (delta=1 → 実質 2F)。過去の「0F 96%」も受信時点の計測で画面反映は未検証だった**
+- **「recv を WaitForTargetFPS の後に挿す」案は棄却**: Unity 6000.3 に WaitForTargetFPS サブシステムは無く、limiter sleep は次フレーム先頭の `TimeUpdate.WaitForLastPresentationAndUpdateTime`。その後に recv しても反映は次フレームの present → 真の 0F にならない
+- 提案 (未実装): Step1 = recv フックを PostLateUpdate 内の描画前 (PlayerUpdateCanvases より前) に移動 → ノンブロッキングのまま実画面 1F 短縮。Step2 = 同位置で予算適応 busy-wait (フレーム経過+待ち上限 < ~12ms の時だけ、PeekAccelFrameId 増分まで上限 ~5ms) → 真の 0F。過去の fps 転落 3 因 (client reflush IPC フラッディング / 12ms+ spin / micro-sleep オーバースリープ) は server-side flush + 予算ガードで全て排除される。間に合わなければ即 1F フォールバックで fps 影響ゼロ
+
+## スクロール低下 解決済み (2026-07-02): damage-streak 検出で flush を動的抑止
+
+「スクロール時にかなり遅くなる」の根本原因と修正 (server.rs 実装・deploy 済み、実測検証済み):
+- **原因**: スクロール中は全 BF に damage が乗るため、flush 込み 3 BF/フレーム = draw+blit+Mach送信が 3 倍 → renderer/GPU 飽和 → `begin_frame_pending_` ガードが後続 BF を silent drop → コンテンツ欠落。実測 (Wikipedia スクロール): flush ON で recv_ok 95-110/120 (実効 ~52fps)・content std 5-8ms、flush OFF なら 119-121/121 (完全 60fps)・std 0.75ms
+- **flush#2 の paint-count スキップだけでは不十分** (recv_ok 86-115 で改善僅か)。2 BF/フレームでも飽和する
+- **解決 = damage streak 抑止**: `send_external_begin_frame` で「前フレームに paint があったか」を PAINT_COUNT 差分で判定し、`DAMAGE_STREAK_SUPPRESS_FLUSH`(3) フレーム連続で paint があれば連続描画中とみなして flush を撃たない (BF#1 のみの綺麗な 60Hz 駆動)。孤立入力は streak が切れるので従来通り flush で 0F
+- **検証結果**: ①Wikipedia スクロール recv_ok 117-121/121 (flush OFF 同等) ②testufo が 60fps@60Hz を報告 (旧: 138fps バースト + 再同期永続失敗) ③5Hz 離散更新 + 8ms 負荷で delta buckets [0:9,1:1] = 0F 90% 維持 ④**重要な副次発見: 旧構成の testufo/mouserate「10fps」はページが bursty rAF を検知して pause していたため。rAF 正常化後は同ページが 60fps で連続アニメする** — 「低fps感」の正体はこれ
+- トレードオフ: 連続アニメ/スクロール/キーリピート中のコンテンツは 1F (連続モーションでは知覚されない)。離散入力は 0F 維持。30fps 動画等 (1 フレームおき damage) は streak が伸びず flush 継続
+- 付随変更: FLUSH_THRESHOLDS_MS [3,5]→[3,6] (flush#1 paint の到着観測を跨ぐため)、flush#2 は BF#1 以降 2 paint 到着済みならスキップ
+- テスト補助 (C# サンプル): `<TMPDIR>/cef_scroll_test` マーカーで毎フレーム ±60px ホイール注入 (3秒毎に反転)。`cef_load_url` トリガーは Time.frameCount>60 に遅延 (初期ナビゲーションとの競合で LoadUrl が負ける race があった)。uloop execute-dynamic-code は isolation level 0 で無効のため、PlayMode への介入は temp ファイルトグル方式を使うこと
+- 計測手順 (再現用): Play 開始 → `cef_load_url` に対象 URL → 12s 待ち (スクリーンショットでロード確認) → `cef_scroll_test` 作成 → clear-console → 13s 待ち → `verify:|jitter` ログ取得。判定は recv_ok/120 (実効fps) と content std (ジッタ)。server 変更は deploy.sh のみで反映可 (server は Play ごとに再起動、Editor 再起動は dylib 変更時のみ)
+
+## 実効 fps 調査 (2026-07-02): パイプラインは 60fps 健全、副作用は rAF 138Hz バースト
+
+「CEF が 60fps より低く見える」調査の実測結果 (Unity Editor + SampleScene、組み込み計装 verify/jitter で計測):
+- **パイプラインは 60fps を完全供給**: rAF アニメーション (data: URI) で content 間隔 mean=16.67ms std=0.5ms、recv_ok=120/120、recv_fail=0。8ms 擬似ゲーム負荷 (`cef_fake_work`) でも維持
+- **低 fps に見える第一原因はページ側の再描画頻度**: testufo.com/mouserate はページ自体が ~10Hz でしか repaint しない → content mean=100.0ms (きっかり 10fps)。external BF は「描く機会」を与えるだけで、damage が無ければ paint は来ない
+- **副作用 (実バグ): renderer の rAF が ~138Hz で不規則バースト発火**: server-side flush により 1 Unity フレームに BF 最大3発 (0/+3/+5ms) → rAF が 2.3回/フレーム。testufo 本体は「138 fps」を報告し「Browser pause detected, resynchronizing」が永続 (同期不能)。影響: (a) rAF 回数ベースのアニメは ~2.3 倍速、(b) rAF タイムスタンプ間隔が不均一 (3/2/11.7ms) → タイムスタンプベースのモーションのサンプリングが不均一 = judder として「低 fps 感」を生み得る、(c) fps 計測系ページは誤動作
+- **`<TMPDIR>/cef_no_server_flush` トグルで flush 無効化すると rAF は正常 59-60Hz** (testufo 実測 59fps@60Hz)。content 供給は 60fps のまま、trade-off は 1F 遅延復活
+- 改善案 (未実装): flush 間隔を 0/+3/+5 でなく均等割り (uniform 180Hz) にすれば rAF タイムスタンプが均一化し judder は解消方向 (回数ベース 3倍速は残る)。または adaptive flush (fresh 取得済みなら flush2 スキップ) でバースト削減
+
+## 最重要 (2026-06-15): クライアント busy-spin はスクロールを重くする → server-side flush で解決
+
+**クライアント側 double-pump (Unity main thread で flush + spin 受信) は 0F を達成するが、スクロール等のアクティブ時に「重さ」を生む。** 原因 (実測で特定):
+- spin は `while(){}` の busy-wait で main thread を占有し、待っている相手の CEF renderer/GPU プロセスを**兵糧攻め**にする → fresh paint が間に合わず fallback 連発。実測: 負荷時 fresh 13/fallback 100 = **コンテンツ実効 7fps** (Unity は 60fps 表示なので fps は落ちないのに中身がカクつく)
+- reflush ループ (2ms 毎に flush) が **IPC コマンドチャネルを溢れさせ**、`SendExternalBeginFrame` 送信自体がブロック (サーバーが Metal blit `waitUntilCompleted` で固まり drain できない) → ブロックが 46ms に膨張、Unity 20fps に転落
+- **micro-sleep/yield は無効**: `Thread.Sleep(1)` は macOS で 10ms+ オーバースリープ、`Thread.Yield()` も負荷時にデスケジュールされ、どちらもフレーム 50ms に悪化。「待ち方」を変えても「フレーム内で GPU バウンドの相手を待つ」結合は切れない
+- 本質: **double-pump を Unity フレーム内でブロック待ちすると、Unity の fps が CEF のコンテンツ生成時間に結合する**。CEF が重い (重ページ/スクロール repaint/GPU 競合) と Unity 全体がカクつく
+- 計測の決定打: フレーム時間 std (機構1=present ジッタ) と content 更新間隔 std (機構2=サンプリングジッタ) を分離。ON: frame std 1.6ms→負荷時 50ms、OFF: frame std 0.44ms 安定
+
+### 解決策: server-side flush (実装・実証済み 2026-06-15)
+
+double-pump をクライアントからサーバーへ移し、**Unity main thread を一切ブロックしない**:
+- クライアント: EarlyUpdate で input + `SendExternalBeginFrame(N)` を**1 回だけ**送る。PostLateUpdate は `TryUpdateTextureOnce()` の**ノンブロッキング受信のみ** (spin/reflush 撤去)
+- サーバー (`server.rs`): `send_external_begin_frame` で BF#1 を撃ち `pending_flush` を予約。event loop の **1ms tick** (`process_pending_flushes`) が +3ms/+5ms (`FLUSH_THRESHOLDS_MS`) で内部 flush を発行。flush は CEF host へのローカル呼び出しなので **IPC フラッディング無し**。fresh #B は従来通り Mach 送信 + accel_frame_id++
+- 待ち (renderer submit) は**サーバースレッド上**で Unity フレームと並列に進む → 結合が切れる
+
+実測 (server-side flush):
+- **フレームペーシング: std 0.41-1.1ms (OFF 同等の滑らかさ)、46ms ブロック消滅** → 重さ解消
+- **コンテンツ: 毎フレーム更新 (60fps)** (旧 spin の 7fps から回復)
+- **0F 達成条件**: PostLateUpdate (recv) が サーバー flush 結果 (~EarlyUpdate+6ms) より後に来る必要がある。
+  - 実ゲーム (EarlyUpdate→PostLateUpdate 間に 8ms+ の処理) → **recv が +8ms 以降 → 0F**。擬似 8ms 負荷で **end-to-end delta=0 が 96% (buckets [0:109,1:4])** を実証
+  - 空シーン (処理ほぼ 0、PostLateUpdate が +2ms) → recv が flush より早く 1F (ただし滑らか)。**limiter sleep は PostLateUpdate より後なので work が無いと recv は前倒しになる**
+- → ユーザーの実ゲームのスクロール時は 0F + 滑らかになる見込み (実ゲームでの最終確認は要)
+
+### 未了 / 次の一手
+
+- 旧クライアント double-pump コード (`PumpAndRecvAccelerated` + `_doublePump*` フィールド) は**現在 dead code** (未使用・警告なし)。要クリーンアップ
+- 空シーンでも 0F を強制したいなら、recv hook を `WaitForTargetFPS` (limiter sleep) の**後**に挿し、present 直前で受信する案 (要 PlayerLoop 調査)
+- 機構2 (scroll 曲線の frame_time サンプリングジッタ) は server flush で発行時刻が tick に揃うため改善方向だが未計測
+- 計測計装 (jitter ログ: frame/content std) は `_enableLog` 配下に残置
+
+---
+
+## 旧記録: client-side double-pump による 0F 達成 (2026-06-13、重さ問題が判明し server-side へ移行)
 
 ## 結論 (2026-06-13 実装完了・実測)
 

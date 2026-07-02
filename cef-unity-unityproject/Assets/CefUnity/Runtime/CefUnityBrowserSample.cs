@@ -258,8 +258,10 @@ namespace CefUnity.Runtime
             }
             // 計測用 (一時): cef_load_url にファイル内容の URL を書くとそこへ遷移する。
             // 音声テスト (440Hz トーンの data: URI 等) を実行中の PlayMode へ渡すために使う。
+            // Time.frameCount > 60: 初期 URL のナビゲーションと競合すると LoadUrl が
+            // 負けて遷移しないことがあるため、初期ロードが落ち着いてから発火させる。
             var navUrlFile = System.IO.Path.Combine(tmpDir, "cef_load_url");
-            if (!_audioTestDone && System.IO.File.Exists(navUrlFile))
+            if (!_audioTestDone && Time.frameCount > 60 && System.IO.File.Exists(navUrlFile))
             {
                 _audioTestDone = true;
                 var u = System.IO.File.ReadAllText(navUrlFile).Trim();
@@ -269,6 +271,14 @@ namespace CefUnity.Runtime
             {
                 var until = Time.realtimeSinceStartup + 0.008f;
                 while (Time.realtimeSinceStartup < until) { }
+            }
+            // 計測用 (一時): cef_scroll_test が在るあいだ、実ユーザーのホイール操作を模して
+            // 毎フレーム ±60px のスクロールを注入する (3 秒ごとに方向反転)。
+            if (_browser != null
+                && System.IO.File.Exists(System.IO.Path.Combine(tmpDir, "cef_scroll_test")))
+            {
+                var dir = ((int)(Time.realtimeSinceStartup / 3f)) % 2 == 0 ? -1 : 1;
+                _browser.SendMouseWheel(_currentWidth / 2, _currentHeight / 2, 0, dir * 60);
             }
 
 

@@ -3,7 +3,8 @@
 - [ゲーム開発者](user_game_developer.md) — ゲーム開発者。浅いレビューではなくメカニクス分析を求める
 - [根本修正優先](feedback_proper_fix.md) — 小手先のワークアラウンドではなく根本原因から解決すること
 - [敬語で対応](feedback_keigo.md) — 「です・ます」調で応対すること
-- [CEF External BeginFrame 0F化](cef-external-begin-frame.md) — double-pump (BeginFrame 二度撃ち) で 0F 達成を実証 (2026-06-13)。ground truth 計測法と toggle、full-pipe は効かない
+- [CEF External BeginFrame 0F化](cef-external-begin-frame.md) — server-side flush で解決 (2026-06-15)。**再調査 (2026-07-02): recv フックが PostLateUpdate 末尾 = present より後で実画面は delta+1 (実質2F)。0F 化は Step1=フックを描画前へ移動 + Step2=予算適応 busy-wait (設計記録済み)**。**スクロール低下は damage-streak 検出の flush 動的抑止で解決済み (2026-07-02 実装・検証済み)。旧 rAF 138Hz バーストも同時解消 (testufo 60fps 正常化)**
+- [音声遅延 実測ログ](audio-latency.md) — 内部合計 404→約160ms 達成済。次: A=producer をオーディオスレッドへ(target 80→30ms, -70〜90ms)→B=frames_per_buffer 512→C=DSP 128 で ~50〜60ms 見込み。**A の実装設計を記録済み**(OnAudioFilterRead 先頭で pull、DetachAndWait による Dispose UAF ガード、SHM read カーソルは単一スレッド限定) (2026-07-02)
 
 ## CEF Crate (v145.5.0) Key Notes
 
