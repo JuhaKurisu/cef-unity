@@ -219,6 +219,15 @@ namespace CefUnity.Runtime
         private readonly System.Collections.Generic.Queue<(int fc, ulong pf, int delta)> _recentSamples
             = new System.Collections.Generic.Queue<(int, ulong, int)>();
 
+        // マウスホイール 1 ステップ (Input.mouseScrollDelta の 1.0) あたりのスクロール量
+        // (CEF view ピクセル)。Chromium ネイティブは macOS ~40px/ライン・Windows
+        // ~100px/ノッチ相当で、その中間に置いている。体感調整はここを変える。
+        private const float WheelPixelsPerStep = 60f;
+        // int 切り捨てで捨てられる端数の繰り越し。macOS トラックパッドは慣性減衰時に
+        // 0.0x 級の微小 delta を返すため、切り捨てると「ゆっくりスクロールが動かない/
+        // 実速度が遅くなる」問題が起きる。
+        private float _wheelAccumX, _wheelAccumY;
+
         // Double/triple click detection
         private float _lastClickTime;
         private int _lastClickX = -1;
@@ -923,7 +932,19 @@ namespace CefUnity.Runtime
             var scroll = Input.mouseScrollDelta;
             if (scroll.y != 0f || scroll.x != 0f)
             {
-                _browser.SendMouseWheel(bx, by, (int)(scroll.x * 60), (int)(scroll.y * 60), mods);
+                // ステップ→ピクセル変換。_resolutionScale で view (CSS px) が広がった分も
+                // 掛けて、画面上の体感スクロール速度を scale に依らず一定に保つ
+                // (マウス座標は既に scale 込みの view 座標へ変換している)。
+                _wheelAccumX += scroll.x * WheelPixelsPerStep * _resolutionScale;
+                _wheelAccumY += scroll.y * WheelPixelsPerStep * _resolutionScale;
+            }
+            var wheelDx = (int)_wheelAccumX;
+            var wheelDy = (int)_wheelAccumY;
+            if (wheelDx != 0 || wheelDy != 0)
+            {
+                _wheelAccumX -= wheelDx;
+                _wheelAccumY -= wheelDy;
+                _browser.SendMouseWheel(bx, by, wheelDx, wheelDy, mods);
                 _inputSentThisFrame = true;
             }
         }
