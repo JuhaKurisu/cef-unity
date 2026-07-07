@@ -1,1 +1,2 @@
 Plugins/** filter=lfs diff=lfs merge=lfs -text
+Plugins/**/*.meta -filter -diff -merge text
