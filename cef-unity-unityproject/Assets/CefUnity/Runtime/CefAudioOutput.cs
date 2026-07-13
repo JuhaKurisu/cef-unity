@@ -177,8 +177,8 @@ namespace CefUnity.Runtime
             // メインスレッドのフレーム間隔 (= ④ポーリング周期の実測)。
             float frameMs = Time.smoothDeltaTime * 1000f;
 
-            // CEF キャプチャバッファ (= ①)。frames_per_buffer=1024 固定。
-            float cefCaptureMs = _srcSampleRate > 0 ? 1024f / _srcSampleRate * 1000f : 0f;
+            // CEF キャプチャバッファ (= ①)。frames_per_buffer=512 固定 (server.rs と要同期)。
+            float cefCaptureMs = _srcSampleRate > 0 ? 512f / _srcSampleRate * 1000f : 0f;
 
             CefLog.Log(
                 $"[CefAudio] {_srcSampleRate}Hz x{_srcChannels}ch recvFrames={TotalFramesReceived} " +

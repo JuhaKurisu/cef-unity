@@ -25,7 +25,7 @@ namespace CefUnity.Runtime
         [SerializeField] [Range(0f, 1f)] private float _volume = 1f;
 
         [Tooltip("jitter buffer の目標滞留量 (ms)。下げるほど低遅延だがスパイクに弱い")]
-        [SerializeField] private float _targetLatencyMs = 15f;
+        [SerializeField] private float _targetLatencyMs = 12f;
 
         [Tooltip("CoreAudio IO バッファフレーム数 (128 ≈ 2.9ms)。デバイス共有設定なので他アプリにも影響する")]
         [SerializeField] private int _ioFrames = 128;

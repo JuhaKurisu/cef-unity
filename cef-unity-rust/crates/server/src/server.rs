@@ -669,7 +669,9 @@ wrap_audio_handler! {
                 p.channel_layout = ChannelLayout::LAYOUT_STEREO;
                 p.sample_rate = 48_000;
                 // 1 コールバックあたりのフレーム数。小さいほど低遅延だがコールバック頻度↑。
-                p.frames_per_buffer = 1024;
+                // 512 = 10.7ms@48kHz (B 案 2026-07-13: 1024→512 でキャプチャ遅延を半減。
+                // パケット量子も半減するので native 経路の target を 15→12ms に下げられる)。
+                p.frames_per_buffer = 512;
             }
             1
         }
