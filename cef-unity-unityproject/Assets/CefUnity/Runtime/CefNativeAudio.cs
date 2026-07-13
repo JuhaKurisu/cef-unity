@@ -98,14 +98,53 @@ namespace CefUnity.Runtime
                            $"target={_targetLatencyMs}ms ioFrames={_ioFrames}");
         }
 
+        /// <summary>
+        ///     現在あるべき出力音量。AudioListener.volume / pause と Inspector 音量に加え、
+        ///     エディタでは Game View の Mute Audio とポーズも反映する
+        ///     (どちらも FMOD にしか効かず、FMOD を迂回する native 経路には届かないため)。
+        /// </summary>
+        private float CurrentVolume()
+        {
+            float v = AudioListener.pause ? 0f : AudioListener.volume * _volume;
+#if UNITY_EDITOR
+            if (UnityEditor.EditorUtility.audioMasterMute || UnityEditor.EditorApplication.isPaused)
+                v = 0f;
+#endif
+            return v;
+        }
+
         // AudioListener の音量/ポーズと Inspector 音量を native 側へ同期する。
         private void SyncVolume()
         {
-            float v = AudioListener.pause ? 0f : AudioListener.volume * _volume;
+            float v = CurrentVolume();
             if (!float.IsNaN(_lastSentVolume) && Mathf.Approximately(v, _lastSentVolume)) return;
             Browser.SetNativeAudioVolume(v);
             _lastSentVolume = v;
         }
+
+#if UNITY_EDITOR
+        private void OnEnable()
+        {
+            UnityEditor.EditorApplication.pauseStateChanged += OnEditorPauseChanged;
+        }
+
+        // エディタポーズ中は Update が止まり SyncVolume が走らないが、native 側は
+        // Unity と独立に鳴り続ける。イベントで即時に音量を反映して止める/戻す。
+        private void OnEditorPauseChanged(UnityEditor.PauseState state)
+        {
+            if (!IsPlaying || Browser == null) return;
+            try
+            {
+                float v = CurrentVolume();
+                Browser.SetNativeAudioVolume(v);
+                _lastSentVolume = v;
+            }
+            catch (Exception)
+            {
+                // teardown と競合しても Rust 側 destroy が voice を停止するので実害なし。
+            }
+        }
+#endif
 
         // 1 秒ごとに滞留量とアンダーラン/オーバーフローをログ出力する診断。
         private void LogDiagnostics()
@@ -142,6 +181,9 @@ namespace CefUnity.Runtime
 
         private void OnDisable()
         {
+#if UNITY_EDITOR
+            UnityEditor.EditorApplication.pauseStateChanged -= OnEditorPauseChanged;
+#endif
             Stop();
         }
     }
