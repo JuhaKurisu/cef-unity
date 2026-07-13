@@ -506,30 +506,138 @@ wrap_load_handler! {
     }
 }
 
-/// JavaScript to track caret position via selectionchange and click events.
-/// Reports position as console.log("__CARET__:x:y:w:h").
+/// JavaScript to track caret position via selectionchange / click / focusin events.
+/// Reports position as console.log("__CARET__:x:y:w:h") (viewport 座標)。
+///
+/// `window.getSelection()` は input/textarea 内部のキャレットを返さない
+/// (テキストコントロールの選択は selectionStart/End でしか公開されない) ため、
+/// テキストコントロールは mirror div 方式 (textarea-caret-position と同手法) で
+/// キャレット座標を計算する。空の contenteditable は collapsed range の rect が
+/// 全ゼロになるため要素矩形へフォールバックする。
 const CARET_TRACKING_JS: &str = r#"
 (function() {
     if (window.__cefUnityCaretTracker) return;
     window.__cefUnityCaretTracker = true;
 
-    function reportCaret() {
-        var sel = window.getSelection();
-        if (!sel || sel.rangeCount === 0) return;
-        var range = sel.getRangeAt(0).cloneRange();
-        range.collapse(false);
-        var rect = range.getBoundingClientRect();
-        if (rect && rect.width === 0 && rect.height > 0) {
-            console.log("__CARET__:" +
-                Math.round(rect.x) + ":" +
-                Math.round(rect.y) + ":" +
-                Math.round(rect.width) + ":" +
-                Math.round(rect.height));
+    var MIRROR_PROPS = [
+        "direction", "boxSizing", "width", "height", "overflowX", "overflowY",
+        "borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth",
+        "borderStyle",
+        "paddingTop", "paddingRight", "paddingBottom", "paddingLeft",
+        "fontStyle", "fontVariant", "fontWeight", "fontStretch", "fontSize",
+        "fontSizeAdjust", "lineHeight", "fontFamily",
+        "textAlign", "textTransform", "textIndent", "textDecoration",
+        "letterSpacing", "wordSpacing", "tabSize"
+    ];
+
+    function lineHeightOf(computed) {
+        var lh = parseFloat(computed.lineHeight);
+        if (!lh) lh = (parseFloat(computed.fontSize) || 16) * 1.2;
+        return lh;
+    }
+
+    // selection API をサポートする input type のみ true (email/number は throw する)
+    function isTextControl(el) {
+        if (!el || !el.nodeName) return false;
+        if (el.nodeName === "TEXTAREA") return true;
+        if (el.nodeName !== "INPUT") return false;
+        var t = (el.type || "text").toLowerCase();
+        return t === "text" || t === "search" || t === "tel" ||
+               t === "url" || t === "password";
+    }
+
+    // フィールド先頭 (padding 内側) の座標。キャレット位置が計算できない場合の近似。
+    function elementCaretFallback(el) {
+        var r = el.getBoundingClientRect();
+        var c = window.getComputedStyle(el);
+        return {
+            x: r.left + (parseInt(c.borderLeftWidth) || 0) + (parseInt(c.paddingLeft) || 0),
+            y: r.top + (parseInt(c.borderTopWidth) || 0) + (parseInt(c.paddingTop) || 0),
+            h: lineHeightOf(c)
+        };
+    }
+
+    // input/textarea のキャレット座標を mirror div で計測する。
+    function textControlCaretRect(el) {
+        var pos = el.selectionEnd || 0;
+        var computed = window.getComputedStyle(el);
+        var isInput = el.nodeName === "INPUT";
+
+        var div = document.createElement("div");
+        div.style.position = "absolute";
+        div.style.visibility = "hidden";
+        div.style.top = "-9999px";
+        div.style.left = "0";
+        for (var i = 0; i < MIRROR_PROPS.length; i++) {
+            div.style[MIRROR_PROPS[i]] = computed[MIRROR_PROPS[i]];
         }
+        div.style.whiteSpace = "pre-wrap";
+        if (!isInput) div.style.wordWrap = "break-word";
+        div.style.overflow = "hidden";
+
+        var value = el.value || "";
+        if (el.type === "password") value = "•".repeat(value.length);
+        var before = value.substring(0, pos);
+        if (isInput) before = before.replace(/\s/g, " ");
+        div.textContent = before;
+
+        var span = document.createElement("span");
+        span.textContent = value.substring(pos) || ".";
+        div.appendChild(span);
+        document.body.appendChild(div);
+
+        var elRect = el.getBoundingClientRect();
+        var x = elRect.left + (parseInt(computed.borderLeftWidth) || 0) +
+                span.offsetLeft - el.scrollLeft;
+        var y = elRect.top + (parseInt(computed.borderTopWidth) || 0) +
+                span.offsetTop - el.scrollTop;
+        document.body.removeChild(div);
+
+        return { x: x, y: y, h: lineHeightOf(computed) };
+    }
+
+    // contenteditable / designMode: collapsed selection の rect を使う。
+    function selectionCaretRect(el) {
+        var sel = window.getSelection();
+        if (sel && sel.rangeCount > 0) {
+            var range = sel.getRangeAt(0).cloneRange();
+            range.collapse(false);
+            var rect = range.getBoundingClientRect();
+            if (rect && rect.height > 0) {
+                return { x: rect.left, y: rect.top, h: rect.height };
+            }
+        }
+        // 空の contenteditable では rect が全ゼロ → 要素矩形で近似
+        return elementCaretFallback(el);
+    }
+
+    function reportCaret() {
+        var el = document.activeElement;
+        var r = null;
+        try {
+            if (isTextControl(el)) {
+                r = textControlCaretRect(el);
+            } else if (el && el.isContentEditable) {
+                r = selectionCaretRect(el);
+            } else if (el && (el.nodeName === "INPUT" || el.nodeName === "TEXTAREA")) {
+                // selection API 非対応の input type (email/number など)
+                r = elementCaretFallback(el);
+            }
+        } catch (e) {
+            if (el && el.getBoundingClientRect) r = elementCaretFallback(el);
+        }
+        if (!r) return;
+        console.log("__CARET__:" +
+            Math.round(r.x) + ":" +
+            Math.round(r.y) + ":0:" +
+            Math.round(r.h));
     }
 
     document.addEventListener("selectionchange", reportCaret);
     document.addEventListener("click", function() {
+        setTimeout(reportCaret, 0);
+    });
+    document.addEventListener("focusin", function() {
         setTimeout(reportCaret, 0);
     });
     document.addEventListener("keyup", function(e) {
