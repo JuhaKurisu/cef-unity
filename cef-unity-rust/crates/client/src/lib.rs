@@ -8,6 +8,9 @@ mod d3d11;
 #[cfg(target_os = "windows")]
 mod d3d12;
 
+#[cfg(target_os = "macos")]
+mod audio_ring;
+
 use std::ffi::{CStr, c_char};
 use std::io::Write;
 use std::path::PathBuf;
