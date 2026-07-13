@@ -90,12 +90,26 @@ namespace CefUnity.Runtime
         [Tooltip("CEF の音声を Unity の AudioSource で再生する (CEF/ブラウザ側では鳴らさない)")]
         [SerializeField] private bool _enableAudio = true;
 
+        [Tooltip("音声レンダラ。UnityMixer=AudioSource 再生 (ミキサ統合, ~160ms) / Native=AudioUnit 直結 (macOS, ~30ms)")]
+        [SerializeField] private AudioRendererMode _audioRenderer = AudioRendererMode.UnityMixer;
+
         [Tooltip("音声出力の DSP バッファサイズ (フレーム/段)。小さいほど低遅延だが負荷増。" +
                  "256=Best latency, 512=Good, 1024=Best performance。0 でプロジェクト設定のまま。" +
                  "ProjectSettings/Audio と同値だがエディタ実行時に確実に反映させるため実行時にも適用する。")]
         [SerializeField] private int _audioDspBufferSize = 256;
 
+        /// <summary>音声レンダラの選択。</summary>
+        public enum AudioRendererMode
+        {
+            /// <summary>Unity AudioSource (FMOD ミキサ) で再生。ミキサ統合 (エフェクト等) が効くが遅延大 (~160ms)。</summary>
+            UnityMixer,
+
+            /// <summary>ネイティブ AudioUnit で再生 (macOS)。低遅延 (~30ms) だが Unity ミキサ機能は効かない。</summary>
+            Native,
+        }
+
         private CefAudioOutput _audioOutput;
+        private CefNativeAudio _nativeAudio;
 
         private readonly Dictionary<KeyCode, float> _keyDownTime = new();
         private readonly Dictionary<KeyCode, float> _keyLastRepeat = new();
@@ -275,7 +289,8 @@ namespace CefUnity.Runtime
                 _useAcceleratedPaint = Browser.IsAcceleratedConnected();
                 if (_enableLog) CefLog.Log($"[CefUnity] Initialized ({_currentWidth}x{_currentHeight}), acceleratedPaint={_useAcceleratedPaint}");
                 SetupImeProxy();
-                ApplyAudioDspBufferSize();
+                // Native レンダラは FMOD ミキサを使わないので DSP バッファ変更は不要。
+                if (_audioRenderer == AudioRendererMode.UnityMixer) ApplyAudioDspBufferSize();
                 SetupAudioOutput();
             }
             catch (Exception e)
@@ -442,6 +457,14 @@ namespace CefUnity.Runtime
             {
                 _audioOutput.Browser = null;
                 _audioOutput.enabled = false;
+            }
+
+            if (_nativeAudio != null)
+            {
+                // enabled=false の OnDisable で StopNativeAudio が走る (dispose 前に停止)。
+                // 仮に順序が崩れても Rust 側 destroy_browser の先頭で voice は停止される。
+                _nativeAudio.enabled = false;
+                _nativeAudio.Browser = null;
             }
 
             _browser?.Dispose();
@@ -760,9 +783,18 @@ namespace CefUnity.Runtime
         {
             if (!_enableAudio || _browser == null) return;
 
-            _audioOutput = GetComponent<CefAudioOutput>();
-            if (_audioOutput == null) _audioOutput = gameObject.AddComponent<CefAudioOutput>();
-            _audioOutput.Browser = _browser;
+            if (_audioRenderer == AudioRendererMode.Native)
+            {
+                _nativeAudio = GetComponent<CefNativeAudio>();
+                if (_nativeAudio == null) _nativeAudio = gameObject.AddComponent<CefNativeAudio>();
+                _nativeAudio.Browser = _browser;
+            }
+            else
+            {
+                _audioOutput = GetComponent<CefAudioOutput>();
+                if (_audioOutput == null) _audioOutput = gameObject.AddComponent<CefAudioOutput>();
+                _audioOutput.Browser = _browser;
+            }
         }
 
         /// <summary>
