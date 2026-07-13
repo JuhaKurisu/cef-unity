@@ -1,4 +1,8 @@
 fn main() {
+    // cc が .c/.m に対して rerun-if-changed を出力すると監視対象がそれだけに絞られ、
+    // FFI (lib.rs) 変更で csbindgen が再実行されなくなる。明示的に lib.rs も監視する。
+    println!("cargo:rerun-if-changed=src/lib.rs");
+
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let workspace_root = std::path::Path::new(&manifest_dir)
         .parent()

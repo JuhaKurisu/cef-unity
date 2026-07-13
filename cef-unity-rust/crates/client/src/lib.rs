@@ -133,10 +133,30 @@ struct ClientBrowserInstance {
     /// 音声リングバッファのリーダー。サーバーが flink を返さなかった場合や
     /// open に失敗した場合は None (音声無効)。
     audio_shm: Option<AudioShmReader>,
+    /// 音声リングの flink。NativeVoice が独立カーソルの自前リーダーを開くのに使う。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    audio_flink: String,
+    /// CRI 方式ネイティブ音声出力 (macOS)。Unity ミキサを迂回して AudioUnit で再生。
+    #[cfg(target_os = "macos")]
+    native_voice: Option<native_voice::NativeVoice>,
 }
 
 fn handle_to_ref<'a>(handle: *mut CefUnityBrowser) -> &'a mut ClientBrowserInstance {
     unsafe { &mut *(handle as *mut ClientBrowserInstance) }
+}
+
+/// ネイティブ音声を停止する (排水待ち)。destroy の先頭で呼ぶこと —
+/// NativeVoice は自前 reader/Shmem を持ち instance と参照関係がないため、
+/// stop (排水待ち) さえ済めば以降の解放順序で UAF は構造的に起きない。
+fn stop_native_voice(instance: &mut ClientBrowserInstance) {
+    #[cfg(target_os = "macos")]
+    {
+        instance.native_voice.take();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = instance;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +458,9 @@ pub extern "C" fn cef_unity_create_browser(
                 browser_id,
                 shm,
                 audio_shm,
+                audio_flink: audio_shm_flink.clone(),
+                #[cfg(target_os = "macos")]
+                native_voice: None,
             });
             Box::into_raw(instance) as *mut CefUnityBrowser
         }
@@ -458,7 +481,8 @@ pub extern "C" fn cef_unity_destroy_browser(handle: *mut CefUnityBrowser) {
     if handle.is_null() {
         return;
     }
-    let instance = unsafe { Box::from_raw(handle as *mut ClientBrowserInstance) };
+    let mut instance = unsafe { Box::from_raw(handle as *mut ClientBrowserInstance) };
+    stop_native_voice(&mut instance);
 
     let guard = CONNECTION.lock().unwrap();
     if let Some(conn) = guard.as_ref() {
@@ -858,6 +882,135 @@ pub extern "C" fn cef_unity_read_audio(
 }
 
 // ---------------------------------------------------------------------------
+// Audio: ネイティブ出力 (CRI 方式)。Unity ミキサを迂回して OS オーディオ API に直結。
+// 現状 macOS (AudioUnit) のみ。非対応 OS では start が -1 を返す。
+// ---------------------------------------------------------------------------
+
+/// ネイティブ音声出力を開始する。
+/// 既存の `cef_unity_read_audio` (録画 tap) とはリングカーソルが独立しており併用可。
+/// CefAudioOutput (Unity ミキサ再生) と同時に有効にすると二重再生になる。
+///
+/// `target_ms`: jitter buffer の目標滞留量 (推奨 15)。
+/// `io_frames`: CoreAudio IO バッファフレーム数 (推奨 128 ≈ 2.9ms)。0 以下は 128。
+/// 戻り値: 0=成功 (既に再生中も 0)、-1=失敗 (音声無効・フォーマット未確定・
+/// AU 起動失敗・非対応 OS)。フォーマット未確定で失敗するため、呼び出し側は
+/// `cef_unity_get_audio_format` が 1 を返してから呼ぶこと。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_audio_native_start(
+    handle: *mut CefUnityBrowser,
+    target_ms: f32,
+    io_frames: i32,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let instance = handle_to_ref(handle);
+        if instance.native_voice.is_some() {
+            return 0;
+        }
+        if instance.audio_flink.is_empty() {
+            return -1;
+        }
+        match native_voice::NativeVoice::start(&instance.audio_flink, target_ms, io_frames) {
+            Ok(v) => {
+                instance.native_voice = Some(v);
+                log_to_file(&format!(
+                    "native audio started (target={}ms io_frames={})",
+                    target_ms, io_frames
+                ));
+                0
+            }
+            Err(e) => {
+                log_to_file(&format!("native audio start failed: {}", e));
+                -1
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (target_ms, io_frames);
+        -1
+    }
+}
+
+/// ネイティブ音声出力を停止する (排水待ちして返る)。未開始なら何もしない。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_audio_native_stop(handle: *mut CefUnityBrowser) {
+    if handle.is_null() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let instance = handle_to_ref(handle);
+        if instance.native_voice.take().is_some() {
+            log_to_file("native audio stopped");
+        }
+    }
+}
+
+/// ネイティブ音声出力の音量 (0.0〜)。callback 内で乗算される。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_audio_native_set_volume(handle: *mut CefUnityBrowser, volume: f32) {
+    if handle.is_null() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let instance = handle_to_ref(handle);
+        if let Some(v) = instance.native_voice.as_ref() {
+            v.set_volume(volume);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = volume;
+    }
+}
+
+/// ネイティブ音声出力の診断値を取得する。
+/// `out_occupancy_ms`: jitter buffer の滞留量 (ms)。
+/// `out_underrun_frames` / `out_overflow_frames`: 累積フレーム数。
+/// 戻り値: 0=再生中、-1=停止中/非対応 OS (out には書き込まない)。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_audio_native_stats(
+    handle: *mut CefUnityBrowser,
+    out_occupancy_ms: *mut f32,
+    out_underrun_frames: *mut u64,
+    out_overflow_frames: *mut u64,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let instance = handle_to_ref(handle);
+        let Some(v) = instance.native_voice.as_ref() else {
+            return -1;
+        };
+        let (occ_ms, under, over) = v.stats();
+        unsafe {
+            if !out_occupancy_ms.is_null() {
+                *out_occupancy_ms = occ_ms;
+            }
+            if !out_underrun_frames.is_null() {
+                *out_underrun_frames = under;
+            }
+            if !out_overflow_frames.is_null() {
+                *out_overflow_frames = over;
+            }
+        }
+        0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (out_occupancy_ms, out_underrun_frames, out_overflow_frames);
+        -1
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Blocking variants — wait for server response, return 0=ok / -1=error.
 // ---------------------------------------------------------------------------
 
@@ -883,7 +1036,8 @@ pub extern "C" fn cef_unity_destroy_browser_blocking(handle: *mut CefUnityBrowse
     if handle.is_null() {
         return -1;
     }
-    let instance = unsafe { Box::from_raw(handle as *mut ClientBrowserInstance) };
+    let mut instance = unsafe { Box::from_raw(handle as *mut ClientBrowserInstance) };
+    stop_native_voice(&mut instance);
     let guard = CONNECTION.lock().unwrap();
     let result = if let Some(conn) = guard.as_ref() {
         blocking_simple(

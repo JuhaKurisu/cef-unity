@@ -52,6 +52,7 @@ impl AudioRing {
         self.write_frame as f64 - self.read_frame
     }
 
+    #[cfg(test)]
     pub fn target_frames(&self) -> usize {
         self.target_frames
     }

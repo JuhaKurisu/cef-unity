@@ -23,6 +23,7 @@ namespace CefUnity
         ///  `use_gpu`: 非 0 で accelerated paint (GPU 共有テクスチャ / IOSurface) を使う。
         ///  0 で software paint (CPU 経由の shm BGRA 転送) を強制する。
         ///  `enable_log`: 非 0 で client/server のファイルログを有効にする。0 で全ログ抑制。
+        ///  Unity 側のマスターログフラグから渡す。
         ///  Returns 0 on success, non-zero on failure.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_init", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
@@ -136,19 +137,60 @@ namespace CefUnity
         /// <summary>
         ///  現在の音声ストリームフォーマットを取得する。
         ///  戻り値: ストリーム再生中なら 1、停止中/音声無効なら 0。
-        ///  out_sample_rate / out_channels には最新のフォーマットを書き込む。
+        ///  `out_sample_rate` / `out_channels` には最新のフォーマットを書き込む
+        ///  (停止中でも直近の値が残る)。
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_get_audio_format", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern int cef_unity_get_audio_format(CefUnityBrowser* handle, uint* out_sample_rate, uint* out_channels);
 
         /// <summary>
-        ///  音声リングバッファから未読の PCM (interleaved f32, LRLR...) を読み出す。
-        ///  out_samples は max_frames * channels 個以上の f32 を保持できること
-        ///  (安全のため max_frames * 8 確保を推奨)。
-        ///  out_channels に実チャネル数を書き込み、戻り値は読み出したフレーム数 (新規なし=0)。
+        ///  音声リングバッファから未読の PCM を読み出す。
+        ///
+        ///  `out_samples` には interleaved な f32 サンプル (LRLR... 順) を書き込む。
+        ///  バッファは少なくとも `max_frames * channels` 個の f32 を保持できること
+        ///  (channels は最大 [`cef_unity_ipc::AUDIO_MAX_CHANNELS`])。安全のため呼び出し側は
+        ///  `max_frames * AUDIO_MAX_CHANNELS` 確保することを推奨。
+        ///
+        ///  `out_channels` には実際のチャネル数を書き込む。
+        ///  戻り値: 実際に読み出したフレーム数 (新規データが無ければ 0)。
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_read_audio", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern int cef_unity_read_audio(CefUnityBrowser* handle, float* out_samples, int max_frames, uint* out_channels);
+
+        /// <summary>
+        ///  ネイティブ音声出力を開始する。
+        ///  既存の `cef_unity_read_audio` (録画 tap) とはリングカーソルが独立しており併用可。
+        ///  CefAudioOutput (Unity ミキサ再生) と同時に有効にすると二重再生になる。
+        ///
+        ///  `target_ms`: jitter buffer の目標滞留量 (推奨 15)。
+        ///  `io_frames`: CoreAudio IO バッファフレーム数 (推奨 128 ≈ 2.9ms)。0 以下は 128。
+        ///  戻り値: 0=成功 (既に再生中も 0)、-1=失敗 (音声無効・フォーマット未確定・
+        ///  AU 起動失敗・非対応 OS)。フォーマット未確定で失敗するため、呼び出し側は
+        ///  `cef_unity_get_audio_format` が 1 を返してから呼ぶこと。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_audio_native_start", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_audio_native_start(CefUnityBrowser* handle, float target_ms, int io_frames);
+
+        /// <summary>
+        ///  ネイティブ音声出力を停止する (排水待ちして返る)。未開始なら何もしない。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_audio_native_stop", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_audio_native_stop(CefUnityBrowser* handle);
+
+        /// <summary>
+        ///  ネイティブ音声出力の音量 (0.0〜)。callback 内で乗算される。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_audio_native_set_volume", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_audio_native_set_volume(CefUnityBrowser* handle, float volume);
+
+        /// <summary>
+        ///  ネイティブ音声出力の診断値を取得する。
+        ///  `out_occupancy_ms`: jitter buffer の滞留量 (ms)。
+        ///  `out_underrun_frames` / `out_overflow_frames`: 累積フレーム数。
+        ///  戻り値: 0=再生中、-1=停止中/非対応 OS (out には書き込まない)。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_audio_native_stats", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_audio_native_stats(CefUnityBrowser* handle, float* out_occupancy_ms, ulong* out_underrun_frames, ulong* out_overflow_frames);
 
         /// <summary>
         ///  Destroy a browser instance (blocking).
