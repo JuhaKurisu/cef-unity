@@ -12,6 +12,10 @@ fn main() {
             .file("src/metal_texture.m")
             .flag("-fobjc-arc")
             .compile("metal_texture");
+        cc::Build::new().file("src/au_output.c").compile("au_output");
+        println!("cargo:rustc-link-lib=framework=AudioUnit");
+        println!("cargo:rustc-link-lib=framework=AudioToolbox");
+        println!("cargo:rustc-link-lib=framework=CoreAudio");
         println!("cargo:rustc-link-lib=framework=Metal");
         println!("cargo:rustc-link-lib=framework=IOSurface");
         println!("cargo:rustc-link-lib=framework=CoreFoundation");

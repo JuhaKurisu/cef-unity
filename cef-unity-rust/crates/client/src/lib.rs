@@ -10,6 +10,8 @@ mod d3d12;
 
 #[cfg(target_os = "macos")]
 mod audio_ring;
+#[cfg(target_os = "macos")]
+mod au_output;
 
 use std::ffi::{CStr, c_char};
 use std::io::Write;
