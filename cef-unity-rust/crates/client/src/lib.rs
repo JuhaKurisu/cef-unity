@@ -12,6 +12,8 @@ mod d3d12;
 mod audio_ring;
 #[cfg(target_os = "macos")]
 mod au_output;
+#[cfg(target_os = "macos")]
+mod native_voice;
 
 use std::ffi::{CStr, c_char};
 use std::io::Write;
