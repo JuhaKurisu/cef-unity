@@ -420,6 +420,59 @@ public sealed class Browser : IDisposable
             return frames;
         }
 
+        // ----- ネイティブ音声出力 (CRI 方式) -----
+
+        /// <summary>
+        ///     ネイティブ音声出力を開始する。Unity の FMOD ミキサを迂回して OS の
+        ///     オーディオ API (macOS: AudioUnit) に直結する低遅延経路 (内部 ~30ms 級。
+        ///     <c>CefAudioOutput</c> 経由の Unity ミキサ経路は ~160ms)。
+        ///     <para>
+        ///     ストリームフォーマット確定後 (<see cref="TryGetAudioFormat" /> が true)
+        ///     に呼ぶこと。<c>CefAudioOutput</c> と同時に使うと二重再生になる。
+        ///     AudioMixer エフェクト・スペーシャライズ等 Unity ミキサの機能は効かない。
+        ///     PCM の取得 (<see cref="ReadAudio" />) はカーソル独立なので併用できる。
+        ///     </para>
+        /// </summary>
+        /// <param name="targetLatencyMs">jitter buffer の目標滞留量 (ms)。</param>
+        /// <param name="ioFrames">CoreAudio IO バッファフレーム数 (128 ≈ 2.9ms)。</param>
+        /// <returns>開始できたら true (既に再生中も true)。非対応 OS・音声無効・フォーマット未確定は false。</returns>
+        public unsafe bool StartNativeAudio(float targetLatencyMs = 15f, int ioFrames = 128)
+        {
+            ThrowIfDisposed();
+            return NativeMethods.cef_unity_audio_native_start(_handle, targetLatencyMs, ioFrames) == 0;
+        }
+
+        /// <summary>ネイティブ音声出力を停止する (再生していなければ何もしない)。</summary>
+        public unsafe void StopNativeAudio()
+        {
+            ThrowIfDisposed();
+            NativeMethods.cef_unity_audio_native_stop(_handle);
+        }
+
+        /// <summary>ネイティブ音声出力の音量 (0.0〜1.0)。AudioListener とは独立。</summary>
+        public unsafe void SetNativeAudioVolume(float volume)
+        {
+            ThrowIfDisposed();
+            NativeMethods.cef_unity_audio_native_set_volume(_handle, volume);
+        }
+
+        /// <summary>
+        ///     ネイティブ音声出力の診断値を取得する。再生中でなければ false。
+        ///     underrun/overflow は累積フレーム数 (0 以外ならぶつ切り/破棄発生)。
+        /// </summary>
+        public unsafe bool TryGetNativeAudioStats(
+            out float occupancyMs, out ulong underrunFrames, out ulong overflowFrames)
+        {
+            ThrowIfDisposed();
+            float occ;
+            ulong under, over;
+            int ok = NativeMethods.cef_unity_audio_native_stats(_handle, &occ, &under, &over);
+            occupancyMs = occ;
+            underrunFrames = under;
+            overflowFrames = over;
+            return ok == 0;
+        }
+
     // ----- IME -----
 
         public void ImeSetComposition(string text, uint selectionStart, uint selectionEnd)
