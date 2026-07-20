@@ -176,6 +176,26 @@ namespace CefUnity.Runtime.Tests
             Assert.AreEqual(27, total + last, "旧 20 + 新 7 が全て排出される");
         }
 
+        // ---- 60Hz イベント (フレームと同率) でもビートジッターが出ない (適応オフセット+履歴4点) ----
+
+        [Test]
+        public void SteadyStream60Hz_NoBeatJitter()
+        {
+            var r = new ScrollResampler();
+            var emitted = new System.Collections.Generic.List<int>();
+            var eventIndex = 0;
+            for (var k = 0; k < 40; k++)
+            {
+                var now = 0.05 + k * F;
+                while (eventIndex * F <= now) { r.AddEvent(Ev(eventIndex * F, 10f)); eventIndex++; }
+                r.Tick(now, out _, out var dy);
+                emitted.Add(dy);
+            }
+            // 適応オフセット収束中も偏差は丸め ±1px に収まる (欠陥時は ±2〜4px のビートが交互に出る)
+            for (var k = 1; k < emitted.Count; k++)
+                Assert.That(emitted[k], Is.InRange(9, 11), $"frame {k}");
+        }
+
         // ---- Reset で全状態破棄 ----
 
         [Test]

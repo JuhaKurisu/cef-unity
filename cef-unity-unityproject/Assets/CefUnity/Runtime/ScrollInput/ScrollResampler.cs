@@ -5,27 +5,35 @@ namespace CefUnity.Runtime
     /// <summary>
     ///     生スクロールイベント列を「フレーム時刻」へ再標本化する (Chromium
     ///     LinearResampling 準拠)。イベントから累積位置 P(t) を構築し、毎フレーム
-    ///     sampleTime = now − SampleOffset の P を直近2イベントの線形補間 (イベント間)
-    ///     または線形外挿 (最終イベント以後、上限 ExtrapolationCap) で求め、前回サンプル
-    ///     との差分を int px で排出する (端数繰り越しで総量保存)。momentum 終端では残差を
-    ///     即時排出して停止する (A案 ScrollSmoother の「停止後の浮遊」が構造的に生じない)。
+    ///     sampleTime = now − 適応オフセット (イベント間隔 EMA×1.25, 5〜25ms) の P を
+    ///     イベント履歴の線形補間 (イベント間) または線形外挿 (最新イベント以後、上限
+    ///     ExtrapolationCap) で求め、前回サンプルとの差分を int px で排出する (端数
+    ///     繰り越しで総量保存)。momentum 終端では残差を即時排出して停止する。
+    ///     オフセットを固定 5ms にすると 60Hz イベント (macOS の momentum は表示レート)
+    ///     でイベント無しフレームが外挿上限に当たり hold→ジャンプのビートが出る (実測
+    ///     median 0.147)。オフセットを 1 イベント間隔強に適応させ、履歴を 4 点持つ
+    ///     ことでサンプルが常に補間帯域に入り、ビートが構造的に消える。
     ///     純 C# (Unity API 非依存)。時刻はイベントと同一クロック (秒) を呼び出し側が渡す。
     ///     設計: docs/superpowers/specs/2026-07-20-raw-scroll-resampling-design.md
     /// </summary>
     public sealed class ScrollResampler
     {
-        /// <summary>サンプル時刻のオフセット (秒)。now からこの分だけ過去を標本化する。</summary>
-        public const double SampleOffset = 0.005;
+        /// <summary>適応サンプルオフセット (now からこの分過去を標本化) の下限/上限 (秒)。</summary>
+        public const double MinSampleOffset = 0.005;
+        public const double MaxSampleOffset = 0.025;
 
-        /// <summary>最終イベントからの外挿上限 (秒)。超えた分は保持 (オーバーシュート防止)。</summary>
+        /// <summary>最新イベントからの外挿上限 (秒)。超えた分は保持 (オーバーシュート防止)。</summary>
         public const double ExtrapolationCap = 0.008;
 
         /// <summary>無イベントでジェスチャ終端とみなすグレース (秒)。</summary>
         public const double GraceTimeout = 0.100;
 
-        // 直近2イベントの (時刻, 累積位置)。_count は保持点数 (0/1/2)。
-        private double _t0, _t1;
-        private double _p0X, _p0Y, _p1X, _p1Y;
+        // イベント履歴 (時刻昇順、[_count-1] が最新)。オフセットが 1 イベント間隔を
+        // 超えても補間できるよう 2 点ではなく 4 点持つ。
+        private const int HistoryCap = 4;
+        private readonly double[] _t = new double[HistoryCap];
+        private readonly double[] _pX = new double[HistoryCap];
+        private readonly double[] _pY = new double[HistoryCap];
         private int _count;
 
         // 前回サンプル位置と、int 排出の端数繰り越し。
@@ -35,17 +43,19 @@ namespace CefUnity.Runtime
         // momentum Ended/Cancelled 受信済み。次の Tick で残差を排出して停止する。
         private bool _ended;
 
+        // イベント間隔の EMA (秒)。適応サンプルオフセットの元 (初期値 8ms ≒ 120Hz)。
+        private double _intervalEma = 0.008;
+
         /// <summary>追跡中のジェスチャがあるか。</summary>
         public bool IsActive => _count > 0;
 
         public void Reset()
         {
             _count = 0;
-            _t0 = _t1 = 0;
-            _p0X = _p0Y = _p1X = _p1Y = 0;
             _sampX = _sampY = 0;
             _fracX = _fracY = 0;
             _ended = false;
+            _intervalEma = 0.008;
         }
 
         /// <summary>イベントを取り込む (delta は view px スケール済みであること)。</summary>
@@ -66,45 +76,56 @@ namespace CefUnity.Runtime
         {
             if (_count == 0)
             {
-                _t1 = e.Timestamp;
+                _t[0] = e.Timestamp;
                 // 前回サンプル位置から連続に開始する (位置ジャンプ防止)。
-                _p1X = _sampX + e.DxPx;
-                _p1Y = _sampY + e.DyPx;
+                _pX[0] = _sampX + e.DxPx;
+                _pY[0] = _sampY + e.DyPx;
                 _count = 1;
                 return;
             }
-            if (e.Timestamp <= _t1)
+            var last = _count - 1;
+            if (e.Timestamp <= _t[last])
             {
                 // 同時刻イベント (同フレーム複数イベント等) は最新点へ合算 (0 除算回避)。
-                _p1X += e.DxPx;
-                _p1Y += e.DyPx;
+                _pX[last] += e.DxPx;
+                _pY[last] += e.DyPx;
                 return;
             }
-            _t0 = _t1;
-            _p0X = _p1X;
-            _p0Y = _p1Y;
-            _t1 = e.Timestamp;
-            _p1X += e.DxPx;
-            _p1Y += e.DyPx;
-            _count = 2;
+            // 新しい時刻へ進む: イベント間隔 EMA を更新 (適応オフセットの元)。
+            _intervalEma += (e.Timestamp - _t[last] - _intervalEma) * 0.2;
+            if (_count == HistoryCap)
+            {
+                // 履歴が満杯: 最古を捨てて左詰め。
+                for (var i = 1; i < HistoryCap; i++)
+                {
+                    _t[i - 1] = _t[i];
+                    _pX[i - 1] = _pX[i];
+                    _pY[i - 1] = _pY[i];
+                }
+                _count--;
+                last--;
+            }
+            _t[_count] = e.Timestamp;
+            _pX[_count] = _pX[last] + e.DxPx;
+            _pY[_count] = _pY[last] + e.DyPx;
+            _count++;
         }
 
         /// <summary>
-        ///     残差 (最終イベント位置 − 前回サンプル) を端数バッファへ移し、履歴をクリアする。
-        ///     外挿でサンプルが最終位置を追い越していた場合 (残差が直近の進行方向と逆) は
+        ///     残差 (最新イベント位置 − 前回サンプル) を端数バッファへ移し、履歴をクリアする。
+        ///     外挿でサンプルが最新位置を追い越していた場合 (残差が直近の進行方向と逆) は
         ///     捨てる — 終端での「巻き戻し」を防ぐ。
         /// </summary>
         private void FlushResidualToFraction()
         {
-            var rx = _p1X - _sampX;
-            var ry = _p1Y - _sampY;
-            var dirX = _p1X - _p0X;
-            var dirY = _p1Y - _p0Y;
+            var last = _count - 1;
+            var rx = _pX[last] - _sampX;
+            var ry = _pY[last] - _sampY;
+            var dirX = _count < 2 ? 0.0 : _pX[last] - _pX[last - 1];
+            var dirY = _count < 2 ? 0.0 : _pY[last] - _pY[last - 1];
             if (_count < 2 || rx * dirX >= 0) _fracX += rx;
             if (_count < 2 || ry * dirY >= 0) _fracY += ry;
             _count = 0;
-            _t0 = _t1 = 0;
-            _p0X = _p0Y = _p1X = _p1Y = 0;
             _sampX = _sampY = 0;
             _ended = false;
         }
@@ -114,42 +135,43 @@ namespace CefUnity.Runtime
         {
             if (_count > 0)
             {
-                if (_ended || now - _t1 > GraceTimeout)
+                var last = _count - 1;
+                if (_ended || now - _t[last] > GraceTimeout)
                 {
                     FlushResidualToFraction();
                 }
                 else
                 {
-                    var sampleTime = now - SampleOffset;
+                    var offset = Math.Min(MaxSampleOffset, Math.Max(MinSampleOffset, _intervalEma * 1.25));
+                    var sampleTime = now - offset;
                     double sx, sy;
-                    if (_count < 2 || sampleTime >= _t1)
+                    if (_count >= 2 && sampleTime > _t[last])
                     {
-                        if (_count == 2 && sampleTime > _t1)
-                        {
-                            // 最終イベント以後: 直近2点の速度で外挿 (上限 cap)。
-                            var dt = Math.Min(sampleTime - _t1, ExtrapolationCap);
-                            var span = _t1 - _t0;
-                            sx = _p1X + (_p1X - _p0X) / span * dt;
-                            sy = _p1Y + (_p1Y - _p0Y) / span * dt;
-                        }
-                        else
-                        {
-                            // 補間に足る2点が無い: 最新位置をそのまま使う (即時排出)。
-                            sx = _p1X;
-                            sy = _p1Y;
-                        }
+                        // 最新イベント以後: 直近2点の速度で外挿 (上限 cap)。
+                        var dt = Math.Min(sampleTime - _t[last], ExtrapolationCap);
+                        var span = _t[last] - _t[last - 1];
+                        sx = _pX[last] + (_pX[last] - _pX[last - 1]) / span * dt;
+                        sy = _pY[last] + (_pY[last] - _pY[last - 1]) / span * dt;
                     }
-                    else if (sampleTime <= _t0)
+                    else if (_count < 2 || sampleTime >= _t[last])
                     {
-                        sx = _p0X;
-                        sy = _p0Y;
+                        // 補間に足る2点が無い: 最新位置をそのまま使う (即時排出)。
+                        sx = _pX[last];
+                        sy = _pY[last];
+                    }
+                    else if (sampleTime <= _t[0])
+                    {
+                        sx = _pX[0];
+                        sy = _pY[0];
                     }
                     else
                     {
-                        // イベント間: 線形補間 (リサンプリングの本体)。
-                        var a = (sampleTime - _t0) / (_t1 - _t0);
-                        sx = _p0X + (_p1X - _p0X) * a;
-                        sy = _p0Y + (_p1Y - _p0Y) * a;
+                        // 履歴内: sampleTime を含む区間を探して線形補間 (リサンプリングの本体)。
+                        var i = last;
+                        while (_t[i - 1] > sampleTime) i--;
+                        var a = (sampleTime - _t[i - 1]) / (_t[i] - _t[i - 1]);
+                        sx = _pX[i - 1] + (_pX[i] - _pX[i - 1]) * a;
+                        sy = _pY[i - 1] + (_pY[i] - _pY[i - 1]) * a;
                     }
                     _fracX += sx - _sampX;
                     _fracY += sy - _sampY;
