@@ -13,8 +13,14 @@ namespace CefUnity.Runtime
     /// </summary>
     public sealed class ScrollSmoother
     {
+        // 終端判定: 入力がこの Tick 数連続で途絶えたらジェスチャ終了とみなし、
+        // 残距離のテール排出/端数破棄を許可する。入力継続中はスナップせず端数を
+        // 保持する (定常的なサブピクセル/frame 入力での過剰排出・取りこぼし防止)。
+        private const int StarvedTicks = 2;
+
         private float _remainX;
         private float _remainY;
+        private int _idleTicks = StarvedTicks;
 
         /// <summary>残距離が残っているか (排出継続の判定用)。</summary>
         public bool IsActive => _remainX != 0f || _remainY != 0f;
@@ -24,6 +30,7 @@ namespace CefUnity.Runtime
         {
             _remainX += dxPx;
             _remainY += dyPx;
+            _idleTicks = 0;
         }
 
         /// <summary>残距離を破棄する (ナビゲーション時など)。</summary>
@@ -31,6 +38,7 @@ namespace CefUnity.Runtime
         {
             _remainX = 0f;
             _remainY = 0f;
+            _idleTicks = StarvedTicks;
         }
 
         /// <summary>
@@ -39,13 +47,15 @@ namespace CefUnity.Runtime
         /// </summary>
         public void Tick(float dt, float tau, out int dx, out int dy)
         {
+            var starved = _idleTicks >= StarvedTicks;
+            if (_idleTicks < int.MaxValue) _idleTicks++;
             // k < 0 を「平滑 OFF」の番兵に使う (排出率としての k は常に [0,1))。
             var k = tau <= 0f ? -1f : 1f - (float)Math.Exp(-dt / tau);
-            dx = TickAxis(ref _remainX, k);
-            dy = TickAxis(ref _remainY, k);
+            dx = TickAxis(ref _remainX, k, starved);
+            dy = TickAxis(ref _remainY, k, starved);
         }
 
-        private static int TickAxis(ref float remain, float k)
+        private static int TickAxis(ref float remain, float k, bool starved)
         {
             if (remain == 0f) return 0;
             int emit;
@@ -58,16 +68,25 @@ namespace CefUnity.Runtime
             }
             if (Math.Abs(remain) <= 1f)
             {
+                if (!starved)
+                {
+                    // 入力継続中: スナップせず切り捨て + 端数保持 (保存則の維持)。
+                    emit = (int)remain;
+                    remain -= emit;
+                    return emit;
+                }
                 // 終端スナップ: 無限テール防止。0.5px 未満の端数は破棄 (許容損失)。
                 emit = (int)Math.Round(remain);
                 remain = 0f;
                 return emit;
             }
             emit = (int)Math.Round(remain * k);
-            if (emit == 0 && k > 0f)
+            if (emit == 0)
             {
-                // 排出が 0 に丸まる帯域 (|remain| < 0.5/k) で停滞しないよう、
-                // 残距離をテールとして排出し切る (スタック防止)。dt=0 (k=0) は除外。
+                // 排出が 0 に丸まる帯域 (|remain| < 0.5/k)。入力継続中は次フレームの
+                // 入力を待ち、途絶時のみテールとして排出し切る (スタック防止)。
+                // dt=0 (k=0) は除外。
+                if (!starved || k <= 0f) return 0;
                 emit = (int)Math.Round(remain);
                 remain = 0f;
                 return emit;

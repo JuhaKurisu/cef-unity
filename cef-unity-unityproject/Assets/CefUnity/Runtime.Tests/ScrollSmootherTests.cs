@@ -84,28 +84,78 @@ namespace CefUnity.Runtime.Tests
             Assert.AreEqual(-100, total, "正味 100 - 200 = -100");
         }
 
-        // ---- 終端スナップ: 微小残距離は破棄され無限テールにならない ----
+        // ---- 終端スナップ: 入力途絶後、微小残距離は破棄され無限テールにならない ----
 
         [Test]
-        public void Smoothing_TinyResidual_SnapsToZero()
+        public void Smoothing_TinyResidual_SnapsToZeroAfterStarvation()
         {
             var s = new ScrollSmoother();
             s.AddInput(0f, 0.4f);
-            s.Tick(Dt60, Tau, out _, out var dy);
-            Assert.AreEqual(0, dy, "0.5px 未満は破棄");
-            Assert.IsFalse(s.IsActive);
+            var total = 0;
+            for (var i = 0; i < 3; i++)
+            {
+                s.Tick(Dt60, Tau, out _, out var dy);
+                total += dy;
+            }
+            Assert.AreEqual(0, total, "0.5px 未満は破棄");
+            Assert.IsFalse(s.IsActive, "入力途絶 (StarvedTicks 経過) 後にスナップされる");
         }
 
-        // ---- 停滞防止: 排出が 0 に丸まる帯域の残距離もテールとして排出し切る ----
+        // ---- 停滞防止: 入力途絶後、排出0丸め帯域の残距離もテールとして排出し切る ----
 
         [Test]
         public void Smoothing_MidTailBand_DoesNotStall()
         {
             var s = new ScrollSmoother();
             s.AddInput(0f, 1.4f); // k≈0.31 では 1.4×k≈0.43 → Round=0 の停滞帯域
-            s.Tick(Dt60, Tau, out _, out var dy);
-            Assert.AreEqual(1, dy, "停滞せずテールを排出し切る");
+            var total = 0;
+            for (var i = 0; i < 5; i++)
+            {
+                s.Tick(Dt60, Tau, out _, out var dy);
+                total += dy;
+            }
+            Assert.AreEqual(1, total, "停滞せずテールを排出し切る");
             Assert.IsFalse(s.IsActive);
+        }
+
+        // ---- 定常サブピクセル入力: スナップ過剰排出 (+25%) も取りこぼし (100%) も起きない ----
+
+        [Test]
+        public void Smoothing_SteadySubPixelStream_ConservesTotal()
+        {
+            var s = new ScrollSmoother();
+            var total = 0;
+            for (var i = 0; i < 100; i++)
+            {
+                s.AddInput(0f, 0.8f); // 毎フレーム 0.8px の定常入力 (合計 80px)
+                s.Tick(Dt60, Tau, out _, out var dy);
+                total += dy;
+            }
+            // 入力停止後のテールを排出し切る
+            for (var i = 0; i < 10 && s.IsActive; i++)
+            {
+                s.Tick(Dt60, Tau, out _, out var dy);
+                total += dy;
+            }
+            Assert.IsFalse(s.IsActive);
+            Assert.That(total, Is.EqualTo(80).Within(1), "過剰排出なら ~100、取りこぼしなら 0 になる");
+        }
+
+        // ---- 出荷値 τ=15ms の動作点でも総量保存が成立する ----
+
+        [Test]
+        public void Smoothing_ProductionTau15ms_ConservesTotal()
+        {
+            var s = new ScrollSmoother();
+            s.AddInput(0f, 1000f);
+            var total = 0;
+            for (var i = 0; i < 200 && s.IsActive; i++)
+            {
+                s.Tick(Dt60, 0.015f, out _, out var dy);
+                total += dy;
+            }
+            Assert.IsFalse(s.IsActive);
+            Assert.AreEqual(1000, total);
         }
 
         // ---- dt=0 (ポーズ等) では何も排出せず残距離を保持する ----
