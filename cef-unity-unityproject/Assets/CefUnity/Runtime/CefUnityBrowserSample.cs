@@ -1034,7 +1034,6 @@ namespace CefUnity.Runtime
         /// </summary>
         private void TickScrollSmoother()
         {
-            if (_browser == null || !_scrollSmoother.IsActive) return;
             // τ の実行時上書き (体感チューニング用・暫定)。毎フレーム I/O を避け 60F に 1 回。
             if (--_scrollTauCheckCountdown <= 0)
             {
@@ -1044,7 +1043,7 @@ namespace CefUnity.Runtime
                     && float.TryParse(System.IO.File.ReadAllText(tauFile).Trim(), out var ms))
                     _scrollSmoothTau = ms / 1000f;
             }
-            if (!_scrollSmoother.IsActive) return;
+            if (_browser == null || !_scrollSmoother.IsActive) return;
             _scrollSmoother.Tick(Time.unscaledDeltaTime, _scrollSmoothTau, out var dx, out var dy);
             if (dx == 0 && dy == 0) return;
             // 最後の有効マウス座標で送る。まだ一度も動いていなければ画面中央。
