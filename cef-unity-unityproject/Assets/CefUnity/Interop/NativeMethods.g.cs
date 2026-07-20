@@ -54,6 +54,28 @@ namespace CefUnity
         public static extern void cef_unity_shutdown();
 
         /// <summary>
+        ///  NSEvent スクロールモニタを開始する。1=成功 0=失敗 (ヘッドレス等)。
+        ///  macOS 以外は常に 0 (呼び出し側がフォールバックする)。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_scroll_monitor_start", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_scroll_monitor_start();
+
+        [DllImport(__DllName, EntryPoint = "cef_scroll_monitor_stop", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_scroll_monitor_stop();
+
+        /// <summary>
+        ///  新着イベントを out に書き、件数を返す。毎フレーム呼ぶこと (リング鮮度維持)。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_scroll_monitor_poll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_scroll_monitor_poll(CefScrollEvent* @out, int max);
+
+        /// <summary>
+        ///  イベント timestamp と同一クロック (起動からの秒) の現在時刻。リサンプル基準用。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_scroll_monitor_now", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern double cef_scroll_monitor_now();
+
+        /// <summary>
         ///  Create a browser instance via IPC.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_create_browser", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
@@ -393,6 +415,21 @@ namespace CefUnity
     public unsafe partial struct CefUnityBrowser
     {
         public byte _opaque;
+    }
+
+    /// <summary>
+    ///  生スクロールイベント (scroll_monitor.m / C# 側と同一レイアウト)。
+    ///  phase: 0=None 1=GestureBegan 2=GestureChanged 3=GestureEnded
+    ///         4=MomentumBegan 5=MomentumChanged 6=MomentumEnded 7=Cancelled
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public unsafe partial struct CefScrollEvent
+    {
+        public double timestamp;
+        public float dx;
+        public float dy;
+        public byte phase;
+        public byte precise;
     }
 
 

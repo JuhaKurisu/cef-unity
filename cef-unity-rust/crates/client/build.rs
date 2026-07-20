@@ -17,6 +17,10 @@ fn main() {
             .flag("-fobjc-arc")
             .compile("metal_texture");
         cc::Build::new().file("src/au_output.c").compile("au_output");
+        cc::Build::new()
+            .file("src/scroll_monitor.m")
+            .flag("-fobjc-arc")
+            .compile("scroll_monitor");
         println!("cargo:rustc-link-lib=framework=AudioUnit");
         println!("cargo:rustc-link-lib=framework=AudioToolbox");
         println!("cargo:rustc-link-lib=framework=CoreAudio");
@@ -25,6 +29,7 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
         println!("cargo:rustc-link-lib=framework=Foundation");
         println!("cargo:rustc-link-lib=dylib=objc");
+        println!("cargo:rustc-link-lib=framework=AppKit");
     }
 
     for dest in [

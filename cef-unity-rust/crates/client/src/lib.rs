@@ -14,6 +14,8 @@ mod audio_ring;
 mod au_output;
 #[cfg(target_os = "macos")]
 mod native_voice;
+#[cfg(target_os = "macos")]
+mod scroll_monitor;
 
 use std::ffi::{CStr, c_char};
 use std::io::Write;
@@ -367,6 +369,72 @@ pub extern "C" fn cef_unity_shutdown() {
     IOSURFACE_CONNECTED.store(false, Ordering::SeqCst);
     USE_GPU_MODE.store(true, Ordering::SeqCst);
     log_to_file("shutdown complete");
+}
+
+/// 生スクロールイベント (scroll_monitor.m / C# 側と同一レイアウト)。
+/// phase: 0=None 1=GestureBegan 2=GestureChanged 3=GestureEnded
+///        4=MomentumBegan 5=MomentumChanged 6=MomentumEnded 7=Cancelled
+#[repr(C)]
+pub struct CefScrollEvent {
+    pub timestamp: f64,
+    pub dx: f32,
+    pub dy: f32,
+    pub phase: u8,
+    pub precise: u8,
+}
+
+/// NSEvent スクロールモニタを開始する。1=成功 0=失敗 (ヘッドレス等)。
+/// macOS 以外は常に 0 (呼び出し側がフォールバックする)。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_scroll_monitor_start() -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { scroll_monitor::cef_scroll_monitor_start_impl() }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        0
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_scroll_monitor_stop() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        scroll_monitor::cef_scroll_monitor_stop_impl()
+    }
+}
+
+/// 新着イベントを out に書き、件数を返す。毎フレーム呼ぶこと (リング鮮度維持)。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_scroll_monitor_poll(out: *mut CefScrollEvent, max: i32) -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe {
+            scroll_monitor::cef_scroll_monitor_poll_impl(
+                out as *mut scroll_monitor::RawScrollEvent,
+                max,
+            )
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (out, max);
+        0
+    }
+}
+
+/// イベント timestamp と同一クロック (起動からの秒) の現在時刻。リサンプル基準用。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_scroll_monitor_now() -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { scroll_monitor::cef_scroll_monitor_now_impl() }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        0.0
+    }
 }
 
 // ---------------------------------------------------------------------------
