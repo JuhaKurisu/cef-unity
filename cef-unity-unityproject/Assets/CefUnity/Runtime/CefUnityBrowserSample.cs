@@ -246,6 +246,12 @@ namespace CefUnity.Runtime
         // 時定数 (秒)。体感チューニング (2026-07-20, ビルドで τ=45/25/15/0 を A/B) で確定した値。
         // 遅延感を最小化しつつジッター/フリック巨大単発を均す最弱設定 (初フレームで残距離の約67%を排出)。
         private const float ScrollSmoothTau = 0.015f;
+        // 生スクロール入力 (C案): native ソース + リサンプラ。_scrollSource が null なら
+        // フォールバック (現行の Input.mouseScrollDelta → ScrollSmoother 経路)。
+        // 設計: docs/superpowers/specs/2026-07-20-raw-scroll-resampling-design.md
+        private IScrollEventSource _scrollSource;
+        private readonly ScrollResampler _scrollResampler = new ScrollResampler();
+        private readonly ScrollInputEvent[] _scrollEventBuf = new ScrollInputEvent[256];
 
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
         // --- 分析用 (開発ビルドのみ): 毎フレームの scroll 量/frame time/paint を CSV 記録 ---
@@ -313,11 +319,41 @@ namespace CefUnity.Runtime
                 // Native レンダラは FMOD ミキサを使わないので DSP バッファ変更は不要。
                 if (_audioRenderer == AudioRendererMode.UnityMixer) ApplyAudioDspBufferSize();
                 SetupAudioOutput();
+                SetupScrollInput();
             }
             catch (Exception e)
             {
                 CefLog.LogError($"[CefUnity] Init failed: {e}");
             }
+        }
+
+        /// <summary>
+        ///     生スクロール入力 (C案) の初期化。native ソースが使えれば有効化し、以後
+        ///     Input.mouseScrollDelta は読まない (二重計上防止)。失敗時は現行経路のまま。
+        /// </summary>
+        private void SetupScrollInput()
+        {
+#if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            // 開発トグル: cef_scroll_legacy で強制フォールバック (A/C 体感比較用)。
+            if (System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_scroll_legacy")))
+            {
+                CefLog.Log("[CefUnity] scroll: legacy mode (cef_scroll_legacy)");
+                return;
+            }
+#endif
+            var src = new MacNativeScrollSource();
+            if (src.Start())
+            {
+                _scrollSource = src;
+                CefLog.Log("[CefUnity] scroll: native NSEvent source active");
+            }
+            else
+            {
+                src.Dispose();
+                CefLog.Log("[CefUnity] scroll: native source unavailable — frame-polled fallback");
+            }
+#endif
         }
 
         private void Update()
@@ -484,8 +520,9 @@ namespace CefUnity.Runtime
 
         public void LoadUrl(string url)
         {
-            // グライド途中の残距離を新ページへ流し込まない。
+            // グライド途中の残距離/履歴を新ページへ流し込まない。
             _scrollSmoother.Reset();
+            _scrollResampler.Reset();
             _browser.LoadUrl(url);
         }
 
@@ -497,6 +534,8 @@ namespace CefUnity.Runtime
                 _playerLoopHooked = false;
             }
             if (s_instance == this) s_instance = null;
+            _scrollSource?.Dispose();
+            _scrollSource = null;
 
             // 音声出力を先に止めてから browser を破棄する (破棄済みハンドルへのアクセス防止)。
             if (_audioOutput != null)
@@ -570,7 +609,10 @@ namespace CefUnity.Runtime
                 self._inputSentThisFrame = true;
             }
 #endif
-            // スクロール平滑の排出。BeginFrame#1 の前なので同フレームの paint に乗る。
+            // 生イベント経路 (C案): native ソースを drain し、リサンプラ排出を送る。
+            self.TickNativeScroll();
+            // スクロール平滑の排出 (非 precise / フォールバック)。BeginFrame#1 の前なので
+            // 同フレームの paint に乗る。
             self.TickScrollSmoother();
             self.UpdateCompositionCursorPos();
             self.HandleImeInput();
@@ -1019,18 +1061,67 @@ namespace CefUnity.Runtime
             HandleButton(bx, by, 1, MouseButton.Right, mods);
             HandleButton(bx, by, 2, MouseButton.Middle, mods);
 
-            var scroll = Input.mouseScrollDelta;
-            if (scroll.y != 0f || scroll.x != 0f)
+            // native ソース有効時は生イベント経路 (TickNativeScroll) が担うため、
+            // フレーム量子化された Input.mouseScrollDelta は読まない (二重計上防止)。
+            if (_scrollSource == null)
             {
-                // ステップ→ピクセル変換。_resolutionScale で view (CSS px) が広がった分も
-                // 掛けて、画面上の体感スクロール速度を scale に依らず一定に保つ
-                // (マウス座標は既に scale 込みの view 座標へ変換している)。
-                // 送信は即時ではなく ScrollSmoother へ蓄積し、OnEarlyUpdateLast の
-                // TickScrollSmoother が毎フレーム均一化して排出する。
-                _scrollSmoother.AddInput(
-                    scroll.x * WheelPixelsPerStep * _resolutionScale,
-                    scroll.y * WheelPixelsPerStep * _resolutionScale);
+                var scroll = Input.mouseScrollDelta;
+                if (scroll.y != 0f || scroll.x != 0f)
+                {
+                    // ステップ→ピクセル変換。_resolutionScale で view (CSS px) が広がった分も
+                    // 掛けて、画面上の体感スクロール速度を scale に依らず一定に保つ
+                    // (マウス座標は既に scale 込みの view 座標へ変換している)。
+                    // 送信は即時ではなく ScrollSmoother へ蓄積し、OnEarlyUpdateLast の
+                    // TickScrollSmoother が毎フレーム均一化して排出する。
+                    _scrollSmoother.AddInput(
+                        scroll.x * WheelPixelsPerStep * _resolutionScale,
+                        scroll.y * WheelPixelsPerStep * _resolutionScale);
+                }
             }
+        }
+
+        /// <summary>
+        ///     native スクロールソースの 1 フレーム処理。イベントを drain し、カーソルが
+        ///     ブラウザ上のときだけ転送する (Editor で他ウィンドウ上のスクロールを拾わない)。
+        ///     precise はリサンプラへ、非 precise (ホイールノッチ) は ScrollSmoother へ。
+        /// </summary>
+        private void TickNativeScroll()
+        {
+            if (_scrollSource == null || _browser == null) return;
+            var n = _scrollSource.Poll(_scrollEventBuf);
+            var overBrowser = TryGetBrowserCoord(out _, out _);
+            if (overBrowser)
+            {
+                for (var i = 0; i < n; i++)
+                {
+                    ref var e = ref _scrollEventBuf[i];
+                    if (e.Precise)
+                    {
+                        // precise delta は CSS px 相当 → view 座標へ _resolutionScale を掛ける。
+                        var scaled = e;
+                        scaled.DxPx *= _resolutionScale;
+                        scaled.DyPx *= _resolutionScale;
+                        _scrollResampler.AddEvent(in scaled);
+                    }
+                    else
+                    {
+                        // ノッチ (ライン単位) は ScrollSmoother でグライドさせる (Chrome 層3相当)。
+                        _scrollSmoother.AddInput(
+                            e.DxPx * WheelPixelsPerStep * _resolutionScale,
+                            e.DyPx * WheelPixelsPerStep * _resolutionScale);
+                    }
+                }
+            }
+            _scrollResampler.Tick(_scrollSource.Now, out var dx, out var dy);
+            if (dx == 0 && dy == 0) return;
+            // 最後の有効マウス座標で送る。まだ一度も動いていなければ画面中央。
+            var bx = _lastMouseX >= 0 ? _lastMouseX : _currentWidth / 2;
+            var by = _lastMouseY >= 0 ? _lastMouseY : _currentHeight / 2;
+            _browser.SendMouseWheel(bx, by, dx, dy, GetCefModifiers());
+            _inputSentThisFrame = true;
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            _frameSentDy = dy; // 分析用: リサンプル後の実送信量
+#endif
         }
 
         /// <summary>
