@@ -343,16 +343,22 @@ namespace CefUnity.Runtime
             }
 #endif
             var src = new MacNativeScrollSource();
-            if (src.Start())
+            try
             {
-                _scrollSource = src;
-                CefLog.Log("[CefUnity] scroll: native NSEvent source active");
+                if (src.Start())
+                {
+                    _scrollSource = src;
+                    CefLog.Log("[CefUnity] scroll: native NSEvent source active");
+                    return;
+                }
             }
-            else
+            catch (Exception e)
             {
-                src.Dispose();
-                CefLog.Log("[CefUnity] scroll: native source unavailable — frame-polled fallback");
+                // dylib 不在等の P/Invoke 例外は回復可能 — フォールバックに落とす。
+                CefLog.Log($"[CefUnity] scroll: native source init threw ({e.GetType().Name}) — fallback");
             }
+            src.Dispose();
+            CefLog.Log("[CefUnity] scroll: native source unavailable — frame-polled fallback");
 #endif
         }
 
