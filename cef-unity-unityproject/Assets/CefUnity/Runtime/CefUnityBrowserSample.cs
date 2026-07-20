@@ -241,10 +241,9 @@ namespace CefUnity.Runtime
         // 旧 _wheelAccum の端数繰り越し (トラックパッド慣性減衰の 0.0x 級微小 delta 対策)
         // は ScrollSmoother 内部に統合。設計: docs/superpowers/specs/2026-07-20-scroll-smoothing-design.md
         private readonly ScrollSmoother _scrollSmoother = new ScrollSmoother();
-        // 時定数 (秒)。$TMPDIR/cef_scroll_tau (ms 値のテキスト) で実行時上書き可 (0 = 平滑 OFF)。
-        // 体感チューニング用の暫定機構 — 値確定後に const 化して撤去する。
-        private float _scrollSmoothTau = 0.045f;
-        private int _scrollTauCheckCountdown; // 初期値 0 → 起動後最初のフレームで即チェック
+        // 時定数 (秒)。体感チューニング (2026-07-20, ビルドで τ=45/25/15/0 を A/B) で確定した値。
+        // 遅延感を最小化しつつジッター/フリック巨大単発を均す最弱設定 (初フレームで残距離の約67%を排出)。
+        private const float ScrollSmoothTau = 0.015f;
 
         // --- 分析用 (一時): 毎フレームの scroll 量/frame time/paint を CSV 記録 ---
         private readonly System.Collections.Generic.List<string> _perfLog = new();
@@ -1034,17 +1033,8 @@ namespace CefUnity.Runtime
         /// </summary>
         private void TickScrollSmoother()
         {
-            // τ の実行時上書き (体感チューニング用・暫定)。毎フレーム I/O を避け 60F に 1 回。
-            if (--_scrollTauCheckCountdown <= 0)
-            {
-                _scrollTauCheckCountdown = 60;
-                var tauFile = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_scroll_tau");
-                if (System.IO.File.Exists(tauFile)
-                    && float.TryParse(System.IO.File.ReadAllText(tauFile).Trim(), out var ms))
-                    _scrollSmoothTau = ms / 1000f;
-            }
             if (_browser == null || !_scrollSmoother.IsActive) return;
-            _scrollSmoother.Tick(Time.unscaledDeltaTime, _scrollSmoothTau, out var dx, out var dy);
+            _scrollSmoother.Tick(Time.unscaledDeltaTime, ScrollSmoothTau, out var dx, out var dy);
             if (dx == 0 && dy == 0) return;
             // 最後の有効マウス座標で送る。まだ一度も動いていなければ画面中央。
             var bx = _lastMouseX >= 0 ? _lastMouseX : _currentWidth / 2;
