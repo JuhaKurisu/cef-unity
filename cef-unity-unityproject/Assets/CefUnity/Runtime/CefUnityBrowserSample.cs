@@ -237,10 +237,18 @@ namespace CefUnity.Runtime
         // (CEF view ピクセル)。Chromium ネイティブは macOS ~40px/ライン・Windows
         // ~100px/ノッチ相当で、その中間に置いている。体感調整はここを変える。
         private const float WheelPixelsPerStep = 60f;
-        // int 切り捨てで捨てられる端数の繰り越し。macOS トラックパッドは慣性減衰時に
-        // 0.0x 級の微小 delta を返すため、切り捨てると「ゆっくりスクロールが動かない/
-        // 実速度が遅くなる」問題が起きる。
-        private float _wheelAccumX, _wheelAccumY;
+        // スクロール平滑 (指数追従): 生 delta を残距離に蓄積し、毎フレーム均一化して排出。
+        // 旧 _wheelAccum の端数繰り越し (トラックパッド慣性減衰の 0.0x 級微小 delta 対策)
+        // は ScrollSmoother 内部に統合。設計: docs/superpowers/specs/2026-07-20-scroll-smoothing-design.md
+        private readonly ScrollSmoother _scrollSmoother = new ScrollSmoother();
+        // 時定数 (秒)。$TMPDIR/cef_scroll_tau (ms 値のテキスト) で実行時上書き可 (0 = 平滑 OFF)。
+        // 体感チューニング用の暫定機構 — 値確定後に const 化して撤去する。
+        private float _scrollSmoothTau = 0.045f;
+        private int _scrollTauCheckCountdown;
+
+        // --- 分析用 (一時): 毎フレームの scroll 量/frame time/paint を CSV 記録 ---
+        private readonly System.Collections.Generic.List<string> _perfLog = new();
+        private int _frameSentDy;
 
         // Double/triple click detection
         private float _lastClickTime;
@@ -260,7 +268,18 @@ namespace CefUnity.Runtime
                 // CEF Viz Compositor は VSync ロックで 60Hz paint。Unity の LateUpdate を
                 // それより高頻度にすると半分以上のフレームで paint が間に合わず取得失敗 →
                 // 1 フレーム遅延が発生する。Unity を 60fps に固定して CEF と同期させる。
-                QualitySettings.vSyncCount = 0;
+                // ティアリング修正: ハードウェア VSync を既定に (60Hz ディスプレイで 60fps ロック、
+                // present がディスプレイ走査に同期してティアリング解消)。cef_novsync で従来比較可。
+                if (System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_novsync")))
+                {
+                    QualitySettings.vSyncCount = 0;
+                    Debug.Log("[CefUnity] VSYNC MODE: vSyncCount=0 (no vsync)");
+                }
+                else
+                {
+                    QualitySettings.vSyncCount = 1;
+                    Debug.Log("[CefUnity] VSYNC MODE: vSyncCount=1 (hardware vsync)");
+                }
                 Application.targetFrameRate = 60;
 
                 // 計測用 (一時): cef_no_zero_wait マーカーで 0F 待ちを無効化 (baseline 比較用)。
@@ -338,6 +357,25 @@ namespace CefUnity.Runtime
             if (ft > 0.018) _ftOver18++;
             if (ft > 0.020) _ftOver20++;
             if (ft > 0.025) _ftOver25++;
+
+            // 分析用 (一時): cef_perf_probe がある間、毎フレーム記録し 30 フレームごとに CSV 追記。
+            if (System.IO.File.Exists(System.IO.Path.Combine(tmpDir, "cef_perf_probe")))
+            {
+                long afiNow = _useAcceleratedPaint && _browser != null ? (long)_browser.PeekAccelFrameId() : 0;
+                _perfLog.Add($"{Time.frameCount},{ft * 1000f:F2},{afiNow},{_frameSentDy}");
+                _frameSentDy = 0;
+                if (_perfLog.Count >= 30)
+                {
+                    try
+                    {
+                        System.IO.File.AppendAllText(
+                            System.IO.Path.Combine(tmpDir, "cef_perf.csv"),
+                            string.Join("\n", _perfLog) + "\n");
+                    }
+                    catch { }
+                    _perfLog.Clear();
+                }
+            }
 
             _diagTimer += Time.deltaTime;
             if (_diagTimer >= 2f)
@@ -440,6 +478,8 @@ namespace CefUnity.Runtime
 
         public void LoadUrl(string url)
         {
+            // グライド途中の残距離を新ページへ流し込まない。
+            _scrollSmoother.Reset();
             _browser.LoadUrl(url);
         }
 
@@ -514,6 +554,16 @@ namespace CefUnity.Runtime
                 self._browser.SendMouseWheel(self._currentWidth / 2, self._currentHeight / 2, 0, dir * 60);
                 self._inputSentThisFrame = true;
             }
+            // 分析用 (一時): cef_scroll_slow が在る間、毎フレーム正確に -10px の均一スクロールを注入。
+            // 「数学的に完璧に均一な入力」でもカクつくか(=パイプライン位相ビート)を切り分ける。
+            if (System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_scroll_slow")))
+            {
+                self._browser.SendMouseWheel(self._currentWidth / 2, self._currentHeight / 2, 0, -10);
+                self._frameSentDy = -10;
+                self._inputSentThisFrame = true;
+            }
+            // スクロール平滑の排出。BeginFrame#1 の前なので同フレームの paint に乗る。
+            self.TickScrollSmoother();
             self.UpdateCompositionCursorPos();
             self.HandleImeInput();
             self.HandleKeyboardInput();
@@ -967,18 +1017,41 @@ namespace CefUnity.Runtime
                 // ステップ→ピクセル変換。_resolutionScale で view (CSS px) が広がった分も
                 // 掛けて、画面上の体感スクロール速度を scale に依らず一定に保つ
                 // (マウス座標は既に scale 込みの view 座標へ変換している)。
-                _wheelAccumX += scroll.x * WheelPixelsPerStep * _resolutionScale;
-                _wheelAccumY += scroll.y * WheelPixelsPerStep * _resolutionScale;
+                // 送信は即時ではなく ScrollSmoother へ蓄積し、OnEarlyUpdateLast の
+                // TickScrollSmoother が毎フレーム均一化して排出する。
+                _scrollSmoother.AddInput(
+                    scroll.x * WheelPixelsPerStep * _resolutionScale,
+                    scroll.y * WheelPixelsPerStep * _resolutionScale);
             }
-            var wheelDx = (int)_wheelAccumX;
-            var wheelDy = (int)_wheelAccumY;
-            if (wheelDx != 0 || wheelDy != 0)
+        }
+
+        /// <summary>
+        /// ScrollSmoother の 1 フレーム分排出。蓄積された wheel 残距離を指数追従で
+        /// 均一化して SendMouseWheel する (per-frame スクロール量ジッターの平滑)。
+        /// HandleMouseInput の外に置くのは、カーソルがブラウザ外に出ても
+        /// (TryGetBrowserCoord 失敗でも) グライド途中の排出を最後の有効座標で
+        /// 継続するため。
+        /// </summary>
+        private void TickScrollSmoother()
+        {
+            // τ の実行時上書き (体感チューニング用・暫定)。毎フレーム I/O を避け 60F に 1 回。
+            if (--_scrollTauCheckCountdown <= 0)
             {
-                _wheelAccumX -= wheelDx;
-                _wheelAccumY -= wheelDy;
-                _browser.SendMouseWheel(bx, by, wheelDx, wheelDy, mods);
-                _inputSentThisFrame = true;
+                _scrollTauCheckCountdown = 60;
+                var tauFile = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_scroll_tau");
+                if (System.IO.File.Exists(tauFile)
+                    && float.TryParse(System.IO.File.ReadAllText(tauFile).Trim(), out var ms))
+                    _scrollSmoothTau = ms / 1000f;
             }
+            if (!_scrollSmoother.IsActive) return;
+            _scrollSmoother.Tick(Time.unscaledDeltaTime, _scrollSmoothTau, out var dx, out var dy);
+            if (dx == 0 && dy == 0) return;
+            // 最後の有効マウス座標で送る。まだ一度も動いていなければ画面中央。
+            var bx = _lastMouseX >= 0 ? _lastMouseX : _currentWidth / 2;
+            var by = _lastMouseY >= 0 ? _lastMouseY : _currentHeight / 2;
+            _browser.SendMouseWheel(bx, by, dx, dy, GetCefModifiers());
+            _inputSentThisFrame = true;
+            _frameSentDy = dy; // 分析用: 平滑後の実送信量
         }
 
         private void HandleButton(int bx, int by, int unityButton, MouseButton cefButton, uint mods)
