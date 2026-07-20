@@ -64,6 +64,14 @@ namespace CefUnity.Runtime
                 return emit;
             }
             emit = (int)Math.Round(remain * k);
+            if (emit == 0 && k > 0f)
+            {
+                // 排出が 0 に丸まる帯域 (|remain| < 0.5/k) で停滞しないよう、
+                // 残距離をテールとして排出し切る (スタック防止)。dt=0 (k=0) は除外。
+                emit = (int)Math.Round(remain);
+                remain = 0f;
+                return emit;
+            }
             remain -= emit; // int で減算するので端数は残距離に残る (総量保存)
             return emit;
         }

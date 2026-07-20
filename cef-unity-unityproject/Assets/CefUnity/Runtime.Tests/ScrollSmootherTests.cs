@@ -48,7 +48,7 @@ namespace CefUnity.Runtime.Tests
             Assert.That(e1, Is.InRange(280, 340));
         }
 
-        // ---- 総量保存: 整数入力なら排出合計が入力と厳密一致 ----
+        // ---- 総量保存: 小数部ゼロの入力なら排出合計が入力と厳密一致 ----
 
         [Test]
         public void Smoothing_IntegerInput_ConservesTotal()
@@ -94,6 +94,30 @@ namespace CefUnity.Runtime.Tests
             s.Tick(Dt60, Tau, out _, out var dy);
             Assert.AreEqual(0, dy, "0.5px 未満は破棄");
             Assert.IsFalse(s.IsActive);
+        }
+
+        // ---- 停滞防止: 排出が 0 に丸まる帯域の残距離もテールとして排出し切る ----
+
+        [Test]
+        public void Smoothing_MidTailBand_DoesNotStall()
+        {
+            var s = new ScrollSmoother();
+            s.AddInput(0f, 1.4f); // k≈0.31 では 1.4×k≈0.43 → Round=0 の停滞帯域
+            s.Tick(Dt60, Tau, out _, out var dy);
+            Assert.AreEqual(1, dy, "停滞せずテールを排出し切る");
+            Assert.IsFalse(s.IsActive);
+        }
+
+        // ---- dt=0 (ポーズ等) では何も排出せず残距離を保持する ----
+
+        [Test]
+        public void Smoothing_ZeroDt_EmitsNothingAndKeepsRemainder()
+        {
+            var s = new ScrollSmoother();
+            s.AddInput(0f, 500f);
+            s.Tick(0f, Tau, out _, out var dy);
+            Assert.AreEqual(0, dy);
+            Assert.IsTrue(s.IsActive, "残距離は保持される");
         }
 
         // ---- dt 非依存: 同じ実時間なら分割数に依らずほぼ同量を排出 ----
