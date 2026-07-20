@@ -214,8 +214,10 @@ namespace CefUnity.Runtime
         private float _lastFreshRealtime = -1f;
         private double _ciSum, _ciSumSq, _ciMax;
         private int _ciCount;
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
         private bool _navTestDone; // 計測用
         private bool _audioTestDone; // 音声テスト用 (cef_load_url トリガー)
+#endif
 
         // PlayerLoop hook 用の singleton 参照 (現在のサンプル構成は単一 Browser のみ対応)
         private static CefUnityBrowserSample s_instance;
@@ -245,9 +247,11 @@ namespace CefUnity.Runtime
         // 遅延感を最小化しつつジッター/フリック巨大単発を均す最弱設定 (初フレームで残距離の約67%を排出)。
         private const float ScrollSmoothTau = 0.015f;
 
-        // --- 分析用 (一時): 毎フレームの scroll 量/frame time/paint を CSV 記録 ---
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+        // --- 分析用 (開発ビルドのみ): 毎フレームの scroll 量/frame time/paint を CSV 記録 ---
         private readonly System.Collections.Generic.List<string> _perfLog = new();
         private int _frameSentDy;
+#endif
 
         // Double/triple click detection
         private float _lastClickTime;
@@ -268,24 +272,23 @@ namespace CefUnity.Runtime
                 // それより高頻度にすると半分以上のフレームで paint が間に合わず取得失敗 →
                 // 1 フレーム遅延が発生する。Unity を 60fps に固定して CEF と同期させる。
                 // ティアリング修正: ハードウェア VSync を既定に (60Hz ディスプレイで 60fps ロック、
-                // present がディスプレイ走査に同期してティアリング解消)。cef_novsync で従来比較可。
+                // present がディスプレイ走査に同期してティアリング解消)。
+                QualitySettings.vSyncCount = 1;
+                Application.targetFrameRate = 60;
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+                // 開発トグル: cef_novsync で VSync 無しの従来挙動と比較できる。
                 if (System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_novsync")))
                 {
                     QualitySettings.vSyncCount = 0;
                     Debug.Log("[CefUnity] VSYNC MODE: vSyncCount=0 (no vsync)");
                 }
-                else
-                {
-                    QualitySettings.vSyncCount = 1;
-                    Debug.Log("[CefUnity] VSYNC MODE: vSyncCount=1 (hardware vsync)");
-                }
-                Application.targetFrameRate = 60;
 
-                // 計測用 (一時): cef_no_zero_wait マーカーで 0F 待ちを無効化 (baseline 比較用)。
-                // シーンの serialized 値は Editor が外部変更を再読込しないため、既存の計測
+                // 開発トグル: cef_no_zero_wait マーカーで 0F 待ちを無効化 (baseline 比較用)。
+                // シーンの serialized 値は Editor が外部変更を再読込しないため、既存の開発
                 // トグル群と同じ temp ファイル方式で切り替える。
                 if (System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_no_zero_wait")))
                     _zeroFrameWaitMs = 0f;
+#endif
 
                 var useGpu = !(SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12 || SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11);
                 // ログのマスタースイッチ: Unity 側 (CefLog) と Rust 側 (client/server)
@@ -323,7 +326,8 @@ namespace CefUnity.Runtime
             // 入力処理 + BeginFrame 発行は PlayerLoop の EarlyUpdate 末尾 (OnEarlyUpdateLast)
             // で行うため、ここからは削除した。MonoBehaviour.Update の役割は Pump と診断のみ。
 
-            // 計測用 (一時): temp ファイルで testufo 遷移 + 擬似ゲーム負荷 (8ms 空回し)。
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            // 開発トグル: temp ファイルで testufo 遷移 + 擬似ゲーム負荷 (8ms 空回し)。
             var tmpDir = System.IO.Path.GetTempPath();
             if (!_navTestDone && System.IO.File.Exists(System.IO.Path.Combine(tmpDir, "cef_load_testufo")))
             {
@@ -346,6 +350,7 @@ namespace CefUnity.Runtime
                 var until = Time.realtimeSinceStartup + 0.008f;
                 while (Time.realtimeSinceStartup < until) { }
             }
+#endif
 
             // 機構1 計装: フレーム時間 (present 間隔) の分布を毎フレーム集計。
             var ft = Time.unscaledDeltaTime;
@@ -357,7 +362,8 @@ namespace CefUnity.Runtime
             if (ft > 0.020) _ftOver20++;
             if (ft > 0.025) _ftOver25++;
 
-            // 分析用 (一時): cef_perf_probe がある間、毎フレーム記録し 30 フレームごとに CSV 追記。
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            // 開発トグル: cef_perf_probe がある間、毎フレーム記録し 30 フレームごとに CSV 追記。
             if (System.IO.File.Exists(System.IO.Path.Combine(tmpDir, "cef_perf_probe")))
             {
                 long afiNow = _useAcceleratedPaint && _browser != null ? (long)_browser.PeekAccelFrameId() : 0;
@@ -375,6 +381,7 @@ namespace CefUnity.Runtime
                     _perfLog.Clear();
                 }
             }
+#endif
 
             _diagTimer += Time.deltaTime;
             if (_diagTimer >= 2f)
@@ -543,7 +550,8 @@ namespace CefUnity.Runtime
             self._inputSentThisFrame = false;
             self.CheckScreenResize();
             self.HandleMouseInput();
-            // 計測用 (一時): cef_scroll_test が在るあいだ、実ユーザーのホイール操作を模して
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            // 開発トグル: cef_scroll_test が在るあいだ、実ユーザーのホイール操作を模して
             // 毎フレーム ±60px のスクロールを注入する (3 秒ごとに方向反転)。実ホイールと
             // 同じ EarlyUpdate 内で送ること (Update 内だと _inputSentThisFrame がこの hook
             // 冒頭のリセットで消え、連続入力判定・アクティブ判定に乗らない)。
@@ -553,7 +561,7 @@ namespace CefUnity.Runtime
                 self._browser.SendMouseWheel(self._currentWidth / 2, self._currentHeight / 2, 0, dir * 60);
                 self._inputSentThisFrame = true;
             }
-            // 分析用 (一時): cef_scroll_slow が在る間、毎フレーム正確に -10px の均一スクロールを注入。
+            // 開発トグル: cef_scroll_slow が在る間、毎フレーム正確に -10px の均一スクロールを注入。
             // 「数学的に完璧に均一な入力」でもカクつくか(=パイプライン位相ビート)を切り分ける。
             if (System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_scroll_slow")))
             {
@@ -561,6 +569,7 @@ namespace CefUnity.Runtime
                 self._frameSentDy = -10;
                 self._inputSentThisFrame = true;
             }
+#endif
             // スクロール平滑の排出。BeginFrame#1 の前なので同フレームの paint に乗る。
             self.TickScrollSmoother();
             self.UpdateCompositionCursorPos();
@@ -1041,7 +1050,9 @@ namespace CefUnity.Runtime
             var by = _lastMouseY >= 0 ? _lastMouseY : _currentHeight / 2;
             _browser.SendMouseWheel(bx, by, dx, dy, GetCefModifiers());
             _inputSentThisFrame = true;
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
             _frameSentDy = dy; // 分析用: 平滑後の実送信量
+#endif
         }
 
         private void HandleButton(int bx, int by, int unityButton, MouseButton cefButton, uint mods)
