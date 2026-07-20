@@ -33,7 +33,7 @@
 | Create: `cef-unity-unityproject/Assets/CefUnity/Runtime/ScrollInput/ScrollInputEvent.cs` | struct + enum + `IScrollEventSource` |
 | Create: `cef-unity-unityproject/Assets/CefUnity/Runtime/ScrollInput/ScrollResampler.cs` | リサンプラ本体 (純 C#) |
 | Create: `cef-unity-unityproject/Assets/CefUnity/Runtime/ScrollInput/MacNativeScrollSource.cs` | FFI 薄ラッパ |
-| Create: `cef-unity-unityproject/Assets/CefUnity/Runtime.Tests/ScrollResamplerTests.cs` | EditMode テスト 9 件 |
+| Create: `cef-unity-unityproject/Assets/CefUnity/Runtime.Tests/ScrollResamplerTests.cs` | EditMode テスト 10 件 |
 | Modify: `cef-unity-unityproject/Assets/CefUnity/Runtime/CefUnityBrowserSample.cs` | SetupScrollInput / TickNativeScroll / ゲート / Reset / Dispose |
 
 ---
@@ -759,7 +759,7 @@ echo "exit=$?"
 grep -o 'total="[0-9]*" passed="[0-9]*" failed="[0-9]*"' /tmp/resampler_green.xml | head -1
 ```
 
-期待: exit=0、total="28" passed="28" failed="0" (既存 19 + 新 9)
+期待: exit=0、total="29" passed="29" failed="0" (既存 19 + 新 10)
 
 - [ ] **Step 6: コミット (.meta 含む — ScrollInput ディレクトリの .meta も)**
 
@@ -769,7 +769,7 @@ git add cef-unity-unityproject/Assets/CefUnity/Runtime/ScrollInput \
         cef-unity-unityproject/Assets/CefUnity/Runtime/ScrollInput.meta \
         cef-unity-unityproject/Assets/CefUnity/Runtime.Tests/ScrollResamplerTests.cs \
         cef-unity-unityproject/Assets/CefUnity/Runtime.Tests/ScrollResamplerTests.cs.meta
-git commit -m "feat: IScrollEventSource 抽象 + ScrollResampler (Chromium 流リサンプラ) + テスト9件"
+git commit -m "feat: IScrollEventSource 抽象 + ScrollResampler (Chromium 流リサンプラ) + テスト10件"
 ```
 
 ---
@@ -1046,7 +1046,7 @@ echo "exit=$?"
 grep -o 'total="[0-9]*" passed="[0-9]*" failed="[0-9]*"' /tmp/task3_tests.xml | head -1
 ```
 
-期待: exit=0、total="28" passed="28" failed="0"
+期待: exit=0、total="29" passed="29" failed="0"
 
 - [ ] **Step 9: コミット**
 
