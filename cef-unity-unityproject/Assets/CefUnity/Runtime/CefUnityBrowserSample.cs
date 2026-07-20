@@ -244,7 +244,7 @@ namespace CefUnity.Runtime
         // 時定数 (秒)。$TMPDIR/cef_scroll_tau (ms 値のテキスト) で実行時上書き可 (0 = 平滑 OFF)。
         // 体感チューニング用の暫定機構 — 値確定後に const 化して撤去する。
         private float _scrollSmoothTau = 0.045f;
-        private int _scrollTauCheckCountdown;
+        private int _scrollTauCheckCountdown; // 初期値 0 → 起動後最初のフレームで即チェック
 
         // --- 分析用 (一時): 毎フレームの scroll 量/frame time/paint を CSV 記録 ---
         private readonly System.Collections.Generic.List<string> _perfLog = new();
@@ -1034,6 +1034,7 @@ namespace CefUnity.Runtime
         /// </summary>
         private void TickScrollSmoother()
         {
+            if (_browser == null || !_scrollSmoother.IsActive) return;
             // τ の実行時上書き (体感チューニング用・暫定)。毎フレーム I/O を避け 60F に 1 回。
             if (--_scrollTauCheckCountdown <= 0)
             {
