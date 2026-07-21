@@ -46,8 +46,20 @@ namespace CefUnity.Runtime
         // イベント間隔の EMA (秒)。適応サンプルオフセットの元 (初期値 8ms ≒ 120Hz)。
         private double _intervalEma = 0.008;
 
+        // 直近の進行方向 (+1/-1、segment slope の符号)。予測モードの no-backtrack 用。
+        private double _lastDirX, _lastDirY;
+
         /// <summary>追跡中のジェスチャがあるか。</summary>
         public bool IsActive => _count > 0;
+
+        /// <summary>
+        ///     予測モード。サンプルを now−MinSampleOffset (5ms) に置き、外挿上限を
+        ///     イベント間隔相当まで拡大して遅延を下げる。定常スクロール中は線形予測が
+        ///     正確なのでビートは出ない。速度急変時のオーバーシュート巻き戻しは排出せず
+        ///     サンプル位置を保持する (no-backtrack。終点誤差は数 px 以内で不可視)。
+        ///     false (既定) は補間主体 (遅延 ~1 イベント間隔、アーティファクトなし)。
+        /// </summary>
+        public bool Predictive { get; set; }
 
         public void Reset()
         {
@@ -56,6 +68,7 @@ namespace CefUnity.Runtime
             _fracX = _fracY = 0;
             _ended = false;
             _intervalEma = 0.008;
+            _lastDirX = _lastDirY = 0;
         }
 
         /// <summary>イベントを取り込む (delta は view px スケール済みであること)。</summary>
@@ -142,13 +155,18 @@ namespace CefUnity.Runtime
                 }
                 else
                 {
-                    var offset = Math.Min(MaxSampleOffset, Math.Max(MinSampleOffset, _intervalEma * 1.25));
+                    var offset = Predictive
+                        ? MinSampleOffset
+                        : Math.Min(MaxSampleOffset, Math.Max(MinSampleOffset, _intervalEma * 1.25));
                     var sampleTime = now - offset;
                     double sx, sy;
                     if (_count >= 2 && sampleTime > _t[last])
                     {
                         // 最新イベント以後: 直近2点の速度で外挿 (上限 cap)。
-                        var dt = Math.Min(sampleTime - _t[last], ExtrapolationCap);
+                        var cap = Predictive
+                            ? Math.Min(MaxSampleOffset, _intervalEma * 1.25)
+                            : ExtrapolationCap;
+                        var dt = Math.Min(sampleTime - _t[last], cap);
                         var span = _t[last] - _t[last - 1];
                         sx = _pX[last] + (_pX[last] - _pX[last - 1]) / span * dt;
                         sy = _pY[last] + (_pY[last] - _pY[last - 1]) / span * dt;
@@ -172,6 +190,18 @@ namespace CefUnity.Runtime
                         var a = (sampleTime - _t[i - 1]) / (_t[i] - _t[i - 1]);
                         sx = _pX[i - 1] + (_pX[i] - _pX[i - 1]) * a;
                         sy = _pY[i - 1] + (_pY[i] - _pY[i - 1]) * a;
+                    }
+                    if (Predictive && _count >= 2)
+                    {
+                        // no-backtrack: 進行方向を更新し、逆向きの微小補正 (外挿
+                        // オーバーシュートの巻き戻し) は排出せず位置を保持する。
+                        // 実イベントによる方向反転は segment slope が反転するので追従する。
+                        var segX = _pX[last] - _pX[last - 1];
+                        var segY = _pY[last] - _pY[last - 1];
+                        if (segX != 0) _lastDirX = segX > 0 ? 1 : -1;
+                        if (segY != 0) _lastDirY = segY > 0 ? 1 : -1;
+                        if ((sx - _sampX) * _lastDirX < 0) sx = _sampX;
+                        if ((sy - _sampY) * _lastDirY < 0) sy = _sampY;
                     }
                     _fracX += sx - _sampX;
                     _fracY += sy - _sampY;

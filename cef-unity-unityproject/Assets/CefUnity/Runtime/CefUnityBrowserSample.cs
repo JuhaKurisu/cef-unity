@@ -254,6 +254,11 @@ namespace CefUnity.Runtime
         private readonly ScrollInputEvent[] _scrollEventBuf = new ScrollInputEvent[256];
 
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
+        // 開発トグル cef_scroll_predict の再チェック間隔 (60F に 1 回)。
+        private int _scrollPredictCheckCountdown;
+#endif
+
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
         // --- 分析用 (開発ビルドのみ): 毎フレームの scroll 量/frame time/paint を CSV 記録 ---
         private readonly System.Collections.Generic.List<string> _perfLog = new();
         private int _frameSentDy;
@@ -1094,6 +1099,15 @@ namespace CefUnity.Runtime
         private void TickNativeScroll()
         {
             if (_scrollSource == null || _browser == null) return;
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            // 開発トグル: cef_scroll_predict で予測モード (低遅延・微小オーバーシュート許容) を試す。
+            if (--_scrollPredictCheckCountdown <= 0)
+            {
+                _scrollPredictCheckCountdown = 60;
+                _scrollResampler.Predictive = System.IO.File.Exists(
+                    System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_scroll_predict"));
+            }
+#endif
             var n = _scrollSource.Poll(_scrollEventBuf);
             var overBrowser = TryGetBrowserCoord(out _, out _);
             if (overBrowser)

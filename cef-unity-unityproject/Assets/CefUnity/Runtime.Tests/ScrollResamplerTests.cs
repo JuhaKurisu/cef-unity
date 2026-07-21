@@ -196,6 +196,57 @@ namespace CefUnity.Runtime.Tests
                 Assert.That(emitted[k], Is.InRange(9, 11), $"frame {k}");
         }
 
+        // ---- 予測モード: 60Hz 定常で均一かつ追従遅れが ~5ms 相当に縮む ----
+
+        [Test]
+        public void Predictive_SteadyStream60Hz_UniformAndLowLatency()
+        {
+            var r = new ScrollResampler { Predictive = true };
+            var emitted = new System.Collections.Generic.List<int>();
+            var total = 0;
+            var eventIndex = 0;
+            var lastNow = 0.0;
+            for (var k = 0; k < 40; k++)
+            {
+                var now = 0.05 + k * F;
+                lastNow = now;
+                while (eventIndex * F <= now) { r.AddEvent(Ev(eventIndex * F, 10f)); eventIndex++; }
+                r.Tick(now, out _, out var dy);
+                emitted.Add(dy);
+                total += dy;
+            }
+            for (var k = 1; k < emitted.Count; k++)
+                Assert.That(emitted[k], Is.InRange(9, 11), $"frame {k}");
+            // P(t) = 600t + 10 の直線。予測モードの追従遅れは ~5ms (3px)。
+            // 補間モード (遅れ ~21ms ≈ 12.5px) では下限を割る → モード差を検証。
+            var pNow = 600.0 * lastNow + 10.0;
+            Assert.GreaterOrEqual(total, pNow - 6.0, "追従遅れが ~5ms 相当 (予測が効いている)");
+        }
+
+        // ---- 予測モード: 急停止でも巻き戻し (負の排出) が出ない ----
+
+        [Test]
+        public void Predictive_AbruptStop_NoBacktrack()
+        {
+            var r = new ScrollResampler { Predictive = true };
+            var emitted = new System.Collections.Generic.List<int>();
+            var total = 0;
+            // 600px/s で 4 イベント → 以後 delta 0 (急停止)
+            for (var k = 0; k < 10; k++)
+            {
+                var now = k * F + 0.006;
+                if (k < 4) r.AddEvent(Ev(k * F, 10f));
+                else if (k < 7) r.AddEvent(Ev(k * F, 0f));
+                r.Tick(now, out _, out var dy);
+                emitted.Add(dy);
+                total += dy;
+            }
+            foreach (var dy in emitted)
+                Assert.GreaterOrEqual(dy, 0, "巻き戻し (負の排出) は出ない");
+            // 入力合計 40px。外挿オーバーシュートの保持分 (+1px 程度) までは許容
+            Assert.That(total, Is.InRange(40, 42));
+        }
+
         // ---- Reset で全状態破棄 ----
 
         [Test]
