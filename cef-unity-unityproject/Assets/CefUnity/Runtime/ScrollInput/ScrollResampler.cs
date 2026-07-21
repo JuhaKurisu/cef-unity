@@ -105,7 +105,11 @@ namespace CefUnity.Runtime
                 return;
             }
             // 新しい時刻へ進む: イベント間隔 EMA を更新 (適応オフセットの元)。
-            _intervalEma += (e.Timestamp - _t[last] - _intervalEma) * 0.2;
+            // ジェスチャ間の休止 (50ms 超の途切れ) はデバイス周期ではないので除外
+            // (混入すると予測モードの外挿上限が膨らみ、再開直後のオーバーシュートが増える)。
+            var interval = e.Timestamp - _t[last];
+            if (interval < 0.05)
+                _intervalEma += (interval - _intervalEma) * 0.2;
             if (_count == HistoryCap)
             {
                 // 履歴が満杯: 最古を捨てて左詰め。
@@ -134,10 +138,12 @@ namespace CefUnity.Runtime
             var last = _count - 1;
             var rx = _pX[last] - _sampX;
             var ry = _pY[last] - _sampY;
-            var dirX = _count < 2 ? 0.0 : _pX[last] - _pX[last - 1];
-            var dirY = _count < 2 ? 0.0 : _pY[last] - _pY[last - 1];
-            if (_count < 2 || rx * dirX >= 0) _fracX += rx;
-            if (_count < 2 || ry * dirY >= 0) _fracY += ry;
+            // 進行方向は永続値 _lastDir で判定する。終端イベントは delta=0 で直近
+            // セグメントの傾きが 0 になるため、その場の傾きで判定すると外挿オーバー
+            // シュートの負残差がすり抜けて端数に溜まり、次ジェスチャ開始時に
+            // 「位置が飛ぶ」(実測バグ)。方向未確定 (0) のときのみ無条件に保存する。
+            if (_lastDirX == 0 || rx * _lastDirX >= 0) _fracX += rx;
+            if (_lastDirY == 0 || ry * _lastDirY >= 0) _fracY += ry;
             _count = 0;
             _sampX = _sampY = 0;
             _ended = false;
@@ -191,17 +197,22 @@ namespace CefUnity.Runtime
                         sx = _pX[i - 1] + (_pX[i] - _pX[i - 1]) * a;
                         sy = _pY[i - 1] + (_pY[i] - _pY[i - 1]) * a;
                     }
-                    if (Predictive && _count >= 2)
+                    if (_count >= 2)
                     {
-                        // no-backtrack: 進行方向を更新し、逆向きの微小補正 (外挿
-                        // オーバーシュートの巻き戻し) は排出せず位置を保持する。
-                        // 実イベントによる方向反転は segment slope が反転するので追従する。
+                        // 進行方向を更新 (非ゼロ傾きのみ。終端の delta=0 では保持)。
+                        // 予測モードの no-backtrack と、フラッシュ時の巻き戻し防止の両方が使う。
                         var segX = _pX[last] - _pX[last - 1];
                         var segY = _pY[last] - _pY[last - 1];
                         if (segX != 0) _lastDirX = segX > 0 ? 1 : -1;
                         if (segY != 0) _lastDirY = segY > 0 ? 1 : -1;
-                        if ((sx - _sampX) * _lastDirX < 0) sx = _sampX;
-                        if ((sy - _sampY) * _lastDirY < 0) sy = _sampY;
+                        if (Predictive)
+                        {
+                            // no-backtrack: 逆向きの微小補正 (外挿オーバーシュートの
+                            // 巻き戻し) は排出せず位置を保持する。実イベントによる方向
+                            // 反転は segment slope が反転するので追従する。
+                            if ((sx - _sampX) * _lastDirX < 0) sx = _sampX;
+                            if ((sy - _sampY) * _lastDirY < 0) sy = _sampY;
+                        }
                     }
                     _fracX += sx - _sampX;
                     _fracY += sy - _sampY;

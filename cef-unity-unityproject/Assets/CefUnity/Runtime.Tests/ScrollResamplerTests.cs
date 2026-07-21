@@ -247,6 +247,26 @@ namespace CefUnity.Runtime.Tests
             Assert.That(total, Is.InRange(40, 42));
         }
 
+        // ---- 予測モード: 急停止のオーバーシュート残差が次ジェスチャ開始時に飛びとして出ない ----
+
+        [Test]
+        public void Predictive_OvershootResidual_NotEmittedOnNextGesture()
+        {
+            var r = new ScrollResampler { Predictive = true };
+            // 1800px/s で 4 イベント → 外挿がサンプルを先行させる
+            for (var k = 0; k < 4; k++) r.AddEvent(Ev(k * F, 30f));
+            r.Tick(3 * F + 0.012, out _, out _);
+            // 急停止 (delta=0 の終端イベント → 直近セグメントの傾きは 0)
+            r.AddEvent(Ev(4 * F, 0f, ScrollPhase.MomentumEnded));
+            r.Tick(4 * F + 0.006, out _, out var d2);
+            Assert.GreaterOrEqual(d2, 0, "終端フラッシュで負の排出をしない");
+            Assert.IsFalse(r.IsActive);
+            // 新ジェスチャ (同方向 5px): 滞留残差による飛びが出ない
+            r.AddEvent(Ev(0.2, 5f, ScrollPhase.GestureBegan));
+            r.Tick(0.2 + 0.006, out _, out var d3);
+            Assert.That(d3, Is.InRange(0, 6), "次ジェスチャ開始時に位置が飛ばない");
+        }
+
         // ---- Reset で全状態破棄 ----
 
         [Test]
