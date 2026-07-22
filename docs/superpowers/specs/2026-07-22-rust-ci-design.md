@@ -85,3 +85,16 @@ mac と独立並列 (片方の失敗が他方をブロックしない)。
   `cef-unity-rust-helper.exe`、`cef/` にランタイム一式 (libcef.dll, chrome_elf.dll,
   *.pak, icudtl.dat, v8_context_snapshot.bin, locales/ 220 ファイル。フラット構造・SDK 除外)
 - **成果: Windows は server 含め全バイナリがビルド可能と機械的に確認** (2026-05 以来の未検証状態が解消)
+
+## 第3弾: publish ジョブ (2026-07-22 実装, ユーザー承認済み)
+
+- **発動**: タグ push (`v*`) または workflow_dispatch。build-mac/build-win 成功後 (`needs`)
+- **動作**: 両 artifact を取得 → `Plugins/osx-arm64` (rsync --delete, .meta 保持) と
+  `win-x64` (フラット展開, archive.json 除外) を更新 → **Secrets の `LFS_URL`** (R2 プロキシ)
+  で lfs.url を設定し main へコミット+push → タグ時のみ両 zip を添付した GitHub Release 作成
+- **ループ防止**: publish のコミットは Unity 側パスのみ → ビルドの paths フィルタ
+  (`cef-unity-rust/**`) に合致せず、かつ GITHUB_TOKEN のイベントは連鎖しない (二重の防止)
+- **新規ファイルの .meta**: CI では生成不能 → 欠落を警告ログに出す (コミットは続行、
+  後で Unity インポートで補完)
+- 既知の不確実性: タグ push と paths フィルタの併用挙動は GitHub 側の仕様が曖昧 →
+  タグで起動しない場合は workflow_dispatch が代替経路

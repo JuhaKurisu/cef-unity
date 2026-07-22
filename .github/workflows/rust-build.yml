@@ -5,6 +5,7 @@ name: rust-build
 on:
   push:
     branches: [main]
+    tags: ["v*"]
     paths:
       - "cef-unity-rust/**"
       - ".github/workflows/rust-build.yml"
@@ -134,3 +135,68 @@ jobs:
         with:
           name: cef-unity-windows-x64
           path: cef-unity-rust/bundle-win
+
+  # 第3弾: タグ push (v*) または手動実行時、ビルド成果物を Plugins/ へコミット (LFS 経由)
+  # し、タグ時は GitHub Release を作成する。publish のコミットは Unity 側パスのみ変更する
+  # ため paths フィルタに合致せず、再ビルドはトリガーされない (ループ防止)。
+  publish:
+    needs: [build-mac, build-win]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Update Plugins (mac)
+        run: |
+          unzip -oq artifacts/cef-unity-macos-arm64/cef-unity-macos-arm64.zip -d /tmp/mac
+          # .meta は Unity 管理なので保持 (--delete は excluded を消さない)
+          rsync -a --delete --exclude '*.meta' /tmp/mac/osx-arm64/ \
+            cef-unity-unityproject/Assets/CefUnity/Interop/Plugins/osx-arm64/
+
+      - name: Update Plugins (win, フラット展開)
+        run: |
+          WD=cef-unity-unityproject/Assets/CefUnity/Interop/Plugins/win-x64
+          SRC=artifacts/cef-unity-windows-x64
+          cp "$SRC/cef_unity_rust.dll" "$SRC/cef-unity-server.exe" "$SRC/cef-unity-rust-helper.exe" "$WD/"
+          rsync -a --exclude archive.json "$SRC/cef/" "$WD/"
+
+      - name: Warn missing .meta (新規ファイルは Unity での meta 生成が必要)
+        run: |
+          MISSING=0
+          while IFS= read -r f; do
+            if [ ! -f "$f.meta" ]; then echo "META なし: $f"; MISSING=1; fi
+          done < <(find cef-unity-unityproject/Assets/CefUnity/Interop/Plugins -type f ! -name '*.meta')
+          [ "$MISSING" = 0 ] && echo "全ファイルに .meta あり" || echo "(警告のみ — コミットは続行)"
+
+      - name: Commit and push via LFS
+        run: |
+          git config user.name "Juha"
+          git config user.email "juhasapps@gmail.com"
+          git config lfs.url "${{ secrets.LFS_URL }}"
+          git add cef-unity-unityproject/Assets/CefUnity/Interop/Plugins
+          if git diff --staged --quiet; then
+            echo "変更なし — コミットをスキップ"
+          else
+            git commit -m "chore: CI ビルド成果物を反映 (${GITHUB_REF_NAME})"
+            git push origin main
+          fi
+
+      - name: Create GitHub Release (タグ時のみ)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd artifacts/cef-unity-windows-x64 && zip -qry ../../cef-unity-windows-x64.zip .)
+          cp artifacts/cef-unity-macos-arm64/cef-unity-macos-arm64.zip .
+          gh release create "$GITHUB_REF_NAME" \
+            cef-unity-macos-arm64.zip cef-unity-windows-x64.zip \
+            --generate-notes
