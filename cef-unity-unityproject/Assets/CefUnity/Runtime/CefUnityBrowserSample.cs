@@ -214,7 +214,7 @@ namespace CefUnity.Runtime
         private float _lastFreshRealtime = -1f;
         private double _ciSum, _ciSumSq, _ciMax;
         private int _ciCount;
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
+#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
         private bool _navTestDone; // 計測用
         private bool _audioTestDone; // 音声テスト用 (cef_load_url トリガー)
 #endif
@@ -254,7 +254,7 @@ namespace CefUnity.Runtime
         private readonly ScrollResampler _scrollResampler = new ScrollResampler { Predictive = true };
         private readonly ScrollInputEvent[] _scrollEventBuf = new ScrollInputEvent[256];
 
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
+#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
         // 開発トグル cef_scroll_predict / cef_scroll_record の再チェック間隔 (60F に 1 回)。
         private int _scrollPredictCheckCountdown;
         private bool _scrollRecordEnabled;
@@ -263,7 +263,7 @@ namespace CefUnity.Runtime
         private readonly System.Collections.Generic.List<string> _scrollRecordLog = new();
 #endif
 
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
+#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
         // --- 分析用 (開発ビルドのみ): 毎フレームの scroll 量/frame time/paint を CSV 記録 ---
         private readonly System.Collections.Generic.List<string> _perfLog = new();
         private int _frameSentDy;
@@ -291,7 +291,7 @@ namespace CefUnity.Runtime
                 // present がディスプレイ走査に同期してティアリング解消)。
                 QualitySettings.vSyncCount = 1;
                 Application.targetFrameRate = 60;
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
+#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
                 // 開発トグル: cef_novsync で VSync 無しの従来挙動と比較できる。
                 if (System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_novsync")))
                 {
@@ -344,7 +344,7 @@ namespace CefUnity.Runtime
         private void SetupScrollInput()
         {
 #if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
+#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
             // 開発トグル: cef_scroll_legacy で強制フォールバック (A/C 体感比較用)。
             if (System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_scroll_legacy")))
             {
@@ -378,7 +378,7 @@ namespace CefUnity.Runtime
             // 入力処理 + BeginFrame 発行は PlayerLoop の EarlyUpdate 末尾 (OnEarlyUpdateLast)
             // で行うため、ここからは削除した。MonoBehaviour.Update の役割は Pump と診断のみ。
 
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
+#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
             // 開発トグル: temp ファイルで testufo 遷移 + 擬似ゲーム負荷 (8ms 空回し)。
             var tmpDir = System.IO.Path.GetTempPath();
             if (!_navTestDone && System.IO.File.Exists(System.IO.Path.Combine(tmpDir, "cef_load_testufo")))
@@ -414,7 +414,7 @@ namespace CefUnity.Runtime
             if (ft > 0.020) _ftOver20++;
             if (ft > 0.025) _ftOver25++;
 
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
+#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
             // 開発トグル: cef_perf_probe がある間、毎フレーム記録し 30 フレームごとに CSV 追記。
             if (System.IO.File.Exists(System.IO.Path.Combine(tmpDir, "cef_perf_probe")))
             {
@@ -605,7 +605,7 @@ namespace CefUnity.Runtime
             self._inputSentThisFrame = false;
             self.CheckScreenResize();
             self.HandleMouseInput();
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
+#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
             // 開発トグル: cef_scroll_test が在るあいだ、実ユーザーのホイール操作を模して
             // 毎フレーム ±60px のスクロールを注入する (3 秒ごとに方向反転)。実ホイールと
             // 同じ EarlyUpdate 内で送ること (Update 内だと _inputSentThisFrame がこの hook
@@ -1104,7 +1104,7 @@ namespace CefUnity.Runtime
         private void TickNativeScroll()
         {
             if (_scrollSource == null || _browser == null) return;
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
+#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
             // 開発トグル: cef_scroll_interp で補間モード (予測が既定)、cef_scroll_record で生イベント録画。
             if (--_scrollPredictCheckCountdown <= 0)
             {
@@ -1118,7 +1118,7 @@ namespace CefUnity.Runtime
             }
 #endif
             var n = _scrollSource.Poll(_scrollEventBuf);
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
+#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
             // 生イベント録画: ポーリング直後の生値 (スケール前) を記録する。
             if (_scrollRecordEnabled)
             {
@@ -1154,7 +1154,7 @@ namespace CefUnity.Runtime
                 }
             }
             _scrollResampler.Tick(_scrollSource.Now, out var dx, out var dy);
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
+#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
             // 毎 Tick 記録 (0 排出も含む — リプレイ忠実度の照合に必要)。30 行毎にフラッシュ。
             if (_scrollRecordEnabled)
             {
@@ -1179,7 +1179,7 @@ namespace CefUnity.Runtime
             var by = _lastMouseY >= 0 ? _lastMouseY : _currentHeight / 2;
             _browser.SendMouseWheel(bx, by, dx, dy, GetCefModifiers());
             _inputSentThisFrame = true;
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
+#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
             _frameSentDy = dy; // 分析用: リサンプル後の実送信量
 #endif
         }
@@ -1201,7 +1201,7 @@ namespace CefUnity.Runtime
             var by = _lastMouseY >= 0 ? _lastMouseY : _currentHeight / 2;
             _browser.SendMouseWheel(bx, by, dx, dy, GetCefModifiers());
             _inputSentThisFrame = true;
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
+#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
             _frameSentDy = dy; // 分析用: 平滑後の実送信量
 #endif
         }

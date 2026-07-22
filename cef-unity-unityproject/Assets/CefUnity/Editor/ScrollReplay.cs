@@ -1,3 +1,5 @@
+// この開発リポジトリ専用ツール (CEF_UNITY_DEV_TOOLS)。パッケージ利用側では無効。
+#if CEF_UNITY_DEV_TOOLS
 using System.Globalization;
 using CefUnity.Runtime;
 using UnityEditor;
@@ -60,3 +62,4 @@ namespace CefUnity.Editor
         }
     }
 }
+#endif
