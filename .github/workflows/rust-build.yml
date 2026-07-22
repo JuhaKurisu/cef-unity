@@ -1,0 +1,125 @@
+# Rust クライアント/サーバーの CI ビルド (設計: docs/superpowers/specs/2026-07-22-rust-ci-design.md)
+# mac は deploy.sh 再利用でバンドルまで、win はビルド+診断+ベストエフォート収集。
+name: rust-build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cef-unity-rust/**"
+      - ".github/workflows/rust-build.yml"
+  pull_request:
+    paths:
+      - "cef-unity-rust/**"
+      - ".github/workflows/rust-build.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: rust-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-mac:
+    runs-on: macos-14 # arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-mac-${{ hashFiles('cef-unity-rust/Cargo.lock') }}
+
+      # 初回の cargo 実行は CEF (~1GB) ダウンロードを含むため 1 回リトライ
+      - name: Unit tests
+        working-directory: cef-unity-rust
+        run: cargo test --workspace --lib --release || cargo test --workspace --lib --release
+
+      # 既存スクリプト再利用: release ビルド + server.app バンドル + ad-hoc 署名 +
+      # cef-unity-unityproject/Assets/CefUnity/Interop/Plugins/osx-arm64/ へ配置
+      - name: Build and bundle (deploy.sh)
+        working-directory: cef-unity-rust
+        run: ./deploy.sh
+
+      - name: Zip artifact
+        working-directory: cef-unity-unityproject/Assets/CefUnity/Interop/Plugins
+        run: zip -qry "$GITHUB_WORKSPACE/cef-unity-macos-arm64.zip" osx-arm64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cef-unity-macos-arm64
+          path: cef-unity-macos-arm64.zip
+
+  build-win:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-win-${{ hashFiles('cef-unity-rust/Cargo.lock') }}
+
+      - name: Unit tests
+        working-directory: cef-unity-rust
+        shell: bash
+        run: cargo test --workspace --lib --release || cargo test --workspace --lib --release
+
+      - name: Build
+        working-directory: cef-unity-rust
+        shell: bash
+        run: cargo build --release
+
+      # Windows のバンドル構成は 2026-05 以来未検証。初回実行はこの診断ログで
+      # 収集対象を確定する (設計書に明記済み)。
+      - name: Diagnostics
+        working-directory: cef-unity-rust
+        shell: bash
+        run: |
+          echo "=== target/release の exe/dll ==="
+          ls -la target/release | grep -Ei '\.(exe|dll)$' || echo "(なし)"
+          echo "=== cef-dll-sys out ==="
+          ls -d target/release/build/cef-dll-sys-*/out/* 2>/dev/null || echo "(なし)"
+          for d in target/release/build/cef-dll-sys-*/out/cef_windows_*; do
+            [ -d "$d" ] || continue
+            echo "--- $d ---"
+            ls -la "$d" | head -50
+          done
+
+      - name: Collect bundle
+        working-directory: cef-unity-rust
+        shell: bash
+        run: |
+          mkdir -p bundle-win
+          for f in target/release/cef_unity_rust.dll \
+                   target/release/cef-unity-server.exe \
+                   target/release/cef-unity-rust-helper.exe; do
+            if [ -f "$f" ]; then
+              cp "$f" bundle-win/
+            else
+              echo "SKIP (not found): $f"
+            fi
+          done
+          CEF_DIR=$(ls -d target/release/build/cef-dll-sys-*/out/cef_windows_* 2>/dev/null | head -1)
+          if [ -n "$CEF_DIR" ]; then
+            mkdir -p bundle-win/cef
+            cp -R "$CEF_DIR"/. bundle-win/cef/
+          else
+            echo "SKIP (not found): cef_windows_* distribution dir"
+          fi
+          echo "=== bundle-win ==="
+          ls -laR bundle-win | head -80
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cef-unity-windows-x64
+          path: cef-unity-rust/bundle-win
