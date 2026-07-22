@@ -186,7 +186,7 @@ jobs:
           if git diff --staged --quiet; then
             echo "変更なし — コミットをスキップ"
           else
-            git commit -m "chore: CI ビルド成果物を反映 (${GITHUB_REF_NAME})"
+            git commit -m "Update binaries (${GITHUB_REF_NAME})"
             git push origin main
           fi
 
