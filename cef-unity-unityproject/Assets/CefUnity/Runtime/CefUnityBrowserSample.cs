@@ -250,7 +250,8 @@ namespace CefUnity.Runtime
         // フォールバック (現行の Input.mouseScrollDelta → ScrollSmoother 経路)。
         // 設計: docs/superpowers/specs/2026-07-20-raw-scroll-resampling-design.md
         private IScrollEventSource _scrollSource;
-        private readonly ScrollResampler _scrollResampler = new ScrollResampler();
+        // Predictive=true 既定: 低遅延 (~5ms) の予測リサンプル。ビルド A/B で採用 (2026-07-22)。
+        private readonly ScrollResampler _scrollResampler = new ScrollResampler { Predictive = true };
         private readonly ScrollInputEvent[] _scrollEventBuf = new ScrollInputEvent[256];
 
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
@@ -1104,13 +1105,14 @@ namespace CefUnity.Runtime
         {
             if (_scrollSource == null || _browser == null) return;
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
-            // 開発トグル: cef_scroll_predict で予測モード、cef_scroll_record で生イベント録画。
+            // 開発トグル: cef_scroll_interp で補間モード (予測が既定)、cef_scroll_record で生イベント録画。
             if (--_scrollPredictCheckCountdown <= 0)
             {
                 _scrollPredictCheckCountdown = 60;
                 var tmp = System.IO.Path.GetTempPath();
-                _scrollResampler.Predictive = System.IO.File.Exists(
-                    System.IO.Path.Combine(tmp, "cef_scroll_predict"));
+                // 既定は予測モード。cef_scroll_interp で補間モードに切替 (A/B 比較用オプトアウト)。
+                _scrollResampler.Predictive = !System.IO.File.Exists(
+                    System.IO.Path.Combine(tmp, "cef_scroll_interp"));
                 _scrollRecordEnabled = System.IO.File.Exists(
                     System.IO.Path.Combine(tmp, "cef_scroll_record"));
             }
