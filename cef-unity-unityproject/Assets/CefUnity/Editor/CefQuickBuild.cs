@@ -1,3 +1,5 @@
+// この開発リポジトリ専用ツール (CEF_UNITY_DEV_TOOLS)。パッケージ利用側では無効。
+#if CEF_UNITY_DEV_TOOLS
 using UnityEditor;
 using UnityEditor.Build.Reporting;
 using UnityEngine;
@@ -34,3 +36,4 @@ namespace CefUnity.Editor
         }
     }
 }
+#endif
