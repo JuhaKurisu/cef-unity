@@ -254,8 +254,12 @@ namespace CefUnity.Runtime
         private readonly ScrollInputEvent[] _scrollEventBuf = new ScrollInputEvent[256];
 
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
-        // 開発トグル cef_scroll_predict の再チェック間隔 (60F に 1 回)。
+        // 開発トグル cef_scroll_predict / cef_scroll_record の再チェック間隔 (60F に 1 回)。
         private int _scrollPredictCheckCountdown;
+        private bool _scrollRecordEnabled;
+        // 生イベント録画 (cef_scroll_record): E,ts,dx,dy,phase,precise / T,now,dx,dy,predictive 行を
+        // バッチで $TMPDIR/cef_scroll_events.csv に追記する。オフラインのリプレイ検証用。
+        private readonly System.Collections.Generic.List<string> _scrollRecordLog = new();
 #endif
 
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
@@ -1100,15 +1104,30 @@ namespace CefUnity.Runtime
         {
             if (_scrollSource == null || _browser == null) return;
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
-            // 開発トグル: cef_scroll_predict で予測モード (低遅延・微小オーバーシュート許容) を試す。
+            // 開発トグル: cef_scroll_predict で予測モード、cef_scroll_record で生イベント録画。
             if (--_scrollPredictCheckCountdown <= 0)
             {
                 _scrollPredictCheckCountdown = 60;
+                var tmp = System.IO.Path.GetTempPath();
                 _scrollResampler.Predictive = System.IO.File.Exists(
-                    System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_scroll_predict"));
+                    System.IO.Path.Combine(tmp, "cef_scroll_predict"));
+                _scrollRecordEnabled = System.IO.File.Exists(
+                    System.IO.Path.Combine(tmp, "cef_scroll_record"));
             }
 #endif
             var n = _scrollSource.Poll(_scrollEventBuf);
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            // 生イベント録画: ポーリング直後の生値 (スケール前) を記録する。
+            if (_scrollRecordEnabled)
+            {
+                for (var i = 0; i < n; i++)
+                {
+                    ref var ev = ref _scrollEventBuf[i];
+                    _scrollRecordLog.Add(
+                        $"E,{ev.Timestamp:R},{ev.DxPx:R},{ev.DyPx:R},{(byte)ev.Phase},{(ev.Precise ? 1 : 0)}");
+                }
+            }
+#endif
             var overBrowser = TryGetBrowserCoord(out _, out _);
             if (overBrowser)
             {
@@ -1133,6 +1152,25 @@ namespace CefUnity.Runtime
                 }
             }
             _scrollResampler.Tick(_scrollSource.Now, out var dx, out var dy);
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+            // 毎 Tick 記録 (0 排出も含む — リプレイ忠実度の照合に必要)。30 行毎にフラッシュ。
+            if (_scrollRecordEnabled)
+            {
+                _scrollRecordLog.Add(
+                    $"T,{_scrollSource.Now:R},{dx},{dy},{(_scrollResampler.Predictive ? 1 : 0)}");
+                if (_scrollRecordLog.Count >= 30)
+                {
+                    try
+                    {
+                        System.IO.File.AppendAllText(
+                            System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_scroll_events.csv"),
+                            string.Join("\n", _scrollRecordLog) + "\n");
+                    }
+                    catch { }
+                    _scrollRecordLog.Clear();
+                }
+            }
+#endif
             if (dx == 0 && dy == 0) return;
             // 最後の有効マウス座標で送る。まだ一度も動いていなければ画面中央。
             var bx = _lastMouseX >= 0 ? _lastMouseX : _currentWidth / 2;
