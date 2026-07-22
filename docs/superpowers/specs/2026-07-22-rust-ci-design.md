@@ -77,3 +77,11 @@ mac と独立並列 (片方の失敗が他方をブロックしない)。
    一式が含まれる (nm で `cef_scroll_monitor_start` 等の新 FFI を確認できる)
 2. win ジョブがビルド green (バンドル内容は初回診断の結果を見て確定)
 3. ユニットテストが両 OS で pass
+
+## 実行結果 (2026-07-22, 実装後追記)
+
+- 2 反復で両ジョブ green (mac は初回一発、win は SIGPIPE 対策のみ)
+- **win バンドル確定レイアウト**: トップに `cef_unity_rust.dll` / `cef-unity-server.exe` /
+  `cef-unity-rust-helper.exe`、`cef/` にランタイム一式 (libcef.dll, chrome_elf.dll,
+  *.pak, icudtl.dat, v8_context_snapshot.bin, locales/ 220 ファイル。フラット構造・SDK 除外)
+- **成果: Windows は server 含め全バイナリがビルド可能と機械的に確認** (2026-05 以来の未検証状態が解消)
