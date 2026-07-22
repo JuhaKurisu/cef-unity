@@ -92,7 +92,8 @@ jobs:
           for d in target/release/build/cef-dll-sys-*/out/cef_windows_*; do
             [ -d "$d" ] || continue
             echo "--- $d ---"
-            ls -la "$d" | head -50
+            # head の SIGPIPE (exit 141) を pipefail に拾わせない
+            { ls -la "$d" | head -50; } || true
           done
 
       - name: Collect bundle
@@ -111,13 +112,23 @@ jobs:
           done
           CEF_DIR=$(ls -d target/release/build/cef-dll-sys-*/out/cef_windows_* 2>/dev/null | head -1)
           if [ -n "$CEF_DIR" ]; then
-            mkdir -p bundle-win/cef
-            cp -R "$CEF_DIR"/. bundle-win/cef/
+            # ランタイムに必要なもののみ (include/cmake/libcef_dll/*.lib 等の SDK は除外)。
+            # 初回実行の診断でレイアウトはフラット (libcef.dll / *.pak / icudtl.dat /
+            # v8_context_snapshot.bin / locales/) と確認済み。
+            mkdir -p bundle-win/cef/locales
+            for f in "$CEF_DIR"/*.dll "$CEF_DIR"/*.pak "$CEF_DIR"/*.dat \
+                     "$CEF_DIR"/*.bin "$CEF_DIR"/*.json; do
+              if [ -f "$f" ]; then cp "$f" bundle-win/cef/; fi
+            done
+            cp -R "$CEF_DIR"/locales/. bundle-win/cef/locales/ 2>/dev/null \
+              || echo "SKIP (not found): locales"
           else
             echo "SKIP (not found): cef_windows_* distribution dir"
           fi
           echo "=== bundle-win ==="
-          ls -laR bundle-win | head -80
+          # head の SIGPIPE を避けるためファイル経由で出力
+          ls -laR bundle-win > "$RUNNER_TEMP/bundle_list.txt"
+          head -80 "$RUNNER_TEMP/bundle_list.txt"
 
       - uses: actions/upload-artifact@v4
         with:
