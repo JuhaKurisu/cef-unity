@@ -267,6 +267,28 @@ namespace CefUnity.Runtime.Tests
             Assert.That(d3, Is.InRange(0, 6), "次ジェスチャ開始時に位置が飛ばない");
         }
 
+        // ---- 予測モード: phase 遷移の近接イベント (0.2ms 差) で外挿傾きが発散しない ----
+
+        [Test]
+        public void Predictive_NearSimultaneousPhaseTransition_NoSpike()
+        {
+            var r = new ScrollResampler { Predictive = true };
+            var t = 0.0;
+            // 低速ジェスチャ (60Hz, -2px)
+            for (var k = 0; k < 6; k++) { r.AddEvent(Ev(t, -2f, ScrollPhase.GestureChanged)); t += F; }
+            // 遷移: GestureEnded (dy=0) の 0.2ms 後に MomentumBegan (-15px) — 実録画のパターン
+            r.AddEvent(Ev(t, 0f, ScrollPhase.GestureEnded));
+            r.AddEvent(Ev(t + 0.0002, -15f, ScrollPhase.MomentumBegan));
+            // 直後の Tick 群でスパイクが出ない (修正前は数百〜数千 px)
+            var worst = 0;
+            for (var k = 0; k < 6; k++)
+            {
+                r.Tick(t + 0.004 + k * F, out _, out var dy);
+                if (System.Math.Abs(dy) > System.Math.Abs(worst)) worst = dy;
+            }
+            Assert.LessOrEqual(System.Math.Abs(worst), 60, $"外挿スパイクが出ない (worst={worst})");
+        }
+
         // ---- Reset で全状態破棄 ----
 
         [Test]

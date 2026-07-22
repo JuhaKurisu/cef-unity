@@ -28,6 +28,14 @@ namespace CefUnity.Runtime
         /// <summary>無イベントでジェスチャ終端とみなすグレース (秒)。</summary>
         public const double GraceTimeout = 0.100;
 
+        /// <summary>
+        ///     この間隔以下で連続するイベントは同一点にマージする (秒)。ジェスチャ→慣性の
+        ///     遷移で macOS は ~0.2ms 差の連続イベント (GestureEnded の dy=0 と
+        ///     MomentumBegan) を送るため、そのまま 2 点にすると外挿傾きが発散して
+        ///     数千 px のスパイク排出になる (録画リプレイで実測 -1422px, 5099px)。
+        /// </summary>
+        public const double MergeEpsilon = 0.002;
+
         // イベント履歴 (時刻昇順、[_count-1] が最新)。オフセットが 1 イベント間隔を
         // 超えても補間できるよう 2 点ではなく 4 点持つ。
         private const int HistoryCap = 4;
@@ -97,9 +105,10 @@ namespace CefUnity.Runtime
                 return;
             }
             var last = _count - 1;
-            if (e.Timestamp <= _t[last])
+            if (e.Timestamp <= _t[last] + MergeEpsilon)
             {
-                // 同時刻イベント (同フレーム複数イベント等) は最新点へ合算 (0 除算回避)。
+                // 近接イベント (同フレーム複数配送・phase 遷移ペア等) は最新点へ合算。
+                // 退化セグメント (極小 dt) を作らないことで補間/外挿の傾き発散を防ぐ。
                 _pX[last] += e.DxPx;
                 _pY[last] += e.DyPx;
                 return;
@@ -168,14 +177,16 @@ namespace CefUnity.Runtime
                     double sx, sy;
                     if (_count >= 2 && sampleTime > _t[last])
                     {
-                        // 最新イベント以後: 直近2点の速度で外挿 (上限 cap)。
+                        // 最新イベント以後: 履歴窓全体 (最大4点) の平均速度で外挿 (上限 cap)。
+                        // 直近2点だと近接タイムスタンプで傾きが発散する (ノイズ増幅) ため、
+                        // 窓の端点間で算出する。
                         var cap = Predictive
                             ? Math.Min(MaxSampleOffset, _intervalEma * 1.25)
                             : ExtrapolationCap;
                         var dt = Math.Min(sampleTime - _t[last], cap);
-                        var span = _t[last] - _t[last - 1];
-                        sx = _pX[last] + (_pX[last] - _pX[last - 1]) / span * dt;
-                        sy = _pY[last] + (_pY[last] - _pY[last - 1]) / span * dt;
+                        var span = _t[last] - _t[0];
+                        sx = _pX[last] + (_pX[last] - _pX[0]) / span * dt;
+                        sy = _pY[last] + (_pY[last] - _pY[0]) / span * dt;
                     }
                     else if (_count < 2 || sampleTime >= _t[last])
                     {
