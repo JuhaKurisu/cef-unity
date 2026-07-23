@@ -25,6 +25,18 @@ namespace CefUnity.Runtime
         /// <summary>最新イベントからの外挿上限 (秒)。超えた分は保持 (オーバーシュート防止)。</summary>
         public const double ExtrapolationCap = 0.008;
 
+        /// <summary>
+        ///     慣性 (momentum) 中のイベント欠落を橋渡しする外挿上限 (秒、予測モードのみ)。
+        ///     メインスレッドのブロックで OS がイベントをコアレッシングし、慣性中に最大
+        ///     66ms (4F) の欠落 + 欠落明けの溜め分巨大イベントが実測されている
+        ///     (2026-07-23, test-results/scroll-drought-2026-07-23/)。慣性中は指が離れて
+        ///     おり、イベントは OS 減衰カーブの機械出力なので、長い外挿でも「指を止めた
+        ///     のに滑る」幽霊スクロールにはならない (指接触中はこの橋渡しを行わない —
+        ///     Chromium が外挿を 20ms で打ち切るのと同じ判断)。GraceTimeout (100ms) が
+        ///     最終的な終端検出として機能するため、それ未満に設定すること。
+        /// </summary>
+        public const double MomentumBridgeCap = 0.070;
+
         /// <summary>無イベントでジェスチャ終端とみなすグレース (秒)。</summary>
         public const double GraceTimeout = 0.100;
 
@@ -57,6 +69,9 @@ namespace CefUnity.Runtime
         // 直近の進行方向 (+1/-1、segment slope の符号)。予測モードの no-backtrack 用。
         private double _lastDirX, _lastDirY;
 
+        // 直近イベントが慣性フェーズ (MomentumBegan/Changed) か。欠落橋渡しの適用条件。
+        private bool _momentum;
+
         /// <summary>追跡中のジェスチャがあるか。</summary>
         public bool IsActive => _count > 0;
 
@@ -77,6 +92,7 @@ namespace CefUnity.Runtime
             _ended = false;
             _intervalEma = 0.008;
             _lastDirX = _lastDirY = 0;
+            _momentum = false;
         }
 
         /// <summary>イベントを取り込む (delta は view px スケール済みであること)。</summary>
@@ -89,6 +105,7 @@ namespace CefUnity.Runtime
                 FlushResidualToFraction();
             }
             Accumulate(e);
+            _momentum = e.Phase == ScrollPhase.MomentumBegan || e.Phase == ScrollPhase.MomentumChanged;
             if (e.Phase == ScrollPhase.MomentumEnded || e.Phase == ScrollPhase.Cancelled)
                 _ended = true;
         }
@@ -179,9 +196,14 @@ namespace CefUnity.Runtime
                     {
                         // 最新イベント以後: 履歴窓全体 (最大4点) の平均速度で外挿 (上限 cap)。
                         // 直近2点だと近接タイムスタンプで傾きが発散する (ノイズ増幅) ため、
-                        // 窓の端点間で算出する。
+                        // 窓の端点間で算出する。慣性中 (予測モード) はイベント欠落の
+                        // 橋渡しとして上限を MomentumBridgeCap まで拡大する (定義箇所の
+                        // コメント参照。通常運転では sampleTime−t[last] ≦ ~12ms なので
+                        // この拡大は欠落フレームにしか効かない)。
                         var cap = Predictive
-                            ? Math.Min(MaxSampleOffset, _intervalEma * 1.25)
+                            ? (_momentum
+                                ? MomentumBridgeCap
+                                : Math.Min(MaxSampleOffset, _intervalEma * 1.25))
                             : ExtrapolationCap;
                         var dt = Math.Min(sampleTime - _t[last], cap);
                         var span = _t[last] - _t[0];

@@ -289,6 +289,73 @@ namespace CefUnity.Runtime.Tests
             Assert.LessOrEqual(System.Math.Abs(worst), 60, $"外挿スパイクが出ない (worst={worst})");
         }
 
+        // ---- 予測モード: 慣性中のイベント欠落 (OS コアレッシング) の橋渡し ----
+        // 実測 (2026-07-23): メインスレッドブロック起因で慣性中に最大 66ms (4F) の
+        // イベント欠落 + 欠落明けに溜め分の巨大イベントが届く。橋渡しが無いと
+        // 「数フレーム停止 → ジャンプ」のガタつきになる。
+
+        [Test]
+        public void Predictive_MomentumDrought_BridgesAtEstablishedVelocity()
+        {
+            var r = new ScrollResampler { Predictive = true };
+            // 600px/s の momentum ストリームで速度確立 (Ev の既定 phase = MomentumChanged)
+            for (var k = 0; k <= 5; k++) r.AddEvent(Ev(k * F, 10f));
+            r.Tick(5 * F + 0.006, out _, out _);
+            // 66ms 欠落: イベント無しのまま 3 フレーム Tick — 橋渡しで排出が途切れない
+            for (var k = 6; k <= 8; k++)
+            {
+                r.Tick(k * F + 0.006, out _, out var dy);
+                Assert.Greater(dy, 0, $"欠落中フレーム {k} でも確立済み速度で排出が続く");
+            }
+        }
+
+        [Test]
+        public void Predictive_MomentumDrought_CoalescedSpikeDoesNotJump()
+        {
+            var r = new ScrollResampler { Predictive = true };
+            var total = 0;
+            var maxDy = 0;
+            // 実運用同様、イベントと Tick を毎フレーム進める (初回キャッチアップを避ける)
+            for (var k = 0; k <= 8; k++)
+            {
+                if (k <= 5) r.AddEvent(Ev(k * F, 10f));
+                r.Tick(k * F + 0.006, out _, out var dy);
+                total += dy;
+                if (k >= 6 && dy > maxDy) maxDy = dy; // 欠落区間以降のみ評価
+            }
+            // 欠落明け: 溜め分 40px がコアレッシングされた 1 イベントで届く (実録画のパターン)
+            r.AddEvent(Ev(9 * F, 40f));
+            r.Tick(9 * F + 0.006, out _, out var dSpike);
+            total += dSpike;
+            if (dSpike > maxDy) maxDy = dSpike;
+            // 橋渡しで先払いした分が差し引かれ、スパイクは 1 フレームに集中しない
+            // (橋渡し無しの旧実装ではこのフレームに ~38px が出る)
+            Assert.LessOrEqual(maxDy, 16, $"欠落明けの溜め分が 1 フレームに集中しない (max={maxDy})");
+            // 終端で総量保存 (no-backtrack による先行分の切り捨ては ±2px 許容)
+            r.AddEvent(Ev(10 * F, 0f, ScrollPhase.MomentumEnded));
+            r.Tick(10 * F + 0.006, out _, out var dEnd);
+            total += dEnd;
+            Assert.That(total, Is.InRange(98, 102), "橋渡しを挟んでも総移動量が保存される");
+            Assert.IsFalse(r.IsActive, "MomentumEnded の即時停止は橋渡しより優先");
+        }
+
+        [Test]
+        public void Predictive_FingerDownDrought_NotBridged()
+        {
+            var r = new ScrollResampler { Predictive = true };
+            // 指が接触したままの欠落 = ユーザーが指を止めた可能性がある。橋渡しすると
+            // 「幽霊スクロール」になるため従来どおり停止する (Chromium と同じ判断)。
+            for (var k = 0; k <= 5; k++) r.AddEvent(Ev(k * F, 10f, ScrollPhase.GestureChanged));
+            r.Tick(5 * F + 0.006, out _, out _);
+            var sawZero = false;
+            for (var k = 6; k <= 8; k++)
+            {
+                r.Tick(k * F + 0.006, out _, out var dy);
+                if (dy == 0) sawZero = true;
+            }
+            Assert.IsTrue(sawZero, "指接触中の欠落は外挿上限で止まる (幽霊スクロール防止)");
+        }
+
         // ---- Reset で全状態破棄 ----
 
         [Test]
