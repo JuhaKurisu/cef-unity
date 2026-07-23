@@ -41,6 +41,16 @@ namespace CefUnity.Runtime
         public const double GraceTimeout = 0.100;
 
         /// <summary>
+        ///     サンプル位置の 1 tick 移動量の上限 = 観測速度 (履歴窓平均) × この係数。
+        ///     ジェスチャ開始の加速中、サンプルがイベント位相の揺れで「1 拍遅れ →
+        ///     溜めた不足分を一括放出」する過渡 (実録画 2026-07-23 build: 入力 -34/F に
+        ///     対し排出 -58/F の倍返し → 低速ストローク連打でガタつき) を、不足分を
+        ///     数フレームに分けた追いつきに均す。定常状態は advance = v×dt でこの上限に
+        ///     当たらない。総量は保存される (終端フラッシュは対象外の即時排出)。
+        /// </summary>
+        public const double CatchUpHeadroom = 1.2;
+
+        /// <summary>
         ///     この間隔以下で連続するイベントは同一点にマージする (秒)。ジェスチャ→慣性の
         ///     遷移で macOS は ~0.2ms 差の連続イベント (GestureEnded の dy=0 と
         ///     MomentumBegan) を送るため、そのまま 2 点にすると外挿傾きが発散して
@@ -72,6 +82,9 @@ namespace CefUnity.Runtime
         // 直近イベントが慣性フェーズ (MomentumBegan/Changed) か。欠落橋渡しの適用条件。
         private bool _momentum;
 
+        // 前回 Tick の時刻 (追いつき上限の dt 算出用)。0 = 未 Tick。
+        private double _lastTickTime;
+
         /// <summary>追跡中のジェスチャがあるか。</summary>
         public bool IsActive => _count > 0;
 
@@ -93,6 +106,7 @@ namespace CefUnity.Runtime
             _intervalEma = 0.008;
             _lastDirX = _lastDirY = 0;
             _momentum = false;
+            _lastTickTime = 0;
         }
 
         /// <summary>イベントを取り込む (delta は view px スケール済みであること)。</summary>
@@ -230,6 +244,20 @@ namespace CefUnity.Runtime
                         sx = _pX[i - 1] + (_pX[i] - _pX[i - 1]) * a;
                         sy = _pY[i - 1] + (_pY[i] - _pY[i - 1]) * a;
                     }
+                    // 追いつき上限 (CatchUpHeadroom の定義コメント参照): 観測速度を超える
+                    // 一括放出を数フレームに分散する。定常状態では上限に当たらない。
+                    if (_count >= 2 && _lastTickTime > 0)
+                    {
+                        var dtTick = Math.Min(0.1, Math.Max(0.001, now - _lastTickTime));
+                        var spanW = _t[last] - _t[0];
+                        if (spanW > 0)
+                        {
+                            var maxX = Math.Abs(_pX[last] - _pX[0]) / spanW * dtTick * CatchUpHeadroom;
+                            var maxY = Math.Abs(_pY[last] - _pY[0]) / spanW * dtTick * CatchUpHeadroom;
+                            sx = Math.Clamp(sx, _sampX - maxX, _sampX + maxX);
+                            sy = Math.Clamp(sy, _sampY - maxY, _sampY + maxY);
+                        }
+                    }
                     if (_count >= 2)
                     {
                         // 進行方向を更新 (非ゼロ傾きのみ。終端の delta=0 では保持)。
@@ -253,6 +281,7 @@ namespace CefUnity.Runtime
                     _sampY = sy;
                 }
             }
+            _lastTickTime = now;
             dx = TakeInt(ref _fracX);
             dy = TakeInt(ref _fracY);
         }

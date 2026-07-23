@@ -356,6 +356,56 @@ namespace CefUnity.Runtime.Tests
             Assert.IsTrue(sawZero, "指接触中の欠落は外挿上限で止まる (幽霊スクロール防止)");
         }
 
+        // ---- 予測モード: ジェスチャ開始の過渡でオーバーシュートしない ----
+        // 実録画 (2026-07-23 build): ストローク開始の加速中、履歴が少ない状態での外挿が
+        // 入力 -4,-30,-34 に対し排出 -4,-12,-58 の「ラグ→倍返し」を生んでいた。
+        // 低速スクロール = 短いストロークの繰り返しなので毎回この過渡が出てガタつく。
+
+        [Test]
+        public void Predictive_GestureStartAcceleration_NoOvershoot()
+        {
+            var r = new ScrollResampler { Predictive = true };
+            // 実録画のストローク開始パターンを再現 (17ms tick、加速する負方向入力)。
+            // ガタつきの知覚対応量は排出の「フレーム間の跳び」— 入力自身の跳び
+            // (加速) より大きく跳ねないことを検証する (旧実装: 排出 -12→-58 =
+            // 跳び 46 の「1 拍遅れ → 一括放出」が出る。入力側の跳びは最大 26)。
+            var inSums = new System.Collections.Generic.List<int>();
+            var outs = new System.Collections.Generic.List<int>();
+            void TickWith(double now, int inSum)
+            {
+                r.Tick(now, out _, out var o);
+                outs.Add(System.Math.Abs(o));
+                inSums.Add(System.Math.Abs(inSum));
+            }
+
+            r.AddEvent(Ev(0.000, -4f, ScrollPhase.GestureBegan));
+            TickWith(0.004, -4);
+            r.AddEvent(Ev(0.014, -7f, ScrollPhase.GestureChanged));
+            r.AddEvent(Ev(0.0225, -23f, ScrollPhase.GestureChanged));
+            TickWith(0.0207, -30);
+            r.AddEvent(Ev(0.031, -34f, ScrollPhase.GestureChanged));
+            TickWith(0.0374, -34);
+            r.AddEvent(Ev(0.048, -36f, ScrollPhase.GestureChanged));
+            TickWith(0.0541, -36);
+
+            int MaxJump(System.Collections.Generic.List<int> xs)
+            {
+                var m = 0;
+                for (var i = 1; i < xs.Count; i++)
+                {
+                    var j = System.Math.Abs(xs[i] - xs[i - 1]);
+                    if (j > m) m = j;
+                }
+                return m;
+            }
+
+            var inJump = MaxJump(inSums);
+            var outJump = MaxJump(outs);
+            var bound = (int)(inJump * ScrollResampler.CatchUpHeadroom) + 2;
+            Assert.LessOrEqual(outJump, bound,
+                $"排出の跳びが入力の跳びを大きく超えない (outJump={outJump} inJump={inJump} bound={bound})");
+        }
+
         // ---- Reset で全状態破棄 ----
 
         [Test]
