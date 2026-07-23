@@ -18,10 +18,25 @@ namespace CefUnity.Runtime
     {
         /// <summary>ソース固有クロックの発生時刻 (秒)。IScrollEventSource.Now と同一基準。</summary>
         public double Timestamp;
+
+        /// <summary>
+        ///     単位規約: Precise=true なら CSS px 相当の生 delta、false なら「ノッチ (ステップ) 数」。
+        ///     ステップ→px 変換 (×WheelPixelsPerStep) と resolutionScale 乗算は
+        ///     ScrollInputPipeline が行うので、ソース実装は変換せずそのまま渡すこと
+        ///     (Windows: WM_MOUSEWHEEL の delta/120 をここに入れる)。
+        /// </summary>
         public float DxPx;
+
+        /// <inheritdoc cref="DxPx" />
         public float DyPx;
+
         /// <summary>true = ピクセル精度 (トラックパッド)、false = ライン単位 (ホイールノッチ)。</summary>
         public bool Precise;
+
+        /// <summary>
+        ///     Phase 非対応プラットフォームは常に None でよい — ジェスチャ終端は
+        ///     リサンプラの GraceTimeout が担保する (正規サポートモード)。
+        /// </summary>
         public ScrollPhase Phase;
     }
 
