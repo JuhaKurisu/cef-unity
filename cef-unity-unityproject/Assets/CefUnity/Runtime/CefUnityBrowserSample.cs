@@ -11,9 +11,6 @@ using UnityEngine.LowLevel;
 using UnityEngine.PlayerLoop;
 using UnityEngine.Rendering;
 using UnityEngine.UI;
-#if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
-using System.Runtime.InteropServices;
-#endif
 
 namespace CefUnity.Runtime
 {
@@ -26,62 +23,6 @@ namespace CefUnity.Runtime
         private const float DoubleClickTime = 0.3f;
         private const int DoubleClickDistance = 4;
 
-        private static readonly float KeyRepeatDelay = GetOSKeyRepeatDelay();
-        private static readonly float KeyRepeatRate = GetOSKeyRepeatRate();
-
-
-        // -----------------------------------------------------------------------
-        // Keyboard
-        // -----------------------------------------------------------------------
-
-        // Unity KeyCode → CefKeyCode の対応テーブル
-        private static readonly (KeyCode unity, CefKeyCode cef)[] SpecialKeyTable =
-        {
-            (KeyCode.Backspace, CefKeyCodes.Backspace),
-            (KeyCode.Tab, CefKeyCodes.Tab),
-            (KeyCode.Return, CefKeyCodes.Return),
-            (KeyCode.Escape, CefKeyCodes.Escape),
-            (KeyCode.Delete, CefKeyCodes.Delete),
-            (KeyCode.Insert, CefKeyCodes.Insert),
-
-            (KeyCode.UpArrow, CefKeyCodes.UpArrow),
-            (KeyCode.DownArrow, CefKeyCodes.DownArrow),
-            (KeyCode.LeftArrow, CefKeyCodes.LeftArrow),
-            (KeyCode.RightArrow, CefKeyCodes.RightArrow),
-            (KeyCode.Home, CefKeyCodes.Home),
-            (KeyCode.End, CefKeyCodes.End),
-            (KeyCode.PageUp, CefKeyCodes.PageUp),
-            (KeyCode.PageDown, CefKeyCodes.PageDown),
-
-            (KeyCode.F1, CefKeyCodes.F1), (KeyCode.F2, CefKeyCodes.F2),
-            (KeyCode.F3, CefKeyCodes.F3), (KeyCode.F4, CefKeyCodes.F4),
-            (KeyCode.F5, CefKeyCodes.F5), (KeyCode.F6, CefKeyCodes.F6),
-            (KeyCode.F7, CefKeyCodes.F7), (KeyCode.F8, CefKeyCodes.F8),
-            (KeyCode.F9, CefKeyCodes.F9), (KeyCode.F10, CefKeyCodes.F10),
-            (KeyCode.F11, CefKeyCodes.F11), (KeyCode.F12, CefKeyCodes.F12),
-
-            (KeyCode.Keypad0, CefKeyCodes.Keypad0), (KeyCode.Keypad1, CefKeyCodes.Keypad1),
-            (KeyCode.Keypad2, CefKeyCodes.Keypad2), (KeyCode.Keypad3, CefKeyCodes.Keypad3),
-            (KeyCode.Keypad4, CefKeyCodes.Keypad4), (KeyCode.Keypad5, CefKeyCodes.Keypad5),
-            (KeyCode.Keypad6, CefKeyCodes.Keypad6), (KeyCode.Keypad7, CefKeyCodes.Keypad7),
-            (KeyCode.Keypad8, CefKeyCodes.Keypad8), (KeyCode.Keypad9, CefKeyCodes.Keypad9),
-            (KeyCode.KeypadPeriod, CefKeyCodes.KeypadPeriod),
-            (KeyCode.KeypadDivide, CefKeyCodes.KeypadDivide),
-            (KeyCode.KeypadMultiply, CefKeyCodes.KeypadMultiply),
-            (KeyCode.KeypadMinus, CefKeyCodes.KeypadMinus),
-            (KeyCode.KeypadPlus, CefKeyCodes.KeypadPlus),
-            (KeyCode.KeypadEnter, CefKeyCodes.KeypadEnter),
-
-            (KeyCode.LeftShift, CefKeyCodes.LeftShift),
-            (KeyCode.RightShift, CefKeyCodes.RightShift),
-            (KeyCode.LeftControl, CefKeyCodes.LeftControl),
-            (KeyCode.RightControl, CefKeyCodes.RightControl),
-            (KeyCode.LeftAlt, CefKeyCodes.LeftAlt),
-            (KeyCode.RightAlt, CefKeyCodes.RightAlt),
-            (KeyCode.LeftCommand, CefKeyCodes.LeftCommand),
-            (KeyCode.RightCommand, CefKeyCodes.RightCommand),
-            (KeyCode.CapsLock, CefKeyCodes.CapsLock)
-        };
 
         [SerializeField] private string _url;
         [SerializeField] private RawImage _rawImage;
@@ -150,50 +91,8 @@ namespace CefUnity.Runtime
         [SerializeField, Tooltip("BF#1 発行からこの時間 (ms) までは flush 結果の到着を待って 0F 化する " +
             "(0 で待ち無効 = 常にノンブロッキング受信)。60fps 予算 16.7ms 内に収まる 10ms 程度を推奨。")]
         private float _zeroFrameWaitMs = 10f;
-        // server-side flush#1 は BF#1+3ms に発行される (server.rs FLUSH_THRESHOLDS_MS[0])。
-        // その draw 由来 paint が accel_frame_id に計上され得る最短時刻のマージン。これより
-        // 前の増分は BF#1 由来の stale paint (#A) とみなして読み捨て、fresh (#B) を待つ。
-        private const float FreshPaintMinDelayMs = 4.5f;
-        // damage の有無は「flush#1 の draw 由来 paint が届き得る時刻」まで分からない
-        // (renderer のタイマー/rAF 発火 → submit +2-4ms → flush#1 draw → paint +5-6ms)。
-        // BF#1 からこの時間まで増分ゼロなら「このフレームに damage なし」と判断して
-        // 待ちを打ち切る (5Hz 更新ページ等で damage の無いフレームの空回りを短縮)。
-        private const float NoDamageGiveUpMs = 7f;
-        // 早着 paint (#A、freshMinTime より前の増分) を読み捨てた後、この時刻までに
-        // flush 由来 (#B) が来なければ #A の内容を採用して抜ける。#A がタイマー発火由来の
-        // fresh な内容 (damage を #A が消費し #B が生成されない) ケースで、絶対上限まで
-        // 粘る無駄を防ぐ。#B の標準到着 (+5-6.5ms) を跨ぐ位置に置く。
-        private const float EarlyPaintAdoptMs = 7.5f;
-        // server は「paint 発生フレーム」が 3 連続すると flush を抑止する (damage streak、
-        // server.rs DAMAGE_STREAK_SUPPRESS_FLUSH)。抑止中は fresh (#B) が来ないため、
-        // クライアント側でもスコアで同じ状態を推定し、最初の AFI 増分 (BF#1 由来 paint)
-        // で即座に待ちを抜けて空回りを防ぐ。スコアは fresh 受信 +1 / 受信なし -2 の
-        // ヒステリシス: 連続スクロール中に 1 フレームだけ受信を取り逃しても抑止推定を
-        // 維持する (即 0 リセットにすると、取り逃しの直後 3 フレームが「非抑止」誤推定と
-        // なり、来ない #B を待って earlyAdopt まで空回りする振動が起きる。実測で
-        // スクロール時 block_avg 5.5ms・コンテンツ供給 85-92% に劣化した)。
-        private const int StreakScoreSuppress = 3; // これ以上で抑止推定
-        private const int StreakScoreMax = 6;      // 天井 (解除応答性のため小さく保つ)
-        private int _streakScore;
-        // 直近何フレーム連続で CEF へ入力を送ったか。連続入力 (スクロール/ドラッグ/
-        // キーリピート) は server 側で damage streak 抑止に入りがち = 待ちの価値が無い。
-        // streak スコアだけだと CEF のヒッチ (2 フレーム paint 欠落) で推定が外れて
-        // 待ちが再発し、busy-wait の CPU 競合が荒れを増幅する振動が起きるため (実測)、
-        // 連続入力そのものも待ちスキップの条件にする。単発入力 (クリック・単打鍵) は
-        // 連続にならないので従来通り待って 0F を取る。
-        private const int SustainedInputFrames = 3;
-        private int _consecutiveInputFrames;
-        // BF#1 送信直前の実時刻 (待ちデッドラインと fresh 判定時刻の基準)。
-        private float _bf1Time;
-        // EarlyUpdate で BeginFrame#1 を撃つ直前の accel_frame_id (増分検知の基準)。
-        private ulong _afiAtBf1;
-        // 直近で fresh paint を取得してからの経過フレーム数。プローブ判定に使う:
-        // この窓の間はページが動いている可能性があるとみなして damage プローブ待ちを行い、
-        // 窓を超えたら完全静止とみなして待ちを止める (busy-wait コストをゼロにする)。
-        // ページ内タイマー起点の低頻度更新 (例: 5Hz = 12 フレーム間隔) を捕捉できるよう
-        // 1 秒 (60 フレーム) に設定。静止→再開の最初の 1 paint だけは 1F で拾う。
-        private int _framesSinceFreshPaint = int.MaxValue;
-        private const int ProbeWindowFrames = 60;
+        // 待ち判定の状態機械 (定数・streak 推定・プローブ窓は CefZeroFramePacer に集約)。
+        private readonly CefZeroFramePacer _pacer = new CefZeroFramePacer();
         // このフレームで CEF へ入力イベントを送ったか (アクティブ判定の即時トリガー)。
         private bool _inputSentThisFrame;
         // 0F 待ち検証メトリクス
@@ -612,14 +511,11 @@ namespace CefUnity.Runtime
             self.UpdateCompositionCursorPos();
             self.HandleImeInput();
             self.HandleKeyboardInput();
-            // 連続入力カウンタ更新 (入力ハンドラ群の後なので _inputSentThisFrame は確定済み)。
-            self._consecutiveInputFrames = self._inputSentThisFrame
-                ? Math.Min(self._consecutiveInputFrames + 1, 1000)
-                : 0;
             // BeginFrame#1 直前の paint カウンタと時刻を記録 (recv 側の増分検知・待ち基準)。
-            if (self._useAcceleratedPaint)
-                self._afiAtBf1 = self._browser.PeekAccelFrameId();
-            self._bf1Time = Time.realtimeSinceStartup;
+            // 入力ハンドラ群の後なので _inputSentThisFrame は確定済み。Peek → 時刻取得の
+            // 順序は旧実装と同一に保つ。
+            var afiNow = self._useAcceleratedPaint ? self._browser.PeekAccelFrameId() : 0UL;
+            self._pacer.OnBeginFrame(Time.realtimeSinceStartup, afiNow, self._inputSentThisFrame);
             // BeginFrame#1: renderer に「このフレームの入力を反映した内容」を作らせる。
             self._browser.SendExternalBeginFrame((ulong)Time.frameCount);
         }
@@ -660,10 +556,8 @@ namespace CefUnity.Runtime
 
             var blockStart = Time.realtimeSinceStartup;
 
-            // プローブ判定: 入力を送った or 直近 1 秒以内にページが動いていた時だけ待つ。
-            // 完全静止ページでは paint 自体が来ないため待たない (ブロック 0)。
-            var expectPaint = _inputSentThisFrame || _framesSinceFreshPaint < ProbeWindowFrames;
-            if (!expectPaint)
+            // プローブ判定 (静止中は待たない)。判定根拠は CefZeroFramePacer 参照。
+            if (_pacer.ShouldSkipAsIdle(_inputSentThisFrame))
             {
                 if (TryUpdateTextureOnce()) OnFreshPaint();
                 else OnNoPaint();
@@ -671,51 +565,20 @@ namespace CefUnity.Runtime
                 return;
             }
 
-            // サーバーの damage streak 抑止 (flush 無し) をクライアント側で推定。
-            // 抑止中 = 連続描画中はコンテンツがどのみち 1F (BF#1 の即時 draw は前フレーム
-            // 内容) なので、待っても鮮度は上がらない。さらに busy-wait の CPU が CEF
-            // プロセス群の paint 生成と競合し、スクロール中の供給を 2-7% 落とす (実測:
-            // 待ち OFF 99-100% / ON 92-98%)。よって抑止中・連続入力中は待ちをスキップして
-            // CPU を返し、ノンブロッキング受信のみ行う (待ち OFF と同じ挙動 = 供給 ~100%)。
-            if (_streakScore >= StreakScoreSuppress || _consecutiveInputFrames >= SustainedInputFrames)
+            // damage streak 抑止推定・連続入力中は待ちスキップ (根拠は CefZeroFramePacer 参照)。
+            if (_pacer.ShouldSkipAsSuppressed())
             {
                 if (TryUpdateTextureOnce()) { OnFreshPaint(); _dpFreshCount++; }
                 else { OnNoPaint(); _dpFallbackCount++; }
                 return;
             }
 
-            var deadline = _bf1Time + _zeroFrameWaitMs * 0.001f;
-            var freshMinTime = _bf1Time + FreshPaintMinDelayMs * 0.001f;
-            var noDamageGiveUp = _bf1Time + NoDamageGiveUpMs * 0.001f;
-            var earlyAdopt = _bf1Time + EarlyPaintAdoptMs * 0.001f;
-
-            var baseline = _afiAtBf1;
-            var sawEarlyPaint = false;
+            var window = _pacer.OpenWaitWindow(_zeroFrameWaitMs);
             while (true)
             {
                 var now = Time.realtimeSinceStartup;
-                if (now >= deadline) break;
-                var afi = _browser.PeekAccelFrameId();
-                if (afi != baseline)
-                {
-                    // 増分検知。flush#1 の draw があり得る時刻 (freshMinTime) より前の増分は
-                    // BF#1 由来 stale (#A) とみなして読み捨て、fresh (#B) を待ち続ける。
-                    if (now >= freshMinTime) break;
-                    baseline = afi;
-                    sawEarlyPaint = true;
-                    continue;
-                }
-                if (sawEarlyPaint)
-                {
-                    // 早着 (#A) は届いたが #B が来ない: タイマー発火由来の damage を #A が
-                    // 消費したケース。#B の標準到着時刻を跨いだら #A を採用して抜ける。
-                    if (now >= earlyAdopt) break;
-                }
-                else if (now >= noDamageGiveUp)
-                {
-                    // 増分ゼロのまま判定時刻超え = このフレームに damage なし。
-                    break;
-                }
+                if (window.DeadlineReached(now)) break;
+                if (window.OnAfiSample(now, _browser.PeekAccelFrameId())) break;
                 // Peek (FFI + SHM read) のフル回転を避けて CPU/メモリバス圧を下げる。
                 // SpinWait はデスケジュールされない (Thread.Sleep(1) は macOS で 10ms+
                 // オーバースリープするため使用不可)。時間精度は ~µs で十分。
@@ -736,8 +599,7 @@ namespace CefUnity.Runtime
         private void OnFreshPaint()
         {
             _gotInPostLateUpdateCount++;
-            _framesSinceFreshPaint = 0;
-            if (_streakScore < StreakScoreMax) _streakScore++;
+            _pacer.OnFreshPaint();
             RecordContentInterval();
         }
 
@@ -745,8 +607,7 @@ namespace CefUnity.Runtime
         private void OnNoPaint()
         {
             if (_textureUpdatedFrame != Time.frameCount) _recvFailCount++;
-            if (_framesSinceFreshPaint != int.MaxValue) _framesSinceFreshPaint++;
-            _streakScore = Math.Max(0, _streakScore - 2);
+            _pacer.OnNoPaint();
         }
 
         /// <summary>機構2 計装: 新テクスチャを適用した実時刻の連続差 (= コンテンツがカバーする
@@ -1233,7 +1094,7 @@ namespace CefUnity.Runtime
             }
 
             // 3) 非印字キー — 長押しリピート対応
-            foreach (var (key, cef) in SpecialKeyTable)
+            foreach (var (key, cef) in CefKeyboardMapper.SpecialKeyTable)
             {
                 if (suppressHArrows && (key == KeyCode.LeftArrow || key == KeyCode.RightArrow)) continue;
                 if (suppressVArrows && (key == KeyCode.UpArrow || key == KeyCode.DownArrow)) continue;
@@ -1271,9 +1132,9 @@ namespace CefUnity.Runtime
             {
                 var now = Time.unscaledTime;
                 if (_keyDownTime.TryGetValue(unityKey, out var downTime)
-                    && now - downTime >= KeyRepeatDelay
+                    && now - downTime >= CefKeyboardMapper.KeyRepeatDelay
                     && _keyLastRepeat.TryGetValue(unityKey, out var lastRepeat)
-                    && now - lastRepeat >= KeyRepeatRate)
+                    && now - lastRepeat >= CefKeyboardMapper.KeyRepeatRate)
                 {
                     _browser.SendKeyEvent(KeyEventType.RawKeyDown, cefKey, mods);
                     _keyLastRepeat[unityKey] = now;
@@ -1445,57 +1306,6 @@ namespace CefUnity.Runtime
         // -----------------------------------------------------------------------
         // OS Settings
         // -----------------------------------------------------------------------
-
-#if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
-        [DllImport("/usr/lib/libobjc.dylib", EntryPoint = "objc_getClass")]
-        private static extern IntPtr ObjcGetClass([MarshalAs(UnmanagedType.LPStr)] string name);
-
-        [DllImport("/usr/lib/libobjc.dylib", EntryPoint = "sel_registerName")]
-        private static extern IntPtr ObjcSelRegisterName([MarshalAs(UnmanagedType.LPStr)] string name);
-
-        [DllImport("/usr/lib/libobjc.dylib", EntryPoint = "objc_msgSend")]
-        private static extern double ObjcMsgSendDouble(IntPtr receiver, IntPtr selector);
-
-        private static float GetOSKeyRepeatDelay()
-        {
-            try
-            {
-                var nsEvent = ObjcGetClass("NSEvent");
-                var sel = ObjcSelRegisterName("keyRepeatDelay");
-                var val = ObjcMsgSendDouble(nsEvent, sel);
-                return val > 0 ? (float)val : 0.5f;
-            }
-            catch
-            {
-                return 0.5f;
-            }
-        }
-
-        private static float GetOSKeyRepeatRate()
-        {
-            try
-            {
-                var nsEvent = ObjcGetClass("NSEvent");
-                var sel = ObjcSelRegisterName("keyRepeatInterval");
-                var val = ObjcMsgSendDouble(nsEvent, sel);
-                return val > 0 ? (float)val : 0.035f;
-            }
-            catch
-            {
-                return 0.035f;
-            }
-        }
-#else
-        private static float GetOSKeyRepeatDelay()
-        {
-            return 0.5f;
-        }
-
-        private static float GetOSKeyRepeatRate()
-        {
-            return 0.035f;
-        }
-#endif
 
 #if UNITY_EDITOR
         private static FieldInfo _zoomAreaField;
