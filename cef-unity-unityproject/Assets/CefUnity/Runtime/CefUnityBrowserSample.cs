@@ -122,6 +122,21 @@ namespace CefUnity.Runtime
 
         // PlayerLoop hook 用の singleton 参照 (現在のサンプル構成は単一 Browser のみ対応)
         private static CefUnityBrowserSample s_instance;
+
+        // --- 開発用診断 (Editor の CefFpsMonitorWindow が参照する読み取り専用サーフェス) ---
+
+        /// <summary>診断用: 現在のインスタンス (Play 中でなければ null)。</summary>
+        public static CefUnityBrowserSample DiagnosticsInstance => s_instance;
+
+        /// <summary>
+        ///     診断用: CEF 内部 paint の累積数 (accel_frame_id)。CEF は damage 駆動で
+        ///     paint するため、静止ページでは増えないのが正常。
+        /// </summary>
+        public ulong DiagAccelFrameId =>
+            _browser != null && _useAcceleratedPaint ? _browser.PeekAccelFrameId() : 0;
+
+        /// <summary>診断用: Unity テクスチャへ実際に適用した paint の累積数。</summary>
+        public ulong DiagTexturesApplied { get; private set; }
         // PlayerLoop hook を install したかどうか
         private bool _playerLoopHooked;
 
@@ -1267,6 +1282,7 @@ namespace CefUnity.Runtime
                 _accelProfRecvTotal = _accelProfUpdateTotal = _accelProfReleaseTotal = 0;
             }
             _textureUpdatedFrame = Time.frameCount;
+            DiagTexturesApplied++;
             return true;
         }
 
@@ -1301,6 +1317,7 @@ namespace CefUnity.Runtime
             }
 
             _texture.Apply(false);
+            DiagTexturesApplied++;
         }
 
         // -----------------------------------------------------------------------
