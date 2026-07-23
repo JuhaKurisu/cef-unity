@@ -872,4 +872,21 @@ SCR-3/5/9/12/15、AUD-4/9/10/11/12/13/15、SRV-N17/N22/N24、CLI-N22、CS-N15/N1
 - **CS-2** ✅ `using UnityEditor;` を `#if UNITY_EDITOR` でガード (UnityEditor 参照は全て既ガード確認済み)
 - **CS-10** ✅ 未使用 useGpu 変数を削除し `Init(useGpu: true, ...)` を明示 (挙動不変、常時 GPU 要求 + サーバー側 software フォールバックの意図をコメント化)
 
-検証: cargo build (警告は既存の DXGI_FORMAT 系のみ)、cargo test -p cef-unity-ipc (19 件)、-p cef-unity-client --lib (12 件 + 1 ignored) パス。NativeMethods.g.cs の diff ゼロ (FFI 署名不変)。deploy.sh 実行済み (dylib 反映には Editor 再起動が必要)。
+検証: cargo build (警告は既存の DXGI_FORMAT 系のみ)、cargo test -p cef-unity-ipc (19 件)、-p cef-unity-client --lib (12 件 + 1 ignored) パス。NativeMethods.g.cs の diff ゼロ (FFI 署名不変)。deploy.sh 実行済み (dylib 反映には Editor 再起動が必要)。コミット 06d8731、CI success。
+
+### 2026-07-23 ステップ2 (リプレイ基盤 + パイプライン抽出、コミット a89086c)
+
+- **SCR-2** ✅ Now 二重取得解消 / **SCR-4** ✅ Dispose 時の録画フラッシュ / **SCR-3** ✅ 録画形式拡張 (S 行 = resolutionScale、E 行 7 列目 = over フラグ。旧形式は後方互換で読める) / **SCR-14** ✅ ScrollReplay 堅牢化 + **忠実度自己照合** (録画時と同モード列 vs live の mismatches 報告、batchmode 非0終了)
+- **SCR-1 = CS-N11 (スクロール部分)** ✅ `ScrollInput/ScrollInputPipeline.cs` 新設 (純 C#)。ルーティング・スケール・録画・プラットフォーム分岐 (StartNativeSource) を集約、`AttachSource` でテスト/将来の Win/Linux ソース差し込み口。Sample のスクロール統合は「トグル読取 + 座標決定 + SendWheelAtLastCursor」のみに (~150 行 → ~40 行)
+- **SCR-9 (一部)** ✅ `_scrollPredictCheckCountdown` → `_scrollToggleCheckCountdown` + 誤コメント修正 / **SCR-13 (一部)** ✅ IScrollEventSource に単位規約 (precise=px / 非precise=ステップ数、WM_MOUSEWHEEL は delta/120) と Phase=None 正規サポートを明文化。ScrollSourceFactory 相当はパイプラインに内蔵
+- テスト: ScrollInputPipelineTests 9 件追加 (EditMode 計 52)。**教訓: 予測モードは外挿で入力総量を超え得る (仕様) — 総量保存テストは MomentumEnded で閉じた列を使うこと**
+
+### 2026-07-23 ステップ3a (CLI-1 全面適用、コミット fe54379)
+
+- **CLI-1** ✅ `ffi_guard` (catch_unwind + payload ログ) を extern "C" **全 55 本**に適用。panic 時は各関数の既存エラー規約値 (-1/0/null/()) を返す。lib.rs 30 + d3d11/d3d12 各 5 箇所の lock を poisoning 耐性化。init の CString unwrap を非致命化。シグネチャ不変 (NativeMethods.g.cs diff ゼロ)、命令列不変 (double-pump / send_external_begin_frame / fence)。CI success (win ビルド含む)
+
+### 2026-07-23 ステップ3b (CS-1 第一段、コミット 14f098f)
+
+- **CS-1 (第一段)** ✅ `CefZeroFramePacer` (純 C#、Unity API 非依存): 0F 待ち判定ステートマシンを抽出 — プローブ窓 / streak 抑止推定 (+1/-2 ヒステリシス) / 連続入力スキップ / busy-wait 4 分岐 (`ZeroFrameWaitWindow`: fresh・stale 読み捨て・earlyAdopt 7.5ms・noDamageGiveUp 7ms)。**最重要ロジックが初めてユニットテスト可能に** (CefZeroFramePacerTests 12 件)。`CefKeyboardMapper` (対応表 + OS キーリピート ObjC interop) も抽出。Sample 側は Peek→時刻の順序・SpinWait(64)・デッドライン先行チェックを旧実装と同一に保持
+- 検証: EditMode **55/55**、実機スモーク (Editor Play で Google 描画 + 検索候補の動的更新 + Console エラー 0 を確認 — 新 dylib の FFI ガード + パイプライン + ペーサ抽出の統合動作)
+- **CS-1 残り (未着手)**: CefPlayerLoopHooks / CefBrowserInput / CefImeHandler / CefTexturePresenter / CefBrowserView 分割。IME 座標系と 0F 統合が壊れやすいため、着手時は Editor での IME 実機確認 (§8) とスクロール実測をセットで
