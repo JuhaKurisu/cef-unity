@@ -1,6 +1,6 @@
 // macOS event loop: CFRunLoopTimer for periodic CEF pump + IPC polling.
 
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::mpsc;
 
 use super::ServerState;
@@ -65,6 +65,16 @@ unsafe extern "C" {
 
 static mut SERVER_STATE: *mut ServerState = std::ptr::null_mut();
 
+/// tick panic 後の停止要求。panic 直後に SERVER_STATE への `&mut` を再作成しない
+/// ための伝達路 (次の tick 冒頭でこれを見てループを止める)。
+static PANICKED: AtomicBool = AtomicBool::new(false);
+
+// tick 再入検出。CEF がネストした run loop (モーダル等) を回すと timer が
+// 再発火し得るため、その場合は SERVER_STATE への `&mut` を二重に作らず戻す。
+thread_local! {
+    static IN_TICK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Global timer ref so BrowserProcessHandler can adjust it from any thread.
 static TIMER: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
@@ -92,13 +102,22 @@ fn log(msg: &str) {
 }
 
 unsafe extern "C" fn timer_callback(_timer: CFRunLoopTimerRef, _info: *mut std::ffi::c_void) {
+    if IN_TICK.with(|f| f.replace(true)) {
+        return; // 再入 (ネスト run loop からの再発火) — &mut の二重作成を避ける
+    }
     let result = std::panic::catch_unwind(|| {
         timer_callback_inner();
     });
-    if result.is_err() {
-        log("timer_callback panicked, stopping run loop");
-        let state = unsafe { &mut *SERVER_STATE };
-        state.running = false;
+    IN_TICK.with(|f| f.set(false));
+    if let Err(payload) = result {
+        // payload を捨てず原因をログに残す (&str / String 以外は型名不明のため定型文)
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        log(&format!("timer_callback panicked: {}", msg));
+        PANICKED.store(true, Ordering::Release);
         unsafe {
             CFRunLoopStop(CFRunLoopGetMain());
         }
@@ -106,6 +125,13 @@ unsafe extern "C" fn timer_callback(_timer: CFRunLoopTimerRef, _info: *mut std::
 }
 
 fn timer_callback_inner() {
+    if PANICKED.load(Ordering::Acquire) {
+        // panic 後に stop 前へ滑り込んだ tick — 状態には触れず止め直すだけ
+        unsafe {
+            CFRunLoopStop(CFRunLoopGetMain());
+        }
+        return;
+    }
     let state = unsafe { &mut *SERVER_STATE };
 
     if !state.running {

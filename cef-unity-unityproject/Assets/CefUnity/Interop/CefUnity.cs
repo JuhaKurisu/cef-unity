@@ -853,7 +853,9 @@ namespace CefUnity.Interop
 
         private void ThrowIfDisposed()
         {
-            if (_disposed) throw new Exception();
+            // 型は ObjectDisposedException であること: CefNativeAudio 等が dispose 競合の
+            // 防御として型指定 catch している (素の Exception だと防御が機能しない)。
+            if (_disposed) throw new ObjectDisposedException(nameof(Browser));
         }
 
         private static byte[] ToUtf8Null(string s)

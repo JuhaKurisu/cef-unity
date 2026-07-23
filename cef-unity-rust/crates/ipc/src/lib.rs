@@ -536,8 +536,9 @@ impl ShmWriter {
 
     /// Write a frame. The buffer must be width*height*4 BGRA bytes.
     pub fn write_frame(&self, pixels: &[u8], width: u32, height: u32) {
-        let size = (width * height * 4) as usize;
-        assert!(size <= BUFFER_SIZE);
+        // u32 のまま乗算すると巨大寸法で wrap し境界チェックをすり抜けるため usize で計算
+        let size = (width as usize) * (height as usize) * 4;
+        assert!(width <= MAX_W && height <= MAX_H && size <= BUFFER_SIZE);
         assert_eq!(pixels.len(), size);
 
         let header = self.header();
@@ -667,11 +668,11 @@ impl ShmReader {
         let active = header.active_buffer.load(Ordering::Acquire);
         let width = header.width.load(Ordering::Acquire);
         let height = header.height.load(Ordering::Acquire);
-        let size = (width * height * 4) as usize;
-        if size == 0 || size > BUFFER_SIZE {
+        // u32 のまま乗算すると wrap して境界チェックをすり抜けるため、次元を先に検証する
+        // (MAX_W×MAX_H×4 == BUFFER_SIZE なので次元が正なら size は常に収まる)
+        if width == 0 || height == 0 || width > MAX_W || height > MAX_H {
             return None;
         }
-
         let offset = SHM_HEADER_SIZE + active as usize * BUFFER_SIZE;
         let ptr = unsafe { self.shmem.as_ptr().add(offset) as *const u8 };
         Some((ptr, width, height))
@@ -690,10 +691,12 @@ impl ShmReader {
         let active = header.active_buffer.load(Ordering::Acquire);
         let width = header.width.load(Ordering::Acquire);
         let height = header.height.load(Ordering::Acquire);
-        let size = (width * height * 4) as usize;
-        if size == 0 || size > BUFFER_SIZE {
+        // u32 のまま乗算すると wrap して境界チェックをすり抜けるため、次元を先に検証する
+        // (MAX_W×MAX_H×4 == BUFFER_SIZE なので次元が正なら size は常に収まる)
+        if width == 0 || height == 0 || width > MAX_W || height > MAX_H {
             return None;
         }
+        let size = (width as usize) * (height as usize) * 4;
 
         let offset = SHM_HEADER_SIZE + active as usize * BUFFER_SIZE;
         dst.resize(size, 0);

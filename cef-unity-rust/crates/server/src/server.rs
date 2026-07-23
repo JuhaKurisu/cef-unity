@@ -4,7 +4,7 @@ use cef::*;
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
@@ -67,7 +67,7 @@ fn log(msg: &str) {
         let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now(), msg);
     }
 
-    let mut buf = LOG_BUFFER.lock().unwrap();
+    let mut buf = LOG_BUFFER.lock().unwrap_or_else(PoisonError::into_inner);
     if buf.len() >= MAX_LOG_ENTRIES {
         buf.remove(0);
     }
@@ -75,7 +75,7 @@ fn log(msg: &str) {
 }
 
 fn drain_logs() -> Vec<String> {
-    std::mem::take(&mut *LOG_BUFFER.lock().unwrap())
+    std::mem::take(&mut *LOG_BUFFER.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +165,11 @@ static LATENCY_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 /// paint 到着時にレイテンシを記録し、N サンプル貯まったら統計をログに出す。
 fn record_paint_latency() {
+    // on_accelerated_paint の hot path から毎フレーム呼ばれるため、
+    // ログ無効時は lock/push/sort を一切行わず素通しする。
+    if !LOG_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
     let begin_ns = LAST_BEGIN_FRAME_NS.load(Ordering::Relaxed);
     if begin_ns == 0 {
         return; // BeginFrame 未発行 (初期化中の自発フレーム等)
@@ -175,7 +180,7 @@ fn record_paint_latency() {
     }
     let elapsed_us = (now - begin_ns) / 1000;
 
-    let mut samples = LATENCY_SAMPLES.lock().unwrap();
+    let mut samples = LATENCY_SAMPLES.lock().unwrap_or_else(PoisonError::into_inner);
     samples.push(elapsed_us);
     if samples.len() >= LATENCY_WINDOW {
         let count = samples.len() as u64;
@@ -441,7 +446,7 @@ wrap_life_span_handler! {
         fn on_after_created(&self, browser: Option<&mut Browser>) {
             log("on_after_created called");
             if let Some(b) = browser {
-                *self.browser_slot.lock().unwrap() = Some(b.clone());
+                *self.browser_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(b.clone());
                 log("browser stored in slot");
             }
         }
@@ -1051,6 +1056,10 @@ impl CefServer {
     }
 
     fn create_browser(&mut self, width: i32, height: i32, url: &str) -> Response {
+        // shm の write_frame は MAX_W×MAX_H 超で assert panic → CEF コールバック越しの
+        // unwind = プロセス abort になるため、受理時点で上限に丸める (software 経路対策)。
+        let width = width.clamp(1, ipc::MAX_W as i32);
+        let height = height.clamp(1, ipc::MAX_H as i32);
         let id = self.next_browser_id.fetch_add(1, Ordering::Relaxed);
         let shm_flink = ipc::shm_flink_path(self.server_pid, id);
 
@@ -1195,7 +1204,7 @@ impl CefServer {
 
     fn destroy_browser(&mut self, browser_id: u32) -> Response {
         if let Some(state) = self.browsers.remove(&browser_id) {
-            if let Some(browser) = state.browser.lock().unwrap().take()
+            if let Some(browser) = state.browser.lock().unwrap_or_else(PoisonError::into_inner).take()
                 && let Some(host) = Browser::host(&browser)
             {
                 BrowserHost::close_browser(&host, 1);
@@ -1211,7 +1220,7 @@ impl CefServer {
     fn load_url(&mut self, browser_id: u32, url: &str) -> Response {
         log(&format!("load_url: browser_id={}, url={}", browser_id, url));
         if let Some(state) = self.browsers.get(&browser_id) {
-            if let Some(ref browser) = *state.browser.lock().unwrap()
+            if let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
                 && let Some(frame) = Browser::main_frame(browser)
             {
                 Frame::load_url(&frame, Some(&CefString::from(url)));
@@ -1228,10 +1237,13 @@ impl CefServer {
     }
 
     fn resize(&mut self, browser_id: u32, width: i32, height: i32) -> Response {
+        // create_browser と同じ上限丸め (shm バッファ超過の assert panic 防止)。
+        let width = width.clamp(1, ipc::MAX_W as i32);
+        let height = height.clamp(1, ipc::MAX_H as i32);
         if let Some(state) = self.browsers.get(&browser_id) {
             state.viewport_w.store(width, Ordering::Relaxed);
             state.viewport_h.store(height, Ordering::Relaxed);
-            if let Some(ref browser) = *state.browser.lock().unwrap()
+            if let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
                 && let Some(host) = Browser::host(browser)
             {
                 BrowserHost::was_resized(&host);
@@ -1247,7 +1259,7 @@ impl CefServer {
 
     fn mouse_move(&self, browser_id: u32, x: i32, y: i32, modifiers: u32) -> Response {
         if let Some(state) = self.browsers.get(&browser_id) {
-            if let Some(ref browser) = *state.browser.lock().unwrap()
+            if let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
                 && let Some(host) = Browser::host(browser)
             {
                 let event = MouseEvent { x, y, modifiers };
@@ -1272,7 +1284,7 @@ impl CefServer {
         click_count: i32,
     ) -> Response {
         if let Some(state) = self.browsers.get(&browser_id) {
-            if let Some(ref browser) = *state.browser.lock().unwrap()
+            if let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
                 && let Some(host) = Browser::host(browser)
             {
                 let event = MouseEvent { x, y, modifiers };
@@ -1311,7 +1323,7 @@ impl CefServer {
         delta_y: i32,
     ) -> Response {
         if let Some(state) = self.browsers.get(&browser_id) {
-            if let Some(ref browser) = *state.browser.lock().unwrap()
+            if let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
                 && let Some(host) = Browser::host(browser)
             {
                 let event = MouseEvent { x, y, modifiers };
@@ -1339,7 +1351,7 @@ impl CefServer {
         focus_on_editable_field: i32,
     ) -> Response {
         if let Some(state) = self.browsers.get(&browser_id) {
-            if let Some(ref browser) = *state.browser.lock().unwrap()
+            if let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
                 && let Some(host) = Browser::host(browser)
             {
                 let type_ = match event_type {
@@ -1375,7 +1387,7 @@ impl CefServer {
             &code[..code.char_indices().nth(100).map_or(code.len(), |(i, _)| i)]
         ));
         if let Some(state) = self.browsers.get(&browser_id) {
-            if let Some(ref browser) = *state.browser.lock().unwrap()
+            if let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
                 && let Some(frame) = Browser::main_frame(browser)
             {
                 log("execute_javascript: calling Frame::execute_java_script");
@@ -1399,7 +1411,7 @@ impl CefServer {
 
     fn edit_command(&self, browser_id: u32, command: u8) -> Response {
         if let Some(state) = self.browsers.get(&browser_id) {
-            if let Some(ref browser) = *state.browser.lock().unwrap()
+            if let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
                 && let Some(frame) = Browser::main_frame(browser)
             {
                 match command {
@@ -1425,7 +1437,7 @@ impl CefServer {
 
     fn get_current_url(&self, browser_id: u32) -> Response {
         if let Some(state) = self.browsers.get(&browser_id) {
-            if let Some(ref browser) = *state.browser.lock().unwrap()
+            if let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
                 && let Some(frame) = Browser::main_frame(browser)
             {
                 let url = frame.url();
@@ -1452,7 +1464,7 @@ impl CefServer {
         selection_end: u32,
     ) -> Response {
         if let Some(state) = self.browsers.get(&browser_id) {
-            if let Some(ref browser) = *state.browser.lock().unwrap()
+            if let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
                 && let Some(host) = Browser::host(browser)
             {
                 let cef_text = CefString::from(text);
@@ -1499,7 +1511,7 @@ impl CefServer {
 
     fn ime_commit_text(&self, browser_id: u32, text: &str) -> Response {
         if let Some(state) = self.browsers.get(&browser_id) {
-            if let Some(ref browser) = *state.browser.lock().unwrap()
+            if let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
                 && let Some(host) = Browser::host(browser)
             {
                 let cef_text = CefString::from(text);
@@ -1522,7 +1534,7 @@ impl CefServer {
 
     fn ime_finish_composing_text(&self, browser_id: u32, keep_selection: bool) -> Response {
         if let Some(state) = self.browsers.get(&browser_id) {
-            if let Some(ref browser) = *state.browser.lock().unwrap()
+            if let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
                 && let Some(host) = Browser::host(browser)
             {
                 BrowserHost::ime_finish_composing_text(&host, keep_selection as i32);
@@ -1537,7 +1549,7 @@ impl CefServer {
 
     fn ime_cancel_composition(&self, browser_id: u32) -> Response {
         if let Some(state) = self.browsers.get(&browser_id) {
-            if let Some(ref browser) = *state.browser.lock().unwrap()
+            if let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
                 && let Some(host) = Browser::host(browser)
             {
                 BrowserHost::ime_cancel_composition(&host);
@@ -1555,7 +1567,7 @@ impl CefServer {
     /// host が取得できた (= 実際に発行した) 場合 true。
     fn issue_begin_frame(&self, browser_id: u32, unity_frame: u64) -> bool {
         if let Some(state) = self.browsers.get(&browser_id)
-            && let Some(ref browser) = *state.browser.lock().unwrap()
+            && let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
             && let Some(host) = Browser::host(browser)
         {
             LAST_BEGIN_FRAME_NS.store(now_ns(), Ordering::Relaxed);

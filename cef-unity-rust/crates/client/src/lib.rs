@@ -180,6 +180,9 @@ static PUMP_COUNT: AtomicU64 = AtomicU64::new(0);
 struct ServerConnection {
     cmd_tx: IpcSender<CommandEnvelope>,
     resp_rx: IpcReceiver<Response>,
+    /// server プロセスのハンドル。保持しないと終了後にゾンビとして残る
+    /// (Editor は長寿命なので Play/Stop の繰り返しで蓄積する)。
+    child: std::process::Child,
 }
 
 static CONNECTION: Mutex<Option<ServerConnection>> = Mutex::new(None);
@@ -272,7 +275,7 @@ pub extern "C" fn cef_unity_init(use_gpu: i32, enable_log: i32) -> i32 {
     // Windows では D3D11 共有テクスチャを DuplicateHandle で渡すために
     // クライアント PID も渡す。
     let client_pid = std::process::id();
-    match std::process::Command::new(&server_app)
+    let mut child = match std::process::Command::new(&server_app)
         .arg("--ipc-server")
         .arg(&server_name)
         .arg("--client-pid")
@@ -283,22 +286,50 @@ pub extern "C" fn cef_unity_init(use_gpu: i32, enable_log: i32) -> i32 {
         .arg(if enable_log != 0 { "1" } else { "0" })
         .spawn()
     {
-        Ok(_child) => {
-            // Server runs independently; we don't track its PID
-        }
+        Ok(child) => child,
         Err(e) => {
             log_to_file(&format!("failed to spawn server: {}", e));
             return -4;
         }
-    }
+    };
     log_to_file("server spawned");
 
-    // Wait for server to connect and send bootstrap (blocking)
-    let bootstrap = match oneshot_server.accept() {
-        Ok((_rx, bootstrap)) => bootstrap,
-        Err(e) => {
-            log_to_file(&format!("failed to accept bootstrap: {}", e));
-            return -5;
+    // Wait for server to connect and send bootstrap.
+    // accept() 自体は無期限ブロックするため別スレッドで行い、server の早期死亡
+    // (codesign 不備・framework 欠落・CEF 初期化失敗等) とタイムアウトを監視する。
+    // これがないと server 起動失敗時に Unity main thread が永久フリーズする。
+    let (boot_tx, boot_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = boot_tx.send(oneshot_server.accept());
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let bootstrap = loop {
+        match boot_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(Ok((_rx, bootstrap))) => break bootstrap,
+            Ok(Err(e)) => {
+                log_to_file(&format!("failed to accept bootstrap: {}", e));
+                let _ = child.kill();
+                let _ = child.wait();
+                return -5;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    log_to_file(&format!("server exited during init: {}", status));
+                    return -6;
+                }
+                if std::time::Instant::now() >= deadline {
+                    log_to_file("bootstrap accept timed out (15s); killing server");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return -7;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                log_to_file("bootstrap accept thread terminated unexpectedly");
+                let _ = child.kill();
+                let _ = child.wait();
+                return -5;
+            }
         }
     };
     log_to_file("bootstrap received from server");
@@ -306,6 +337,7 @@ pub extern "C" fn cef_unity_init(use_gpu: i32, enable_log: i32) -> i32 {
     *CONNECTION.lock().unwrap() = Some(ServerConnection {
         cmd_tx: bootstrap.cmd_tx,
         resp_rx: bootstrap.resp_rx,
+        child,
     });
 
     // Connect to server's Mach IOSurface port service (macOS only)
@@ -355,7 +387,10 @@ pub extern "C" fn cef_unity_shutdown() {
     }
     log_to_file("cef_unity_shutdown()");
 
-    if let Some(conn) = CONNECTION.lock().unwrap().take() {
+    // 先に take してガードを解放する: 保持したまま 500ms sleep すると
+    // 他スレッドの全 FFI 呼び出しがその間ロック待ちになる。
+    let conn = CONNECTION.lock().unwrap().take();
+    if let Some(mut conn) = conn {
         // fire-and-forget: server プロセスが無応答でも Unity main thread を
         // 永久ブロックさせないため、応答は待たない。server 側は
         // expects_response=false でも Shutdown を正しく処理して running=false にする
@@ -363,6 +398,8 @@ pub extern "C" fn cef_unity_shutdown() {
         send_command_no_wait(&conn, Command::Shutdown);
         // Server が Shutdown を処理して cef::shutdown() を呼び終わるまで少し待つ。
         std::thread::sleep(std::time::Duration::from_millis(500));
+        // 終了済みならここで回収してゾンビ化を防ぐ (未終了なら従来どおり放置)。
+        let _ = conn.child.try_wait();
     }
 
     INITIALIZED.store(false, Ordering::SeqCst);
@@ -408,6 +445,9 @@ pub extern "C" fn cef_scroll_monitor_stop() {
 /// 新着イベントを out に書き、件数を返す。毎フレーム呼ぶこと (リング鮮度維持)。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_scroll_monitor_poll(out: *mut CefScrollEvent, max: i32) -> i32 {
+    if out.is_null() || max <= 0 {
+        return 0; // 負の max は .m 側 memcpy の size_t ラップ = 巨大コピーになる
+    }
     #[cfg(target_os = "macos")]
     {
         unsafe {

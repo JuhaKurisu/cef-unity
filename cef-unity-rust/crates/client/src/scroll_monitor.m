@@ -33,6 +33,10 @@ static uint8_t phase_of(NSEvent *e) {
 }
 
 int cef_scroll_monitor_start_impl(void) {
+    // 前回セッションの残骸を掃除する: dylib は Editor に常駐するため、異常終了で
+    // stop 未到達だと古い timestamp のイベントが残り、次回開始直後の初回 poll で
+    // GraceTimeout 超の蓄積分が一括排出されて「飛び」になる。
+    g_count = 0;
     if (g_monitor != nil) return 1;
     if (NSApp == nil) return 0; // ヘッドレス (batchmode 等) → フォールバックさせる
     g_monitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskScrollWheel

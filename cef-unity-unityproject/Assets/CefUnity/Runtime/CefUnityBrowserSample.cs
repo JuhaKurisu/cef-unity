@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.Reflection;
 using System.Text;
 using CefUnity.Interop;
+#if UNITY_EDITOR
 using UnityEditor;
+#endif
 using UnityEngine;
 using UnityEngine.LowLevel;
 using UnityEngine.PlayerLoop;
@@ -306,11 +308,12 @@ namespace CefUnity.Runtime
                     _zeroFrameWaitMs = 0f;
 #endif
 
-                var useGpu = !(SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12 || SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11);
                 // ログのマスタースイッチ: Unity 側 (CefLog) と Rust 側 (client/server)
                 // の両方を _enableLog 一つで制御する。
                 CefLog.Enabled = _enableLog;
-                CefRuntime.Init(enableLog: _enableLog);
+                // GPU 経路 (macOS: IOSurface / Windows: D3D11 共有テクスチャ) を常に要求する。
+                // サーバー側がプール構築に失敗した場合は software paint へ自動フォールバックする。
+                CefRuntime.Init(useGpu: true, enableLog: _enableLog);
                 _browser = new Browser(_currentWidth, _currentHeight, _url);
 
                 // PlayerLoop に EarlyUpdate / PostLateUpdate の hook を挿入。

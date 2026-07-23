@@ -234,34 +234,38 @@ void* cef_unity_create_metal_texture_objc(
     int32_t height,
     uint32_t format)
 {
-    if (surface_id == 0 || width <= 0 || height <= 0) return NULL;
+    // Rust スレッドから呼ばれる (pool なし) — autoreleased な descriptor を
+    // 蓄積させないため必ず pool で囲む。
+    @autoreleasepool {
+        if (surface_id == 0 || width <= 0 || height <= 0) return NULL;
 
-    if (!_sharedDevice) {
-        _sharedDevice = MTLCreateSystemDefaultDevice();
-        if (!_sharedDevice) return NULL;
+        if (!_sharedDevice) {
+            _sharedDevice = MTLCreateSystemDefaultDevice();
+            if (!_sharedDevice) return NULL;
+        }
+
+        IOSurfaceRef surface = IOSurfaceLookup(surface_id);
+        if (!surface) return NULL;
+
+        MTLPixelFormat pixelFormat = (format == 1)
+            ? MTLPixelFormatRGBA8Unorm
+            : MTLPixelFormatBGRA8Unorm;
+
+        MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
+                                                                                       width:(NSUInteger)width
+                                                                                      height:(NSUInteger)height
+                                                                                   mipmapped:NO];
+        desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+        desc.storageMode = MTLStorageModeShared;
+
+        id<MTLTexture> texture = [_sharedDevice newTextureWithDescriptor:desc
+                                                                iosurface:surface
+                                                                    plane:0];
+        CFRelease(surface);
+        if (!texture) return NULL;
+
+        return (__bridge_retained void*)texture;
     }
-
-    IOSurfaceRef surface = IOSurfaceLookup(surface_id);
-    if (!surface) return NULL;
-
-    MTLPixelFormat pixelFormat = (format == 1)
-        ? MTLPixelFormatRGBA8Unorm
-        : MTLPixelFormatBGRA8Unorm;
-
-    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
-                                                                                   width:(NSUInteger)width
-                                                                                  height:(NSUInteger)height
-                                                                               mipmapped:NO];
-    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-    desc.storageMode = MTLStorageModeShared;
-
-    id<MTLTexture> texture = [_sharedDevice newTextureWithDescriptor:desc
-                                                            iosurface:surface
-                                                                plane:0];
-    CFRelease(surface);
-    if (!texture) return NULL;
-
-    return (__bridge_retained void*)texture;
 }
 
 void cef_unity_release_metal_texture_objc(void* texture_ptr)

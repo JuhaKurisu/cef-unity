@@ -82,18 +82,32 @@ impl PullCtx {
     }
 }
 
+/// pull_trampoline 内で panic が起きた回数。edition 2024 では extern "C" 越しの
+/// unwind が即 abort (= Unity ごと落ちる) なので、RT スレッドの将来バグは
+/// 「無音 1 バッファ + このカウンタ」に留める。stats FFI への露出は将来課題。
+static PULL_PANIC_COUNT: AtomicU64 = AtomicU64::new(0);
+
 unsafe extern "C" fn pull_trampoline(ctx: *mut c_void, out: *mut f32, frames: i32) -> i32 {
-    let ctx = unsafe { &mut *(ctx as *mut PullCtx) };
+    let ctx = ctx as *mut PullCtx;
     let frames = frames as usize;
-    let out = unsafe { std::slice::from_raw_parts_mut(out, frames * ctx.channels) };
-    ctx.pull_into(out, frames);
+    let channels = unsafe { (*ctx).channels };
+    let out = unsafe { std::slice::from_raw_parts_mut(out, frames * channels) };
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unsafe { &mut *ctx }.pull_into(out, frames);
+    }))
+    .is_err();
+    if panicked {
+        out.fill(0.0);
+        PULL_PANIC_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
     frames as i32
 }
 
 pub struct NativeVoice {
     /// AU callback が参照する。Drop の au_output_stop が返るまで解放してはならない。
-    #[allow(dead_code)]
-    ctx: Box<PullCtx>,
+    /// Box のまま持つと「AU スレッドへ渡した生ポインタ」と Box の noalias 主張が
+    /// 衝突する (Stacked Borrows の aliasing UB) ため、raw で所有する。
+    ctx: *mut PullCtx,
     au: *mut c_void,
     stats: Arc<VoiceStats>,
     src_rate: u32,
@@ -104,18 +118,22 @@ impl NativeVoice {
     /// ストリームフォーマット未確定 (sample_rate/channels が 0) なら Err —
     /// 呼び出し側は cef_unity_get_audio_format が 1 を返してから呼ぶこと。
     pub fn start(flink: &str, target_ms: f32, io_frames: i32) -> Result<NativeVoice, String> {
-        let (mut ctx, stats, src_rate) = Self::prepare(flink, target_ms)?;
+        let (ctx, stats, src_rate) = Self::prepare(flink, target_ms)?;
+        let channels = ctx.channels;
         let io_frames = if io_frames > 0 { io_frames } else { 128 };
+        let ctx = Box::into_raw(ctx);
         let au = unsafe {
             au_output::au_output_start(
                 src_rate as f64,
-                ctx.channels as i32,
+                channels as i32,
                 io_frames,
                 pull_trampoline,
-                &mut *ctx as *mut PullCtx as *mut c_void,
+                ctx as *mut c_void,
             )
         };
         if au.is_null() {
+            // 起動失敗 = callback は未登録なので即回収してよい
+            drop(unsafe { Box::from_raw(ctx) });
             return Err("au_output_start failed".into());
         }
         Ok(NativeVoice {
@@ -178,6 +196,7 @@ impl Drop for NativeVoice {
     fn drop(&mut self) {
         // 排水待ち付き stop。返った後は callback が走らないので ctx を安全に解放できる。
         unsafe { au_output::au_output_stop(self.au) };
+        drop(unsafe { Box::from_raw(self.ctx) });
     }
 }
 
