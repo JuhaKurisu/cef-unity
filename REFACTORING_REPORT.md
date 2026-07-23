@@ -2,6 +2,7 @@
 
 - **作成日**: 2026-07-13
 - **対象コミット**: eb7a098 (main)
+- **第2回監査**: 2026-07-23 (対象コミット ebfa317) — §9 以降に追記。旧指摘の現状と最新行番号は §9 の照合表を参照 (§3〜§6 の行番号は 2026-07-13 時点のもの)
 - **目的**: 設計レベルのリファクタリング候補の全件記録。将来のセッション (Opus 等) がこのレポートだけを読んで修正作業に着手できることを意図している
 - **分析範囲**: Rust server / Rust client / IPC crate / Unity C# 層の全ソース (約 10K 行)
 
@@ -441,3 +442,408 @@
 ### IME 関連
 - 連続 IME 入力 (「夏目」確定 →「漱石」入力) で候補ウィンドウ位置を確認
 - Editor GameView Scale を 2x にしてキャレット座標を確認 (Y 反転は不要が正)
+
+---
+---
+
+# 第2回監査 (2026-07-23)
+
+- **対象コミット**: ebfa317 (main)。第1回 (eb7a098) 以降の差分 = スクロール入力系 (NSEvent monitor + ScrollResampler + ScrollSmoother + 録画リプレイ)、ネイティブ音声系 (audio_ring/native_voice/au_output + CefNativeAudio)、CI (rust-build.yml)、CARET_TRACKING_JS 全面改修など約 +3800 行
+- **方法**: 領域別 5 並列監査 (スクロール入力 / ネイティブ音声 / Rust server+ipc / Rust client コア / Unity C#+CI)
+- **結論サマリ**: 旧 40 件のうち**修正済みは 0 件** (CLI-16 のみ部分修正)。SRV-1 / CLI-1 / CLI-4 / CS-1 / CS-3 / CS-5 は悪化。新規発見 **約 60 件** (SCR 16 / AUD 15 / SRV-N 10 / IPC-N 3 / CLI-N 6 / CS-N 9 / CI 6、重複統合後)
+- 新規サブシステムの設計自体は健全 (IScrollEventSource 抽象、単一スレッド無ロック音声、排水付き停止、独立カーソル)。問題は「God Class への統合コードの堆積」「FFI 境界の既知問題パターンの踏襲」「録画リプレイ・診断など開発資産の細部の綻び」に集中
+
+---
+
+## §9 旧指摘ステータス (2026-07-23 照合、行番号は現時点)
+
+### Rust server / ipc — 全 24 件残存、悪化は SRV-1 のみ
+
+| ID | 判定 | 現在の場所 | 一言 |
+|---|---|---|---|
+| SRV-1 | **悪化** | server.rs 1590→1700行 (ログ46-79/ローダ85-112/計測138-201/ハンドラ203-805/JS 509-652/ペーシング820-856+1553-1660/dispatch 858-1676/helperパス1682-1700) | CARET_TRACKING_JS が 33→144行に肥大し「JS アセット管理」が 8 責務目として追加 |
+| SRV-2 | 有効 | PAINT_COUNT :138, pending_flush :868-869 | 変化なし |
+| SRV-3 | 有効 | macos.rs:66,100,109,170,204 | ctx.info 依然 null (:175) |
+| SRV-4 | 有効 | server.rs:1211-1616、browsers.get 反復 **14 箇所** | 非一貫 (load_url=Error / mouse_move=黙Ok / ime_commit_text=黙Ok) 不変 |
+| SRV-5〜14 | 有効 | SRV-12 は :1575-1660 | 新テスト (ime_caret_tracking.rs) は IME のみ、ペーシングは依然テスト不能 |
+| IPC-1〜10 | 有効 | IPC-6 は 19 分岐 match (:963-1051) | eb7a098 以降 IPC コマンド追加ゼロのため悪化なし |
+
+### Rust client — CLI-16 のみ部分修正、CLI-1/4 は悪化
+
+| ID | 判定 | 現在の場所 | 一言 |
+|---|---|---|---|
+| CLI-1 | **悪化 (対象拡大)** | CONNECTION.lock().unwrap() 27箇所、無防備 extern "C" は **47→55 本** | 新規 8 FFI (scroll 4 + native audio 4) もガードなしで追加 |
+| CLI-2 | 有効 + 新面 | handle_to_ref :146-148、destroy :552/:1107 | native audio は「AU callback は instance 非接触 + destroy 先頭で排水」で懸念を構造的に回避 (良)。ただし Box<PullCtx> の新 aliasing 面 (→AUD-3) |
+| CLI-3 | 有効 | lib.rs:297 (accept 無期限), :286 (Child 破棄) | 未着手 |
+| CLI-4 | **悪化** | lib.rs 1614→1843行、責務層 6→8 (scroll FFI :374-438、native audio FFI :952-1079) | 追加コード自体の品質は旧より良好 (設計意図コメントは改善傾向) |
+| CLI-5 | 有効 (訂正) | ff 群 :548-772 / blocking 群 :1086-1305 | 実測 **8 関数×2** (旧レポートの 11×2 は過大計上)。新規 FFI はペアを持たず悪化なし |
+| CLI-6 | 有効 | IUnityInterfaces 乖離 d3d11.rs:52-62 vs d3d12.rs:50-56 ほか | 三重重複そのまま |
+| CLI-7 | 有効 (微増) | unwrap_or("") ×7、audio_native_start も 4 原因→一律 -1 | 新規 FFI が同パターン踏襲 |
+| CLI-8 | 有効 | :185, :205-213 | 新規 scroll/audio FFI は CONNECTION 非依存でこの点は悪化なし |
+| CLI-9 | 有効 | lib.rs:940-942 | native 経路は非通過で回避、録画 tap / UnityMixer 経路に unsoundness 残存 |
+| CLI-10 | 有効 | metal_texture.m:44,59-64 / lib.rs:352-372 | disconnect 未実装 |
+| CLI-11 | 有効 (削除条件成立) | metal_texture.m:231-265 | C# ラッパ CreateMetalTexture は**呼び出し元ゼロを確認済み** → ABI 削除可 |
+| CLI-12〜15 | 有効 | CLI-14 は :365 + **新事実: sleep 中 Mutex 保持** (→CLI-N23) | |
+| CLI-16 | **部分修正** | build.rs:4 に rerun-if-changed=src/lib.rs 追加済み | ただし .m/.c は依然対象外 (→CLI-N20 が核心)。出力先ハードコードは残存 |
+
+### Unity C# — CS-7 のみ半分改善、CS-1/3 は悪化。CS-2 は重大度下方修正
+
+| ID | 判定 | 現在の場所 | 一言 |
+|---|---|---|---|
+| CS-1 | **悪化** | Sample 1363→1620行、8→**実質 11 責務** | スクロール 3 経路ルーティング・音声レンダラ切替・dev トグル 11 種・CSV レコーダ 2 系統が追加同居 (→CS-N11) |
+| CS-2 | 未修正 (重大度↓) | Sample:6 の using 未ガード | **新事実**: Unity 6000.3 ではプレイヤーの CoreModule に UnityEditor 名前空間型が同梱され、mac スタンドアロンビルドは実際に成功している。「実機ビルド不能」は現バージョンでは顕在化しないが Unity 内部実装の偶然依存 — ガード追加は依然推奨。優先度 高→中 |
+| CS-3 | 有効 (微悪化) | CefUnity.cs の diff **1187 行** (Unity 側のみ 568 / csharp 側のみ 427) | 音声 FFI 4 本 + scroll + D3D12 追加で手動二重更新の面積拡大。cef-unity-rust/CLAUDE.md が手動同期手順を明文化 (制度化) してしまっている |
+| CS-4 | 有効 | Interop:221-253, ThrowIfDisposed は素の Exception (:856) | native 音声 API 追加で並行 UAF 面積拡大 (→AUD-1 の直接原因) |
+| CS-5 | **軽度悪化** | CefAudioOutput + CefNativeAudio | ICefAudioSource 抽象は不採用、並立コンポーネント化でネゴシエーション+診断が二重化 (→AUD-7) |
+| CS-6 | 有効 | CefAudioSink.cs:39-60, CefAudioRing.cs | 皮肉にも求めていた「SPSC lock-free リング」は Rust 側 audio_ring.rs に実現済みで C# に還元されず |
+| CS-7 | **半分改善** | 全トグルが `#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR \|\| DEVELOPMENT_BUILD)` でリリース消滅 (db94540) | ただし dev では File.Exists 最大 6 回/フレームに増加、トグル 11 種に増殖 (→CS-N12/SCR-8) |
+| CS-8 | 有効 (拡大) | PostProc:45-47, 90-92 | win 用 PostProcessWindows 追加でハードコード 1→2 箇所 |
+| CS-9 | 有効 | Sample:223, Interop:455-465 | 変化なし |
+| CS-10 | 有効 | Sample:309 | useGpu 計算→未使用のまま |
+
+---
+
+## §10 スクロール入力サブシステム (SCR-1〜16)
+
+> 検証資産: 既存 19 テスト + 録画リプレイ照合 (cef_scroll_record + ScrollReplay)。全提案は「排出列の完全一致」を検証条件にできる。チューニング値 (τ=15ms, EMA×1.25, clamp 5-25ms, MergeEpsilon 2ms 等) は**値を 1 つも変えない**こと。
+
+### SCR-1. スクロールパイプライン統合コードが God Class に約150行散在【高 / 中】
+- 場所: CefUnityBrowserSample.cs:238-264 (フィールド), :344-373 (SetupScrollInput), :539-541, :553-554, :628-632, :1080-1096, :1104-1185 (TickNativeScroll), :1194-1207 (TickScrollSmoother)
+- 問題: source/resampler/smoother/録画/トグル/座標フォールバック/スケーリングの所有と配線が全て MonoBehaviour 直書き。「precise→リサンプラ、非precise→Smoother×WheelPixelsPerStep」のルーティングと `_resolutionScale` 乗算は純ロジックなのにテスト不能。送信定型 (1176-1181 / 1198-1203) がコピペ
+- 修正案: `ScrollInput/ScrollInputPipeline.cs` (純 C#) に source+resampler+smoother+録画を集約。MonoBehaviour は座標決定と SendMouseWheel のみ。送信定型は `SendWheelAtLastCursor` ヘルパへ
+- リスク: 低。録画リプレイで移行前後の排出列一致を機械検証可能。CS-N11 と同一施策
+
+### SCR-2. 録画 T 行の時刻と Tick に渡した時刻が別サンプル (Now 二重呼び出し)【中 / 小】
+- 場所: CefUnityBrowserSample.cs:1156 と :1162
+- 問題: `Tick(_scrollSource.Now, ...)` 後に録画行を別の `_scrollSource.Now` で生成。リプレイ照合前提に系統誤差が混入し、境界条件では 1 フレームずれた排出になり得る
+- 修正案: `var now = _scrollSource.Now;` を 1 回取得し両方に使う。挙動不変
+
+### SCR-3. 録画がフィルタ前・スケール前の生値のみでリプレイ忠実度が条件付き【中 / 小〜中】
+- 場所: :1121-1132 (E 行はフィルタ前記録) vs :1133-1145 (live は overBrowser ゲート + _resolutionScale 乗算後)、ScrollReplay.cs:45-48 (無条件・無スケール投入)
+- 問題: ブラウザ外イベント・scale≠1 で live 列とリプレイ列が一致しない。現在は scale=1・ブラウザ上操作でたまたま成立
+- 修正案: E 行に overBrowser フラグ列追加 (または記録時除外) + 録画開始時に `S,{resolutionScale}` ヘッダ行 → ScrollReplay 側で乗算。CSV 変更なので両側同時更新
+
+### SCR-4. 録画バッファ末尾 (最大29行 ≒ 0.5秒) が Play 停止時に消失【中 / 小】
+- 場所: :1163-1173 (30 行閾値フラッシュのみ)、OnDestroy にフラッシュなし
+- 問題: ジェスチャ終端 (飛びバグが出る局面) が記録の最後に来やすく、検証資産として痛い欠落
+- 修正案: `FlushScrollRecord()` 抽出 + OnDestroy から呼ぶ
+
+### SCR-5. FFI 構造体レイアウトと phase 値が 4 言語 5 箇所に重複、静的検証なし【中 / 小】(旧 CLI-N19 統合)
+- 場所: scroll_monitor.m:9-14 (+phase マジックナンバー :21-33)、scroll_monitor.rs:6-14 (RawScrollEvent)、lib.rs:377-384 (CefScrollEvent、:414 生キャスト)、NativeMethods.g.cs:425-433 (×2 リポジトリ)、ScrollInputEvent.cs:4-14
+- 問題: レイアウト同一はコメント上の約束のみ。フィールド追加で片方だけ変えてもコンパイルが通る。phase 値も .m リテラルと C# enum の暗黙一致 (値域チェックなし)
+- 修正案: Rust に `const _: () = assert!(size_of::<CefScrollEvent>() == 24 && ...)`、.m に `_Static_assert`。RawScrollEvent を廃し lib.rs の型を scroll_monitor.rs で直接使用。phase は .m に enum 定数化
+
+### SCR-6. cef_scroll_monitor_poll の C ABI 境界に防御なし (負の max で memcpy 破綻)【低 / 小】(旧 CLI-N18 統合)
+- 場所: scroll_monitor.m:64-71、lib.rs:410-425
+- 問題: `max` 負値で `(size_t)n` が巨大化し memcpy クラッシュ。`out == NULL` 未チェック。本ファイルの他 FFI は全て null チェックあり (非一貫)
+- 修正案: lib.rs 側先頭に `if out.is_null() || max <= 0 { return 0; }`、.m 側にも同ガード。デバッグビルドで NSThread.isMainThread assert
+
+### SCR-7. 異常終了後の残留モニタ + 古いリングイベントが次回 Play 開始時のジャンプ源【中 / 小】
+- 場所: scroll_monitor.m:35-37 (`g_monitor != nil` の early return が g_count を掃除しない)
+- 問題: 前回 Play の Dispose 未到達時、dylib 常駐でリング残存 → 次回 Play 初回 Poll で GraceTimeout 超の蓄積分が一括排出され**開始直後に飛ぶ**。symptom がユーザー既知バグと紛らわしい
+- 修正案: start_impl の early return 側と新規作成側の両方で `g_count = 0;`。正常系挙動不変
+
+### SCR-8. temp ファイル dev トグルの読み取りが 11 箇所コピペ・方式 3 種混在【中 / 中】(CS-N12 と同一施策)
+- 場所: CefUnityBrowserSample.cs:296, 305, 349, 384, 394, 400, 419, 613, 621, 1114-1117
+- 問題: EarlyUpdate ホットパスで毎フレーム File.Exists×2 (613, 621)、60F カウントダウン (1109-1118)、起動時 1 回 (349) の 3 方式混在。CSV バッチフラッシュ「List→30件→AppendAllText」も 2 箇所重複 (424-434 / 1163-1173)
+- 修正案: `#if` 内に `CefDevToggles` 静的ヘルパ (トグル名 const + パス組立一元化 + チェック頻度パラメータ化) + `CsvBatchWriter`。**現行のチェック頻度・トグルファイル名は維持** (計測ワークフロー互換)
+- リスク: 頻度を変えなければ不変
+
+### SCR-9. 陳腐化した命名・コメント【低 / 小】
+- `_scrollPredictCheckCountdown` + コメントは「cef_scroll_predict」だが実トグル名は **cef_scroll_interp** (:258-259 vs :1114-1115)
+- MacNativeScrollSource.cs:12-15 の `SignX/SignY=1f`「Task 4 で逆なら -1」仮置きコメント — 検証完了済みなのに残存 (毎イベント無意味な ×1f も)
+- ScrollSmootherTests.cs:17 `Tau=0.045f // 既定の時定数 45ms` — 本番既定は 15ms。「既定」の記述が誤り
+
+### SCR-10. チューニング値のマジックナンバー散在と重複リテラル【中 / 小】
+- 場所: ScrollResampler.cs:175 と :184 に **1.25 が生値重複** (片方だけ変えると補間/予測でズレる事故が可能)、:121 (EMA α 0.2)、:120 (休止閾値 0.05)、:55 と :78 (EMA 初期値 0.008 重複)。バッファ長 256 が 3 箇所 (scroll_monitor.m:16 / MacNativeScrollSource.cs:18 / Sample:255)
+- 修正案: ScrollResampler に `public const` 集約 (数値同一 = ビット単位不変)。バッファ長は `IScrollEventSource` 近傍に const。**値は絶対に変えない**
+
+### SCR-11. ScrollResampler.Tick が 75 行・4 分岐+方向更新+no-backtrack 一体化【中 / 中】
+- 場所: ScrollResampler.cs:162-236
+- 修正案: `ComputeSamplePosition` / `ApplyDirectionAndNoBacktrack` に抽出し Tick を 4 行構成へ。分岐はガード節順に並べ替え
+- リスク: **飛びバグ 2 件をリプレイ検証で根治した高密度ロジック**。数式・比較演算子を 1 文字も変えず移送し、19 テスト+録画リプレイ照合で排出列完全一致を必須確認
+
+### SCR-12. Smoother と Resampler の API 流儀不一致・配置不整合【低 / 小】
+- ScrollSmoother.cs が Runtime/ 直下 (ScrollInput/ の外)。設定方法が引数渡し vs プロパティで不統一。IScrollEventSource が ScrollInputEvent.cs 内に同居
+- 修正案: ScrollInput/ へ移動 (meta ごと GUID 維持)、IScrollEventSource.cs 分離
+
+### SCR-13. プラットフォーム抽象の暗黙契約【中 / 中】
+- 問題: (a) DxPx/DyPx の単位規約 (precise=CSS px / 非precise=ノッチ数、×WheelPixelsPerStep は呼び出し側) が実装から逆算しないと分からない — Windows (WM_MOUSEWHEEL 120 単位) 実装者が迷う。(b) Phase 非対応プラットフォームは GraceTimeout 依存で可、の明記なし。(c) SetupScrollInput 丸ごと OSX `#if` で Windows 追加時に God Class に `#elif` が増える構造
+- 修正案: IScrollEventSource の XML doc に単位規約と Phase 契約を明記 + `ScrollSourceFactory.TryCreate()` でプラットフォーム `#if` をファクトリ内へ封じ込め
+
+### SCR-14. ScrollReplay の堅牢性: 入力欠如・不正行で生例外、自己照合なし【低 / 小】(旧 CS-N17 統合)
+- 場所: ScrollReplay.cs:24-61 (File.Exists ガードなし、double.Parse 素通し、0 件でも出力)
+- 修正案: ガード + 行番号付きエラー + `EditorApplication.Exit(1)`。さらに T 行の記録済みモード列と live 列の不一致行数をカウントして出力すれば**自己検証ツールに昇格** (SCR-2/3 の誤差検出にも有効)
+
+### SCR-15. dev 注入トグル (cef_scroll_test / cef_scroll_slow) の本経路との非対称【低 / 小】
+- 場所: :613-626。modifiers 省略 (本経路は GetCefModifiers())、_frameSentDy 記録が slow のみ (test は欠落)、2 ブロックコピペ
+- 修正案: `InjectDevScroll(int dy)` に統合。**送信内容は現状維持** (過去計測との条件一致のため)
+
+### SCR-16. テスト構造: asmdef 命名・ヘルパ重複【低 / 小】
+- asmdef 名 `Runtime.Tests` (接頭辞欠落・衝突リスク) → `CefUnity.Runtime.Tests` へ (GUID 不変)。「IsActive 消滅まで Tick して合計」ループが 8 箇所コピペ → `DrainTotal` ヘルパ抽出。アサーション条件は 1 つも変えない
+
+### 問題なしと確認済み (スクロール)
+ゼロ除算安全性 (MergeEpsilon が span>0 を保証)、FFI 2 リポジトリ同期、非 mac cfg ゲート、フォールバック 3 段連鎖の明瞭さ、二重計上防止ゲート、LoadUrl リセット、Poll バッファ安全性、リングのロックフリー前提根拠、NSApp==nil ガード、ScrollSmoother 排出アルゴリズム+テストカバレッジ
+
+---
+
+## §11 ネイティブ音声サブシステム (AUD-1〜15)
+
+> 設計自体は健全: pull_into (RT パス) はロック・ヒープ確保・syscall・ログ I/O 一切なし。排水付き停止 (detached→Stop→spin) の UAF 防御一貫。録画 tap と独立カーソル。以下は細部の綻び。
+
+### AUD-1. dispose 競合の防御 catch が実例外型と不一致で機能しない【高 / 小】
+- 場所: CefNativeAudio.cs:70-73 (`catch (ObjectDisposedException)`) ⇔ CefUnity.cs:854-857 (ThrowIfDisposed は**素の Exception を throw**)
+- 問題: 防御 catch が一度も機能せず、Browser dispose 後は Update が毎フレーム未捕捉例外。同一クラス内で捕捉方針が 3 通りに分裂
+- 修正案: 最小 = catch を Exception に揃える。根本 = ThrowIfDisposed を `ObjectDisposedException(nameof(Browser))` に (CS-4 と整合。他呼び出し元に型指定 catch なしを grep 確認済み)
+
+### AUD-2. AU render callback / 新規 FFI 4 本にパニックガードなし (CLI-1 の新面)【高 / 小】
+- 場所: native_voice.rs:85-91 (pull_trampoline)、lib.rs:967, 1008, 1023, 1045
+- 問題: edition 2024 で extern "C" 越し unwind は即 abort。pull_trampoline→AudioRing はスライス演算の塊で、将来バグ 1 つで**リアルタイムスレッドから Unity ごと abort**
+- 修正案: pull_trampoline に catch_unwind (panic 時は無音 fill + AtomicBool フラグを stats 露出)。FFI 4 本は CLI-1 の ffi_guard 導入時に機械適用
+
+### AUD-3. Box<PullCtx> 保持 + 生ポインタ配布の aliasing UB (Stacked Borrows)【高 / 小】
+- 場所: native_voice.rs:93-100, :109-117 (`&mut *ctx as *mut` を C へ渡した後 Box を struct へ move。その struct は毎 FFI で `&mut` 再借用される ClientBrowserInstance 内)
+- 問題: Box の noalias 保証と AU スレッドの deref が衝突する UB (Miri 検出対象)。「たまたま動いている」状態
+- 修正案: `ctx: *mut PullCtx` (`Box::into_raw`) 保持 + Drop で `au_output_stop` **後に** `Box::from_raw`。数行で挙動完全不変
+
+### AUD-4. pull_into の format()/read() TOCTOU + read() 返り値 channels 無視【中 / 小】
+- 場所: native_voice.rs:50-54, :59 (`let (got, _) = self.reader.read(...)`)
+- 問題: チェックと read の間にチャネル数変更が挟まるとミスインターリーブノイズ。read が返す実チャネル数を捨てているのが直接原因
+- 修正案: `let (got, ch) = ...; if ch != self.channels { 無音 return; }`
+
+### AUD-5. アイドル中 underrun が毎秒 48k 増加し診断が無意味化【中 / 小】
+- 場所: audio_ring.rs:105-118、native_voice.rs:47-82 (stream_active を見ない)
+- 問題: 動画一時停止だけで underrun が出力レートで増え続け「>0 ならアンダーラン」の意味と underrun/s ログが崩壊。primed も再開時に非リセット (初回だけ特別、の暗黙仕様)
+- 修正案: 非 active/未 prime 中は加算しない or `priming_silence_frames` として別カウンタ化 + stats に stream_active。re-prime は可聴挙動が変わるため現仕様をコメント明文化に留める
+- リスク: MEMORY の「underrun=0」実測との比較基準を注記
+
+### AUD-6. 診断デルタが再起動時に ulong アンダーフロー【中 / 小】
+- 場所: CefNativeAudio.cs:42-43, :60-65, :159-162
+- 問題: チャネル変更再起動でカウンタ 0 リセット後、`0 - 旧値` が wrap して「underrun/s=1844京」級のログ
+- 修正案: TryStart 成功時に `_lastUnderrun = _lastOverflow = 0;` の 2 行
+
+### AUD-7. ネゴシエーション+診断の二重化 (CS-5 の悪化分)【中 / 中】
+- 場所: CefNativeAudio.cs:77-99 ⇔ CefAudioOutput.cs:226-266 (TryStart/TryInitStream)、:150-166 ⇔ :135-220 (診断)
+- 問題: 「フォーマットポーリング→開始」「1 秒タイマーでデルタログ」パターンが 2 コンポーネントに複製。Windows native (WASAPI) 追加で 3 分岐目が生える構造
+- 修正案: `CefAudioStreamNegotiator` + `CefAudioDiagnostics` を抽出し共用。最低限「両方 AddComponent で警告」ガード (二重再生事故検出)
+- リスク: MonoBehaviour ライフサイクルを変えぬよう composition で
+
+### AUD-8. マジックナンバー散在と既定値の実乖離【中 / 小】
+- 512: server.rs:674 (真の出所) / CefAudioOutput.cs:181 (ハードコード+要同期コメント) / native_voice.rs:22 (**古い 1024 記述**)。**target_ms: CefNativeAudio.cs:28 は 12、CefUnity.cs:608 default と lib.rs:961 doc は 15 — 既に乖離済み** (Inspector と API でデフォルト遅延が異なる)。128 (io_frames)・0.02 (max_rate_adjust)・リング容量 (0.25s vs 0.5s)・裸の 8 (AUDIO_MAX_CHANNELS) も分散
+- 修正案: Rust 側 pub const 集約 + C# は CefAudioConstants 1 箇所。12/15 統一は実挙動が変わるため**現に使われている 12 (Inspector 側) に合わせる**
+
+### AUD-9. エラー伝搬の欠落 — OSStatus 全破棄 + 無限リトライ【中 / 小〜中】
+- 場所: au_output.c:57-110 (全失敗パスが OSStatus を捨て NULL)、native_voice.rs:119、lib.rs:993-996、CefNativeAudio.cs:45-53+91 (失敗時毎フレーム再試行、非対応 OS で永久)
+- 修正案: 失敗 stage+OSStatus を記録 → CLI-7 の LAST_ERROR パターンへ。C# は失敗 N 回で警告 + リトライ 1s 間隔に
+
+### AUD-10. SHM リングの torn read 未検出【中 / 小】
+- 場所: ipc/src/lib.rs:332-356 (write_packet), :404-445 (read — コピー後の再検証なし)
+- 問題: native 経路は occupancy 極小で実質起きないが、録画 tap は Editor ポーズ→再開で overrun 巻き戻しパスに入り torn 域を読む。非アトミック f32 並行 R/W の UB 許容も未文書
+- 修正案: コピー後に write_frames を再ロードし古さを検出 → 「torn の可能性」カウンタ (破棄まではしない = 挙動不変)。UB 許容の設計判断をモジュールコメントに明記
+
+### AUD-11. au_output.c の細部堅牢性【低 / 小】
+- AudioOutputUnitStop 戻り値未チェック (:119)、排水 spin が yield なし busy loop + タイムアウトなし (:120-122)、`h->pull` の戻り値無視 (契約が void 相当と int32 の二重定義, :38)、mData NULL 防御なし (:31-32)
+- 修正案: spin に sched_yield + 上限。pull 型 void 化は C/Rust 3 箇所同時変更 + `cargo clean -p` 厳守
+
+### AUD-12. ドキュメント腐敗【低 / 小】
+- native_voice.rs:21-22「1024 フレーム単位」(実際 512)、server.rs:661-662 コメントがコードと逆 (「frames_per_buffer のみ指定」だが 3 つとも設定)、volume の範囲表記不一致 (C#「0-1」/ Rust「0.0〜」/ C はクランプなし)
+
+### AUD-13. エッジケース群【低 / 小】
+- (a) 再生中 start は新パラメータ黙殺で 0 (判別不能) → doc 明記。(b) 再生中の Browser プロパティ差し替えで旧 flink に張り付いたまま分裂 → setter ガード or doc。(c) `[DisallowMultipleComponent]` なし (2 個アタッチで共有状態が混乱)。(d) stats false 時に out 3 つが未初期化スタック値のまま → C# 側 0 初期化
+
+### AUD-14. リング実装の言語間二重化 — パリティ人力維持【低 / 中】
+- audio_ring.rs ⇔ CefAudioRing.cs (アルゴリズム完全複製 + テストも移植二重化)。複製理由 (C#=MT lock 必須 / Rust=単一スレッド lock 不要) は正当だが差分が既に発生
+- 修正案: 一元化はリスク過大で不採用。①冒頭に「パリティ必須」明示 + 差分一覧 ②共有テストベクタ (CSV) を両テストから読む ③SHM リング (backstop 1s) → ローカルリング (steering 0.25s) の 2 段構成役割分担図を module doc へ
+
+### AUD-15. リング write のフレーム毎剰余演算 (RT パス最適化余地)【低 / 小】
+- audio_ring.rs:85-91 ほか。2 セグメント memcpy 化で分岐と剰余がループ外に出る。実測 underrun=0 なので純粋に将来余裕
+
+### 問題なしと確認済み (音声)
+RT パスの無ロック性 (本丸)、排水契約の一貫性、独立カーソル設計、FFI 2 プロジェクト同期、prepare() の入力防御、Editor Mute/ポーズ同期 (購読解除も対称)、純ロジック分離のテスト可能性
+
+---
+
+## §12 Rust server / ipc の追加発見 (SRV-N15〜N24, IPC-N11〜N13)
+
+> 事実確認: eb7a098 以降の server/ipc 変更は server.rs のみ +138 行 (①CARET_TRACKING_JS 全面改修 ②frames_per_buffer 512 化)。IPC コマンド追加ゼロ。ipc/lib.rs 無変更。
+
+### SRV-N15. CARET_TRACKING_JS が 144 行の無検証 JS 文字列リテラル【中 / 小】
+- 場所: server.rs:509-652
+- 修正案: `src/caret_tracking.js` に切り出し `include_str!`。バイト同一の純移動。JS 単体を静的 HTML で検証可能になる副次効果。SRV-1 分割の先行切り出しに最適
+
+### SRV-N16. __CARET__ プロトコルの w フィールドが死亡し 2 書込み元で乖離【低 / 小】
+- 場所: server.rs:630-633 (JS は常に `:0:` 固定) vs :400-404 (on_ime_composition_range_changed は実幅) vs docstring :510
+- 修正案: w を「常に 0 (未使用)」に統一ドキュメント化 or 3 フィールド化。read_ime_caret の FFI 形は不変に
+
+### SRV-N17. mirror div が毎イベント DOM 生成 + 強制同期リフロー【低〜中 / 小】
+- 場所: server.rs:561-597, :636-650。selectionchange 連発時に createElement+getComputedStyle+offsetLeft (forced reflow)+removeChild
+- 修正案: mirror div シングルトン再利用 + rAF デバウンス (1 フレーム 1 回)。caret_follows_focus_change テストで回帰確認
+
+### SRV-N18. テストハーネス 3 点セットの二重実装 — 安全性が既に乖離【中 / 小〜中】
+- 場所: ime_caret_tracking.rs:52-317 vs ime_integration.rs:34-259 (~200 行逐語コピー)
+- 問題: 新側だけが Drop kill / poison 回復 / BeginFrame 60Hz ポンプを獲得し、**旧側は panic 時サーバー残留→シングルトンロック永久ハングのまま**
+- 修正案: `tests/common/mod.rs` へ抽出し ime_integration も乗せ替え
+- リスク: 旧側にポンプを足すと key_event_sanity_check の既知失敗挙動が変わり得る — 変化したら記録
+
+### SRV-N19. テストの固定 sleep 依存 (1 テスト ~5-7 秒、CI でフレーク確実)【中 / 中】
+- 修正案: `wait_for(|| 条件, timeout)` ヘルパ (SHM ポーリング / eval_js 結果ポーリング)。SRV-4 の「未準備が判別できない」が根本原因である点も記録
+
+### SRV-N20. record_paint_latency がログ無効時も毎 paint で稼働 (hot path 常時計装)【中 / 小】
+- 場所: server.rs:167-201、呼出 :287/:368 (on_accelerated_paint 内)
+- 問題: LOG_ENABLED チェックが末端のみで、無効時も毎フレーム Mutex lock + Vec push、60 フレームごと clone+sort。プロジェクト規約 (計測後削除 / 3000 フレーム間隔) 違反
+- 修正案: 関数先頭に `if !LOG_ENABLED { return; }`。LAST_BEGIN_FRAME_NS の store は機能側なので触らない
+
+### SRV-N21. viewport 未 clamp → write_frame の assert panic → FFI 境界 abort【中 / 小】
+- 場所: server.rs:1053 (create_browser), 1230-1246 (resize)。到達先 ipc/lib.rs:539-541 の assert
+- 問題: software 経路 (Windows 本番) で 3840x2160 超 Resize → CEF コールバック内 panic = extern "C" 越し unwind = **プロセス abort**。正規コマンドで実到達可能
+- 修正案: 受理時に clamp か Response::Error。MAX_W/MAX_H は ipc crate 参照で単一出所化
+
+### SRV-N22. helper が第 3 のログ系統 + load_cef_auto の二重実装【低 / 小】
+- 場所: helper/main.rs:42-96 (無条件ファイル追記、--logging 非連動、全 helper 起動ごと) / :7-33 vs server.rs:87-106 (同型ローダ)
+- 修正案: env var ゲート化 + ローダ共通化 (引数=遡る階層数)。SRV-8 のログ統合対象に helper を含める
+
+### SRV-N23. iosurface_pool.m の MTLTextureDescriptor 生成が @autoreleasepool 外【低 / 小】
+- 場所: iosurface_pool.m:88-95, 144-152 (blit 部 :159-177 は pool 済み)
+- 問題: 既知知見「Rust→ObjC の Metal 生成は必ず pool で囲む」違反 (CLI-11 の server 側版、旧レポート見落とし)
+- 修正案: copy_and_get 全体を @autoreleasepool で囲む。waitUntilCompleted の命令列不変。.m 変更後は cargo clean -p
+
+### SRV-N24. PAINT_COUNT の増分位置が on_paint / on_accelerated_paint で非対称【低 / 小】
+- 場所: server.rs:250 (type チェック**前**、POPUP もカウント) vs :289 (VIEW チェック**後**)
+- 問題: Windows software 経路でポップアップ描画がカウントを汚し damage streak 誤伸長の芽
+- 修正案: on_paint の増分を type チェック後へ。修正後に Windows software 経路でスクロール実測を再確認
+
+### IPC-N11. ShmReader / AudioShmReader open 時のセグメントサイズ検証欠如【中 / 小】
+- 場所: ipc/lib.rs:572-584, 369-378
+- 問題: stale flink・audio/video flink 逆渡し・レイアウトドリフトでマッピング外読取 = UB/segfault
+- 修正案: open/new 直後に `shmem.len() >= 期待サイズ` チェック。IPC-4 (layout_version) の前哨として安価
+
+### IPC-N12. Mach subscribe 受信メッセージの無検証採用【低 / 小】
+- 場所: mach_iosurface.c:103-107 (msgh_id/size/COMPLEX 未検証で client_port 採用)
+- 問題: SRV-6 の MACH_NOTIFY_DEAD_NAME 導入時に必ず踏む地雷
+- 修正案: 採用前に 'SUBS'/サイズ/COMPLEX を検証。IPC-3 の共有ヘッダ化と同時に
+
+### IPC-N13. ime_caret 4 フィールドの torn read【低 / 小】
+- 場所: ipc/lib.rs:487-493 (4 独立 atomic store), 646-654
+- 修正案: x/y を AtomicU64 パック or IPC-7 の seqlock に相乗り。実害は IME 窓 1 フレーム誤位置程度
+
+---
+
+## §13 Rust client コアの追加発見 (CLI-N17〜N23)
+
+### CLI-N17. cfg(target_os) 分岐ボイラープレートの増殖【中 / 小〜中】
+- 場所: lib.rs:386-438, :966-1079, 既存 :1521-1591, :1756-1843 — macOS 専用 FFI 約 14 関数が `#[cfg]` 2 分岐全文コピペ。stub 側 `let _ = (...)` タプルは引数追加時の更新漏れ源
+- 修正案: `macro_rules! os_gated_ffi` か CLI-4 分割時に `ffi/macos.rs` / `ffi/stub.rs` 層分離 (シグネチャは csbindgen の都合で lib.rs に残す)。NativeMethods.g.cs diff ゼロを検証条件に
+
+### CLI-N20. build.rs コメントの事実誤認 + .m/.c が rerun 対象外 (**MEMORY 記載「.m 変更後 cargo clean 必須」の根本原因**)【中 / 小】
+- 場所: build.rs:2-4
+- 問題: コメントは「cc が .c/.m の rerun-if-changed を出力する」と主張するが**実測は逆** (cc は rerun-if-env-changed のみ。rerun-if 系が 1 つでもあると cargo のデフォルト全ファイル監視が無効になる)。metal_texture.m / au_output.c / scroll_monitor.m 変更で再コンパイルされない
+- 修正案: `cargo:rerun-if-changed=src` (ディレクトリ指定) + コメント修正。監視が増える方向のみでリスクなし
+
+### CLI-N21. cef_unity_get_ime_caret だけ out ポインタを無条件 deref【低 / 小】
+- 場所: lib.rs:860-879。他 getter は全て null チェックあり (非一貫)
+- 修正案: 同じ null ガードを先頭に
+
+### CLI-N22. dead code / コメント腐敗の蓄積【低 / 小】
+- d3d12.rs:461-464 `_unused_state_types` (純デッドコード、削除可)。lib.rs:332-336 `cef_unity_pump` は IPC 化以降 no-op だが C# が毎フレーム呼ぶ (削除は ABI 変更手順で)。metal_texture.m:1-5 の「Two modes」コメント (legacy は死に体)。lib.rs:370 の `USE_GPU_MODE.store(true)` 意図コメントなし
+
+### CLI-N23. shutdown の 500ms sleep が CONNECTION Mutex を握ったまま【低 / 小】
+- 場所: lib.rs:358-366 (`if let Some(conn) = CONNECTION.lock().unwrap().take()` のガード一時値が then 終端まで生存)
+- 問題: sleep 中、他スレッドの全 FFI が 500ms ロック待ち (CLI-14 の隠れ悪化)
+- 修正案: `let conn = CONNECTION.lock().unwrap().take();` でガードを先に drop してから if let
+
+(CLI-N18/N19 は SCR-6/SCR-5 に統合。native audio FFI の CLI-1/2/7 パターン踏襲は CLI-1 修正時に lib.rs:966-1079 の 4 関数を適用対象に含めること)
+
+---
+
+## §14 Unity C# / Editor の追加発見 (CS-N11〜N19)
+
+### CS-N11. God Class への +311 行 = 「入力パイプライン司令塔」責務の追加【高 / 大】
+- 場所: Sample:340-373, 1104-1207, 238-264, 892-939
+- 問題: スクロール 3 経路の選択・スケーリング・モード切替・録画・送信、音声モード enum 分岐、`_audioOutput`/`_nativeAudio` の破棄順序契約 (556-569 コメント頼み) が全て Sample 持ち。`IScrollEventSource` 抽象は綺麗だがプラットフォーム選択が Sample 直書きで、Win/Linux 追加時に `#if` が増える構造
+- 修正案: ① `CefScrollInputRouter` 抽出 (~150 行、SCR-1 と同一施策) ② 音声は factory / `ICefAudioRenderer` へ ③ 旧 CS-1 分割計画に Router を追加
+- リスク: TickNativeScroll/TickScrollSmoother の呼出位置 (EarlyUpdate 内、BeginFrame#1 前) と `_inputSentThisFrame` 副作用が 0F 待ちと結合。録画リプレイで検証可能
+
+### CS-N12. dev トグル基盤の重複散在【中 / 小】→ SCR-8 と同一施策 (CefDevToggles + CsvBatchWriter)
+- 補足: 複合 define `CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)` が Sample 内 10 ブロック。CefQuickBuild 側で ExtraScriptingDefines 指定にすれば条件 1 項化も可
+
+### CS-N13. ライブラリが QualitySettings/targetFrameRate/AudioSettings をグローバル書換【中 / 小】
+- 場所: Sample:292-293 (vSyncCount/targetFrameRate)、922-939 (AudioSettings.Reset — 全 AudioSource 停止副作用)
+- 問題: Start() がアプリ全体のフレームペーシングと DSP バッファをオプトアウト不能に上書き。120Hz ゲームに組み込むと黙って 60fps 化
+- 修正案: `[SerializeField] bool _manageFramePacing = true` + 根拠 (CEF Viz 60Hz) の doc 明示。**既定値は現挙動維持** (0F 同期の実測特性を守る)
+
+### CS-N14. 初期ブラウザサイズが _resolutionScale を無視【低 / 小】
+- 場所: Sample:284-285 (Screen.width 生値) vs 1379-1380 (CeilToInt(× _resolutionScale))
+- 問題: scale≠1 で生成直後に必ず無駄な Resize が走り、初回 1 フレームは IME 座標も不整合
+- 修正案: Start でも scale 適用 (2 行)
+
+### CS-N15. software 経路の TryUpdateTextureOnce が無条件 true【低 / 小】
+- 場所: Sample:527-531 (新フレーム有無の判定を UpdateTextureSoftware:1499 内で握り潰し)
+- 問題: software 経路で毎フレーム OnFreshPaint 扱いになり streak/interval 計装が虚偽値 (0F 待ちは accelerated 限定なので実害は計測のみ)
+- 修正案: UpdateTextureSoftware を bool 化して伝搬
+
+### CS-N16. CefQuickBuild のユーザー絶対パスハードコード + 偽成功の余地【低 / 小】
+- 場所: CefQuickBuild.cs:15-16 (`/Users/juha/...` 固定)、:23、:32-35 (BuildPlayer 失敗でも Debug.Log のみ → batchmode で成功終了コード)
+- 修正案: CWD 相対化 + EditorBuildSettings.scenes 参照 + 失敗時 `EditorApplication.Exit(1)`。開発専用と割り切るなら現状維持 + その旨コメントでも可
+
+### CS-N18. 「サンプルのサンプル」問題は現状維持【低 / 小】
+- Assets/Scripts/Sample.cs (20 行): 製品本体を参照する別 Sample、YouTube URL ハードコード、無説明のマウス追従コード。CS-1 分割時に Samples~/ へ。それまでは用途コメント 2 行
+
+### CS-N19. UPM 化の中途半端な進捗 (旧 CS-3 の部分実施)【中 / 小】
+- package.json は name/displayName/version の 3 フィールドのみ (unity/description/author なし)。asmdef はアセンブリ名 `CefUnity.Runtime` に改名済みだが**ファイル名は Script.asmdef のまま**。リリースタグ/package.json/bundleVersion の手動 3 点同期が発生中
+- 修正案: フィールド補完 + CS-8 のパス解決とセットで Packages/ 移動。asmdef リネーム (GUID 維持)
+
+(CS-N17 は SCR-14 に統合)
+
+---
+
+## §15 CI / ビルドスクリプト (CI-1〜6)
+
+### CI-1. Windows「何を出荷するか」ポリシーの三重定義【中 / 中】
+- 場所: rust-build.yml:100-132 (glob 収集) / :165-170 (publish フラット展開 + `--exclude archive.json` の辻褄合わせ) / deploy.ps1:59-94 (明示ホワイトリスト)
+- 問題: CEF 更新で必要ファイルが増えた場合、3 箇所の更新漏れが「ローカルは動くが CI 産物は起動しない」型の障害に
+- 修正案: `tools/collect-win-bundle.sh` に一本化し双方から呼ぶ (mac 側が deploy.sh 再利用で重複ゼロなのと同じ構図)
+
+### CI-2. mac/win ジョブの定型 4 ステップ重複【低 / 中】
+- :26-41 vs :61-76。matrix 化は可能だが固有ステップが大半で費用対効果は低め — 202 行に収まる現状維持も合理的
+
+### CI-3. publish の main 直 push に鮮度・競合の穴【中 / 小】
+- 場所: :149-151 (checkout ref: main — タグ起動でもコミット先は最新 main = 混成コミット化)、:180-191 (push リトライなし)、:182-183 (git identity `juhasapps@gmail.com` ハードコード — リポジトリ author と別)
+- 修正案: push 前 `git pull --rebase origin main` + 1 回リトライ。publish の concurrency group を固定名に。identity は github-actions[bot] か既存 author に統一
+
+### CI-4. 「初回診断用」ステップの恒久残置【低 / 小】
+- :83-98 (コメント自身が目的完了を明記)。削除 or `if: runner.debug == '1'` に
+
+### CI-5. `cargo test || cargo test` の盲目リトライ【低 / 小】
+- :39-41, :73-76。CEF ~1GB DL のフレーク対策がテスト本体の flaky 失敗も隠す。「build をリトライ、test は 1 回」に分離 (CEF DL は build.rs 実行時のため)
+
+### CI-6. deploy.sh の CWD 依存と pipefail なし【低 / 小】
+- deploy.sh:2-4 (set -e のみ、相対 DEST)、:18 (`ls | head -1` の非決定選択)。deploy.ps1 は自己解決+存在確認つきで兄弟スクリプト間に品質差。冒頭 `cd "$(dirname "$0")"` + `set -euo pipefail` の 3 行
+
+---
+
+## §16 改訂ロードマップ (第2回監査反映)
+
+旧 §7 の Phase 構成は維持し、新規発見を挿入する。**旧 Phase 0 は 1 件も着手されていない**ので、まず旧 Phase 0 + 以下の即効枠から。
+
+### Phase 0 追加 (即効・安全性、全て工数小)
+- **AUD-1** 機能しない防御 catch (実害中) / **AUD-2** RT パス panic ガード / **AUD-3** Box aliasing UB / **AUD-6** 診断 wrap
+- **SRV-N21** viewport clamp (正規コマンドで abort) / **SRV-N20** hot path 常時計装の停止 / **SRV-N23** server 側 @autoreleasepool
+- **CLI-N20** build.rs rerun-if-changed (「.m 変更後 cargo clean」問題の根治) / **CLI-N21** null ガード / **CLI-N23** Mutex 保持 sleep
+- **SCR-2** Now 二重呼び出し / **SCR-4** 録画フラッシュ / **SCR-6** poll ガード / **SCR-7** 残留リング掃除 / **CS-N14** 初期サイズ scale
+- **CI-3** publish rebase+リトライ / **CI-6** deploy.sh 3 行
+
+### Phase 1 追加 (分割の受け皿)
+- **SRV-N15** caret_tracking.js 切り出し (SRV-1 分割の先行) / **SRV-N18+N19** テストハーネス共通化+wait_for (旧 SRV-12 着手の前提) / **CLI-N17** cfg 分岐整理 (CLI-4 分割に同梱) / **SCR-16** テストヘルパ整理
+
+### Phase 2 追加 (最重要ロジックの資産保護)
+- **SCR-1 = CS-N11** ScrollInputPipeline/Router 抽出 (録画リプレイで排出列一致検証) / **SCR-14** ScrollReplay の自己照合ツール化 (先にやると SCR-1 の検証が楽になる) / **SCR-11** Resampler.Tick 分解 / **SCR-8 = CS-N12** DevToggles 集約 / **SCR-10** const 集約
+- **AUD-7** Negotiator/Diagnostics 抽出 / **AUD-5** underrun 意味論修正 / **AUD-8** 定数一元化 (12/15 乖離解消)
+
+### Phase 4 追加 (ワイヤ/プロトコル系)
+- **IPC-N11** shm サイズ検証 (IPC-4 の前哨、これだけは Phase 0 でも可) / **IPC-N12** Mach subscribe 検証 (IPC-3/SRV-6 と同時) / **IPC-N13** ime_caret パック (IPC-7 相乗り) / **SRV-N16** __CARET__ w 廃止
+
+### Phase 5 追加 (エコシステム)
+- **CS-N19** UPM 完成 (CS-3/CS-8 とセット) / **CI-1** win バンドル一本化 / **SCR-13** ScrollSourceFactory + 単位規約 doc (Windows スクロール実装の前提) / **AUD-14** リングパリティ体制 / **CS-N13** フレームペーシングのオプトアウト (配布前に)
+
+### 残り低優先
+SCR-3/5/9/12/15、AUD-4/9/10/11/12/13/15、SRV-N17/N22/N24、CLI-N22、CS-N15/N16/N18、CI-2/4/5
