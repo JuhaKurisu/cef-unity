@@ -20,7 +20,7 @@ mod scroll_monitor;
 use std::ffi::{CStr, c_char};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ipc_channel::ipc::{IpcOneShotServer, IpcReceiver, IpcSender};
@@ -201,6 +201,24 @@ fn log_to_file(msg: &str) {
     }
 }
 
+/// FFI 境界のパニックガード。extern "C" 越しの unwind は edition 2024 で即 abort
+/// (= Unity Editor ごと落ちる) ため、全エントリポイントの本体をこれで包む。
+/// panic 時は default を返し、原因を試行ログに残す (ログ自体の失敗は無視)。
+fn ffi_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            let _ = std::panic::catch_unwind(|| log_to_file(&format!("FFI panic: {}", msg)));
+            default
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // IPC helpers
 // ---------------------------------------------------------------------------
@@ -235,177 +253,191 @@ fn send_command_no_wait(conn: &ServerConnection, cmd: Command) {
 /// Returns 0 on success, non-zero on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_init(use_gpu: i32, enable_log: i32) -> i32 {
-    // ログ有効/無効を最初に確定させる (以降の log_to_file がこれに従う)。
-    LOG_ENABLED.store(enable_log != 0, Ordering::SeqCst);
+    ffi_guard(-1, || {
+        // ログ有効/無効を最初に確定させる (以降の log_to_file がこれに従う)。
+        LOG_ENABLED.store(enable_log != 0, Ordering::SeqCst);
 
-    if INITIALIZED.load(Ordering::SeqCst) {
-        return 0;
-    }
+        if INITIALIZED.load(Ordering::SeqCst) {
+            return 0;
+        }
 
-    let use_gpu_bool = use_gpu != 0;
-    USE_GPU_MODE.store(use_gpu_bool, Ordering::SeqCst);
-    log_to_file(&format!(
-        "---- cef_unity_init(use_gpu={}) called (IPC client mode) ----",
-        use_gpu_bool
-    ));
-
-    // Find server binary next to dylib
-    let plugin_dir = dylib_dir();
-    let server_app = server_binary_path(&plugin_dir);
-    if !server_app.exists() {
+        let use_gpu_bool = use_gpu != 0;
+        USE_GPU_MODE.store(use_gpu_bool, Ordering::SeqCst);
         log_to_file(&format!(
-            "server binary not found: {}",
-            server_app.display()
+            "---- cef_unity_init(use_gpu={}) called (IPC client mode) ----",
+            use_gpu_bool
         ));
-        return -3;
-    }
-    log_to_file(&format!("server binary: {}", server_app.display()));
 
-    // Create one-shot server for bootstrap
-    let (oneshot_server, server_name) = match IpcOneShotServer::<Bootstrap>::new() {
-        Ok(pair) => pair,
-        Err(e) => {
-            log_to_file(&format!("failed to create one-shot server: {}", e));
-            return -4;
+        // Find server binary next to dylib
+        let plugin_dir = dylib_dir();
+        let server_app = server_binary_path(&plugin_dir);
+        if !server_app.exists() {
+            log_to_file(&format!(
+                "server binary not found: {}",
+                server_app.display()
+            ));
+            return -3;
         }
-    };
-    log_to_file(&format!("one-shot server name = {}", server_name));
+        log_to_file(&format!("server binary: {}", server_app.display()));
 
-    // Launch server process with --ipc-server argument。
-    // Windows では D3D11 共有テクスチャを DuplicateHandle で渡すために
-    // クライアント PID も渡す。
-    let client_pid = std::process::id();
-    let mut child = match std::process::Command::new(&server_app)
-        .arg("--ipc-server")
-        .arg(&server_name)
-        .arg("--client-pid")
-        .arg(client_pid.to_string())
-        .arg("--use-gpu")
-        .arg(if use_gpu_bool { "1" } else { "0" })
-        .arg("--logging")
-        .arg(if enable_log != 0 { "1" } else { "0" })
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            log_to_file(&format!("failed to spawn server: {}", e));
-            return -4;
-        }
-    };
-    log_to_file("server spawned");
-
-    // Wait for server to connect and send bootstrap.
-    // accept() 自体は無期限ブロックするため別スレッドで行い、server の早期死亡
-    // (codesign 不備・framework 欠落・CEF 初期化失敗等) とタイムアウトを監視する。
-    // これがないと server 起動失敗時に Unity main thread が永久フリーズする。
-    let (boot_tx, boot_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = boot_tx.send(oneshot_server.accept());
-    });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    let bootstrap = loop {
-        match boot_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            Ok(Ok((_rx, bootstrap))) => break bootstrap,
-            Ok(Err(e)) => {
-                log_to_file(&format!("failed to accept bootstrap: {}", e));
-                let _ = child.kill();
-                let _ = child.wait();
-                return -5;
+        // Create one-shot server for bootstrap
+        let (oneshot_server, server_name) = match IpcOneShotServer::<Bootstrap>::new() {
+            Ok(pair) => pair,
+            Err(e) => {
+                log_to_file(&format!("failed to create one-shot server: {}", e));
+                return -4;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    log_to_file(&format!("server exited during init: {}", status));
-                    return -6;
-                }
-                if std::time::Instant::now() >= deadline {
-                    log_to_file("bootstrap accept timed out (15s); killing server");
+        };
+        log_to_file(&format!("one-shot server name = {}", server_name));
+
+        // Launch server process with --ipc-server argument。
+        // Windows では D3D11 共有テクスチャを DuplicateHandle で渡すために
+        // クライアント PID も渡す。
+        let client_pid = std::process::id();
+        let mut child = match std::process::Command::new(&server_app)
+            .arg("--ipc-server")
+            .arg(&server_name)
+            .arg("--client-pid")
+            .arg(client_pid.to_string())
+            .arg("--use-gpu")
+            .arg(if use_gpu_bool { "1" } else { "0" })
+            .arg("--logging")
+            .arg(if enable_log != 0 { "1" } else { "0" })
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                log_to_file(&format!("failed to spawn server: {}", e));
+                return -4;
+            }
+        };
+        log_to_file("server spawned");
+
+        // Wait for server to connect and send bootstrap.
+        // accept() 自体は無期限ブロックするため別スレッドで行い、server の早期死亡
+        // (codesign 不備・framework 欠落・CEF 初期化失敗等) とタイムアウトを監視する。
+        // これがないと server 起動失敗時に Unity main thread が永久フリーズする。
+        let (boot_tx, boot_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = boot_tx.send(oneshot_server.accept());
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let bootstrap = loop {
+            match boot_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(Ok((_rx, bootstrap))) => break bootstrap,
+                Ok(Err(e)) => {
+                    log_to_file(&format!("failed to accept bootstrap: {}", e));
                     let _ = child.kill();
                     let _ = child.wait();
-                    return -7;
+                    return -5;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        log_to_file(&format!("server exited during init: {}", status));
+                        return -6;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        log_to_file("bootstrap accept timed out (15s); killing server");
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return -7;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    log_to_file("bootstrap accept thread terminated unexpectedly");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return -5;
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                log_to_file("bootstrap accept thread terminated unexpectedly");
-                let _ = child.kill();
-                let _ = child.wait();
-                return -5;
+        };
+        log_to_file("bootstrap received from server");
+
+        *CONNECTION.lock().unwrap_or_else(PoisonError::into_inner) = Some(ServerConnection {
+            cmd_tx: bootstrap.cmd_tx,
+            resp_rx: bootstrap.resp_rx,
+            child,
+        });
+
+        // Connect to server's Mach IOSurface port service (macOS only)
+        // GPU モード時のみ接続する。CPU モードでは IOSURFACE_CONNECTED は false のまま。
+        #[cfg(target_os = "macos")]
+        if use_gpu_bool {
+            let service_name = cef_unity_ipc::iosurface_service_name(bootstrap.server_pid);
+            log_to_file(&format!("connecting to Mach IOSurface service: {}", service_name));
+            if let Ok(cname) = std::ffi::CString::new(service_name.as_str()) {
+                let ret = unsafe { mach_iosurface_client_connect(cname.as_ptr()) };
+                if ret == 0 {
+                    IOSURFACE_CONNECTED.store(true, Ordering::SeqCst);
+                    log_to_file("Mach IOSurface service connected");
+                } else {
+                    log_to_file(&format!("Mach IOSurface service connect failed: {}", ret));
+                }
+            } else {
+                // service name に NUL が混入した場合のみ。接続失敗と同じく非致命 (CPU 経路へ)。
+                log_to_file("iosurface service name contained NUL; skipping connect");
             }
         }
-    };
-    log_to_file("bootstrap received from server");
 
-    *CONNECTION.lock().unwrap() = Some(ServerConnection {
-        cmd_tx: bootstrap.cmd_tx,
-        resp_rx: bootstrap.resp_rx,
-        child,
-    });
-
-    // Connect to server's Mach IOSurface port service (macOS only)
-    // GPU モード時のみ接続する。CPU モードでは IOSURFACE_CONNECTED は false のまま。
-    #[cfg(target_os = "macos")]
-    if use_gpu_bool {
-        let service_name = cef_unity_ipc::iosurface_service_name(bootstrap.server_pid);
-        log_to_file(&format!("connecting to Mach IOSurface service: {}", service_name));
-        let cname = std::ffi::CString::new(service_name.as_str()).unwrap();
-        let ret = unsafe { mach_iosurface_client_connect(cname.as_ptr()) };
-        if ret == 0 {
-            IOSURFACE_CONNECTED.store(true, Ordering::SeqCst);
-            log_to_file("Mach IOSurface service connected");
-        } else {
-            log_to_file(&format!("Mach IOSurface service connect failed: {}", ret));
-        }
-    }
-
-    INITIALIZED.store(true, Ordering::SeqCst);
-    log_to_file("initialized successfully (IPC client)");
-    0
+        INITIALIZED.store(true, Ordering::SeqCst);
+        log_to_file("initialized successfully (IPC client)");
+        0
+    })
 }
 
 /// Pump CEF message loop — no-op in IPC mode (server has its own loop).
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_pump() {
-    PUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+    ffi_guard((), || {
+        PUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+    })
 }
 
 /// Returns the number of on_paint calls (tracked per-frame reads in IPC mode).
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_get_paint_count() -> u64 {
-    PAINT_COUNT.load(Ordering::Relaxed)
+    ffi_guard(0, || {
+        PAINT_COUNT.load(Ordering::Relaxed)
+    })
 }
 
 /// Returns the number of pump iterations.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_get_pump_count() -> u64 {
-    PUMP_COUNT.load(Ordering::Relaxed)
+    ffi_guard(0, || {
+        PUMP_COUNT.load(Ordering::Relaxed)
+    })
 }
 
 /// Shut down: send Shutdown command and wait for server to exit.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_shutdown() {
-    if !INITIALIZED.load(Ordering::SeqCst) {
-        return;
-    }
-    log_to_file("cef_unity_shutdown()");
+    ffi_guard((), || {
+        if !INITIALIZED.load(Ordering::SeqCst) {
+            return;
+        }
+        log_to_file("cef_unity_shutdown()");
 
-    // 先に take してガードを解放する: 保持したまま 500ms sleep すると
-    // 他スレッドの全 FFI 呼び出しがその間ロック待ちになる。
-    let conn = CONNECTION.lock().unwrap().take();
-    if let Some(mut conn) = conn {
-        // fire-and-forget: server プロセスが無応答でも Unity main thread を
-        // 永久ブロックさせないため、応答は待たない。server 側は
-        // expects_response=false でも Shutdown を正しく処理して running=false にする
-        // (event_loop/generic.rs の drain_commands 参照)。
-        send_command_no_wait(&conn, Command::Shutdown);
-        // Server が Shutdown を処理して cef::shutdown() を呼び終わるまで少し待つ。
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        // 終了済みならここで回収してゾンビ化を防ぐ (未終了なら従来どおり放置)。
-        let _ = conn.child.try_wait();
-    }
+        // 先に take してガードを解放する: 保持したまま 500ms sleep すると
+        // 他スレッドの全 FFI 呼び出しがその間ロック待ちになる。
+        let conn = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(mut conn) = conn {
+            // fire-and-forget: server プロセスが無応答でも Unity main thread を
+            // 永久ブロックさせないため、応答は待たない。server 側は
+            // expects_response=false でも Shutdown を正しく処理して running=false にする
+            // (event_loop/generic.rs の drain_commands 参照)。
+            send_command_no_wait(&conn, Command::Shutdown);
+            // Server が Shutdown を処理して cef::shutdown() を呼び終わるまで少し待つ。
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            // 終了済みならここで回収してゾンビ化を防ぐ (未終了なら従来どおり放置)。
+            let _ = conn.child.try_wait();
+        }
 
-    INITIALIZED.store(false, Ordering::SeqCst);
-    IOSURFACE_CONNECTED.store(false, Ordering::SeqCst);
-    USE_GPU_MODE.store(true, Ordering::SeqCst);
-    log_to_file("shutdown complete");
+        INITIALIZED.store(false, Ordering::SeqCst);
+        IOSURFACE_CONNECTED.store(false, Ordering::SeqCst);
+        USE_GPU_MODE.store(true, Ordering::SeqCst);
+        log_to_file("shutdown complete");
+    })
 }
 
 /// 生スクロールイベント (scroll_monitor.m / C# 側と同一レイアウト)。
@@ -424,57 +456,65 @@ pub struct CefScrollEvent {
 /// macOS 以外は常に 0 (呼び出し側がフォールバックする)。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_scroll_monitor_start() -> i32 {
-    #[cfg(target_os = "macos")]
-    {
-        unsafe { scroll_monitor::cef_scroll_monitor_start_impl() }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        0
-    }
+    ffi_guard(0, || {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe { scroll_monitor::cef_scroll_monitor_start_impl() }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            0
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_scroll_monitor_stop() {
-    #[cfg(target_os = "macos")]
-    unsafe {
-        scroll_monitor::cef_scroll_monitor_stop_impl()
-    }
+    ffi_guard((), || {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            scroll_monitor::cef_scroll_monitor_stop_impl()
+        }
+    })
 }
 
 /// 新着イベントを out に書き、件数を返す。毎フレーム呼ぶこと (リング鮮度維持)。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_scroll_monitor_poll(out: *mut CefScrollEvent, max: i32) -> i32 {
-    if out.is_null() || max <= 0 {
-        return 0; // 負の max は .m 側 memcpy の size_t ラップ = 巨大コピーになる
-    }
-    #[cfg(target_os = "macos")]
-    {
-        unsafe {
-            scroll_monitor::cef_scroll_monitor_poll_impl(
-                out as *mut scroll_monitor::RawScrollEvent,
-                max,
-            )
+    ffi_guard(0, || {
+        if out.is_null() || max <= 0 {
+            return 0; // 負の max は .m 側 memcpy の size_t ラップ = 巨大コピーになる
         }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (out, max);
-        0
-    }
+        #[cfg(target_os = "macos")]
+        {
+            unsafe {
+                scroll_monitor::cef_scroll_monitor_poll_impl(
+                    out as *mut scroll_monitor::RawScrollEvent,
+                    max,
+                )
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (out, max);
+            0
+        }
+    })
 }
 
 /// イベント timestamp と同一クロック (起動からの秒) の現在時刻。リサンプル基準用。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_scroll_monitor_now() -> f64 {
-    #[cfg(target_os = "macos")]
-    {
-        unsafe { scroll_monitor::cef_scroll_monitor_now_impl() }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        0.0
-    }
+    ffi_guard(0.0, || {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe { scroll_monitor::cef_scroll_monitor_now_impl() }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            0.0
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -488,156 +528,164 @@ pub extern "C" fn cef_unity_create_browser(
     height: i32,
     url: *const c_char,
 ) -> *mut CefUnityBrowser {
-    if !INITIALIZED.load(Ordering::SeqCst) || url.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    let url_str = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
-    log_to_file(&format!(
-        "cef_unity_create_browser({}x{}, {})",
-        width, height, url_str
-    ));
-
-    let guard = CONNECTION.lock().unwrap();
-    let conn = match guard.as_ref() {
-        Some(c) => c,
-        None => return std::ptr::null_mut(),
-    };
-
-    let cmd = Command::CreateBrowser {
-        width,
-        height,
-        url: url_str.to_string(),
-    };
-    let resp = match send_command(conn, cmd) {
-        Ok(r) => r,
-        Err(e) => {
-            log_to_file(&format!("create_browser IPC error: {}", e));
+    ffi_guard(std::ptr::null_mut(), || {
+        if !INITIALIZED.load(Ordering::SeqCst) || url.is_null() {
             return std::ptr::null_mut();
         }
-    };
 
-    match resp {
-        Response::BrowserCreated {
-            browser_id,
-            shm_flink,
-            d3d11_fence_handle,
-            audio_shm_flink,
-        } => {
-            log_to_file(&format!(
-                "browser created: id={}, shm={}, fence_handle=0x{:x}, audio_shm={}",
-                browser_id, shm_flink, d3d11_fence_handle, audio_shm_flink
-            ));
-            let shm = match ShmReader::open(&shm_flink) {
-                Ok(s) => s,
-                Err(e) => {
-                    log_to_file(&format!("shm_open failed: {}", e));
-                    return std::ptr::null_mut();
-                }
-            };
-            let audio_shm = match AudioShmReader::open(&audio_shm_flink) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    // 音声は必須ではないので open 失敗時は警告のみ。
-                    log_to_file(&format!("audio_shm_open failed (audio disabled): {}", e));
-                    None
-                }
-            };
-            #[cfg(target_os = "windows")]
-            {
-                if d3d11_fence_handle != 0 {
-                    // Unity の graphics backend に応じて開ける方を試す。
-                    // D3D11/D3D12 双方無接続でも fence_handle 自体は同じ NT 共有 HANDLE。
-                    if d3d11::is_connected() {
-                        if let Err(e) = d3d11::open_fence(d3d11_fence_handle) {
-                            log_to_file(&format!("d3d11::open_fence failed: {}", e));
-                        }
-                    }
-                    if d3d12::is_connected() {
-                        if let Err(e) = d3d12::open_fence(d3d11_fence_handle) {
-                            log_to_file(&format!("d3d12::open_fence failed: {}", e));
-                        }
-                    }
-                }
+        let url_str = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
+        log_to_file(&format!(
+            "cef_unity_create_browser({}x{}, {})",
+            width, height, url_str
+        ));
+
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        let conn = match guard.as_ref() {
+            Some(c) => c,
+            None => return std::ptr::null_mut(),
+        };
+
+        let cmd = Command::CreateBrowser {
+            width,
+            height,
+            url: url_str.to_string(),
+        };
+        let resp = match send_command(conn, cmd) {
+            Ok(r) => r,
+            Err(e) => {
+                log_to_file(&format!("create_browser IPC error: {}", e));
+                return std::ptr::null_mut();
             }
-            #[cfg(not(target_os = "windows"))]
-            let _ = d3d11_fence_handle;
-            let instance = Box::new(ClientBrowserInstance {
+        };
+
+        match resp {
+            Response::BrowserCreated {
                 browser_id,
-                shm,
-                audio_shm,
-                audio_flink: audio_shm_flink.clone(),
-                #[cfg(target_os = "macos")]
-                native_voice: None,
-            });
-            Box::into_raw(instance) as *mut CefUnityBrowser
+                shm_flink,
+                d3d11_fence_handle,
+                audio_shm_flink,
+            } => {
+                log_to_file(&format!(
+                    "browser created: id={}, shm={}, fence_handle=0x{:x}, audio_shm={}",
+                    browser_id, shm_flink, d3d11_fence_handle, audio_shm_flink
+                ));
+                let shm = match ShmReader::open(&shm_flink) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log_to_file(&format!("shm_open failed: {}", e));
+                        return std::ptr::null_mut();
+                    }
+                };
+                let audio_shm = match AudioShmReader::open(&audio_shm_flink) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        // 音声は必須ではないので open 失敗時は警告のみ。
+                        log_to_file(&format!("audio_shm_open failed (audio disabled): {}", e));
+                        None
+                    }
+                };
+                #[cfg(target_os = "windows")]
+                {
+                    if d3d11_fence_handle != 0 {
+                        // Unity の graphics backend に応じて開ける方を試す。
+                        // D3D11/D3D12 双方無接続でも fence_handle 自体は同じ NT 共有 HANDLE。
+                        if d3d11::is_connected() {
+                            if let Err(e) = d3d11::open_fence(d3d11_fence_handle) {
+                                log_to_file(&format!("d3d11::open_fence failed: {}", e));
+                            }
+                        }
+                        if d3d12::is_connected() {
+                            if let Err(e) = d3d12::open_fence(d3d11_fence_handle) {
+                                log_to_file(&format!("d3d12::open_fence failed: {}", e));
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                let _ = d3d11_fence_handle;
+                let instance = Box::new(ClientBrowserInstance {
+                    browser_id,
+                    shm,
+                    audio_shm,
+                    audio_flink: audio_shm_flink.clone(),
+                    #[cfg(target_os = "macos")]
+                    native_voice: None,
+                });
+                Box::into_raw(instance) as *mut CefUnityBrowser
+            }
+            Response::Error { msg } => {
+                log_to_file(&format!("create_browser error: {}", msg));
+                std::ptr::null_mut()
+            }
+            _ => {
+                log_to_file("unexpected response to CreateBrowser");
+                std::ptr::null_mut()
+            }
         }
-        Response::Error { msg } => {
-            log_to_file(&format!("create_browser error: {}", msg));
-            std::ptr::null_mut()
-        }
-        _ => {
-            log_to_file("unexpected response to CreateBrowser");
-            std::ptr::null_mut()
-        }
-    }
+    })
 }
 
 /// Destroy a browser instance.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_destroy_browser(handle: *mut CefUnityBrowser) {
-    if handle.is_null() {
-        return;
-    }
-    let mut instance = unsafe { Box::from_raw(handle as *mut ClientBrowserInstance) };
-    stop_native_voice(&mut instance);
+    ffi_guard((), || {
+        if handle.is_null() {
+            return;
+        }
+        let mut instance = unsafe { Box::from_raw(handle as *mut ClientBrowserInstance) };
+        stop_native_voice(&mut instance);
 
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        let cmd = Command::DestroyBrowser {
-            browser_id: instance.browser_id,
-        };
-        send_command_no_wait(conn, cmd);
-    }
-    drop(instance);
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            let cmd = Command::DestroyBrowser {
+                browser_id: instance.browser_id,
+            };
+            send_command_no_wait(conn, cmd);
+        }
+        drop(instance);
+    })
 }
 
 /// Load a URL in the browser.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_load_url(handle: *mut CefUnityBrowser, url: *const c_char) {
-    if handle.is_null() || url.is_null() {
-        return;
-    }
-    let instance = handle_to_ref(handle);
-    let url_str = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
+    ffi_guard((), || {
+        if handle.is_null() || url.is_null() {
+            return;
+        }
+        let instance = handle_to_ref(handle);
+        let url_str = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
 
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        let cmd = Command::LoadUrl {
-            browser_id: instance.browser_id,
-            url: url_str.to_string(),
-        };
-        send_command_no_wait(conn, cmd);
-    }
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            let cmd = Command::LoadUrl {
+                browser_id: instance.browser_id,
+                url: url_str.to_string(),
+            };
+            send_command_no_wait(conn, cmd);
+        }
+    })
 }
 
 /// Resize the browser viewport.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_resize(handle: *mut CefUnityBrowser, width: i32, height: i32) {
-    if handle.is_null() {
-        return;
-    }
-    let instance = handle_to_ref(handle);
+    ffi_guard((), || {
+        if handle.is_null() {
+            return;
+        }
+        let instance = handle_to_ref(handle);
 
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        let cmd = Command::Resize {
-            browser_id: instance.browser_id,
-            width,
-            height,
-        };
-        send_command_no_wait(conn, cmd);
-    }
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            let cmd = Command::Resize {
+                browser_id: instance.browser_id,
+                width,
+                height,
+            };
+            send_command_no_wait(conn, cmd);
+        }
+    })
 }
 
 /// Send a mouse move event.
@@ -648,23 +696,25 @@ pub extern "C" fn cef_unity_send_mouse_move(
     y: i32,
     modifiers: u32,
 ) {
-    if handle.is_null() {
-        return;
-    }
-    let instance = handle_to_ref(handle);
+    ffi_guard((), || {
+        if handle.is_null() {
+            return;
+        }
+        let instance = handle_to_ref(handle);
 
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        send_command_no_wait(
-            conn,
-            Command::MouseMove {
-                browser_id: instance.browser_id,
-                x,
-                y,
-                modifiers,
-            },
-        );
-    }
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            send_command_no_wait(
+                conn,
+                Command::MouseMove {
+                    browser_id: instance.browser_id,
+                    x,
+                    y,
+                    modifiers,
+                },
+            );
+        }
+    })
 }
 
 /// Send a mouse click event.
@@ -678,26 +728,28 @@ pub extern "C" fn cef_unity_send_mouse_click(
     mouse_up: i32,
     click_count: i32,
 ) {
-    if handle.is_null() {
-        return;
-    }
-    let instance = handle_to_ref(handle);
+    ffi_guard((), || {
+        if handle.is_null() {
+            return;
+        }
+        let instance = handle_to_ref(handle);
 
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        send_command_no_wait(
-            conn,
-            Command::MouseClick {
-                browser_id: instance.browser_id,
-                x,
-                y,
-                modifiers,
-                button,
-                mouse_up: mouse_up != 0,
-                click_count,
-            },
-        );
-    }
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            send_command_no_wait(
+                conn,
+                Command::MouseClick {
+                    browser_id: instance.browser_id,
+                    x,
+                    y,
+                    modifiers,
+                    button,
+                    mouse_up: mouse_up != 0,
+                    click_count,
+                },
+            );
+        }
+    })
 }
 
 /// Send a mouse wheel event.
@@ -710,25 +762,27 @@ pub extern "C" fn cef_unity_send_mouse_wheel(
     delta_x: i32,
     delta_y: i32,
 ) {
-    if handle.is_null() {
-        return;
-    }
-    let instance = handle_to_ref(handle);
+    ffi_guard((), || {
+        if handle.is_null() {
+            return;
+        }
+        let instance = handle_to_ref(handle);
 
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        send_command_no_wait(
-            conn,
-            Command::MouseWheel {
-                browser_id: instance.browser_id,
-                x,
-                y,
-                modifiers,
-                delta_x,
-                delta_y,
-            },
-        );
-    }
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            send_command_no_wait(
+                conn,
+                Command::MouseWheel {
+                    browser_id: instance.browser_id,
+                    x,
+                    y,
+                    modifiers,
+                    delta_x,
+                    delta_y,
+                },
+            );
+        }
+    })
 }
 
 /// Send a key event.
@@ -744,70 +798,76 @@ pub extern "C" fn cef_unity_send_key_event(
     is_system_key: i32,
     focus_on_editable_field: i32,
 ) {
-    if handle.is_null() {
-        return;
-    }
-    let instance = handle_to_ref(handle);
+    ffi_guard((), || {
+        if handle.is_null() {
+            return;
+        }
+        let instance = handle_to_ref(handle);
 
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        send_command_no_wait(
-            conn,
-            Command::KeyEvent {
-                browser_id: instance.browser_id,
-                event_type,
-                modifiers,
-                windows_key_code,
-                native_key_code,
-                character,
-                unmodified_character,
-                is_system_key,
-                focus_on_editable_field,
-            },
-        );
-    }
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            send_command_no_wait(
+                conn,
+                Command::KeyEvent {
+                    browser_id: instance.browser_id,
+                    event_type,
+                    modifiers,
+                    windows_key_code,
+                    native_key_code,
+                    character,
+                    unmodified_character,
+                    is_system_key,
+                    focus_on_editable_field,
+                },
+            );
+        }
+    })
 }
 
 /// Execute JavaScript in the browser's main frame.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_execute_javascript(handle: *mut CefUnityBrowser, code: *const c_char) {
-    if handle.is_null() || code.is_null() {
-        return;
-    }
-    let instance = handle_to_ref(handle);
-    let code_str = unsafe { CStr::from_ptr(code) }.to_str().unwrap_or("");
+    ffi_guard((), || {
+        if handle.is_null() || code.is_null() {
+            return;
+        }
+        let instance = handle_to_ref(handle);
+        let code_str = unsafe { CStr::from_ptr(code) }.to_str().unwrap_or("");
 
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        send_command_no_wait(
-            conn,
-            Command::ExecuteJavaScript {
-                browser_id: instance.browser_id,
-                code: code_str.to_string(),
-            },
-        );
-    }
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            send_command_no_wait(
+                conn,
+                Command::ExecuteJavaScript {
+                    browser_id: instance.browser_id,
+                    code: code_str.to_string(),
+                },
+            );
+        }
+    })
 }
 
 /// Execute an editing command (copy, paste, cut, select_all, undo, redo).
 /// command: 0=Copy, 1=Paste, 2=Cut, 3=SelectAll, 4=Undo, 5=Redo
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_edit_command(handle: *mut CefUnityBrowser, command: u8) {
-    if handle.is_null() {
-        return;
-    }
-    let instance = handle_to_ref(handle);
+    ffi_guard((), || {
+        if handle.is_null() {
+            return;
+        }
+        let instance = handle_to_ref(handle);
 
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        send_command_no_wait(
-            conn,
-            Command::EditCommand {
-                browser_id: instance.browser_id,
-                command,
-            },
-        );
-    }
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            send_command_no_wait(
+                conn,
+                Command::EditCommand {
+                    browser_id: instance.browser_id,
+                    command,
+                },
+            );
+        }
+    })
 }
 
 /// Get the browser's current main-frame URL as UTF-8 bytes.
@@ -818,47 +878,49 @@ pub extern "C" fn cef_unity_get_url(
     buffer: *mut u8,
     buffer_len: i32,
 ) -> i32 {
-    if handle.is_null() {
-        return 0;
-    }
-    let instance = handle_to_ref(handle);
-
-    let guard = CONNECTION.lock().unwrap();
-    let Some(conn) = guard.as_ref() else {
-        return 0;
-    };
-
-    let url = match send_command(
-        conn,
-        Command::GetCurrentUrl {
-            browser_id: instance.browser_id,
-        },
-    ) {
-        Ok(Response::CurrentUrl { url }) => url,
-        Ok(Response::Error { msg }) => {
-            log_to_file(&format!("get_url error: {}", msg));
+    ffi_guard(0, || {
+        if handle.is_null() {
             return 0;
         }
-        Ok(other) => {
-            log_to_file(&format!("get_url unexpected response: {:?}", other));
-            return 0;
-        }
-        Err(e) => {
-            log_to_file(&format!("get_url IPC error: {}", e));
-            return 0;
-        }
-    };
+        let instance = handle_to_ref(handle);
 
-    let bytes = url.as_bytes();
-    let required = bytes.len() + 1;
-    if !buffer.is_null() && buffer_len as usize >= required {
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len());
-            *buffer.add(bytes.len()) = 0;
-        }
-    }
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(conn) = guard.as_ref() else {
+            return 0;
+        };
 
-    required as i32
+        let url = match send_command(
+            conn,
+            Command::GetCurrentUrl {
+                browser_id: instance.browser_id,
+            },
+        ) {
+            Ok(Response::CurrentUrl { url }) => url,
+            Ok(Response::Error { msg }) => {
+                log_to_file(&format!("get_url error: {}", msg));
+                return 0;
+            }
+            Ok(other) => {
+                log_to_file(&format!("get_url unexpected response: {:?}", other));
+                return 0;
+            }
+            Err(e) => {
+                log_to_file(&format!("get_url IPC error: {}", e));
+                return 0;
+            }
+        };
+
+        let bytes = url.as_bytes();
+        let required = bytes.len() + 1;
+        if !buffer.is_null() && buffer_len as usize >= required {
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len());
+                *buffer.add(bytes.len()) = 0;
+            }
+        }
+
+        required as i32
+    })
 }
 
 /// Get the latest frame buffer from shared memory.
@@ -870,30 +932,32 @@ pub extern "C" fn cef_unity_get_buffer(
     out_width: *mut i32,
     out_height: *mut i32,
 ) -> i32 {
-    if handle.is_null() || out_buffer.is_null() || out_width.is_null() || out_height.is_null() {
-        return 0;
-    }
-    let instance = handle_to_ref(handle);
+    ffi_guard(0, || {
+        if handle.is_null() || out_buffer.is_null() || out_width.is_null() || out_height.is_null() {
+            return 0;
+        }
+        let instance = handle_to_ref(handle);
 
-    match instance.shm.get_active_buffer_ptr() {
-        Some((ptr, w, h)) => {
-            PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
-            unsafe {
-                *out_buffer = ptr;
-                *out_width = w as i32;
-                *out_height = h as i32;
+        match instance.shm.get_active_buffer_ptr() {
+            Some((ptr, w, h)) => {
+                PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
+                unsafe {
+                    *out_buffer = ptr;
+                    *out_width = w as i32;
+                    *out_height = h as i32;
+                }
+                1
             }
-            1
-        }
-        None => {
-            unsafe {
-                *out_buffer = std::ptr::null();
-                *out_width = 0;
-                *out_height = 0;
+            None => {
+                unsafe {
+                    *out_buffer = std::ptr::null();
+                    *out_width = 0;
+                    *out_height = 0;
+                }
+                0
             }
-            0
         }
-    }
+    })
 }
 
 /// Read the IME caret rect from shared memory.
@@ -905,17 +969,19 @@ pub extern "C" fn cef_unity_get_ime_caret(
     out_w: *mut i32,
     out_h: *mut i32,
 ) {
-    if handle.is_null() {
-        return;
-    }
-    let instance = handle_to_ref(handle);
-    let (x, y, w, h) = instance.shm.read_ime_caret();
-    unsafe {
-        *out_x = x;
-        *out_y = y;
-        *out_w = w;
-        *out_h = h;
-    }
+    ffi_guard((), || {
+        if handle.is_null() {
+            return;
+        }
+        let instance = handle_to_ref(handle);
+        let (x, y, w, h) = instance.shm.read_ime_caret();
+        unsafe {
+            *out_x = x;
+            *out_y = y;
+            *out_w = w;
+            *out_h = h;
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -932,23 +998,25 @@ pub extern "C" fn cef_unity_get_audio_format(
     out_sample_rate: *mut u32,
     out_channels: *mut u32,
 ) -> i32 {
-    if handle.is_null() {
-        return 0;
-    }
-    let instance = handle_to_ref(handle);
-    let Some(reader) = instance.audio_shm.as_ref() else {
-        return 0;
-    };
-    let (sample_rate, channels, active) = reader.format();
-    unsafe {
-        if !out_sample_rate.is_null() {
-            *out_sample_rate = sample_rate;
+    ffi_guard(0, || {
+        if handle.is_null() {
+            return 0;
         }
-        if !out_channels.is_null() {
-            *out_channels = channels;
+        let instance = handle_to_ref(handle);
+        let Some(reader) = instance.audio_shm.as_ref() else {
+            return 0;
+        };
+        let (sample_rate, channels, active) = reader.format();
+        unsafe {
+            if !out_sample_rate.is_null() {
+                *out_sample_rate = sample_rate;
+            }
+            if !out_channels.is_null() {
+                *out_channels = channels;
+            }
         }
-    }
-    if active { 1 } else { 0 }
+        if active { 1 } else { 0 }
+    })
 }
 
 /// 音声リングバッファから未読の PCM を読み出す。
@@ -967,26 +1035,28 @@ pub extern "C" fn cef_unity_read_audio(
     max_frames: i32,
     out_channels: *mut u32,
 ) -> i32 {
-    if handle.is_null() || out_samples.is_null() || max_frames <= 0 {
-        return 0;
-    }
-    let instance = handle_to_ref(handle);
-    let Some(reader) = instance.audio_shm.as_mut() else {
-        return 0;
-    };
-    let max_frames = max_frames as usize;
-    // 出力スライス長は最悪ケース (AUDIO_MAX_CHANNELS) を仮定して構築する。
-    // read() は実 channels に基づき max_frames*channels までしか書き込まない。
-    let out = unsafe {
-        std::slice::from_raw_parts_mut(out_samples, max_frames * cef_unity_ipc::AUDIO_MAX_CHANNELS)
-    };
-    let (frames, channels) = reader.read(out, max_frames);
-    unsafe {
-        if !out_channels.is_null() {
-            *out_channels = channels as u32;
+    ffi_guard(0, || {
+        if handle.is_null() || out_samples.is_null() || max_frames <= 0 {
+            return 0;
         }
-    }
-    frames as i32
+        let instance = handle_to_ref(handle);
+        let Some(reader) = instance.audio_shm.as_mut() else {
+            return 0;
+        };
+        let max_frames = max_frames as usize;
+        // 出力スライス長は最悪ケース (AUDIO_MAX_CHANNELS) を仮定して構築する。
+        // read() は実 channels に基づき max_frames*channels までしか書き込まない。
+        let out = unsafe {
+            std::slice::from_raw_parts_mut(out_samples, max_frames * cef_unity_ipc::AUDIO_MAX_CHANNELS)
+        };
+        let (frames, channels) = reader.read(out, max_frames);
+        unsafe {
+            if !out_channels.is_null() {
+                *out_channels = channels as u32;
+            }
+        }
+        frames as i32
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,72 +1079,78 @@ pub extern "C" fn cef_unity_audio_native_start(
     target_ms: f32,
     io_frames: i32,
 ) -> i32 {
-    if handle.is_null() {
-        return -1;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let instance = handle_to_ref(handle);
-        if instance.native_voice.is_some() {
-            return 0;
-        }
-        if instance.audio_flink.is_empty() {
+    ffi_guard(-1, || {
+        if handle.is_null() {
             return -1;
         }
-        match native_voice::NativeVoice::start(&instance.audio_flink, target_ms, io_frames) {
-            Ok(v) => {
-                instance.native_voice = Some(v);
-                log_to_file(&format!(
-                    "native audio started (target={}ms io_frames={})",
-                    target_ms, io_frames
-                ));
-                0
+        #[cfg(target_os = "macos")]
+        {
+            let instance = handle_to_ref(handle);
+            if instance.native_voice.is_some() {
+                return 0;
             }
-            Err(e) => {
-                log_to_file(&format!("native audio start failed: {}", e));
-                -1
+            if instance.audio_flink.is_empty() {
+                return -1;
+            }
+            match native_voice::NativeVoice::start(&instance.audio_flink, target_ms, io_frames) {
+                Ok(v) => {
+                    instance.native_voice = Some(v);
+                    log_to_file(&format!(
+                        "native audio started (target={}ms io_frames={})",
+                        target_ms, io_frames
+                    ));
+                    0
+                }
+                Err(e) => {
+                    log_to_file(&format!("native audio start failed: {}", e));
+                    -1
+                }
             }
         }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (target_ms, io_frames);
-        -1
-    }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (target_ms, io_frames);
+            -1
+        }
+    })
 }
 
 /// ネイティブ音声出力を停止する (排水待ちして返る)。未開始なら何もしない。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_audio_native_stop(handle: *mut CefUnityBrowser) {
-    if handle.is_null() {
-        return;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let instance = handle_to_ref(handle);
-        if instance.native_voice.take().is_some() {
-            log_to_file("native audio stopped");
+    ffi_guard((), || {
+        if handle.is_null() {
+            return;
         }
-    }
+        #[cfg(target_os = "macos")]
+        {
+            let instance = handle_to_ref(handle);
+            if instance.native_voice.take().is_some() {
+                log_to_file("native audio stopped");
+            }
+        }
+    })
 }
 
 /// ネイティブ音声出力の音量 (0.0〜)。callback 内で乗算される。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_audio_native_set_volume(handle: *mut CefUnityBrowser, volume: f32) {
-    if handle.is_null() {
-        return;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let instance = handle_to_ref(handle);
-        if let Some(v) = instance.native_voice.as_ref() {
-            v.set_volume(volume);
+    ffi_guard((), || {
+        if handle.is_null() {
+            return;
         }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = volume;
-    }
+        #[cfg(target_os = "macos")]
+        {
+            let instance = handle_to_ref(handle);
+            if let Some(v) = instance.native_voice.as_ref() {
+                v.set_volume(volume);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = volume;
+        }
+    })
 }
 
 /// ネイティブ音声出力の診断値を取得する。
@@ -1088,34 +1164,36 @@ pub extern "C" fn cef_unity_audio_native_stats(
     out_underrun_frames: *mut u64,
     out_overflow_frames: *mut u64,
 ) -> i32 {
-    if handle.is_null() {
-        return -1;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let instance = handle_to_ref(handle);
-        let Some(v) = instance.native_voice.as_ref() else {
+    ffi_guard(-1, || {
+        if handle.is_null() {
             return -1;
-        };
-        let (occ_ms, under, over) = v.stats();
-        unsafe {
-            if !out_occupancy_ms.is_null() {
-                *out_occupancy_ms = occ_ms;
-            }
-            if !out_underrun_frames.is_null() {
-                *out_underrun_frames = under;
-            }
-            if !out_overflow_frames.is_null() {
-                *out_overflow_frames = over;
-            }
         }
-        0
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (out_occupancy_ms, out_underrun_frames, out_overflow_frames);
-        -1
-    }
+        #[cfg(target_os = "macos")]
+        {
+            let instance = handle_to_ref(handle);
+            let Some(v) = instance.native_voice.as_ref() else {
+                return -1;
+            };
+            let (occ_ms, under, over) = v.stats();
+            unsafe {
+                if !out_occupancy_ms.is_null() {
+                    *out_occupancy_ms = occ_ms;
+                }
+                if !out_underrun_frames.is_null() {
+                    *out_underrun_frames = under;
+                }
+                if !out_overflow_frames.is_null() {
+                    *out_overflow_frames = over;
+                }
+            }
+            0
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (out_occupancy_ms, out_underrun_frames, out_overflow_frames);
+            -1
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,24 +1219,26 @@ fn blocking_simple(conn: &ServerConnection, cmd: Command) -> i32 {
 /// Destroy a browser instance (blocking).
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_destroy_browser_blocking(handle: *mut CefUnityBrowser) -> i32 {
-    if handle.is_null() {
-        return -1;
-    }
-    let mut instance = unsafe { Box::from_raw(handle as *mut ClientBrowserInstance) };
-    stop_native_voice(&mut instance);
-    let guard = CONNECTION.lock().unwrap();
-    let result = if let Some(conn) = guard.as_ref() {
-        blocking_simple(
-            conn,
-            Command::DestroyBrowser {
-                browser_id: instance.browser_id,
-            },
-        )
-    } else {
-        -1
-    };
-    drop(instance);
-    result
+    ffi_guard(-1, || {
+        if handle.is_null() {
+            return -1;
+        }
+        let mut instance = unsafe { Box::from_raw(handle as *mut ClientBrowserInstance) };
+        stop_native_voice(&mut instance);
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        let result = if let Some(conn) = guard.as_ref() {
+            blocking_simple(
+                conn,
+                Command::DestroyBrowser {
+                    browser_id: instance.browser_id,
+                },
+            )
+        } else {
+            -1
+        };
+        drop(instance);
+        result
+    })
 }
 
 /// Load a URL in the browser (blocking).
@@ -1167,23 +1247,25 @@ pub extern "C" fn cef_unity_load_url_blocking(
     handle: *mut CefUnityBrowser,
     url: *const c_char,
 ) -> i32 {
-    if handle.is_null() || url.is_null() {
-        return -1;
-    }
-    let instance = handle_to_ref(handle);
-    let url_str = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        blocking_simple(
-            conn,
-            Command::LoadUrl {
-                browser_id: instance.browser_id,
-                url: url_str.to_string(),
-            },
-        )
-    } else {
-        -1
-    }
+    ffi_guard(-1, || {
+        if handle.is_null() || url.is_null() {
+            return -1;
+        }
+        let instance = handle_to_ref(handle);
+        let url_str = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            blocking_simple(
+                conn,
+                Command::LoadUrl {
+                    browser_id: instance.browser_id,
+                    url: url_str.to_string(),
+                },
+            )
+        } else {
+            -1
+        }
+    })
 }
 
 /// Resize the browser viewport (blocking).
@@ -1193,23 +1275,25 @@ pub extern "C" fn cef_unity_resize_blocking(
     width: i32,
     height: i32,
 ) -> i32 {
-    if handle.is_null() {
-        return -1;
-    }
-    let instance = handle_to_ref(handle);
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        blocking_simple(
-            conn,
-            Command::Resize {
-                browser_id: instance.browser_id,
-                width,
-                height,
-            },
-        )
-    } else {
-        -1
-    }
+    ffi_guard(-1, || {
+        if handle.is_null() {
+            return -1;
+        }
+        let instance = handle_to_ref(handle);
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            blocking_simple(
+                conn,
+                Command::Resize {
+                    browser_id: instance.browser_id,
+                    width,
+                    height,
+                },
+            )
+        } else {
+            -1
+        }
+    })
 }
 
 /// Send a mouse move event (blocking).
@@ -1220,24 +1304,26 @@ pub extern "C" fn cef_unity_send_mouse_move_blocking(
     y: i32,
     modifiers: u32,
 ) -> i32 {
-    if handle.is_null() {
-        return -1;
-    }
-    let instance = handle_to_ref(handle);
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        blocking_simple(
-            conn,
-            Command::MouseMove {
-                browser_id: instance.browser_id,
-                x,
-                y,
-                modifiers,
-            },
-        )
-    } else {
-        -1
-    }
+    ffi_guard(-1, || {
+        if handle.is_null() {
+            return -1;
+        }
+        let instance = handle_to_ref(handle);
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            blocking_simple(
+                conn,
+                Command::MouseMove {
+                    browser_id: instance.browser_id,
+                    x,
+                    y,
+                    modifiers,
+                },
+            )
+        } else {
+            -1
+        }
+    })
 }
 
 /// Send a mouse click event (blocking).
@@ -1251,27 +1337,29 @@ pub extern "C" fn cef_unity_send_mouse_click_blocking(
     mouse_up: i32,
     click_count: i32,
 ) -> i32 {
-    if handle.is_null() {
-        return -1;
-    }
-    let instance = handle_to_ref(handle);
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        blocking_simple(
-            conn,
-            Command::MouseClick {
-                browser_id: instance.browser_id,
-                x,
-                y,
-                modifiers,
-                button,
-                mouse_up: mouse_up != 0,
-                click_count,
-            },
-        )
-    } else {
-        -1
-    }
+    ffi_guard(-1, || {
+        if handle.is_null() {
+            return -1;
+        }
+        let instance = handle_to_ref(handle);
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            blocking_simple(
+                conn,
+                Command::MouseClick {
+                    browser_id: instance.browser_id,
+                    x,
+                    y,
+                    modifiers,
+                    button,
+                    mouse_up: mouse_up != 0,
+                    click_count,
+                },
+            )
+        } else {
+            -1
+        }
+    })
 }
 
 /// Send a mouse wheel event (blocking).
@@ -1284,26 +1372,28 @@ pub extern "C" fn cef_unity_send_mouse_wheel_blocking(
     delta_x: i32,
     delta_y: i32,
 ) -> i32 {
-    if handle.is_null() {
-        return -1;
-    }
-    let instance = handle_to_ref(handle);
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        blocking_simple(
-            conn,
-            Command::MouseWheel {
-                browser_id: instance.browser_id,
-                x,
-                y,
-                modifiers,
-                delta_x,
-                delta_y,
-            },
-        )
-    } else {
-        -1
-    }
+    ffi_guard(-1, || {
+        if handle.is_null() {
+            return -1;
+        }
+        let instance = handle_to_ref(handle);
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            blocking_simple(
+                conn,
+                Command::MouseWheel {
+                    browser_id: instance.browser_id,
+                    x,
+                    y,
+                    modifiers,
+                    delta_x,
+                    delta_y,
+                },
+            )
+        } else {
+            -1
+        }
+    })
 }
 
 /// Send a key event (blocking).
@@ -1319,29 +1409,31 @@ pub extern "C" fn cef_unity_send_key_event_blocking(
     is_system_key: i32,
     focus_on_editable_field: i32,
 ) -> i32 {
-    if handle.is_null() {
-        return -1;
-    }
-    let instance = handle_to_ref(handle);
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        blocking_simple(
-            conn,
-            Command::KeyEvent {
-                browser_id: instance.browser_id,
-                event_type,
-                modifiers,
-                windows_key_code,
-                native_key_code,
-                character,
-                unmodified_character,
-                is_system_key,
-                focus_on_editable_field,
-            },
-        )
-    } else {
-        -1
-    }
+    ffi_guard(-1, || {
+        if handle.is_null() {
+            return -1;
+        }
+        let instance = handle_to_ref(handle);
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            blocking_simple(
+                conn,
+                Command::KeyEvent {
+                    browser_id: instance.browser_id,
+                    event_type,
+                    modifiers,
+                    windows_key_code,
+                    native_key_code,
+                    character,
+                    unmodified_character,
+                    is_system_key,
+                    focus_on_editable_field,
+                },
+            )
+        } else {
+            -1
+        }
+    })
 }
 
 /// Set IME composition text (preedit).
@@ -1352,45 +1444,49 @@ pub extern "C" fn cef_unity_ime_set_composition(
     selection_start: u32,
     selection_end: u32,
 ) {
-    if handle.is_null() || text.is_null() {
-        return;
-    }
-    let instance = handle_to_ref(handle);
-    let text_str = unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("");
+    ffi_guard((), || {
+        if handle.is_null() || text.is_null() {
+            return;
+        }
+        let instance = handle_to_ref(handle);
+        let text_str = unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("");
 
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        send_command_no_wait(
-            conn,
-            Command::ImeSetComposition {
-                browser_id: instance.browser_id,
-                text: text_str.to_string(),
-                selection_start,
-                selection_end,
-            },
-        );
-    }
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            send_command_no_wait(
+                conn,
+                Command::ImeSetComposition {
+                    browser_id: instance.browser_id,
+                    text: text_str.to_string(),
+                    selection_start,
+                    selection_end,
+                },
+            );
+        }
+    })
 }
 
 /// Commit IME text (finalize composition and insert text).
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_ime_commit_text(handle: *mut CefUnityBrowser, text: *const c_char) {
-    if handle.is_null() || text.is_null() {
-        return;
-    }
-    let instance = handle_to_ref(handle);
-    let text_str = unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("");
+    ffi_guard((), || {
+        if handle.is_null() || text.is_null() {
+            return;
+        }
+        let instance = handle_to_ref(handle);
+        let text_str = unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("");
 
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        send_command_no_wait(
-            conn,
-            Command::ImeCommitText {
-                browser_id: instance.browser_id,
-                text: text_str.to_string(),
-            },
-        );
-    }
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            send_command_no_wait(
+                conn,
+                Command::ImeCommitText {
+                    browser_id: instance.browser_id,
+                    text: text_str.to_string(),
+                },
+            );
+        }
+    })
 }
 
 /// Finish composing text (apply current composition).
@@ -1399,21 +1495,23 @@ pub extern "C" fn cef_unity_ime_finish_composing_text(
     handle: *mut CefUnityBrowser,
     keep_selection: i32,
 ) {
-    if handle.is_null() {
-        return;
-    }
-    let instance = handle_to_ref(handle);
+    ffi_guard((), || {
+        if handle.is_null() {
+            return;
+        }
+        let instance = handle_to_ref(handle);
 
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        send_command_no_wait(
-            conn,
-            Command::ImeFinishComposingText {
-                browser_id: instance.browser_id,
-                keep_selection: keep_selection != 0,
-            },
-        );
-    }
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            send_command_no_wait(
+                conn,
+                Command::ImeFinishComposingText {
+                    browser_id: instance.browser_id,
+                    keep_selection: keep_selection != 0,
+                },
+            );
+        }
+    })
 }
 
 /// External BeginFrame: CEF Viz Compositor に次フレームの描画許可を出す。
@@ -1426,21 +1524,23 @@ pub extern "C" fn cef_unity_send_external_begin_frame(
     handle: *mut CefUnityBrowser,
     unity_frame: u64,
 ) {
-    if handle.is_null() {
-        return;
-    }
-    let instance = handle_to_ref(handle);
+    ffi_guard((), || {
+        if handle.is_null() {
+            return;
+        }
+        let instance = handle_to_ref(handle);
 
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        send_command_no_wait(
-            conn,
-            Command::SendExternalBeginFrame {
-                browser_id: instance.browser_id,
-                unity_frame,
-            },
-        );
-    }
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            send_command_no_wait(
+                conn,
+                Command::SendExternalBeginFrame {
+                    browser_id: instance.browser_id,
+                    unity_frame,
+                },
+            );
+        }
+    })
 }
 
 /// 最後の on_accelerated_paint に対応する SendExternalBeginFrame 発行時の Unity frame
@@ -1448,11 +1548,13 @@ pub extern "C" fn cef_unity_send_external_begin_frame(
 /// (BeginFrame 発行から実際にテクスチャが使えるようになるまで) を計算できる。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_get_accel_paint_unity_frame(handle: *mut CefUnityBrowser) -> u64 {
-    if handle.is_null() {
-        return 0;
-    }
-    let instance = handle_to_ref(handle);
-    instance.shm.read_paint_unity_frame()
+    ffi_guard(0, || {
+        if handle.is_null() {
+            return 0;
+        }
+        let instance = handle_to_ref(handle);
+        instance.shm.read_paint_unity_frame()
+    })
 }
 
 /// accelerated paint の単調増加カウンタ (accel_frame_id) を消費せずに返す。
@@ -1461,30 +1563,34 @@ pub extern "C" fn cef_unity_get_accel_paint_unity_frame(handle: *mut CefUnityBro
 /// 受信ポートに届いていることが保証される (server は Mach 送信完了後に +1 する)。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_peek_accel_frame_id(handle: *mut CefUnityBrowser) -> u64 {
-    if handle.is_null() {
-        return 0;
-    }
-    let instance = handle_to_ref(handle);
-    instance.shm.peek_accel_frame_id()
+    ffi_guard(0, || {
+        if handle.is_null() {
+            return 0;
+        }
+        let instance = handle_to_ref(handle);
+        instance.shm.peek_accel_frame_id()
+    })
 }
 
 /// Cancel the current IME composition.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_ime_cancel_composition(handle: *mut CefUnityBrowser) {
-    if handle.is_null() {
-        return;
-    }
-    let instance = handle_to_ref(handle);
+    ffi_guard((), || {
+        if handle.is_null() {
+            return;
+        }
+        let instance = handle_to_ref(handle);
 
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        send_command_no_wait(
-            conn,
-            Command::ImeCancelComposition {
-                browser_id: instance.browser_id,
-            },
-        );
-    }
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            send_command_no_wait(
+                conn,
+                Command::ImeCancelComposition {
+                    browser_id: instance.browser_id,
+                },
+            );
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1522,37 +1628,39 @@ pub extern "C" fn cef_unity_get_iosurface_info(
     out_height: *mut i32,
     out_format: *mut u32,
 ) -> i32 {
-    static ACCEL_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+    ffi_guard(0, || {
+        static ACCEL_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 
-    if handle.is_null()
-        || out_surface_id.is_null()
-        || out_width.is_null()
-        || out_height.is_null()
-        || out_format.is_null()
-    {
-        return 0;
-    }
-    let instance = handle_to_ref(handle);
-
-    match instance.shm.get_iosurface_info() {
-        Some((surface_id, w, h, format)) => {
-            let count = ACCEL_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-            if count <= 5 || count % 100 == 0 {
-                log_to_file(&format!(
-                    "get_iosurface_info #{}: surface_id={} {}x{} fmt={}",
-                    count, surface_id, w, h, format
-                ));
-            }
-            unsafe {
-                *out_surface_id = surface_id;
-                *out_width = w as i32;
-                *out_height = h as i32;
-                *out_format = format;
-            }
-            1
+        if handle.is_null()
+            || out_surface_id.is_null()
+            || out_width.is_null()
+            || out_height.is_null()
+            || out_format.is_null()
+        {
+            return 0;
         }
-        None => 0,
-    }
+        let instance = handle_to_ref(handle);
+
+        match instance.shm.get_iosurface_info() {
+            Some((surface_id, w, h, format)) => {
+                let count = ACCEL_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if count <= 5 || count % 100 == 0 {
+                    log_to_file(&format!(
+                        "get_iosurface_info #{}: surface_id={} {}x{} fmt={}",
+                        count, surface_id, w, h, format
+                    ));
+                }
+                unsafe {
+                    *out_surface_id = surface_id;
+                    *out_width = w as i32;
+                    *out_height = h as i32;
+                    *out_format = format;
+                }
+                1
+            }
+            None => 0,
+        }
+    })
 }
 
 /// Create a Metal texture backed by an IOSurface.
@@ -1565,15 +1673,17 @@ pub extern "C" fn cef_unity_create_metal_texture(
     height: i32,
     format: u32,
 ) -> *mut std::ffi::c_void {
-    #[cfg(target_os = "macos")]
-    {
-        unsafe { cef_unity_create_metal_texture_objc(surface_id, width, height, format) }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (surface_id, width, height, format);
-        std::ptr::null_mut()
-    }
+    ffi_guard(std::ptr::null_mut(), || {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe { cef_unity_create_metal_texture_objc(surface_id, width, height, format) }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (surface_id, width, height, format);
+            std::ptr::null_mut()
+        }
+    })
 }
 
 /// Receive the latest IOSurface from the server via Mach port and create a Metal texture.
@@ -1585,23 +1695,25 @@ pub extern "C" fn cef_unity_recv_iosurface_texture(
     out_height: *mut i32,
     out_format: *mut u32,
 ) -> *mut std::ffi::c_void {
-    if out_width.is_null() || out_height.is_null() || out_format.is_null() {
-        return std::ptr::null_mut();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if !IOSURFACE_CONNECTED.load(Ordering::SeqCst) {
+    ffi_guard(std::ptr::null_mut(), || {
+        if out_width.is_null() || out_height.is_null() || out_format.is_null() {
             return std::ptr::null_mut();
         }
-        unsafe {
-            mach_iosurface_recv_texture(out_width, out_height, out_format)
+        #[cfg(target_os = "macos")]
+        {
+            if !IOSURFACE_CONNECTED.load(Ordering::SeqCst) {
+                return std::ptr::null_mut();
+            }
+            unsafe {
+                mach_iosurface_recv_texture(out_width, out_height, out_format)
+            }
         }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (out_width, out_height, out_format);
-        std::ptr::null_mut()
-    }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (out_width, out_height, out_format);
+            std::ptr::null_mut()
+        }
+    })
 }
 
 
@@ -1609,25 +1721,29 @@ pub extern "C" fn cef_unity_recv_iosurface_texture(
 /// CPU モード (Init で use_gpu=0) のときは常に 0 を返す。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_is_iosurface_connected() -> i32 {
-    if !USE_GPU_MODE.load(Ordering::SeqCst) {
-        return 0;
-    }
-    if IOSURFACE_CONNECTED.load(Ordering::SeqCst) { 1 } else { 0 }
+    ffi_guard(0, || {
+        if !USE_GPU_MODE.load(Ordering::SeqCst) {
+            return 0;
+        }
+        if IOSURFACE_CONNECTED.load(Ordering::SeqCst) { 1 } else { 0 }
+    })
 }
 
 /// Release a Metal texture previously created by cef_unity_create_metal_texture.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_release_metal_texture(texture: *mut std::ffi::c_void) {
-    #[cfg(target_os = "macos")]
-    {
-        unsafe {
-            cef_unity_release_metal_texture_objc(texture);
+    ffi_guard((), || {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe {
+                cef_unity_release_metal_texture_objc(texture);
+            }
         }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = texture;
-    }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = texture;
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1641,50 +1757,52 @@ static CACHED_LOGS: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 /// If buffer is non-null, copies cached data into buffer and clears the cache.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_get_logs(buffer: *mut u8, buffer_len: i32) -> i32 {
-    if !INITIALIZED.load(Ordering::SeqCst) {
-        return 0;
-    }
-
-    if buffer.is_null() {
-        // Phase 1: fetch from server and cache
-        let guard = CONNECTION.lock().unwrap();
-        let Some(conn) = guard.as_ref() else {
-            return 0;
-        };
-
-        let entries = match send_command(conn, Command::GetLogs) {
-            Ok(Response::Logs { entries }) => entries,
-            _ => return 0,
-        };
-
-        if entries.is_empty() {
-            *CACHED_LOGS.lock().unwrap() = None;
+    ffi_guard(0, || {
+        if !INITIALIZED.load(Ordering::SeqCst) {
             return 0;
         }
 
-        // Encode as "msg1\0msg2\0" (trailing NUL included)
-        let mut encoded = Vec::new();
-        for entry in &entries {
-            encoded.extend_from_slice(entry.as_bytes());
-            encoded.push(0);
-        }
+        if buffer.is_null() {
+            // Phase 1: fetch from server and cache
+            let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(conn) = guard.as_ref() else {
+                return 0;
+            };
 
-        let size = encoded.len() as i32;
-        *CACHED_LOGS.lock().unwrap() = Some(encoded);
-        size
-    } else {
-        // Phase 2: copy cached data to buffer
-        let mut cache = CACHED_LOGS.lock().unwrap();
-        let Some(data) = cache.take() else {
-            return 0;
-        };
+            let entries = match send_command(conn, Command::GetLogs) {
+                Ok(Response::Logs { entries }) => entries,
+                _ => return 0,
+            };
 
-        let copy_len = data.len().min(buffer_len as usize);
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), buffer, copy_len);
+            if entries.is_empty() {
+                *CACHED_LOGS.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                return 0;
+            }
+
+            // Encode as "msg1\0msg2\0" (trailing NUL included)
+            let mut encoded = Vec::new();
+            for entry in &entries {
+                encoded.extend_from_slice(entry.as_bytes());
+                encoded.push(0);
+            }
+
+            let size = encoded.len() as i32;
+            *CACHED_LOGS.lock().unwrap_or_else(PoisonError::into_inner) = Some(encoded);
+            size
+        } else {
+            // Phase 2: copy cached data to buffer
+            let mut cache = CACHED_LOGS.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(data) = cache.take() else {
+                return 0;
+            };
+
+            let copy_len = data.len().min(buffer_len as usize);
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), buffer, copy_len);
+            }
+            copy_len as i32
         }
-        copy_len as i32
-    }
+    })
 }
 
 /// Execute JavaScript in the browser's main frame (blocking).
@@ -1693,23 +1811,25 @@ pub extern "C" fn cef_unity_execute_javascript_blocking(
     handle: *mut CefUnityBrowser,
     code: *const c_char,
 ) -> i32 {
-    if handle.is_null() || code.is_null() {
-        return -1;
-    }
-    let instance = handle_to_ref(handle);
-    let code_str = unsafe { CStr::from_ptr(code) }.to_str().unwrap_or("");
-    let guard = CONNECTION.lock().unwrap();
-    if let Some(conn) = guard.as_ref() {
-        blocking_simple(
-            conn,
-            Command::ExecuteJavaScript {
-                browser_id: instance.browser_id,
-                code: code_str.to_string(),
-            },
-        )
-    } else {
-        -1
-    }
+    ffi_guard(-1, || {
+        if handle.is_null() || code.is_null() {
+            return -1;
+        }
+        let instance = handle_to_ref(handle);
+        let code_str = unsafe { CStr::from_ptr(code) }.to_str().unwrap_or("");
+        let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(conn) = guard.as_ref() {
+            blocking_simple(
+                conn,
+                Command::ExecuteJavaScript {
+                    browser_id: instance.browser_id,
+                    code: code_str.to_string(),
+                },
+            )
+        } else {
+            -1
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1722,51 +1842,57 @@ pub extern "C" fn cef_unity_execute_javascript_blocking(
 /// 非 Windows プラットフォームでは何もしない。
 #[unsafe(no_mangle)]
 pub extern "C" fn UnityPluginLoad(unity_interfaces: *mut std::ffi::c_void) {
-    log_to_file(&format!(
-        "UnityPluginLoad called (interfaces={:p})",
-        unity_interfaces
-    ));
-    #[cfg(target_os = "windows")]
-    {
-        d3d11::set_unity_interfaces(unity_interfaces as *mut d3d11::IUnityInterfaces);
-        d3d12::set_unity_interfaces(unity_interfaces);
+    ffi_guard((), || {
         log_to_file(&format!(
-            "UnityPluginLoad: d3d11_connected={} d3d12_connected={}",
-            d3d11::is_connected(),
-            d3d12::is_connected()
+            "UnityPluginLoad called (interfaces={:p})",
+            unity_interfaces
         ));
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = unity_interfaces;
-    }
+        #[cfg(target_os = "windows")]
+        {
+            d3d11::set_unity_interfaces(unity_interfaces as *mut d3d11::IUnityInterfaces);
+            d3d12::set_unity_interfaces(unity_interfaces);
+            log_to_file(&format!(
+                "UnityPluginLoad: d3d11_connected={} d3d12_connected={}",
+                d3d11::is_connected(),
+                d3d12::is_connected()
+            ));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = unity_interfaces;
+        }
+    })
 }
 
 /// Unity Native Plugin Interface のアンロード。Unity が DLL アンロード時に呼ぶ。
 #[unsafe(no_mangle)]
 pub extern "C" fn UnityPluginUnload() {
-    #[cfg(target_os = "windows")]
-    {
-        d3d11::clear_unity_interfaces();
-        d3d12::clear_unity_interfaces();
-    }
+    ffi_guard((), || {
+        #[cfg(target_os = "windows")]
+        {
+            d3d11::clear_unity_interfaces();
+            d3d12::clear_unity_interfaces();
+        }
+    })
 }
 
 /// Windows: Unity の D3D11 device に接続済みなら 1 を返す。
 /// CPU モード (Init で use_gpu=0) のときは常に 0 を返す。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_is_d3d11_connected() -> i32 {
-    if !USE_GPU_MODE.load(Ordering::SeqCst) {
-        return 0;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if d3d11::is_connected() { 1 } else { 0 }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        0
-    }
+    ffi_guard(0, || {
+        if !USE_GPU_MODE.load(Ordering::SeqCst) {
+            return 0;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if d3d11::is_connected() { 1 } else { 0 }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            0
+        }
+    })
 }
 
 /// Windows: Unity の D3D12 device に接続済みなら 1 を返す。
@@ -1774,17 +1900,19 @@ pub extern "C" fn cef_unity_is_d3d11_connected() -> i32 {
 /// CPU モード (Init で use_gpu=0) のときは常に 0 を返す。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_is_d3d12_connected() -> i32 {
-    if !USE_GPU_MODE.load(Ordering::SeqCst) {
-        return 0;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if d3d12::is_connected() { 1 } else { 0 }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        0
-    }
+    ffi_guard(0, || {
+        if !USE_GPU_MODE.load(Ordering::SeqCst) {
+            return 0;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if d3d12::is_connected() { 1 } else { 0 }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            0
+        }
+    })
 }
 
 /// Windows: 共有メモリから最新の D3D11 共有 HANDLE を読み出し、
@@ -1800,39 +1928,41 @@ pub extern "C" fn cef_unity_recv_d3d11_texture(
     out_height: *mut i32,
     out_format: *mut u32,
 ) -> *mut std::ffi::c_void {
-    if handle.is_null() || out_width.is_null() || out_height.is_null() || out_format.is_null() {
-        return std::ptr::null_mut();
-    }
+    ffi_guard(std::ptr::null_mut(), || {
+        if handle.is_null() || out_width.is_null() || out_height.is_null() || out_format.is_null() {
+            return std::ptr::null_mut();
+        }
 
-    #[cfg(target_os = "windows")]
-    {
-        let instance = handle_to_ref(handle);
-        let Some((handle_value, w, h, format, fence_value)) = instance.shm.get_d3d11_handle()
-        else {
-            // 新フレーム無し: 前回開いたテクスチャを Unity 側で使い続けてもらう (null 返却)。
-            return std::ptr::null_mut();
-        };
-        // GPU-side wait: Unity の immediate context に fence_value 到達待ちを発行する。
-        // CPU はブロックせず、Unity の以降の描画コマンドが GPU 上で server.Copy 完了を待つ。
-        if let Err(e) = d3d11::wait_fence(fence_value) {
-            log_to_file(&format!("d3d11::wait_fence({}) failed: {}", fence_value, e));
+        #[cfg(target_os = "windows")]
+        {
+            let instance = handle_to_ref(handle);
+            let Some((handle_value, w, h, format, fence_value)) = instance.shm.get_d3d11_handle()
+            else {
+                // 新フレーム無し: 前回開いたテクスチャを Unity 側で使い続けてもらう (null 返却)。
+                return std::ptr::null_mut();
+            };
+            // GPU-side wait: Unity の immediate context に fence_value 到達待ちを発行する。
+            // CPU はブロックせず、Unity の以降の描画コマンドが GPU 上で server.Copy 完了を待つ。
+            if let Err(e) = d3d11::wait_fence(fence_value) {
+                log_to_file(&format!("d3d11::wait_fence({}) failed: {}", fence_value, e));
+            }
+            let Some((tex_ptr, w_out, h_out)) = d3d11::open_or_cached(handle_value, w, h) else {
+                return std::ptr::null_mut();
+            };
+            unsafe {
+                *out_width = w_out as i32;
+                *out_height = h_out as i32;
+                *out_format = format;
+            }
+            PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
+            tex_ptr
         }
-        let Some((tex_ptr, w_out, h_out)) = d3d11::open_or_cached(handle_value, w, h) else {
-            return std::ptr::null_mut();
-        };
-        unsafe {
-            *out_width = w_out as i32;
-            *out_height = h_out as i32;
-            *out_format = format;
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (handle, out_width, out_height, out_format);
+            std::ptr::null_mut()
         }
-        PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
-        tex_ptr
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (handle, out_width, out_height, out_format);
-        std::ptr::null_mut()
-    }
+    })
 }
 
 /// Windows: 共有メモリから最新の D3D11 共有 HANDLE を読み出し、
@@ -1847,37 +1977,39 @@ pub extern "C" fn cef_unity_recv_d3d12_texture(
     out_height: *mut i32,
     out_format: *mut u32,
 ) -> *mut std::ffi::c_void {
-    if handle.is_null() || out_width.is_null() || out_height.is_null() || out_format.is_null() {
-        return std::ptr::null_mut();
-    }
+    ffi_guard(std::ptr::null_mut(), || {
+        if handle.is_null() || out_width.is_null() || out_height.is_null() || out_format.is_null() {
+            return std::ptr::null_mut();
+        }
 
-    #[cfg(target_os = "windows")]
-    {
-        let instance = handle_to_ref(handle);
-        let Some((handle_value, w, h, format, fence_value)) = instance.shm.get_d3d11_handle()
-        else {
-            // 新フレーム無し: 前回開いたテクスチャを Unity 側で使い続けてもらう (null 返却)。
-            return std::ptr::null_mut();
-        };
-        // GPU-side wait: Unity の D3D12 queue に fence_value 到達待ちを発行する。
-        // CPU はブロックせず、Unity の以降の queue 操作が GPU 上で server.Copy 完了を待つ。
-        if let Err(e) = d3d12::wait_fence(fence_value) {
-            log_to_file(&format!("d3d12::wait_fence({}) failed: {}", fence_value, e));
+        #[cfg(target_os = "windows")]
+        {
+            let instance = handle_to_ref(handle);
+            let Some((handle_value, w, h, format, fence_value)) = instance.shm.get_d3d11_handle()
+            else {
+                // 新フレーム無し: 前回開いたテクスチャを Unity 側で使い続けてもらう (null 返却)。
+                return std::ptr::null_mut();
+            };
+            // GPU-side wait: Unity の D3D12 queue に fence_value 到達待ちを発行する。
+            // CPU はブロックせず、Unity の以降の queue 操作が GPU 上で server.Copy 完了を待つ。
+            if let Err(e) = d3d12::wait_fence(fence_value) {
+                log_to_file(&format!("d3d12::wait_fence({}) failed: {}", fence_value, e));
+            }
+            let Some((res_ptr, w_out, h_out)) = d3d12::open_or_cached(handle_value, w, h) else {
+                return std::ptr::null_mut();
+            };
+            unsafe {
+                *out_width = w_out as i32;
+                *out_height = h_out as i32;
+                *out_format = format;
+            }
+            PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
+            res_ptr
         }
-        let Some((res_ptr, w_out, h_out)) = d3d12::open_or_cached(handle_value, w, h) else {
-            return std::ptr::null_mut();
-        };
-        unsafe {
-            *out_width = w_out as i32;
-            *out_height = h_out as i32;
-            *out_format = format;
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (handle, out_width, out_height, out_format);
+            std::ptr::null_mut()
         }
-        PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
-        res_ptr
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = (handle, out_width, out_height, out_format);
-        std::ptr::null_mut()
-    }
+    })
 }

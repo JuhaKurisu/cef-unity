@@ -13,7 +13,7 @@
 #![cfg(target_os = "windows")]
 
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use std::io::Write;
@@ -130,11 +130,11 @@ pub fn clear_unity_interfaces() {
     UNITY_INTERFACES.store(std::ptr::null_mut(), Ordering::Release);
     UNITY_DEVICE.store(std::ptr::null_mut(), Ordering::Release);
     {
-        let mut state = OPENED.lock().unwrap();
+        let mut state = OPENED.lock().unwrap_or_else(PoisonError::into_inner);
         state.current = None;
         state.previous = None;
     }
-    *FENCE.lock().unwrap() = None;
+    *FENCE.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
 /// 保持している IUnityInterfaces* から ID3D11Device を遅延取得する。
@@ -212,7 +212,7 @@ pub fn open_fence(handle_value: u64) -> Result<(), String> {
         .cast()
         .map_err(|e| format!("cast ID3D11DeviceContext4 (Unity context): {:?}", e))?;
 
-    *FENCE.lock().unwrap() = Some(FenceState {
+    *FENCE.lock().unwrap_or_else(PoisonError::into_inner) = Some(FenceState {
         fence,
         context4,
         last_waited: 0,
@@ -231,7 +231,7 @@ pub fn wait_fence(target_value: u64) -> Result<(), String> {
     if target_value == 0 {
         return Ok(());
     }
-    let mut guard = FENCE.lock().unwrap();
+    let mut guard = FENCE.lock().unwrap_or_else(PoisonError::into_inner);
     let Some(state) = guard.as_mut() else {
         return Ok(()); // fence 未対応経路
     };
@@ -269,7 +269,7 @@ pub fn open_or_cached(
         return None;
     }
 
-    let mut state = OPENED.lock().unwrap();
+    let mut state = OPENED.lock().unwrap_or_else(PoisonError::into_inner);
 
     let cache_hit = matches!(
         state.current.as_ref(),

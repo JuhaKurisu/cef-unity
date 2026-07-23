@@ -21,7 +21,7 @@
 
 use std::ffi::c_void;
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
@@ -141,14 +141,14 @@ pub fn clear_unity_interfaces() {
     UNITY_DEVICE.store(std::ptr::null_mut(), Ordering::Release);
     UNITY_QUEUE.store(std::ptr::null_mut(), Ordering::Release);
     {
-        let mut state = OPENED.lock().unwrap();
+        let mut state = OPENED.lock().unwrap_or_else(PoisonError::into_inner);
         state.current = None;
         state.previous = None;
         state.declared.clear();
         state.cmd_list = None;
         state.cmd_allocator = None;
     }
-    *FENCE.lock().unwrap() = None;
+    *FENCE.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
 /// IUnityInterfaces から IUnityGraphicsD3D12v5 経由で ID3D12Device* / ID3D12CommandQueue* を
@@ -354,7 +354,7 @@ pub fn open_fence(handle_value: u64) -> Result<(), String> {
     }
     let fence = fence_opt.ok_or_else(|| "OpenSharedHandle (fence) returned None".to_string())?;
 
-    *FENCE.lock().unwrap() = Some(FenceState {
+    *FENCE.lock().unwrap_or_else(PoisonError::into_inner) = Some(FenceState {
         fence,
         last_waited: 0,
     });
@@ -372,7 +372,7 @@ pub fn wait_fence(target_value: u64) -> Result<(), String> {
     if target_value == 0 {
         return Ok(());
     }
-    let mut guard = FENCE.lock().unwrap();
+    let mut guard = FENCE.lock().unwrap_or_else(PoisonError::into_inner);
     let Some(state) = guard.as_mut() else {
         return Ok(());
     };
@@ -404,7 +404,7 @@ pub fn open_or_cached(
     }
     let device = unity_device()?;
 
-    let mut state = OPENED.lock().unwrap();
+    let mut state = OPENED.lock().unwrap_or_else(PoisonError::into_inner);
 
     let cache_hit = matches!(
         state.current.as_ref(),
