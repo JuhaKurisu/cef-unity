@@ -259,9 +259,24 @@ wrap_render_handler! {
             if type_.get_raw() != PaintElementType::VIEW.get_raw() {
                 return;
             }
-            let size = (width * height * 4) as usize;
+            let (width, height) = (width as u32, height as u32);
+            // software 経路の shm バッファは MAX_W×MAX_H 固定長。超過フレームを
+            // write_frame に渡すと assert panic → CEF コールバック越しの unwind で
+            // プロセス abort するため、ここで読み捨てる (制約は software 経路にのみ
+            // 実在する。viewport 側で clamp すると GPU 経路まで Unity の想定サイズと
+            // 乖離して縦伸び/マウス座標ズレになる — 2026-07-23 のリグレッションで実証)。
+            if width == 0 || height == 0 || width > ipc::MAX_W || height > ipc::MAX_H {
+                if count <= 3 || count.is_multiple_of(100) {
+                    log(&format!(
+                        "on_paint: {}x{} exceeds software shm buffer ({}x{}) — frame skipped",
+                        width, height, ipc::MAX_W, ipc::MAX_H
+                    ));
+                }
+                return;
+            }
+            let size = (width as usize) * (height as usize) * 4;
             let src = unsafe { std::slice::from_raw_parts(buffer, size) };
-            self.shm.write_frame(src, width as u32, height as u32);
+            self.shm.write_frame(src, width, height);
         }
 
         fn on_accelerated_paint(
@@ -1056,10 +1071,12 @@ impl CefServer {
     }
 
     fn create_browser(&mut self, width: i32, height: i32, url: &str) -> Response {
-        // shm の write_frame は MAX_W×MAX_H 超で assert panic → CEF コールバック越しの
-        // unwind = プロセス abort になるため、受理時点で上限に丸める (software 経路対策)。
-        let width = width.clamp(1, ipc::MAX_W as i32);
-        let height = height.clamp(1, ipc::MAX_H as i32);
+        // viewport はクライアント申告値をそのまま使う。上限 clamp をここに入れると
+        // GPU 経路 (IOSurface — サイズ上限なし) で Unity 側の想定サイズと乖離し、
+        // テクスチャの引き伸ばし + マウス座標ズレになる (Retina の縦長 Game view は
+        // 2160px を超える)。software shm の上限は on_paint 側でガードする。
+        let width = width.max(1);
+        let height = height.max(1);
         let id = self.next_browser_id.fetch_add(1, Ordering::Relaxed);
         let shm_flink = ipc::shm_flink_path(self.server_pid, id);
 
@@ -1237,9 +1254,9 @@ impl CefServer {
     }
 
     fn resize(&mut self, browser_id: u32, width: i32, height: i32) -> Response {
-        // create_browser と同じ上限丸め (shm バッファ超過の assert panic 防止)。
-        let width = width.clamp(1, ipc::MAX_W as i32);
-        let height = height.clamp(1, ipc::MAX_H as i32);
+        // create_browser と同じく上限 clamp はしない (GPU 経路のサイズ乖離防止)。
+        let width = width.max(1);
+        let height = height.max(1);
         if let Some(state) = self.browsers.get(&browser_id) {
             state.viewport_w.store(width, Ordering::Relaxed);
             state.viewport_h.store(height, Ordering::Relaxed);

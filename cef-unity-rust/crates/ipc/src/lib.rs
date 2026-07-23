@@ -626,6 +626,15 @@ impl ShmReader {
         Some((surface_id, width, height, format))
     }
 
+    /// accel paint の寸法をフレーム消費なしで読む (テスト/診断用)。未 paint なら (0, 0)。
+    pub fn read_accel_dims(&self) -> (u32, u32) {
+        let header = unsafe { &*(self.shmem.as_ptr() as *const ShmHeader) };
+        (
+            header.accel_width.load(Ordering::Acquire),
+            header.accel_height.load(Ordering::Acquire),
+        )
+    }
+
     /// 最後の paint が対応する Unity frame 番号 (Time.frameCount) を読む。
     /// Unity 側は current frame との差で end-to-end の遅延フレーム数を計算する。
     pub fn read_paint_unity_frame(&self) -> u64 {
