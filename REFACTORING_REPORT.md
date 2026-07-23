@@ -890,3 +890,9 @@ SCR-3/5/9/12/15、AUD-4/9/10/11/12/13/15、SRV-N17/N22/N24、CLI-N22、CS-N15/N1
 - **CS-1 (第一段)** ✅ `CefZeroFramePacer` (純 C#、Unity API 非依存): 0F 待ち判定ステートマシンを抽出 — プローブ窓 / streak 抑止推定 (+1/-2 ヒステリシス) / 連続入力スキップ / busy-wait 4 分岐 (`ZeroFrameWaitWindow`: fresh・stale 読み捨て・earlyAdopt 7.5ms・noDamageGiveUp 7ms)。**最重要ロジックが初めてユニットテスト可能に** (CefZeroFramePacerTests 12 件)。`CefKeyboardMapper` (対応表 + OS キーリピート ObjC interop) も抽出。Sample 側は Peek→時刻の順序・SpinWait(64)・デッドライン先行チェックを旧実装と同一に保持
 - 検証: EditMode **55/55**、実機スモーク (Editor Play で Google 描画 + 検索候補の動的更新 + Console エラー 0 を確認 — 新 dylib の FFI ガード + パイプライン + ペーサ抽出の統合動作)
 - **CS-1 残り (未着手)**: CefPlayerLoopHooks / CefBrowserInput / CefImeHandler / CefTexturePresenter / CefBrowserView 分割。IME 座標系と 0F 統合が壊れやすいため、着手時は Editor での IME 実機確認 (§8) とスクロール実測をセットで
+
+### 2026-07-23 SRV-N21 の修正見直し (リグレッション対応、コミット d46a5db)
+
+- **ステップ1 の SRV-N21 clamp はリグレッションだった**: viewport の受理時 clamp が GPU (IOSurface) 経路にも効き、Retina の縦長 Game view (実セッションで CreateBrowser 1706x2762 を確認 — **2160px 超は Retina では普通に発生する**) で server 描画 2160px vs Unity 想定 2762px が乖離 → テクスチャ縦伸び + マウス座標ズレ
+- **教訓: MAX_W/MAX_H は software shm バッファの制約であって viewport の制約ではない。上限ガードは制約が実在する sink (on_paint の write_frame 直前) に置く**。viewport は max(1) の下限のみ
+- 回帰テスト `crates/server/tests/oversize_viewport.rs` 追加 (実サーバーで 2400/2600px paint 追従を SHM 検証)。実行: `CEF_SERVER_APP=<bundle> cargo test -p cef-unity-server --test oversize_viewport -- --ignored`。ipc に `ShmReader::read_accel_dims()` 追加
