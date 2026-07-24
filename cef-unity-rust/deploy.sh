@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-DEST="../cef-unity-unityproject/Assets/CefUnity/Interop/Plugins/osx-arm64"
+DEST="../cef-unity-unityproject/Assets/CefUnity/Plugins/osx-arm64"
 
 # ヘルパーのbundle IDは親プロセス(CEF Server)と一致させる。
 # CEFのMachPortRendezvousServerサービス名が BaseBundleID.MachPortRendezvousServer.PID
