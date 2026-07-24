@@ -7,4 +7,8 @@
     <AssemblyName>CefUnity.Core</AssemblyName>
     <RootNamespace>CefUnity</RootNamespace>
   </PropertyGroup>
+  <Target Name="CopyToUnityPlugins" AfterTargets="Build" Condition="'$(Configuration)'=='Release'">
+    <Copy SourceFiles="$(OutputPath)CefUnity.Core.dll"
+          DestinationFolder="$(MSBuildThisFileDirectory)..\..\cef-unity-unityproject\Assets\CefUnity\Plugins" />
+  </Target>
 </Project>
