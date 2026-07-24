@@ -26,23 +26,23 @@ namespace CefUnity.Runtime
         public unsafe int Poll(ScrollInputEvent[] buffer)
         {
             if (!_started) return 0;
-            int n;
-            fixed (CefScrollEvent* p = _native)
+            int count;
+            fixed (CefScrollEvent* pointer = _native)
             {
-                n = NativeMethods.cef_scroll_monitor_poll(p, Math.Min(_native.Length, buffer.Length));
+                count = NativeMethods.cef_scroll_monitor_poll(pointer, Math.Min(_native.Length, buffer.Length));
             }
-            for (var i = 0; i < n; i++)
+            for (var index = 0; index < count; index++)
             {
-                buffer[i] = new ScrollInputEvent
+                buffer[index] = new ScrollInputEvent
                 {
-                    Timestamp = _native[i].timestamp,
-                    DxPx = _native[i].dx * SignX,
-                    DyPx = _native[i].dy * SignY,
-                    Precise = _native[i].precise != 0,
-                    Phase = (ScrollPhase)_native[i].phase,
+                    Timestamp = _native[index].timestamp,
+                    DeltaXPixels = _native[index].delta_x * SignX,
+                    DeltaYPixels = _native[index].delta_y * SignY,
+                    Precise = _native[index].precise != 0,
+                    Phase = (ScrollPhase)_native[index].phase,
                 };
             }
-            return n;
+            return count;
         }
 
         public double Now => NativeMethods.cef_scroll_monitor_now();

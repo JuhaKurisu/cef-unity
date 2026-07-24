@@ -60,8 +60,8 @@ impl TestHttpServer {
                     if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
                         break;
                     }
-                    if let Some(val) = header.strip_prefix("Content-Length: ") {
-                        content_length = val.trim().parse().unwrap_or(0);
+                    if let Some(value) = header.strip_prefix("Content-Length: ") {
+                        content_length = value.trim().parse().unwrap_or(0);
                     }
                 }
 
@@ -70,22 +70,22 @@ impl TestHttpServer {
 <html><body>
 <input id="t" type="text" style="font-size:24px;width:400px;">
 </body></html>"#;
-                    let resp = format!(
+                    let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
                         html.len(),
                         html
                     );
-                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.write_all(response.as_bytes());
                 } else if request_line.starts_with("POST /value") {
                     let mut body = vec![0u8; content_length];
                     let _ = reader.read_exact(&mut body);
-                    let body_str = String::from_utf8_lossy(&body).to_string();
-                    *value_clone.lock().unwrap() = Some(body_str);
-                    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nAccess-Control-Allow-Origin: *\r\n\r\nOK";
-                    let _ = stream.write_all(resp.as_bytes());
+                    let body_string = String::from_utf8_lossy(&body).to_string();
+                    *value_clone.lock().unwrap() = Some(body_string);
+                    let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nAccess-Control-Allow-Origin: *\r\n\r\nOK";
+                    let _ = stream.write_all(response.as_bytes());
                 } else {
-                    let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-                    let _ = stream.write_all(resp.as_bytes());
+                    let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                    let _ = stream.write_all(response.as_bytes());
                 }
             }
         });
@@ -111,8 +111,8 @@ impl TestHttpServer {
 // ---------------------------------------------------------------------------
 
 struct TestCefServer {
-    cmd_tx: ipc::IpcSender<CommandEnvelope>,
-    resp_rx: ipc::IpcReceiver<Response>,
+    command_sender: ipc::IpcSender<CommandEnvelope>,
+    response_receiver: ipc::IpcReceiver<Response>,
     child: std::process::Child,
 }
 
@@ -134,31 +134,31 @@ impl TestCefServer {
             .arg("--ipc-server")
             .arg(&server_name)
             .spawn()
-            .unwrap_or_else(|e| panic!("{}: {}", server_bin.display(), e));
+            .unwrap_or_else(|error| panic!("{}: {}", server_bin.display(), error));
 
-        let (_rx, bootstrap) = oneshot_server.accept().expect("bootstrap");
+        let (_receiver, bootstrap) = oneshot_server.accept().expect("bootstrap");
 
         TestCefServer {
-            cmd_tx: bootstrap.cmd_tx,
-            resp_rx: bootstrap.resp_rx,
+            command_sender: bootstrap.command_sender,
+            response_receiver: bootstrap.response_receiver,
             child,
         }
     }
 
-    fn send(&self, cmd: Command) -> Response {
-        self.cmd_tx
+    fn send(&self, command: Command) -> Response {
+        self.command_sender
             .send(CommandEnvelope {
-                command: cmd,
+                command: command,
                 expects_response: true,
             })
             .unwrap();
-        self.resp_rx.recv().unwrap()
+        self.response_receiver.recv().unwrap()
     }
 
-    fn fire(&self, cmd: Command) {
-        self.cmd_tx
+    fn fire(&self, command: Command) {
+        self.command_sender
             .send(CommandEnvelope {
-                command: cmd,
+                command: command,
                 expects_response: false,
             })
             .unwrap();
@@ -238,9 +238,9 @@ impl TestCefServer {
 
 fn find_server_app() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("CEF_SERVER_APP") {
-        let p = PathBuf::from(&path);
-        if p.exists() {
-            return Some(p);
+        let path = PathBuf::from(&path);
+        if path.exists() {
+            return Some(path);
         }
     }
 
@@ -255,7 +255,7 @@ fn find_server_app() -> Option<PathBuf> {
             .join("cef-unity-csharp/Interop/cef-unity-server.app"),
     ];
 
-    candidates.into_iter().find(|p| p.exists())
+    candidates.into_iter().find(|path| path.exists())
 }
 
 // ---------------------------------------------------------------------------
@@ -269,11 +269,11 @@ fn key_event_sanity_check() {
     let _lock = TEST_MUTEX.lock().unwrap();
     let http = TestHttpServer::start();
     let cef = TestCefServer::start();
-    let bid = cef.setup_browser(&http.url());
+    let browser_id = cef.setup_browser(&http.url());
 
     // 'a' を KeyEvent で入力
     cef.fire(Command::KeyEvent {
-        browser_id: bid,
+        browser_id: browser_id,
         event_type: 0, // RAWKEYDOWN
         modifiers: 0,
         windows_key_code: 0x41,
@@ -284,7 +284,7 @@ fn key_event_sanity_check() {
         focus_on_editable_field: 0,
     });
     cef.fire(Command::KeyEvent {
-        browser_id: bid,
+        browser_id: browser_id,
         event_type: 2, // CHAR
         modifiers: 0,
         windows_key_code: 0x61,
@@ -295,7 +295,7 @@ fn key_event_sanity_check() {
         focus_on_editable_field: 0,
     });
     cef.fire(Command::KeyEvent {
-        browser_id: bid,
+        browser_id: browser_id,
         event_type: 1, // KEYUP
         modifiers: 0,
         windows_key_code: 0x41,
@@ -307,7 +307,7 @@ fn key_event_sanity_check() {
     });
     thread::sleep(Duration::from_millis(500));
 
-    cef.post_input_value(bid, http.port);
+    cef.post_input_value(browser_id, http.port);
     let value = http.take_value().unwrap_or_default();
     assert_eq!(value, "a", "regular key input should work");
 
@@ -320,10 +320,10 @@ fn ime_set_composition_then_commit() {
     let _lock = TEST_MUTEX.lock().unwrap();
     let http = TestHttpServer::start();
     let cef = TestCefServer::start();
-    let bid = cef.setup_browser(&http.url());
+    let browser_id = cef.setup_browser(&http.url());
 
     cef.send(Command::ImeSetComposition {
-        browser_id: bid,
+        browser_id: browser_id,
         text: "漢字".to_string(),
         selection_start: 0,
         selection_end: 2,
@@ -331,12 +331,12 @@ fn ime_set_composition_then_commit() {
     thread::sleep(Duration::from_secs(1));
 
     cef.send(Command::ImeCommitText {
-        browser_id: bid,
+        browser_id: browser_id,
         text: "漢字".to_string(),
     });
     thread::sleep(Duration::from_secs(1));
 
-    cef.post_input_value(bid, http.port);
+    cef.post_input_value(browser_id, http.port);
     let value = http.take_value().unwrap_or_default();
     assert_eq!(value, "漢字", "SetComposition → CommitText");
 
@@ -349,10 +349,10 @@ fn ime_set_composition_then_finish() {
     let _lock = TEST_MUTEX.lock().unwrap();
     let http = TestHttpServer::start();
     let cef = TestCefServer::start();
-    let bid = cef.setup_browser(&http.url());
+    let browser_id = cef.setup_browser(&http.url());
 
     cef.fire(Command::ImeSetComposition {
-        browser_id: bid,
+        browser_id: browser_id,
         text: "テスト".to_string(),
         selection_start: 0,
         selection_end: 3,
@@ -360,12 +360,12 @@ fn ime_set_composition_then_finish() {
     thread::sleep(Duration::from_millis(200));
 
     cef.fire(Command::ImeFinishComposingText {
-        browser_id: bid,
+        browser_id: browser_id,
         keep_selection: false,
     });
     thread::sleep(Duration::from_millis(500));
 
-    cef.post_input_value(bid, http.port);
+    cef.post_input_value(browser_id, http.port);
     let value = http.take_value().unwrap_or_default();
     assert_eq!(value, "テスト", "SetComposition → FinishComposingText");
 
@@ -378,20 +378,20 @@ fn ime_set_composition_then_cancel() {
     let _lock = TEST_MUTEX.lock().unwrap();
     let http = TestHttpServer::start();
     let cef = TestCefServer::start();
-    let bid = cef.setup_browser(&http.url());
+    let browser_id = cef.setup_browser(&http.url());
 
     cef.fire(Command::ImeSetComposition {
-        browser_id: bid,
+        browser_id: browser_id,
         text: "入力中".to_string(),
         selection_start: 0,
         selection_end: 3,
     });
     thread::sleep(Duration::from_millis(200));
 
-    cef.fire(Command::ImeCancelComposition { browser_id: bid });
+    cef.fire(Command::ImeCancelComposition { browser_id: browser_id });
     thread::sleep(Duration::from_millis(500));
 
-    cef.post_input_value(bid, http.port);
+    cef.post_input_value(browser_id, http.port);
     let value = http.take_value().unwrap_or_default();
     assert_eq!(value, "", "cancel should leave input empty");
 
@@ -404,15 +404,15 @@ fn ime_commit_text_standalone() {
     let _lock = TEST_MUTEX.lock().unwrap();
     let http = TestHttpServer::start();
     let cef = TestCefServer::start();
-    let bid = cef.setup_browser(&http.url());
+    let browser_id = cef.setup_browser(&http.url());
 
     cef.fire(Command::ImeCommitText {
-        browser_id: bid,
+        browser_id: browser_id,
         text: "直接入力".to_string(),
     });
     thread::sleep(Duration::from_millis(500));
 
-    cef.post_input_value(bid, http.port);
+    cef.post_input_value(browser_id, http.port);
     let value = http.take_value().unwrap_or_default();
     assert_eq!(value, "直接入力", "standalone CommitText");
 
@@ -425,37 +425,37 @@ fn ime_sequential_inputs() {
     let _lock = TEST_MUTEX.lock().unwrap();
     let http = TestHttpServer::start();
     let cef = TestCefServer::start();
-    let bid = cef.setup_browser(&http.url());
+    let browser_id = cef.setup_browser(&http.url());
 
     // 1回目
     cef.fire(Command::ImeSetComposition {
-        browser_id: bid,
+        browser_id: browser_id,
         text: "東".to_string(),
         selection_start: 0,
         selection_end: 1,
     });
     thread::sleep(Duration::from_millis(100));
     cef.fire(Command::ImeCommitText {
-        browser_id: bid,
+        browser_id: browser_id,
         text: "東".to_string(),
     });
     thread::sleep(Duration::from_millis(300));
 
     // 2回目
     cef.fire(Command::ImeSetComposition {
-        browser_id: bid,
+        browser_id: browser_id,
         text: "京".to_string(),
         selection_start: 0,
         selection_end: 1,
     });
     thread::sleep(Duration::from_millis(100));
     cef.fire(Command::ImeCommitText {
-        browser_id: bid,
+        browser_id: browser_id,
         text: "京".to_string(),
     });
     thread::sleep(Duration::from_millis(500));
 
-    cef.post_input_value(bid, http.port);
+    cef.post_input_value(browser_id, http.port);
     let value = http.take_value().unwrap_or_default();
     assert_eq!(value, "東京", "sequential inputs should concatenate");
 

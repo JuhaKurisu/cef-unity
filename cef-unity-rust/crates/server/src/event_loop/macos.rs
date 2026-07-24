@@ -42,7 +42,7 @@ struct CFRunLoopTimerContext {
 unsafe extern "C" {
     static kCFRunLoopDefaultMode: CFStringRef;
     fn CFRunLoopGetMain() -> CFRunLoopRef;
-    fn CFRunLoopAddTimer(rl: CFRunLoopRef, timer: CFRunLoopTimerRef, mode: CFStringRef);
+    fn CFRunLoopAddTimer(run_loop: CFRunLoopRef, timer: CFRunLoopTimerRef, mode: CFStringRef);
     fn CFRunLoopTimerCreate(
         allocator: CFAllocatorRef,
         fire_date: CFAbsoluteTime,
@@ -55,8 +55,8 @@ unsafe extern "C" {
     fn CFRunLoopTimerSetNextFireDate(timer: CFRunLoopTimerRef, fire_date: CFAbsoluteTime);
     fn CFAbsoluteTimeGetCurrent() -> CFAbsoluteTime;
     fn CFRunLoopRun();
-    fn CFRunLoopStop(rl: CFRunLoopRef);
-    fn CFRunLoopWakeUp(rl: CFRunLoopRef);
+    fn CFRunLoopStop(run_loop: CFRunLoopRef);
+    fn CFRunLoopWakeUp(run_loop: CFRunLoopRef);
 }
 
 // ---------------------------------------------------------------------------
@@ -79,44 +79,44 @@ thread_local! {
 static TIMER: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Called from BrowserProcessHandler::on_schedule_message_pump_work.
-/// Adjusts the timer to fire after `delay_ms` and wakes the run loop.
-pub fn schedule_pump(delay_ms: i64) {
+/// Adjusts the timer to fire after `delay_milliseconds` and wakes the run loop.
+pub fn schedule_pump(delay_milliseconds: i64) {
     let timer = TIMER.load(Ordering::Acquire);
     if timer.is_null() {
         return;
     }
     unsafe {
         let now = CFAbsoluteTimeGetCurrent();
-        let delay = if delay_ms <= 0 {
+        let delay = if delay_milliseconds <= 0 {
             0.0
         } else {
-            delay_ms as f64 / 1000.0
+            delay_milliseconds as f64 / 1000.0
         };
         CFRunLoopTimerSetNextFireDate(timer, now + delay);
         CFRunLoopWakeUp(CFRunLoopGetMain());
     }
 }
 
-fn log(msg: &str) {
-    crate::log(msg);
+fn log(message: &str) {
+    crate::log(message);
 }
 
 unsafe extern "C" fn timer_callback(_timer: CFRunLoopTimerRef, _info: *mut std::ffi::c_void) {
-    if IN_TICK.with(|f| f.replace(true)) {
+    if IN_TICK.with(|flag| flag.replace(true)) {
         return; // 再入 (ネスト run loop からの再発火) — &mut の二重作成を避ける
     }
     let result = std::panic::catch_unwind(|| {
         timer_callback_inner();
     });
-    IN_TICK.with(|f| f.set(false));
+    IN_TICK.with(|flag| flag.set(false));
     if let Err(payload) = result {
         // payload を捨てず原因をログに残す (&str / String 以外は型名不明のため定型文)
-        let msg = payload
+        let message = payload
             .downcast_ref::<&str>()
-            .map(|s| s.to_string())
+            .map(|text| text.to_string())
             .or_else(|| payload.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "<non-string panic payload>".to_string());
-        log(&format!("timer_callback panicked: {}", msg));
+        log(&format!("timer_callback panicked: {}", message));
         PANICKED.store(true, Ordering::Release);
         unsafe {
             CFRunLoopStop(CFRunLoopGetMain());
@@ -162,16 +162,16 @@ fn timer_callback_inner() {
 /// mpsc チャネルからコマンドを全て取り出して処理する。
 fn drain_commands(state: &mut ServerState) {
     loop {
-        match state.cmd_rx.try_recv() {
-            Ok(env) => {
-                let is_shutdown = matches!(env.command, cef_unity_ipc::Command::Shutdown);
-                if env.expects_response {
-                    log(&format!("received command: {:?}", env.command));
+        match state.command_receiver.try_recv() {
+            Ok(envelope) => {
+                let is_shutdown = matches!(envelope.command, cef_unity_ipc::Command::Shutdown);
+                if envelope.expects_response {
+                    log(&format!("received command: {:?}", envelope.command));
                 }
-                let resp = state.cef_server.handle_command(env.command);
-                if env.expects_response
-                    && let Err(e) = state.resp_tx.send(resp) {
-                        log(&format!("send error: {}", e));
+                let response = state.cef_server.handle_command(envelope.command);
+                if envelope.expects_response
+                    && let Err(error) = state.response_sender.send(response) {
+                        log(&format!("send error: {}", error));
                         state.running = false;
                         break;
                     }
@@ -197,7 +197,7 @@ pub fn run_event_loop(state: ServerState) -> ServerState {
     }
 
     unsafe {
-        let mut ctx = CFRunLoopTimerContext {
+        let mut context = CFRunLoopTimerContext {
             version: 0,
             info: std::ptr::null_mut(),
             retain: std::ptr::null(),
@@ -215,7 +215,7 @@ pub fn run_event_loop(state: ServerState) -> ServerState {
             0,
             0,
             timer_callback,
-            &mut ctx,
+            &mut context,
         );
         TIMER.store(timer, Ordering::Release);
         CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopDefaultMode);

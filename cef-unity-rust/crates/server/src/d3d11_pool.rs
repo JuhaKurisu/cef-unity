@@ -83,7 +83,7 @@ pub struct D3D11Pool {
     /// クライアントプロセスへの DUP_HANDLE 用ハンドル。
     /// `client_pid` 不明時は None (このときは DuplicateHandle せず、
     /// ローカルの shared HANDLE 値をそのまま返す = 同一プロセス前提のテスト経路)。
-    client_proc: Option<usize>, // 実体は HANDLE。Send/Sync のため usize で保持
+    client_process: Option<usize>, // 実体は HANDLE。Send/Sync のため usize で保持
 }
 
 #[cfg(target_os = "windows")]
@@ -98,7 +98,7 @@ struct PoolState {
     /// クライアントプロセス内で有効な DuplicateHandle 済みの HANDLE 値。
     client_handle_value: u64,
     /// サーバプロセス内のローカル shared HANDLE (Drop で CloseHandle する)。
-    /// `client_proc` が None のときは client_handle_value と同じ値が入る。
+    /// `client_process` が None のときは client_handle_value と同じ値が入る。
     local_handle_value: u64,
     width: u32,
     height: u32,
@@ -118,8 +118,8 @@ impl Drop for D3D11Pool {
         if self.fence_local_handle != 0 {
             let _ = unsafe { CloseHandle(HANDLE(self.fence_local_handle as *mut _)) };
         }
-        if let Some(p) = self.client_proc {
-            let _ = unsafe { CloseHandle(HANDLE(p as *mut _)) };
+        if let Some(process_handle) = self.client_process {
+            let _ = unsafe { CloseHandle(HANDLE(process_handle as *mut _)) };
         }
     }
 }
@@ -129,7 +129,7 @@ impl D3D11Pool {
     pub fn new(client_pid: Option<u32>) -> Result<Self, String> {
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
-        let mut feat: D3D_FEATURE_LEVEL = D3D_FEATURE_LEVEL::default();
+        let mut feature_level: D3D_FEATURE_LEVEL = D3D_FEATURE_LEVEL::default();
         unsafe {
             D3D11CreateDevice(
                 None,                       // pAdapter: 既定アダプタ
@@ -139,21 +139,21 @@ impl D3D11Pool {
                 None,                       // pFeatureLevels: 既定
                 D3D11_SDK_VERSION,
                 Some(&mut device),
-                Some(&mut feat),
+                Some(&mut feature_level),
                 Some(&mut context),
             )
-            .map_err(|e| format!("D3D11CreateDevice failed: {:?}", e))?;
+            .map_err(|error| format!("D3D11CreateDevice failed: {:?}", error))?;
         }
         let device = device.ok_or_else(|| "D3D11 device is None".to_string())?;
         let context = context.ok_or_else(|| "D3D11 context is None".to_string())?;
 
-        let client_proc = if let Some(pid) = client_pid {
-            let h = unsafe { OpenProcess(PROCESS_DUP_HANDLE, false, pid) }
-                .map_err(|e| format!("OpenProcess(PROCESS_DUP_HANDLE, pid={}) failed: {:?}", pid, e))?;
-            if h.is_invalid() {
+        let client_process = if let Some(pid) = client_pid {
+            let handle = unsafe { OpenProcess(PROCESS_DUP_HANDLE, false, pid) }
+                .map_err(|error| format!("OpenProcess(PROCESS_DUP_HANDLE, pid={}) failed: {:?}", pid, error))?;
+            if handle.is_invalid() {
                 return Err(format!("OpenProcess returned invalid handle for pid {}", pid));
             }
-            Some(h.0 as usize)
+            Some(handle.0 as usize)
         } else {
             None
         };
@@ -161,39 +161,39 @@ impl D3D11Pool {
         // shared fence を作成。D3D11.4 (Win10 1703+) 以降が必要。
         let device5: ID3D11Device5 = device
             .cast()
-            .map_err(|e| format!("cast ID3D11Device5: {:?}", e))?;
-        let mut fence_opt: Option<ID3D11Fence> = None;
+            .map_err(|error| format!("cast ID3D11Device5: {:?}", error))?;
+        let mut fence_option: Option<ID3D11Fence> = None;
         unsafe {
             device5
-                .CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence_opt)
-                .map_err(|e| format!("ID3D11Device5::CreateFence: {:?}", e))?;
+                .CreateFence(0, D3D11_FENCE_FLAG_SHARED, &mut fence_option)
+                .map_err(|error| format!("ID3D11Device5::CreateFence: {:?}", error))?;
         }
         let fence: ID3D11Fence =
-            fence_opt.ok_or_else(|| "CreateFence returned None".to_string())?;
+            fence_option.ok_or_else(|| "CreateFence returned None".to_string())?;
         // GENERIC_ALL = 0x10000000。ID3D11Fence::CreateSharedHandle は GENERIC_ALL のみ受け付ける。
         const GENERIC_ALL: u32 = 0x10000000;
         let fence_local_handle: HANDLE = unsafe {
             fence
                 .CreateSharedHandle(None, GENERIC_ALL, None)
-                .map_err(|e| format!("ID3D11Fence::CreateSharedHandle: {:?}", e))?
+                .map_err(|error| format!("ID3D11Fence::CreateSharedHandle: {:?}", error))?
         };
 
-        let fence_client_handle: u64 = if let Some(client_proc_usize) = client_proc {
-            let mut dup = HANDLE::default();
-            let cp = HANDLE(client_proc_usize as *mut _);
+        let fence_client_handle: u64 = if let Some(client_process_usize) = client_process {
+            let mut duplicated_handle = HANDLE::default();
+            let client_process_handle = HANDLE(client_process_usize as *mut _);
             unsafe {
                 DuplicateHandle(
                     GetCurrentProcess(),
                     fence_local_handle,
-                    cp,
-                    &mut dup,
+                    client_process_handle,
+                    &mut duplicated_handle,
                     0,
                     false,
                     DUPLICATE_HANDLE_OPTIONS(DUPLICATE_SAME_ACCESS.0),
                 )
-                .map_err(|e| format!("DuplicateHandle(fence): {:?}", e))?;
+                .map_err(|error| format!("DuplicateHandle(fence): {:?}", error))?;
             }
-            dup.0 as u64
+            duplicated_handle.0 as u64
         } else {
             fence_local_handle.0 as u64
         };
@@ -213,7 +213,7 @@ impl D3D11Pool {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
                 next_fence_value: 0,
             }),
-            client_proc,
+            client_process,
         })
     }
 
@@ -230,7 +230,7 @@ impl D3D11Pool {
     /// クライアントは戻り値の fence_value 以上に到達するのを待ってからサンプルする。
     pub fn copy_from_source(
         &self,
-        src_handle: HANDLE,
+        source_handle: HANDLE,
         width: u32,
         height: u32,
         format: DXGI_FORMAT,
@@ -240,10 +240,10 @@ impl D3D11Pool {
             let device1: ID3D11Device1 = self
                 .device
                 .cast()
-                .map_err(|e| format!("cast ID3D11Device1: {:?}", e))?;
-            let src_tex: ID3D11Texture2D = device1
-                .OpenSharedResource1(src_handle)
-                .map_err(|e| format!("OpenSharedResource1(src): {:?}", e))?;
+                .map_err(|error| format!("cast ID3D11Device1: {:?}", error))?;
+            let source_texture: ID3D11Texture2D = device1
+                .OpenSharedResource1(source_handle)
+                .map_err(|error| format!("OpenSharedResource1(src): {:?}", error))?;
 
             // 2. 出力テクスチャをサイズ変更時のみ作り直し
             let mut state = self.state.lock().unwrap();
@@ -260,7 +260,7 @@ impl D3D11Pool {
                 }
                 state.texture = None;
 
-                let desc = D3D11_TEXTURE2D_DESC {
+                let description = D3D11_TEXTURE2D_DESC {
                     Width: width,
                     Height: height,
                     MipLevels: 1,
@@ -287,42 +287,42 @@ impl D3D11Pool {
                         | D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0)
                         as u32,
                 };
-                let mut new_tex: Option<ID3D11Texture2D> = None;
+                let mut new_texture: Option<ID3D11Texture2D> = None;
                 self.device
-                    .CreateTexture2D(&desc, None, Some(&mut new_tex))
-                    .map_err(|e| format!("CreateTexture2D: {:?}", e))?;
-                let new_tex = new_tex.ok_or_else(|| "CreateTexture2D returned None".to_string())?;
+                    .CreateTexture2D(&description, None, Some(&mut new_texture))
+                    .map_err(|error| format!("CreateTexture2D: {:?}", error))?;
+                let new_texture = new_texture.ok_or_else(|| "CreateTexture2D returned None".to_string())?;
 
-                let dxgi_res: IDXGIResource1 = new_tex
+                let dxgi_resource: IDXGIResource1 = new_texture
                     .cast()
-                    .map_err(|e| format!("cast IDXGIResource1: {:?}", e))?;
-                let local_handle: HANDLE = dxgi_res
+                    .map_err(|error| format!("cast IDXGIResource1: {:?}", error))?;
+                let local_handle: HANDLE = dxgi_resource
                     .CreateSharedHandle(
                         None,
                         DXGI_SHARED_RESOURCE_READ.0 | DXGI_SHARED_RESOURCE_WRITE.0,
                         None,
                     )
-                    .map_err(|e| format!("CreateSharedHandle: {:?}", e))?;
+                    .map_err(|error| format!("CreateSharedHandle: {:?}", error))?;
 
-                let client_handle_value: u64 = if let Some(client_proc) = self.client_proc {
-                    let mut dup = HANDLE::default();
-                    let cp = HANDLE(client_proc as *mut _);
+                let client_handle_value: u64 = if let Some(client_process) = self.client_process {
+                    let mut duplicated_handle = HANDLE::default();
+                    let client_process_handle = HANDLE(client_process as *mut _);
                     DuplicateHandle(
                         GetCurrentProcess(),
                         local_handle,
-                        cp,
-                        &mut dup,
+                        client_process_handle,
+                        &mut duplicated_handle,
                         0,
                         false,
                         DUPLICATE_HANDLE_OPTIONS(DUPLICATE_SAME_ACCESS.0),
                     )
-                    .map_err(|e| format!("DuplicateHandle: {:?}", e))?;
-                    dup.0 as u64
+                    .map_err(|error| format!("DuplicateHandle: {:?}", error))?;
+                    duplicated_handle.0 as u64
                 } else {
                     local_handle.0 as u64
                 };
 
-                state.texture = Some(new_tex);
+                state.texture = Some(new_texture);
                 state.local_handle_value = local_handle.0 as u64;
                 state.client_handle_value = client_handle_value;
                 state.width = width;
@@ -333,12 +333,12 @@ impl D3D11Pool {
             // 3. CopyResource → Flush → Fence.Signal で client に "ここまで GPU 完了" を通知。
             //    client (D3D11/D3D12) は signal_value を Wait してからサンプルすることで、
             //    server の書き込み完了を待ってから読む。KeyedMutex は使わない。
-            let dst_tex = state
+            let destination_texture = state
                 .texture
                 .as_ref()
                 .ok_or_else(|| "dst texture is None".to_string())?;
 
-            self.context.CopyResource(dst_tex, &src_tex);
+            self.context.CopyResource(destination_texture, &source_texture);
             self.context.Flush();
 
             state.next_fence_value += 1;
@@ -346,10 +346,10 @@ impl D3D11Pool {
             let context4: ID3D11DeviceContext4 = self
                 .context
                 .cast()
-                .map_err(|e| format!("cast ID3D11DeviceContext4: {:?}", e))?;
+                .map_err(|error| format!("cast ID3D11DeviceContext4: {:?}", error))?;
             context4
                 .Signal(&self.fence, signal_value)
-                .map_err(|e| format!("ID3D11DeviceContext4::Signal: {:?}", e))?;
+                .map_err(|error| format!("ID3D11DeviceContext4::Signal: {:?}", error))?;
 
             Ok((state.client_handle_value, signal_value))
         }

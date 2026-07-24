@@ -1,23 +1,23 @@
 using CefUnity.Interop;
 
 // サブコマンド: (なし)=スモーク, replay=Phase 4 で追加
-var cmd = args.Length > 0 ? args[0] : "smoke";
-if (cmd == "smoke")
+var command = args.Length > 0 ? args[0] : "smoke";
+if (command == "smoke")
 {
     var frames = 0;
-    CefRuntime.Init(useGpu: false);
+    CefRuntime.Initialize(useGpu: false);
     using (var browser = new Browser(1280, 720, "https://example.com"))
     {
-        for (var i = 0; i < 600; i++)
+        for (var frameIndex = 0; frameIndex < 600; frameIndex++)
         {
-            browser.SendExternalBeginFrame((ulong)i);
+            browser.SendExternalBeginFrame((ulong)frameIndex);
             CefRuntime.Pump();
             Thread.Sleep(16);
-            if (browser.TryGetBuffer(out var bgra, out var w, out var h))
+            if (browser.TryGetBuffer(out var bgra, out var width, out var height))
             {
                 frames++;
                 if (frames <= 3 || frames % 25 == 0)
-                    Console.WriteLine($"Frame #{frames}: {w}x{h}, {bgra.Length} bytes");
+                    Console.WriteLine($"Frame #{frames}: {width}x{height}, {bgra.Length} bytes");
             }
         }
         Console.WriteLine($"SMOKE_OK frames={frames}");
@@ -25,7 +25,7 @@ if (cmd == "smoke")
     CefRuntime.Shutdown();
     return frames > 0 ? 0 : 1;
 }
-if (cmd == "replay")
+if (command == "replay")
 {
     if (args.Length < 2) { Console.Error.WriteLine("usage: replay <recording-csv>"); return 2; }
     var result = CefUnity.Runtime.ScrollReplayRunner.Run(File.ReadLines(args[1]));
@@ -33,5 +33,5 @@ if (cmd == "replay")
     Console.WriteLine($"REPLAY ok events={result.Events} ticks={result.Ticks} mismatches={result.Mismatches}/{result.Ticks}");
     return 0;
 }
-Console.Error.WriteLine($"unknown command: {cmd}");
+Console.Error.WriteLine($"unknown command: {command}");
 return 2;

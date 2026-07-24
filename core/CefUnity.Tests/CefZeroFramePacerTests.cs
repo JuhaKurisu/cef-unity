@@ -11,31 +11,31 @@ namespace CefUnity.Runtime.Tests
     /// </summary>
     public class CefZeroFramePacerTests
     {
-        private const float Bf1 = 100f;      // 基準時刻 (秒)
-        private const float WaitMs = 10f;    // _zeroFrameWaitMs 既定
+        private const float BeginFrame1Time = 100f;      // 基準時刻 (秒)
+        private const float WaitMilliseconds = 10f;      // _zeroFrameWaitMilliseconds 既定
 
-        private static float Ms(float ms) => Bf1 + ms * 0.001f;
+        private static float AtMilliseconds(float milliseconds) => BeginFrame1Time + milliseconds * 0.001f;
 
         // ---- プローブ判定 (ShouldSkipAsIdle) ----
 
         [Test]
         public void Idle_WhenNeverPainted_AndNoInput()
         {
-            var p = new CefZeroFramePacer();
-            Assert.IsTrue(p.ShouldSkipAsIdle(inputSentThisFrame: false), "初期状態 (paint 未取得) は静止扱い");
-            Assert.IsFalse(p.ShouldSkipAsIdle(inputSentThisFrame: true), "入力を送ったフレームは待つ");
+            var pacer = new CefZeroFramePacer();
+            Assert.IsTrue(pacer.ShouldSkipAsIdle(inputSentThisFrame: false), "初期状態 (paint 未取得) は静止扱い");
+            Assert.IsFalse(pacer.ShouldSkipAsIdle(inputSentThisFrame: true), "入力を送ったフレームは待つ");
         }
 
         [Test]
         public void ProbeWindow_StaysActiveFor60FramesAfterFreshPaint()
         {
-            var p = new CefZeroFramePacer();
-            p.OnFreshPaint();
+            var pacer = new CefZeroFramePacer();
+            pacer.OnFreshPaint();
             // 59 回受信なしでも窓内 (framesSince=59 < 60)
-            for (var i = 0; i < 59; i++) p.OnNoPaint();
-            Assert.IsFalse(p.ShouldSkipAsIdle(false), "fresh から 59F は窓内 = 待つ");
-            p.OnNoPaint();
-            Assert.IsTrue(p.ShouldSkipAsIdle(false), "60F で窓を超え静止扱い");
+            for (var frameIndex = 0; frameIndex < 59; frameIndex++) pacer.OnNoPaint();
+            Assert.IsFalse(pacer.ShouldSkipAsIdle(false), "fresh から 59F は窓内 = 待つ");
+            pacer.OnNoPaint();
+            Assert.IsTrue(pacer.ShouldSkipAsIdle(false), "60F で窓を超え静止扱い");
         }
 
         // ---- streak 抑止推定 (ShouldSkipAsSuppressed) ----
@@ -43,34 +43,34 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void StreakScore_SuppressesAfter3ConsecutiveFresh()
         {
-            var p = new CefZeroFramePacer();
-            p.OnFreshPaint();
-            p.OnFreshPaint();
-            Assert.IsFalse(p.ShouldSkipAsSuppressed(), "スコア 2 では非抑止");
-            p.OnFreshPaint();
-            Assert.IsTrue(p.ShouldSkipAsSuppressed(), "スコア 3 で抑止推定");
+            var pacer = new CefZeroFramePacer();
+            pacer.OnFreshPaint();
+            pacer.OnFreshPaint();
+            Assert.IsFalse(pacer.ShouldSkipAsSuppressed(), "スコア 2 では非抑止");
+            pacer.OnFreshPaint();
+            Assert.IsTrue(pacer.ShouldSkipAsSuppressed(), "スコア 3 で抑止推定");
         }
 
         [Test]
         public void StreakScore_HysteresisSurvivesOneMiss()
         {
-            var p = new CefZeroFramePacer();
-            for (var i = 0; i < 5; i++) p.OnFreshPaint(); // スコア 5
-            p.OnNoPaint(); // -2 → 3
-            Assert.IsTrue(p.ShouldSkipAsSuppressed(), "1 回の取り逃しでは抑止推定を維持 (ヒステリシス)");
-            p.OnNoPaint(); // -2 → 1
-            Assert.IsFalse(p.ShouldSkipAsSuppressed(), "2 連続で外れたら解除");
+            var pacer = new CefZeroFramePacer();
+            for (var frameIndex = 0; frameIndex < 5; frameIndex++) pacer.OnFreshPaint(); // スコア 5
+            pacer.OnNoPaint(); // -2 → 3
+            Assert.IsTrue(pacer.ShouldSkipAsSuppressed(), "1 回の取り逃しでは抑止推定を維持 (ヒステリシス)");
+            pacer.OnNoPaint(); // -2 → 1
+            Assert.IsFalse(pacer.ShouldSkipAsSuppressed(), "2 連続で外れたら解除");
         }
 
         [Test]
         public void StreakScore_CapsAtMax_ForFastRelease()
         {
-            var p = new CefZeroFramePacer();
-            for (var i = 0; i < 100; i++) p.OnFreshPaint(); // 天井 6 で頭打ち
+            var pacer = new CefZeroFramePacer();
+            for (var frameIndex = 0; frameIndex < 100; frameIndex++) pacer.OnFreshPaint(); // 天井 6 で頭打ち
             // 6 → -2×2 = 2 (< 3) で解除される (天井が高いと解除が遅れる)
-            p.OnNoPaint();
-            p.OnNoPaint();
-            Assert.IsFalse(p.ShouldSkipAsSuppressed(), "長時間スクロール後も 2 フレームで解除");
+            pacer.OnNoPaint();
+            pacer.OnNoPaint();
+            Assert.IsFalse(pacer.ShouldSkipAsSuppressed(), "長時間スクロール後も 2 フレームで解除");
         }
 
         // ---- 連続入力スキップ ----
@@ -78,14 +78,14 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void SustainedInput_SkipsAfter3ConsecutiveInputFrames()
         {
-            var p = new CefZeroFramePacer();
-            p.OnBeginFrame(Bf1, 0, inputSentThisFrame: true);
-            p.OnBeginFrame(Bf1, 0, inputSentThisFrame: true);
-            Assert.IsFalse(p.ShouldSkipAsSuppressed(), "連続 2 フレームでは待つ (単発入力は 0F を取る)");
-            p.OnBeginFrame(Bf1, 0, inputSentThisFrame: true);
-            Assert.IsTrue(p.ShouldSkipAsSuppressed(), "連続 3 フレームでスキップ");
-            p.OnBeginFrame(Bf1, 0, inputSentThisFrame: false);
-            Assert.IsFalse(p.ShouldSkipAsSuppressed(), "入力が途切れたら即リセット");
+            var pacer = new CefZeroFramePacer();
+            pacer.OnBeginFrame(BeginFrame1Time, 0, inputSentThisFrame: true);
+            pacer.OnBeginFrame(BeginFrame1Time, 0, inputSentThisFrame: true);
+            Assert.IsFalse(pacer.ShouldSkipAsSuppressed(), "連続 2 フレームでは待つ (単発入力は 0F を取る)");
+            pacer.OnBeginFrame(BeginFrame1Time, 0, inputSentThisFrame: true);
+            Assert.IsTrue(pacer.ShouldSkipAsSuppressed(), "連続 3 フレームでスキップ");
+            pacer.OnBeginFrame(BeginFrame1Time, 0, inputSentThisFrame: false);
+            Assert.IsFalse(pacer.ShouldSkipAsSuppressed(), "入力が途切れたら即リセット");
         }
 
         // ---- busy-wait 窓 (ZeroFrameWaitWindow) ----
@@ -93,67 +93,67 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void Wait_FreshPaintAfterMinDelay_EndsWait()
         {
-            var p = new CefZeroFramePacer();
-            p.OnBeginFrame(Bf1, afiNow: 5, inputSentThisFrame: true);
-            var w = p.OpenWaitWindow(WaitMs);
-            // 4.5ms (FreshPaintMinDelayMs) 以降の増分 = fresh (#B) → 即終了
-            Assert.IsFalse(w.OnAfiSample(Ms(2f), 5), "増分なしは継続");
-            Assert.IsTrue(w.OnAfiSample(Ms(5f), 6), "freshMinTime 後の増分で待ち終了");
+            var pacer = new CefZeroFramePacer();
+            pacer.OnBeginFrame(BeginFrame1Time, acceleratedFrameIdNow: 5, inputSentThisFrame: true);
+            var waitWindow = pacer.OpenWaitWindow(WaitMilliseconds);
+            // 4.5ms (FreshPaintMinDelayMilliseconds) 以降の増分 = fresh (#B) → 即終了
+            Assert.IsFalse(waitWindow.OnAcceleratedFrameIdSample(AtMilliseconds(2f), 5), "増分なしは継続");
+            Assert.IsTrue(waitWindow.OnAcceleratedFrameIdSample(AtMilliseconds(5f), 6), "freshMinTime 後の増分で待ち終了");
         }
 
         [Test]
         public void Wait_StalePaintBeforeMinDelay_IsSkippedThenFreshTaken()
         {
-            var p = new CefZeroFramePacer();
-            p.OnBeginFrame(Bf1, afiNow: 5, inputSentThisFrame: true);
-            var w = p.OpenWaitWindow(WaitMs);
+            var pacer = new CefZeroFramePacer();
+            pacer.OnBeginFrame(BeginFrame1Time, acceleratedFrameIdNow: 5, inputSentThisFrame: true);
+            var waitWindow = pacer.OpenWaitWindow(WaitMilliseconds);
             // 4.5ms より前の増分 = BF#1 由来 stale (#A) → 読み捨てて継続
-            Assert.IsFalse(w.OnAfiSample(Ms(2f), 6), "stale (#A) は読み捨てて待ち続行");
+            Assert.IsFalse(waitWindow.OnAcceleratedFrameIdSample(AtMilliseconds(2f), 6), "stale (#A) は読み捨てて待ち続行");
             // その後 fresh (#B) が来たら終了
-            Assert.IsTrue(w.OnAfiSample(Ms(6f), 7), "fresh (#B) で終了");
+            Assert.IsTrue(waitWindow.OnAcceleratedFrameIdSample(AtMilliseconds(6f), 7), "fresh (#B) で終了");
         }
 
         [Test]
         public void Wait_EarlyPaintWithoutFresh_AdoptsAtEarlyAdoptTime()
         {
-            var p = new CefZeroFramePacer();
-            p.OnBeginFrame(Bf1, afiNow: 5, inputSentThisFrame: true);
-            var w = p.OpenWaitWindow(WaitMs);
-            Assert.IsFalse(w.OnAfiSample(Ms(2f), 6), "stale (#A) 読み捨て");
-            // #B が来ないまま 7.5ms (EarlyPaintAdoptMs) 到達 → #A を採用して終了
-            Assert.IsFalse(w.OnAfiSample(Ms(7f), 6), "earlyAdopt 前は粘る");
-            Assert.IsTrue(w.OnAfiSample(Ms(7.6f), 6), "earlyAdopt で #A 採用");
+            var pacer = new CefZeroFramePacer();
+            pacer.OnBeginFrame(BeginFrame1Time, acceleratedFrameIdNow: 5, inputSentThisFrame: true);
+            var waitWindow = pacer.OpenWaitWindow(WaitMilliseconds);
+            Assert.IsFalse(waitWindow.OnAcceleratedFrameIdSample(AtMilliseconds(2f), 6), "stale (#A) 読み捨て");
+            // #B が来ないまま 7.5ms (EarlyPaintAdoptMilliseconds) 到達 → #A を採用して終了
+            Assert.IsFalse(waitWindow.OnAcceleratedFrameIdSample(AtMilliseconds(7f), 6), "earlyAdopt 前は粘る");
+            Assert.IsTrue(waitWindow.OnAcceleratedFrameIdSample(AtMilliseconds(7.6f), 6), "earlyAdopt で #A 採用");
         }
 
         [Test]
         public void Wait_NoDamage_GivesUpAt7ms()
         {
-            var p = new CefZeroFramePacer();
-            p.OnBeginFrame(Bf1, afiNow: 5, inputSentThisFrame: true);
-            var w = p.OpenWaitWindow(WaitMs);
-            // 増分ゼロのまま 7ms (NoDamageGiveUpMs) → damage なしと判断して打ち切り
-            Assert.IsFalse(w.OnAfiSample(Ms(6.9f), 5), "7ms 前は待つ");
-            Assert.IsTrue(w.OnAfiSample(Ms(7.1f), 5), "7ms 超で打ち切り (deadline 10ms より先に)");
+            var pacer = new CefZeroFramePacer();
+            pacer.OnBeginFrame(BeginFrame1Time, acceleratedFrameIdNow: 5, inputSentThisFrame: true);
+            var waitWindow = pacer.OpenWaitWindow(WaitMilliseconds);
+            // 増分ゼロのまま 7ms (NoDamageGiveUpMilliseconds) → damage なしと判断して打ち切り
+            Assert.IsFalse(waitWindow.OnAcceleratedFrameIdSample(AtMilliseconds(6.9f), 5), "7ms 前は待つ");
+            Assert.IsTrue(waitWindow.OnAcceleratedFrameIdSample(AtMilliseconds(7.1f), 5), "7ms 超で打ち切り (deadline 10ms より先に)");
         }
 
         [Test]
         public void Wait_DeadlineIsAbsoluteCap()
         {
-            var p = new CefZeroFramePacer();
-            p.OnBeginFrame(Bf1, afiNow: 5, inputSentThisFrame: true);
-            var w = p.OpenWaitWindow(WaitMs);
-            Assert.IsFalse(w.DeadlineReached(Ms(9.9f)));
-            Assert.IsTrue(w.DeadlineReached(Ms(10f)), "BF#1 + 10ms で絶対上限");
+            var pacer = new CefZeroFramePacer();
+            pacer.OnBeginFrame(BeginFrame1Time, acceleratedFrameIdNow: 5, inputSentThisFrame: true);
+            var waitWindow = pacer.OpenWaitWindow(WaitMilliseconds);
+            Assert.IsFalse(waitWindow.DeadlineReached(AtMilliseconds(9.9f)));
+            Assert.IsTrue(waitWindow.DeadlineReached(AtMilliseconds(10f)), "BF#1 + 10ms で絶対上限");
         }
 
         [Test]
         public void Wait_HeavyFrame_DeadlineAlreadyPassed()
         {
-            var p = new CefZeroFramePacer();
-            p.OnBeginFrame(Bf1, afiNow: 5, inputSentThisFrame: true);
-            var w = p.OpenWaitWindow(WaitMs);
+            var pacer = new CefZeroFramePacer();
+            pacer.OnBeginFrame(BeginFrame1Time, acceleratedFrameIdNow: 5, inputSentThisFrame: true);
+            var waitWindow = pacer.OpenWaitWindow(WaitMilliseconds);
             // ゲーム処理が重く recv 到達が BF#1+12ms → 待ちゼロ (自動 cap)
-            Assert.IsTrue(w.DeadlineReached(Ms(12f)));
+            Assert.IsTrue(waitWindow.DeadlineReached(AtMilliseconds(12f)));
         }
     }
 }

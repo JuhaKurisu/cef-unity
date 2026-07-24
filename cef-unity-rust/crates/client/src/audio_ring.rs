@@ -10,8 +10,8 @@
 //! オーディオコールバックスレッドで動くため、C# 版と違いロックを持たない。
 
 pub struct AudioRing {
-    buf: Vec<f32>, // interleaved
-    cap_frames: usize,
+    buffer: Vec<f32>, // interleaved
+    capacity_frames: usize,
     channels: usize,
     target_frames: usize,
     max_rate_adjust: f64,
@@ -31,13 +31,13 @@ impl AudioRing {
         target_frames: usize,
         max_rate_adjust: f64,
     ) -> AudioRing {
-        let cap = capacity_frames.max(2);
-        let ch = channels.max(1);
+        let capacity = capacity_frames.max(2);
+        let channel_count = channels.max(1);
         AudioRing {
-            buf: vec![0.0; cap * ch],
-            cap_frames: cap,
-            channels: ch,
-            target_frames: target_frames.clamp(1, cap - 1),
+            buffer: vec![0.0; capacity * channel_count],
+            capacity_frames: capacity,
+            channels: channel_count,
+            target_frames: target_frames.clamp(1, capacity - 1),
             max_rate_adjust,
             write_frame: 0,
             read_frame: 0.0,
@@ -57,54 +57,54 @@ impl AudioRing {
         self.target_frames
     }
 
-    /// producer: interleaved サンプル src[..frame_count*channels] を書く。
+    /// producer: interleaved サンプル source[..frame_count*channels] を書く。
     /// 容量を超える場合は最古フレームを捨てる (バックストップ)。
-    pub fn write(&mut self, src: &[f32], mut frame_count: usize) {
+    pub fn write(&mut self, source: &[f32], mut frame_count: usize) {
         if frame_count == 0 {
             return;
         }
         let mut offset = 0usize;
 
         // パケット自体が容量を超える: 最新側だけ残す。
-        if frame_count > self.cap_frames {
-            let skip = frame_count - self.cap_frames;
+        if frame_count > self.capacity_frames {
+            let skip = frame_count - self.capacity_frames;
             offset = skip * self.channels;
             self.overflow_drop_frames += skip as u64;
-            frame_count = self.cap_frames;
+            frame_count = self.capacity_frames;
         }
 
         // 空き不足: 最古を捨てる = read 位置を前進。
-        let occ = self.write_frame as i64 - self.read_frame.floor() as i64;
-        let free = self.cap_frames as i64 - occ;
+        let occupancy = self.write_frame as i64 - self.read_frame.floor() as i64;
+        let free = self.capacity_frames as i64 - occupancy;
         if frame_count as i64 > free {
             let drop = frame_count as i64 - free;
             self.read_frame += drop as f64;
             self.overflow_drop_frames += drop as u64;
         }
 
-        for f in 0..frame_count {
-            let dst_base = (self.write_frame as usize % self.cap_frames) * self.channels;
-            let src_base = offset + f * self.channels;
-            self.buf[dst_base..dst_base + self.channels]
-                .copy_from_slice(&src[src_base..src_base + self.channels]);
+        for frame_index in 0..frame_count {
+            let destination_base = (self.write_frame as usize % self.capacity_frames) * self.channels;
+            let source_base = offset + frame_index * self.channels;
+            self.buffer[destination_base..destination_base + self.channels]
+                .copy_from_slice(&source[source_base..source_base + self.channels]);
             self.write_frame += 1;
         }
     }
 
-    /// consumer: dst を frame_count フレーム分 (interleaved) 埋める。
-    /// base_step = srcRate/outRate (出力1フレームあたり進める src フレーム数)。
+    /// consumer: destination を frame_count フレーム分 (interleaved) 埋める。
+    /// base_step = srcRate/outRate (出力1フレームあたり進める source フレーム数)。
     /// 滞留量が目標から外れていれば step を ±max_rate_adjust だけ操作して収束させる。
     /// データ不足時は無音で埋め underrun_frames を加算する。
-    pub fn read(&mut self, dst: &mut [f32], frame_count: usize, base_step: f64) {
-        for f in 0..frame_count {
-            let ob = f * self.channels;
-            let occ = self.write_frame as f64 - self.read_frame;
+    pub fn read(&mut self, destination: &mut [f32], frame_count: usize, base_step: f64) {
+        for frame_index in 0..frame_count {
+            let output_base = frame_index * self.channels;
+            let occupancy = self.write_frame as f64 - self.read_frame;
 
             // 初回プライミング: 目標滞留量に達するまでは無音 (read を進めない)。
             // 開始直後のピッチ揺れを避けるためクリーンに目標まで貯めてから再生開始する。
             if !self.primed {
-                if occ < self.target_frames as f64 {
-                    dst[ob..ob + self.channels].fill(0.0);
+                if occupancy < self.target_frames as f64 {
+                    destination[output_base..output_base + self.channels].fill(0.0);
                     self.underrun_frames += 1;
                     continue;
                 }
@@ -112,30 +112,30 @@ impl AudioRing {
             }
 
             // 線形補間には floor と floor+1 の 2 フレームが要る。
-            if occ < 2.0 {
-                dst[ob..ob + self.channels].fill(0.0);
+            if occupancy < 2.0 {
+                destination[output_base..output_base + self.channels].fill(0.0);
                 self.underrun_frames += 1;
                 continue;
             }
 
-            let i0 = self.read_frame.floor() as u64;
-            let frac = (self.read_frame - i0 as f64) as f32;
-            let b0 = (i0 as usize % self.cap_frames) * self.channels;
-            let b1 = ((i0 + 1) as usize % self.cap_frames) * self.channels;
-            for c in 0..self.channels {
-                let s0 = self.buf[b0 + c];
-                let s1 = self.buf[b1 + c];
-                dst[ob + c] = s0 + (s1 - s0) * frac;
+            let index_0 = self.read_frame.floor() as u64;
+            let fraction = (self.read_frame - index_0 as f64) as f32;
+            let base_0 = (index_0 as usize % self.capacity_frames) * self.channels;
+            let base_1 = ((index_0 + 1) as usize % self.capacity_frames) * self.channels;
+            for channel_index in 0..self.channels {
+                let sample_0 = self.buffer[base_0 + channel_index];
+                let sample_1 = self.buffer[base_1 + channel_index];
+                destination[output_base + channel_index] = sample_0 + (sample_1 - sample_0) * fraction;
             }
 
             // レート操作: 滞留量誤差を [-1,1] に正規化し ±max_rate_adjust を掛ける。
-            // occ > target → step を大きく (速く消費) して滞留を減らす。逆も同様。
-            let err = ((occ - self.target_frames as f64) / self.target_frames as f64)
+            // occupancy > target → step を大きく (速く消費) して滞留を減らす。逆も同様。
+            let error = ((occupancy - self.target_frames as f64) / self.target_frames as f64)
                 .clamp(-1.0, 1.0);
-            let mut step = base_step * (1.0 + self.max_rate_adjust * err);
+            let mut step = base_step * (1.0 + self.max_rate_adjust * error);
 
             // 補間に floor+1 が要るので利用可能量を食い尽くさないようガード。
-            let max_advance = occ - 1.0;
+            let max_advance = occupancy - 1.0;
             if step > max_advance {
                 step = max_advance;
             }
@@ -151,28 +151,28 @@ impl AudioRing {
 mod tests {
     use super::*;
 
-    const SRC_RATE: usize = 48_000;
-    const OUT_RATE: usize = 44_100;
+    const SOURCE_RATE: usize = 48_000;
+    const OUTPUT_RATE: usize = 44_100;
     const CHANNELS: usize = 2;
 
     fn make_ring() -> AudioRing {
-        let cap = (0.5 * SRC_RATE as f64).ceil() as usize;
-        let target = (0.08 * SRC_RATE as f64).ceil() as usize;
-        AudioRing::new(cap, CHANNELS, target, 0.01)
+        let capacity = (0.5 * SOURCE_RATE as f64).ceil() as usize;
+        let target = (0.08 * SOURCE_RATE as f64).ceil() as usize;
+        AudioRing::new(capacity, CHANNELS, target, 0.01)
     }
 
     // 440Hz サイン波を interleaved で frame_count フレーム生成する。phase は継続用に更新。
     fn make_sine(frame_count: usize, phase: &mut f64) -> Vec<f32> {
-        let mut buf = vec![0.0f32; frame_count * CHANNELS];
-        let dphi = 2.0 * std::f64::consts::PI * 440.0 / SRC_RATE as f64;
-        for f in 0..frame_count {
-            let s = (phase.sin() * 0.2) as f32;
-            for c in 0..CHANNELS {
-                buf[f * CHANNELS + c] = s;
+        let mut buffer = vec![0.0f32; frame_count * CHANNELS];
+        let delta_phase = 2.0 * std::f64::consts::PI * 440.0 / SOURCE_RATE as f64;
+        for frame_index in 0..frame_count {
+            let sample = (phase.sin() * 0.2) as f32;
+            for channel_index in 0..CHANNELS {
+                buffer[frame_index * CHANNELS + channel_index] = sample;
             }
-            *phase += dphi;
+            *phase += delta_phase;
         }
-        buf
+        buffer
     }
 
     // producer/consumer を tick 単位で交互に動かし、(プライミング後アンダーラン,
@@ -183,65 +183,65 @@ mod tests {
         ticks: usize,
     ) -> (u64, u64, f32) {
         let mut ring = make_ring();
-        let base_step = SRC_RATE as f64 / OUT_RATE as f64;
+        let base_step = SOURCE_RATE as f64 / OUTPUT_RATE as f64;
         let mut phase = 0.0;
 
-        let mut out_buf = vec![0.0f32; (consume_frames_per_tick + 8) * CHANNELS];
+        let mut output_buffer = vec![0.0f32; (consume_frames_per_tick + 8) * CHANNELS];
         let mut max_discontinuity = 0.0f32;
-        let mut under_at_prime_window: Option<u64> = None;
+        let mut underrun_at_prime_window: Option<u64> = None;
         // プライミング完了とみなす tick (目標 80ms ≒ 8 tick + 余裕)。これ以降を評価。
         const PRIME_WINDOW_TICKS: usize = 20;
         // 連続性は安定後 (priming 直後の開始トランジェントを除く) のみ評価。
         const CONTINUITY_FROM_TICK: usize = 25;
 
-        let mut prev_frame: Option<[f32; CHANNELS]> = None;
+        let mut previous_frame: Option<[f32; CHANNELS]> = None;
 
-        for t in 0..ticks {
+        for tick in 0..ticks {
             let sine = make_sine(produce_frames_per_tick, &mut phase);
             ring.write(&sine, produce_frames_per_tick);
 
-            ring.read(&mut out_buf, consume_frames_per_tick, base_step);
+            ring.read(&mut output_buffer, consume_frames_per_tick, base_step);
 
-            if t == PRIME_WINDOW_TICKS {
-                under_at_prime_window = Some(ring.underrun_frames);
+            if tick == PRIME_WINDOW_TICKS {
+                underrun_at_prime_window = Some(ring.underrun_frames);
             }
 
-            if t >= CONTINUITY_FROM_TICK {
-                for f in 0..consume_frames_per_tick {
-                    if let Some(prev) = prev_frame {
-                        for c in 0..CHANNELS {
-                            let d = (out_buf[f * CHANNELS + c] - prev[c]).abs();
-                            if d > max_discontinuity {
-                                max_discontinuity = d;
+            if tick >= CONTINUITY_FROM_TICK {
+                for frame_index in 0..consume_frames_per_tick {
+                    if let Some(previous) = previous_frame {
+                        for channel_index in 0..CHANNELS {
+                            let difference = (output_buffer[frame_index * CHANNELS + channel_index] - previous[channel_index]).abs();
+                            if difference > max_discontinuity {
+                                max_discontinuity = difference;
                             }
                         }
                     }
-                    let mut cur = [0.0f32; CHANNELS];
-                    cur.copy_from_slice(&out_buf[f * CHANNELS..f * CHANNELS + CHANNELS]);
-                    prev_frame = Some(cur);
+                    let mut current = [0.0f32; CHANNELS];
+                    current.copy_from_slice(&output_buffer[frame_index * CHANNELS..frame_index * CHANNELS + CHANNELS]);
+                    previous_frame = Some(current);
                 }
             }
         }
 
-        let under_after_prime = match under_at_prime_window {
-            Some(w) => ring.underrun_frames - w,
+        let underrun_after_prime = match underrun_at_prime_window {
+            Some(count) => ring.underrun_frames - count,
             None => ring.underrun_frames,
         };
-        (under_after_prime, ring.overflow_drop_frames, max_discontinuity)
+        (underrun_after_prime, ring.overflow_drop_frames, max_discontinuity)
     }
 
     #[test]
     fn read_with_unit_step_returns_written_samples_in_order() {
-        // baseStep=1.0 (リサンプルなし), 1ch でランプを書くとそのまま順に出る (frac=0)。
+        // baseStep=1.0 (リサンプルなし), 1ch でランプを書くとそのまま順に出る (fraction=0)。
         let mut ring = AudioRing::new(1000, 1, 4, 0.0);
-        let ramp: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        let ramp: Vec<f32> = (0..100).map(|index| index as f32).collect();
         ring.write(&ramp, 100); // 目標(4)以上溜まっている → プライミング即完了
 
         let mut out = vec![0.0f32; 10];
         ring.read(&mut out, 10, 1.0);
 
-        for (i, &s) in out.iter().enumerate() {
-            assert!((s - i as f32).abs() < 1e-4, "index {}: {}", i, s);
+        for (index, &sample) in out.iter().enumerate() {
+            assert!((sample - index as f32).abs() < 1e-4, "index {}: {}", index, sample);
         }
         assert_eq!(ring.underrun_frames, 0);
         assert_eq!(ring.overflow_drop_frames, 0);
@@ -256,8 +256,8 @@ mod tests {
         let mut out = vec![9.9f32; 8];
         ring.read(&mut out, 8, 1.0);
 
-        for &s in &out {
-            assert_eq!(s, 0.0, "プライミング前は無音であるべき");
+        for &sample in &out {
+            assert_eq!(sample, 0.0, "プライミング前は無音であるべき");
         }
         assert_eq!(ring.underrun_frames, 8);
     }
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn write_beyond_capacity_drops_oldest_and_counts_overflow() {
         let mut ring = AudioRing::new(100, 1, 10, 0.0);
-        let big: Vec<f32> = (0..500).map(|i| i as f32).collect();
+        let big: Vec<f32> = (0..500).map(|index| index as f32).collect();
         ring.write(&big, 500); // 容量 100 を大きく超える
 
         assert!(
@@ -280,65 +280,65 @@ mod tests {
 
     #[test]
     fn steady_state_matched_clocks_no_underrun_no_overflow_continuous_output() {
-        let (under, over, max_disc) = run_streaming_scenario(480, 441, 500);
-        assert_eq!(under, 0, "プライミング後のアンダーランは 0 であるべき");
-        assert_eq!(over, 0, "オーバーフロー破棄は 0 であるべき");
+        let (underrun, overflow, max_discontinuity) = run_streaming_scenario(480, 441, 500);
+        assert_eq!(underrun, 0, "プライミング後のアンダーランは 0 であるべき");
+        assert_eq!(overflow, 0, "オーバーフロー破棄は 0 であるべき");
         // 440Hz/0.2amp の隣接サンプル差は最大 ~0.0125。クリックなら ~0.4 跳ぶ。
         assert!(
-            max_disc < 0.05,
+            max_discontinuity < 0.05,
             "出力に不連続 (クリック) があってはならない: {}",
-            max_disc
+            max_discontinuity
         );
     }
 
     #[test]
     fn producer_slightly_faster_steering_absorbs_no_overflow_no_underrun() {
         // producer が consumer よりわずかに速い (≈+0.4%)。steering (±1%) で吸収できるはず。
-        let (under, over, max_disc) = run_streaming_scenario(482, 441, 800);
-        assert_eq!(over, 0, "速い producer でも steering がオーバーフローを防ぐべき");
-        assert_eq!(under, 0, "アンダーランは発生しないべき");
-        assert!(max_disc < 0.05, "出力は連続であるべき: {}", max_disc);
+        let (underrun, overflow, max_discontinuity) = run_streaming_scenario(482, 441, 800);
+        assert_eq!(overflow, 0, "速い producer でも steering がオーバーフローを防ぐべき");
+        assert_eq!(underrun, 0, "アンダーランは発生しないべき");
+        assert!(max_discontinuity < 0.05, "出力は連続であるべき: {}", max_discontinuity);
     }
 
     #[test]
     fn producer_slightly_slower_steering_absorbs_no_underrun_no_overflow() {
         // producer がわずかに遅い (≈-0.4%)。steering が消費を緩めてアンダーランを防ぐ。
-        let (under, over, max_disc) = run_streaming_scenario(478, 441, 800);
-        assert_eq!(under, 0, "遅い producer でも steering がアンダーランを防ぐべき");
-        assert_eq!(over, 0, "オーバーフローは発生しないべき");
-        assert!(max_disc < 0.05, "出力は連続であるべき: {}", max_disc);
+        let (underrun, overflow, max_discontinuity) = run_streaming_scenario(478, 441, 800);
+        assert_eq!(underrun, 0, "遅い producer でも steering がアンダーランを防ぐべき");
+        assert_eq!(overflow, 0, "オーバーフローは発生しないべき");
+        assert!(max_discontinuity < 0.05, "出力は連続であるべき: {}", max_discontinuity);
     }
 
     #[test]
     fn steady_state_occupancy_converges_near_target() {
         // 定常運転後、滞留量が目標近傍へ収束していること。
         let mut ring = make_ring();
-        let base_step = SRC_RATE as f64 / OUT_RATE as f64;
+        let base_step = SOURCE_RATE as f64 / OUTPUT_RATE as f64;
         let mut phase = 0.0;
         let mut produced = 0usize;
         let mut consumed = 0usize;
-        let mut out_buf = vec![0.0f32; 441 * CHANNELS];
+        let mut output_buffer = vec![0.0f32; 441 * CHANNELS];
 
-        for t in 0..600usize {
-            let prod = (((t + 1) as f64 * 480.0).round() as usize) - produced;
-            let sine = make_sine(prod, &mut phase);
-            ring.write(&sine, prod);
-            produced += prod;
+        for tick in 0..600usize {
+            let produce_frames = (((tick + 1) as f64 * 480.0).round() as usize) - produced;
+            let sine = make_sine(produce_frames, &mut phase);
+            ring.write(&sine, produce_frames);
+            produced += produce_frames;
 
-            let mut cons = (((t + 1) as f64 * 441.0).round() as usize) - consumed;
-            if cons > out_buf.len() / CHANNELS {
-                cons = out_buf.len() / CHANNELS;
+            let mut consume_frames = (((tick + 1) as f64 * 441.0).round() as usize) - consumed;
+            if consume_frames > output_buffer.len() / CHANNELS {
+                consume_frames = output_buffer.len() / CHANNELS;
             }
-            ring.read(&mut out_buf, cons, base_step);
-            consumed += cons;
+            ring.read(&mut output_buffer, consume_frames, base_step);
+            consumed += consume_frames;
         }
 
-        let occ = ring.occupancy_frames();
+        let occupancy = ring.occupancy_frames();
         let target = ring.target_frames() as f64;
         assert!(
-            occ >= target * 0.5 && occ <= target * 1.5,
+            occupancy >= target * 0.5 && occupancy <= target * 1.5,
             "滞留量 ({:.0}) は目標 ({}) 近傍へ収束すべき",
-            occ,
+            occupancy,
             target
         );
     }

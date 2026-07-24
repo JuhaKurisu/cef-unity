@@ -7,8 +7,8 @@
 #[derive(Clone, Copy)]
 pub struct RawScrollEvent {
     pub timestamp: f64,
-    pub dx: f32,
-    pub dy: f32,
+    pub delta_x: f32,
+    pub delta_y: f32,
     pub phase: u8,
     pub precise: u8,
 }

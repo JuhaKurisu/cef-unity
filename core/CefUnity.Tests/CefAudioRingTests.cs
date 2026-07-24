@@ -16,26 +16,26 @@ namespace CefUnity.Runtime.Tests
         private const int OutRate = 44100;
         private const int Channels = 2;
 
-        private static CefAudioRing MakeRing(float bufSec = 0.5f, float targetSec = 0.08f, double adjust = 0.01)
+        private static CefAudioRing MakeRing(float bufferSeconds = 0.5f, float targetSeconds = 0.08f, double adjust = 0.01)
         {
-            int cap = (int)Math.Ceiling(bufSec * SrcRate);
-            int target = (int)Math.Ceiling(targetSec * SrcRate);
-            return new CefAudioRing(cap, Channels, target, adjust);
+            int capacity = (int)Math.Ceiling(bufferSeconds * SrcRate);
+            int target = (int)Math.Ceiling(targetSeconds * SrcRate);
+            return new CefAudioRing(capacity, Channels, target, adjust);
         }
 
         // 440Hz サイン波を interleaved で frameCount フレーム生成する。phase は継続用に更新。
-        private static float[] MakeSine(int frameCount, ref double phase, double freq = 440.0, float amp = 0.2f)
+        private static float[] MakeSine(int frameCount, ref double phase, double frequency = 440.0, float amplitude = 0.2f)
         {
-            var buf = new float[frameCount * Channels];
-            double dphi = 2.0 * Math.PI * freq / SrcRate;
-            for (int f = 0; f < frameCount; f++)
+            var buffer = new float[frameCount * Channels];
+            double phaseIncrement = 2.0 * Math.PI * frequency / SrcRate;
+            for (int frameIndex = 0; frameIndex < frameCount; frameIndex++)
             {
-                float s = (float)(Math.Sin(phase) * amp);
-                for (int c = 0; c < Channels; c++) buf[f * Channels + c] = s;
-                phase += dphi;
+                float sample = (float)(Math.Sin(phase) * amplitude);
+                for (int channelIndex = 0; channelIndex < Channels; channelIndex++) buffer[frameIndex * Channels + channelIndex] = sample;
+                phase += phaseIncrement;
             }
 
-            return buf;
+            return buffer;
         }
 
         // ----- 基本正当性 -----
@@ -43,17 +43,17 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void Read_WithUnitStep_ReturnsWrittenSamplesInOrder()
         {
-            // baseStep=1.0 (リサンプルなし), 1ch でランプを書くとそのまま順に出る (frac=0)。
+            // baseStep=1.0 (リサンプルなし), 1ch でランプを書くとそのまま順に出る (fraction=0)。
             var ring = new CefAudioRing(1000, 1, targetFrames: 4, maxRateAdjust: 0.0);
             var ramp = new float[100];
-            for (int i = 0; i < ramp.Length; i++) ramp[i] = i;
+            for (int index = 0; index < ramp.Length; index++) ramp[index] = index;
             ring.Write(ramp, 0, 100); // 目標(4)以上溜まっている → プライミング即完了
 
-            var outBuf = new float[10];
-            ring.Read(outBuf, 10, baseStep: 1.0);
+            var outputBuffer = new float[10];
+            ring.Read(outputBuffer, 10, baseStep: 1.0);
 
-            for (int i = 0; i < 10; i++)
-                Assert.AreEqual((float)i, outBuf[i], 1e-4f, $"index {i}");
+            for (int index = 0; index < 10; index++)
+                Assert.AreEqual((float)index, outputBuffer[index], 1e-4f, $"index {index}");
             Assert.AreEqual(0, ring.UnderrunFrames);
             Assert.AreEqual(0, ring.OverflowDropFrames);
         }
@@ -63,13 +63,13 @@ namespace CefUnity.Runtime.Tests
         {
             var ring = new CefAudioRing(1000, 1, targetFrames: 50, maxRateAdjust: 0.0);
             var few = new float[10];
-            for (int i = 0; i < few.Length; i++) few[i] = 1f;
+            for (int index = 0; index < few.Length; index++) few[index] = 1f;
             ring.Write(few, 0, 10); // 目標 50 未満 → まだプライミングしない
 
-            var outBuf = new float[8];
-            ring.Read(outBuf, 8, baseStep: 1.0);
+            var outputBuffer = new float[8];
+            ring.Read(outputBuffer, 8, baseStep: 1.0);
 
-            foreach (var s in outBuf) Assert.AreEqual(0f, s, "プライミング前は無音であるべき");
+            foreach (var sample in outputBuffer) Assert.AreEqual(0f, sample, "プライミング前は無音であるべき");
             Assert.AreEqual(8, ring.UnderrunFrames);
         }
 
@@ -78,7 +78,7 @@ namespace CefUnity.Runtime.Tests
         {
             var ring = new CefAudioRing(100, 1, targetFrames: 10, maxRateAdjust: 0.0);
             var big = new float[500];
-            for (int i = 0; i < big.Length; i++) big[i] = i;
+            for (int index = 0; index < big.Length; index++) big[index] = index;
             ring.Write(big, 0, 500); // 容量 100 を大きく超える
 
             Assert.Greater(ring.OverflowDropFrames, 0, "容量超過で破棄が記録されるべき");
@@ -140,25 +140,25 @@ namespace CefUnity.Runtime.Tests
             double baseStep = (double)SrcRate / OutRate;
             double phase = 0;
             int produced = 0, consumed = 0;
-            var outBuf = new float[441 * Channels];
+            var outputBuffer = new float[441 * Channels];
 
-            for (int t = 0; t < 600; t++)
+            for (int tick = 0; tick < 600; tick++)
             {
-                int prod = (int)Math.Round((t + 1) * 480.0) - produced;
-                var sine = MakeSine(prod, ref phase);
-                ring.Write(sine, 0, prod);
-                produced += prod;
+                int produceFrames = (int)Math.Round((tick + 1) * 480.0) - produced;
+                var sine = MakeSine(produceFrames, ref phase);
+                ring.Write(sine, 0, produceFrames);
+                produced += produceFrames;
 
-                int cons = (int)Math.Round((t + 1) * 441.0) - consumed;
-                if (cons > outBuf.Length / Channels) cons = outBuf.Length / Channels;
-                ring.Read(outBuf, cons, baseStep);
-                consumed += cons;
+                int consumeFrames = (int)Math.Round((tick + 1) * 441.0) - consumed;
+                if (consumeFrames > outputBuffer.Length / Channels) consumeFrames = outputBuffer.Length / Channels;
+                ring.Read(outputBuffer, consumeFrames, baseStep);
+                consumed += consumeFrames;
             }
 
-            double occ = ring.OccupancyFrames;
+            double occupancy = ring.OccupancyFrames;
             float target = ring.TargetFrames;
-            Assert.That(occ, Is.InRange(target * 0.5, target * 1.5),
-                $"滞留量({occ:F0})は目標({target})近傍へ収束すべき");
+            Assert.That(occupancy, Is.InRange(target * 0.5, target * 1.5),
+                $"滞留量({occupancy:F0})は目標({target})近傍へ収束すべき");
         }
 
         // ----- 共通シナリオ実行器 -----
@@ -173,7 +173,7 @@ namespace CefUnity.Runtime.Tests
             double baseStep = (double)SrcRate / OutRate;
             double phase = 0;
 
-            var outBuf = new float[(consumeFramesPerTick + 8) * Channels];
+            var outputBuffer = new float[(consumeFramesPerTick + 8) * Channels];
             maxDiscontinuity = 0f;
             long underAtPrimeWindow = -1;
             // プライミング完了とみなす tick (目標 80ms ≒ 8 tick + 余裕)。これ以降のアンダーランを評価。
@@ -181,35 +181,35 @@ namespace CefUnity.Runtime.Tests
             // 連続性は安定後 (priming 直後の開始トランジェントを除く) のみ評価。
             const int continuityFromTick = 25;
 
-            float[] prevFrame = null;
+            float[] previousFrame = null;
 
-            for (int t = 0; t < ticks; t++)
+            for (int tick = 0; tick < ticks; tick++)
             {
                 var sine = MakeSine(produceFramesPerTick, ref phase);
                 ring.Write(sine, 0, produceFramesPerTick);
 
-                ring.Read(outBuf, consumeFramesPerTick, baseStep);
+                ring.Read(outputBuffer, consumeFramesPerTick, baseStep);
 
-                if (t == primeWindowTicks) underAtPrimeWindow = ring.UnderrunFrames;
+                if (tick == primeWindowTicks) underAtPrimeWindow = ring.UnderrunFrames;
 
-                if (t >= continuityFromTick)
+                if (tick >= continuityFromTick)
                 {
-                    for (int f = 0; f < consumeFramesPerTick; f++)
+                    for (int frameIndex = 0; frameIndex < consumeFramesPerTick; frameIndex++)
                     {
-                        if (prevFrame != null)
+                        if (previousFrame != null)
                         {
-                            for (int c = 0; c < Channels; c++)
+                            for (int channelIndex = 0; channelIndex < Channels; channelIndex++)
                             {
-                                float d = Math.Abs(outBuf[f * Channels + c] - prevFrame[c]);
-                                if (d > maxDiscontinuity) maxDiscontinuity = d;
+                                float difference = Math.Abs(outputBuffer[frameIndex * Channels + channelIndex] - previousFrame[channelIndex]);
+                                if (difference > maxDiscontinuity) maxDiscontinuity = difference;
                             }
                         }
                         else
                         {
-                            prevFrame = new float[Channels];
+                            previousFrame = new float[Channels];
                         }
 
-                        for (int c = 0; c < Channels; c++) prevFrame[c] = outBuf[f * Channels + c];
+                        for (int channelIndex = 0; channelIndex < Channels; channelIndex++) previousFrame[channelIndex] = outputBuffer[frameIndex * Channels + channelIndex];
                     }
                 }
             }

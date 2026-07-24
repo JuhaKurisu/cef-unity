@@ -12,16 +12,16 @@ namespace CefUnity.Editor
     /// </summary>
     public static class CefQuickBuild
     {
-        private const string OutPath =
+        private const string OutputPath =
             "/Users/juha/Documents/GitHub/cef-unity/build-mac/CefUnity.app";
 
         [MenuItem("CefUnity/Build Mac Player (measure)")]
         public static void BuildMac()
         {
-            var opts = new BuildPlayerOptions
+            var buildPlayerOptions = new BuildPlayerOptions
             {
                 scenes = new[] { "Assets/Scenes/SampleScene.unity" },
-                locationPathName = OutPath,
+                locationPathName = OutputPath,
                 target = BuildTarget.StandaloneOSX,
                 // Development ビルド: temp ファイルの開発トグル群
                 // (cef_perf_probe / cef_scroll_* / cef_novsync 等、DEVELOPMENT_BUILD で
@@ -29,10 +29,10 @@ namespace CefUnity.Editor
                 options = BuildOptions.Development,
             };
 
-            var report = BuildPipeline.BuildPlayer(opts);
-            var s = report.summary;
-            Debug.Log($"[CefQuickBuild] result={s.result} sizeBytes={s.totalSize} " +
-                      $"errors={s.totalErrors} out={OutPath}");
+            var report = BuildPipeline.BuildPlayer(buildPlayerOptions);
+            var summary = report.summary;
+            Debug.Log($"[CefQuickBuild] result={summary.result} sizeBytes={summary.totalSize} " +
+                      $"errors={summary.totalErrors} out={OutputPath}");
         }
     }
 }

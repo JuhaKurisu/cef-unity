@@ -11,11 +11,11 @@ namespace CefUnity.Runtime
         public int Events;
         public int Ticks;
         public int Mismatches;
-        public IReadOnlyList<string> OutLines = Array.Empty<string>();
+        public IReadOnlyList<string> OutputLines = Array.Empty<string>();
     }
 
     /// <summary>
-    ///   cef_scroll_record の S/E/T CSV を ScrollResampler(interp + predictive)へ
+    ///   cef_scroll_record の S/E/T CSV を ScrollResampler(interpolating + predictive)へ
     ///   オフラインリプレイし、録画時の live 実排出との忠実度(mismatches)を測る純ロジック。
     ///   Editor/Harness は本クラスを呼び、I/O・終了コード・ログのみ担当する。
     /// </summary>
@@ -23,62 +23,63 @@ namespace CefUnity.Runtime
     {
         public static ScrollReplayResult Run(IEnumerable<string> csvLines)
         {
-            var interp = new ScrollResampler();
-            var pred = new ScrollResampler { Predictive = true };
-            var outLines = new List<string>();
+            var interpolatingResampler = new ScrollResampler();
+            var predictiveResampler = new ScrollResampler { Predictive = true };
+            var outputLines = new List<string>();
             var scale = 1f;                       // S 行が無い旧録画は scale=1
-            int events = 0, ticks = 0, mismatches = 0, lineNo = 0;
+            int events = 0, ticks = 0, mismatches = 0, lineNumber = 0;
             foreach (var line in csvLines)
             {
-                lineNo++;
+                lineNumber++;
                 if (line.Length == 0) continue;
                 try
                 {
-                    var c = line.Split(',');
-                    if (c.Length >= 2 && c[0] == "S")
+                    var columns = line.Split(',');
+                    if (columns.Length >= 2 && columns[0] == "S")
                     {
-                        scale = float.Parse(c[1], CultureInfo.InvariantCulture);
+                        scale = float.Parse(columns[1], CultureInfo.InvariantCulture);
                     }
-                    else if (c.Length >= 6 && c[0] == "E")
+                    else if (columns.Length >= 6 && columns[0] == "E")
                     {
-                        if (c.Length >= 7 && c[6] != "1") continue;   // live 未転送は投入しない
-                        var e = new ScrollInputEvent
+                        if (columns.Length >= 7 && columns[6] != "1") continue;   // live 未転送は投入しない
+                        var inputEvent = new ScrollInputEvent
                         {
-                            Timestamp = double.Parse(c[1], CultureInfo.InvariantCulture),
-                            DxPx = float.Parse(c[2], CultureInfo.InvariantCulture) * scale,
-                            DyPx = float.Parse(c[3], CultureInfo.InvariantCulture) * scale,
-                            Phase = (ScrollPhase)byte.Parse(c[4], CultureInfo.InvariantCulture),
-                            Precise = c[5] == "1",
+                            Timestamp = double.Parse(columns[1], CultureInfo.InvariantCulture),
+                            DeltaXPixels = float.Parse(columns[2], CultureInfo.InvariantCulture) * scale,
+                            DeltaYPixels = float.Parse(columns[3], CultureInfo.InvariantCulture) * scale,
+                            Phase = (ScrollPhase)byte.Parse(columns[4], CultureInfo.InvariantCulture),
+                            Precise = columns[5] == "1",
                         };
-                        if (!e.Precise) continue;                     // precise のみ
-                        interp.AddEvent(in e);
-                        pred.AddEvent(in e);
+                        if (!inputEvent.Precise) continue;                     // precise のみ
+                        interpolatingResampler.AddEvent(in inputEvent);
+                        predictiveResampler.AddEvent(in inputEvent);
                         events++;
                     }
-                    else if (c.Length >= 5 && c[0] == "T")
+                    else if (columns.Length >= 5 && columns[0] == "T")
                     {
-                        var now = double.Parse(c[1], CultureInfo.InvariantCulture);
-                        interp.Tick(now, out var idx, out var idy);
-                        pred.Tick(now, out var pdx, out var pdy);
-                        outLines.Add($"{c[1]},{c[2]},{c[3]},{idx},{idy},{pdx},{pdy}");
-                        var wasPredictive = c[4] == "1";
-                        var liveDx = int.Parse(c[2], CultureInfo.InvariantCulture);
-                        var liveDy = int.Parse(c[3], CultureInfo.InvariantCulture);
-                        if ((wasPredictive ? pdx : idx) != liveDx || (wasPredictive ? pdy : idy) != liveDy)
+                        var now = double.Parse(columns[1], CultureInfo.InvariantCulture);
+                        interpolatingResampler.Tick(now, out var interpolatedDeltaX, out var interpolatedDeltaY);
+                        predictiveResampler.Tick(now, out var predictedDeltaX, out var predictedDeltaY);
+                        outputLines.Add($"{columns[1]},{columns[2]},{columns[3]},{interpolatedDeltaX},{interpolatedDeltaY},{predictedDeltaX},{predictedDeltaY}");
+                        var wasPredictive = columns[4] == "1";
+                        var liveDeltaX = int.Parse(columns[2], CultureInfo.InvariantCulture);
+                        var liveDeltaY = int.Parse(columns[3], CultureInfo.InvariantCulture);
+                        if ((wasPredictive ? predictedDeltaX : interpolatedDeltaX) != liveDeltaX ||
+                            (wasPredictive ? predictedDeltaY : interpolatedDeltaY) != liveDeltaY)
                             mismatches++;
                         ticks++;
                     }
                 }
-                catch (Exception ex)
+                catch (Exception exception)
                 {
-                    return new ScrollReplayResult { Ok = false, Error = $"parse error at line {lineNo}: \"{line}\" ({ex.Message})" };
+                    return new ScrollReplayResult { Ok = false, Error = $"parse error at line {lineNumber}: \"{line}\" ({exception.Message})" };
                 }
             }
             if (ticks == 0)
                 return new ScrollReplayResult { Ok = false, Error = "no T lines (録画が空)" };
             return new ScrollReplayResult
             {
-                Ok = true, Events = events, Ticks = ticks, Mismatches = mismatches, OutLines = outLines,
+                Ok = true, Events = events, Ticks = ticks, Mismatches = mismatches, OutputLines = outputLines,
             };
         }
     }

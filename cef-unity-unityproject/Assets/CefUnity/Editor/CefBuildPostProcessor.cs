@@ -35,31 +35,31 @@ namespace CefUnity.Editor
                 return;
             }
 
-            var pluginsDir = Path.Combine(appPath, "Contents", "Plugins");
-            if (!Directory.Exists(pluginsDir))
+            var pluginsDirectory = Path.Combine(appPath, "Contents", "Plugins");
+            if (!Directory.Exists(pluginsDirectory))
             {
-                Debug.LogError("[CefUnity] Plugins directory not found: " + pluginsDir);
+                Debug.LogError("[CefUnity] Plugins directory not found: " + pluginsDirectory);
                 return;
             }
 
-            var src = Path.Combine(
+            var source = Path.Combine(
                 Application.dataPath,
                 "CefUnity", "Plugins", "osx-arm64", "cef-unity-server.app");
 
-            if (!Directory.Exists(src))
+            if (!Directory.Exists(source))
             {
-                Debug.LogError("[CefUnity] cef-unity-server.app not found at: " + src);
+                Debug.LogError("[CefUnity] cef-unity-server.app not found at: " + source);
                 return;
             }
 
-            var dst = Path.Combine(pluginsDir, "cef-unity-server.app");
+            var destination = Path.Combine(pluginsDirectory, "cef-unity-server.app");
 
-            if (Directory.Exists(dst))
-                Directory.Delete(dst, true);
+            if (Directory.Exists(destination))
+                Directory.Delete(destination, true);
 
             Debug.Log("[CefUnity] Copying cef-unity-server.app to build...");
-            CopyDirectory(src, dst);
-            Debug.Log("[CefUnity] Done. Copied to: " + dst);
+            CopyDirectory(source, destination);
+            Debug.Log("[CefUnity] Done. Copied to: " + destination);
         }
 
         // -------------------------------------------------------------------
@@ -68,79 +68,79 @@ namespace CefUnity.Editor
         //          Unity は cef_unity_rust.dll のみ自動コピーするので、それ以外を
         //          手動配置する。
         // -------------------------------------------------------------------
-        private static void PostProcessWindows(string exePath)
+        private static void PostProcessWindows(string executablePath)
         {
-            if (!exePath.EndsWith(".exe"))
+            if (!executablePath.EndsWith(".exe"))
             {
                 Debug.LogWarning("[CefUnity] Build output is not an .exe, skipping post-process.");
                 return;
             }
 
-            var dataDir = Path.Combine(
-                Path.GetDirectoryName(exePath) ?? string.Empty,
-                Path.GetFileNameWithoutExtension(exePath) + "_Data");
+            var dataDirectory = Path.Combine(
+                Path.GetDirectoryName(executablePath) ?? string.Empty,
+                Path.GetFileNameWithoutExtension(executablePath) + "_Data");
 
-            var pluginsDir = Path.Combine(dataDir, "Plugins", "x86_64");
-            if (!Directory.Exists(pluginsDir))
+            var pluginsDirectory = Path.Combine(dataDirectory, "Plugins", "x86_64");
+            if (!Directory.Exists(pluginsDirectory))
             {
-                Debug.LogError("[CefUnity] Plugins/x86_64 directory not found: " + pluginsDir);
+                Debug.LogError("[CefUnity] Plugins/x86_64 directory not found: " + pluginsDirectory);
                 return;
             }
 
-            var src = Path.Combine(
+            var source = Path.Combine(
                 Application.dataPath,
                 "CefUnity", "Plugins", "win-x64");
 
-            if (!Directory.Exists(src))
+            if (!Directory.Exists(source))
             {
-                Debug.LogError("[CefUnity] win-x64 plugin folder not found at: " + src);
+                Debug.LogError("[CefUnity] win-x64 plugin folder not found at: " + source);
                 return;
             }
 
             Debug.Log("[CefUnity] Copying CEF runtime to build...");
-            CopyDirectoryFlat(src, pluginsDir, skipExtensions: new[] { ".meta" });
-            Debug.Log("[CefUnity] Done. Copied to: " + pluginsDir);
+            CopyDirectoryFlat(source, pluginsDirectory, skipExtensions: new[] { ".meta" });
+            Debug.Log("[CefUnity] Done. Copied to: " + pluginsDirectory);
         }
 
         // -------------------------------------------------------------------
         // ヘルパー
         // -------------------------------------------------------------------
-        private static void CopyDirectory(string src, string dst)
+        private static void CopyDirectory(string source, string destination)
         {
-            Directory.CreateDirectory(dst);
+            Directory.CreateDirectory(destination);
 
-            foreach (var file in Directory.GetFiles(src))
+            foreach (var file in Directory.GetFiles(source))
             {
                 // Unity が .app 内に作る .meta ファイルはスキップ
                 if (file.EndsWith(".meta"))
                     continue;
 
-                var destFile = Path.Combine(dst, Path.GetFileName(file));
-                File.Copy(file, destFile, true);
+                var destinationFile = Path.Combine(destination, Path.GetFileName(file));
+                File.Copy(file, destinationFile, true);
             }
 
-            foreach (var dir in Directory.GetDirectories(src))
+            foreach (var directory in Directory.GetDirectories(source))
             {
-                var dirName = Path.GetFileName(dir);
-                if (dirName.StartsWith("."))
+                var directoryName = Path.GetFileName(directory);
+                if (directoryName.StartsWith("."))
                     continue;
 
-                CopyDirectory(dir, Path.Combine(dst, dirName));
+                CopyDirectory(directory, Path.Combine(destination, directoryName));
             }
         }
 
         /// <summary>
-        /// src の中身を dst に再帰的にコピーするが、cef_unity_rust.dll は除外する
+        /// source の中身を destination に再帰的にコピーするが、cef_unity_rust.dll は除外する
         /// (Unity が自動でコピー済みのため)。
         /// </summary>
-        private static void CopyDirectoryFlat(string src, string dst, string[] skipExtensions)
+        private static void CopyDirectoryFlat(string source, string destination, string[] skipExtensions)
         {
-            Directory.CreateDirectory(dst);
+            Directory.CreateDirectory(destination);
 
-            foreach (var file in Directory.GetFiles(src))
+            foreach (var file in Directory.GetFiles(source))
             {
-                var ext = Path.GetExtension(file);
-                if (System.Array.IndexOf(skipExtensions, ext) >= 0)
+                var extension = Path.GetExtension(file);
+                if (System.Array.IndexOf(skipExtensions, extension) >= 0)
                     continue;
 
                 var fileName = Path.GetFileName(file);
@@ -148,16 +148,16 @@ namespace CefUnity.Editor
                 if (fileName.Equals("cef_unity_rust.dll", System.StringComparison.OrdinalIgnoreCase))
                     continue;
 
-                File.Copy(file, Path.Combine(dst, fileName), true);
+                File.Copy(file, Path.Combine(destination, fileName), true);
             }
 
-            foreach (var dir in Directory.GetDirectories(src))
+            foreach (var directory in Directory.GetDirectories(source))
             {
-                var dirName = Path.GetFileName(dir);
-                if (dirName.StartsWith("."))
+                var directoryName = Path.GetFileName(directory);
+                if (directoryName.StartsWith("."))
                     continue;
 
-                CopyDirectoryFlat(dir, Path.Combine(dst, dirName), skipExtensions);
+                CopyDirectoryFlat(directory, Path.Combine(destination, directoryName), skipExtensions);
             }
         }
     }

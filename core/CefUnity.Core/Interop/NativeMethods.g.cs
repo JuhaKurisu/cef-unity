@@ -26,8 +26,8 @@ namespace CefUnity
         ///  Unity 側のマスターログフラグから渡す。
         ///  Returns 0 on success, non-zero on failure.
         /// </summary>
-        [DllImport(__DllName, EntryPoint = "cef_unity_init", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern int cef_unity_init(int use_gpu, int enable_log);
+        [DllImport(__DllName, EntryPoint = "cef_unity_initialize", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_initialize(int use_gpu, int enable_log);
 
         /// <summary>
         ///  Pump CEF message loop — no-op in IPC mode (server has its own loop).
@@ -141,7 +141,7 @@ namespace CefUnity
         ///  Returns the required buffer size including the trailing NUL terminator.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_get_url", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern int cef_unity_get_url(CefUnityBrowser* handle, byte* buffer, int buffer_len);
+        public static extern int cef_unity_get_url(CefUnityBrowser* handle, byte* buffer, int buffer_length);
 
         /// <summary>
         ///  Get the latest frame buffer from shared memory.
@@ -154,7 +154,7 @@ namespace CefUnity
         ///  Read the IME caret rect from shared memory.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_get_ime_caret", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern void cef_unity_get_ime_caret(CefUnityBrowser* handle, int* out_x, int* out_y, int* out_w, int* out_h);
+        public static extern void cef_unity_get_ime_caret(CefUnityBrowser* handle, int* out_x, int* out_y, int* out_width, int* out_height);
 
         /// <summary>
         ///  現在の音声ストリームフォーマットを取得する。
@@ -184,14 +184,14 @@ namespace CefUnity
         ///  既存の `cef_unity_read_audio` (録画 tap) とはリングカーソルが独立しており併用可。
         ///  CefAudioOutput (Unity ミキサ再生) と同時に有効にすると二重再生になる。
         ///
-        ///  `target_ms`: jitter buffer の目標滞留量 (推奨 15)。
+        ///  `target_milliseconds`: jitter buffer の目標滞留量 (推奨 15)。
         ///  `io_frames`: CoreAudio IO バッファフレーム数 (推奨 128 ≈ 2.9ms)。0 以下は 128。
         ///  戻り値: 0=成功 (既に再生中も 0)、-1=失敗 (音声無効・フォーマット未確定・
         ///  AU 起動失敗・非対応 OS)。フォーマット未確定で失敗するため、呼び出し側は
         ///  `cef_unity_get_audio_format` が 1 を返してから呼ぶこと。
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_audio_native_start", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern int cef_unity_audio_native_start(CefUnityBrowser* handle, float target_ms, int io_frames);
+        public static extern int cef_unity_audio_native_start(CefUnityBrowser* handle, float target_milliseconds, int io_frames);
 
         /// <summary>
         ///  ネイティブ音声出力を停止する (排水待ちして返る)。未開始なら何もしない。
@@ -207,12 +207,12 @@ namespace CefUnity
 
         /// <summary>
         ///  ネイティブ音声出力の診断値を取得する。
-        ///  `out_occupancy_ms`: jitter buffer の滞留量 (ms)。
+        ///  `out_occupancy_milliseconds`: jitter buffer の滞留量 (ms)。
         ///  `out_underrun_frames` / `out_overflow_frames`: 累積フレーム数。
         ///  戻り値: 0=再生中、-1=停止中/非対応 OS (out には書き込まない)。
         /// </summary>
-        [DllImport(__DllName, EntryPoint = "cef_unity_audio_native_stats", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern int cef_unity_audio_native_stats(CefUnityBrowser* handle, float* out_occupancy_ms, ulong* out_underrun_frames, ulong* out_overflow_frames);
+        [DllImport(__DllName, EntryPoint = "cef_unity_audio_native_statistics", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_audio_native_statistics(CefUnityBrowser* handle, float* out_occupancy_milliseconds, ulong* out_underrun_frames, ulong* out_overflow_frames);
 
         /// <summary>
         ///  Destroy a browser instance (blocking).
@@ -279,7 +279,7 @@ namespace CefUnity
         ///  Unity の Update 冒頭で呼ぶ。Init 時に WindowInfo::external_begin_frame_enabled=1
         ///  が立っているブラウザに対してのみ意味を持つ。fire-and-forget。
         ///  `unity_frame` には Time.frameCount を渡す。on_accelerated_paint 経由で shm に転送され、
-        ///  `cef_unity_get_accel_paint_unity_frame` で読み取ることで end-to-end の遅延フレーム数を測れる。
+        ///  `cef_unity_get_accelerated_paint_unity_frame` で読み取ることで end-to-end の遅延フレーム数を測れる。
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_send_external_begin_frame", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern void cef_unity_send_external_begin_frame(CefUnityBrowser* handle, ulong unity_frame);
@@ -289,17 +289,17 @@ namespace CefUnity
         ///  番号を返す。Unity 側は `Time.frameCount - 戻り値` で end-to-end の遅延フレーム数
         ///  (BeginFrame 発行から実際にテクスチャが使えるようになるまで) を計算できる。
         /// </summary>
-        [DllImport(__DllName, EntryPoint = "cef_unity_get_accel_paint_unity_frame", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern ulong cef_unity_get_accel_paint_unity_frame(CefUnityBrowser* handle);
+        [DllImport(__DllName, EntryPoint = "cef_unity_get_accelerated_paint_unity_frame", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern ulong cef_unity_get_accelerated_paint_unity_frame(CefUnityBrowser* handle);
 
         /// <summary>
-        ///  accelerated paint の単調増加カウンタ (accel_frame_id) を消費せずに返す。
+        ///  accelerated paint の単調増加カウンタ (accelerated_frame_id) を消費せずに返す。
         ///  double-pump 同期に使う: flush BeginFrame の直前にこの値を記録し、flush 後に
         ///  この値を超えるまで待てば、flush が生成した最新 paint の IOSurface が
         ///  受信ポートに届いていることが保証される (server は Mach 送信完了後に +1 する)。
         /// </summary>
-        [DllImport(__DllName, EntryPoint = "cef_unity_peek_accel_frame_id", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern ulong cef_unity_peek_accel_frame_id(CefUnityBrowser* handle);
+        [DllImport(__DllName, EntryPoint = "cef_unity_peek_accelerated_frame_id", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern ulong cef_unity_peek_accelerated_frame_id(CefUnityBrowser* handle);
 
         /// <summary>
         ///  Cancel the current IME composition.
@@ -327,8 +327,8 @@ namespace CefUnity
         ///  Returns an opaque MTLTexture pointer, or null if no new frame.
         ///  The caller must release the returned texture with cef_unity_release_metal_texture.
         /// </summary>
-        [DllImport(__DllName, EntryPoint = "cef_unity_recv_iosurface_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern void* cef_unity_recv_iosurface_texture(int* out_width, int* out_height, uint* out_format);
+        [DllImport(__DllName, EntryPoint = "cef_unity_receive_iosurface_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void* cef_unity_receive_iosurface_texture(int* out_width, int* out_height, uint* out_format);
 
         /// <summary>
         ///  Returns 1 if the Mach IOSurface port channel is connected, 0 otherwise.
@@ -349,7 +349,7 @@ namespace CefUnity
         ///  If buffer is non-null, copies cached data into buffer and clears the cache.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_get_logs", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern int cef_unity_get_logs(byte* buffer, int buffer_len);
+        public static extern int cef_unity_get_logs(byte* buffer, int buffer_length);
 
         /// <summary>
         ///  Execute JavaScript in the browser's main frame (blocking).
@@ -381,7 +381,7 @@ namespace CefUnity
 
         /// <summary>
         ///  Windows: Unity の D3D12 device に接続済みなら 1 を返す。
-        ///  C# 側はこちらが 1 のとき `cef_unity_recv_d3d12_texture` を呼ぶ。
+        ///  C# 側はこちらが 1 のとき `cef_unity_receive_d3d12_texture` を呼ぶ。
         ///  CPU モード (Init で use_gpu=0) のときは常に 0 を返す。
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_is_d3d12_connected", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
@@ -395,8 +395,8 @@ namespace CefUnity
         ///  戻り値ポインタは内部で AddRef 済みのキャッシュであり、次に handle が変わるか
         ///  プラグイン unload までは Unity 側で再 AddRef せずに使ってよい。
         /// </summary>
-        [DllImport(__DllName, EntryPoint = "cef_unity_recv_d3d11_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern void* cef_unity_recv_d3d11_texture(CefUnityBrowser* handle, int* out_width, int* out_height, uint* out_format);
+        [DllImport(__DllName, EntryPoint = "cef_unity_receive_d3d11_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void* cef_unity_receive_d3d11_texture(CefUnityBrowser* handle, int* out_width, int* out_height, uint* out_format);
 
         /// <summary>
         ///  Windows: 共有メモリから最新の D3D11 共有 HANDLE を読み出し、
@@ -405,8 +405,8 @@ namespace CefUnity
         ///  初回のみ COMMON → PIXEL_SHADER_RESOURCE 状態遷移を Unity に宣言する。
         ///  新フレームが無い場合は null。
         /// </summary>
-        [DllImport(__DllName, EntryPoint = "cef_unity_recv_d3d12_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern void* cef_unity_recv_d3d12_texture(CefUnityBrowser* handle, int* out_width, int* out_height, uint* out_format);
+        [DllImport(__DllName, EntryPoint = "cef_unity_receive_d3d12_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void* cef_unity_receive_d3d12_texture(CefUnityBrowser* handle, int* out_width, int* out_height, uint* out_format);
 
 
     }
@@ -426,8 +426,8 @@ namespace CefUnity
     public unsafe partial struct CefScrollEvent
     {
         public double timestamp;
-        public float dx;
-        public float dy;
+        public float delta_x;
+        public float delta_y;
         public byte phase;
         public byte precise;
     }

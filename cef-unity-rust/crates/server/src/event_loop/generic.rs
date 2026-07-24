@@ -11,20 +11,20 @@ use super::ServerState;
 // Global schedule signal
 // ---------------------------------------------------------------------------
 
-static SCHEDULE_DELAY_MS: AtomicI64 = AtomicI64::new(4);
+static SCHEDULE_DELAY_MILLISECONDS: AtomicI64 = AtomicI64::new(4);
 static WAKE_MUTEX: Mutex<()> = Mutex::new(());
 static WAKE_CONDVAR: Condvar = Condvar::new();
 
 /// Called from BrowserProcessHandler::on_schedule_message_pump_work.
-pub fn schedule_pump(delay_ms: i64) {
-    SCHEDULE_DELAY_MS.store(delay_ms.max(0), Ordering::Release);
+pub fn schedule_pump(delay_milliseconds: i64) {
+    SCHEDULE_DELAY_MILLISECONDS.store(delay_milliseconds.max(0), Ordering::Release);
     // Wake the sleeping event loop
     let _guard = WAKE_MUTEX.lock().unwrap();
     WAKE_CONDVAR.notify_one();
 }
 
-fn log(msg: &str) {
-    crate::log(msg);
+fn log(message: &str) {
+    crate::log(message);
 }
 
 pub fn run_event_loop(mut state: ServerState) -> ServerState {
@@ -40,7 +40,7 @@ pub fn run_event_loop(mut state: ServerState) -> ServerState {
         }
 
         if state.running {
-            let delay = SCHEDULE_DELAY_MS.load(Ordering::Acquire);
+            let delay = SCHEDULE_DELAY_MILLISECONDS.load(Ordering::Acquire);
             let wait = Duration::from_millis(delay.max(1) as u64);
             let guard = WAKE_MUTEX.lock().unwrap();
             let _ = WAKE_CONDVAR.wait_timeout(guard, wait);
@@ -67,16 +67,16 @@ fn tick(state: &mut ServerState) {
 
 fn drain_commands(state: &mut ServerState) {
     loop {
-        match state.cmd_rx.try_recv() {
-            Ok(env) => {
-                let is_shutdown = matches!(env.command, cef_unity_ipc::Command::Shutdown);
-                if env.expects_response {
-                    log(&format!("received command: {:?}", env.command));
+        match state.command_receiver.try_recv() {
+            Ok(envelope) => {
+                let is_shutdown = matches!(envelope.command, cef_unity_ipc::Command::Shutdown);
+                if envelope.expects_response {
+                    log(&format!("received command: {:?}", envelope.command));
                 }
-                let resp = state.cef_server.handle_command(env.command);
-                if env.expects_response {
-                    if let Err(e) = state.resp_tx.send(resp) {
-                        log(&format!("send error: {}", e));
+                let response = state.cef_server.handle_command(envelope.command);
+                if envelope.expects_response {
+                    if let Err(error) = state.response_sender.send(response) {
+                        log(&format!("send error: {}", error));
                         state.running = false;
                         break;
                     }

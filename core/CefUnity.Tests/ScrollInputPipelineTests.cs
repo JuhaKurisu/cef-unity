@@ -11,8 +11,8 @@ namespace CefUnity.Runtime.Tests
     /// </summary>
     public class ScrollInputPipelineTests
     {
-        private const double E = 1.0 / 120.0; // 120Hz イベント間隔
-        private const float F = 1.0f / 60.0f; // 60fps フレーム間隔
+        private const double EventInterval = 1.0 / 120.0; // 120Hz イベント間隔
+        private const float FrameInterval = 1.0f / 60.0f; // 60fps フレーム間隔
 
         /// <summary>テスト用の合成イベントソース。Poll でキュー内容を排出する。</summary>
         private sealed class FakeSource : IScrollEventSource
@@ -24,39 +24,39 @@ namespace CefUnity.Runtime.Tests
 
             public int Poll(ScrollInputEvent[] buffer)
             {
-                var n = 0;
-                while (n < buffer.Length && _queue.Count > 0) buffer[n++] = _queue.Dequeue();
-                return n;
+                var count = 0;
+                while (count < buffer.Length && _queue.Count > 0) buffer[count++] = _queue.Dequeue();
+                return count;
             }
 
             public void Dispose() { }
 
-            public void Enqueue(double t, float dy, bool precise,
+            public void Enqueue(double timestamp, float deltaY, bool precise,
                 ScrollPhase phase = ScrollPhase.MomentumChanged)
                 => _queue.Enqueue(new ScrollInputEvent
-                    { Timestamp = t, DyPx = dy, Precise = precise, Phase = phase });
+                    { Timestamp = timestamp, DeltaYPixels = deltaY, Precise = precise, Phase = phase });
         }
 
         /// <summary>入力途絶までリサンプラ排出を合計する (終端スナップ含む)。</summary>
         private static int DrainResampler(
-            ScrollInputPipeline p, FakeSource src, double start, int frames = 60, float scale = 1f)
+            ScrollInputPipeline pipeline, FakeSource source, double start, int frames = 60, float scale = 1f)
         {
             var total = 0;
-            for (var k = 0; k < frames; k++)
+            for (var frameIndex = 0; frameIndex < frames; frameIndex++)
             {
-                src.Now = start + k * F;
-                p.Drain(true, scale);
-                p.TickResampler(out _, out var dy);
-                total += dy;
+                source.Now = start + frameIndex * FrameInterval;
+                pipeline.Drain(true, scale);
+                pipeline.TickResampler(out _, out var deltaY);
+                total += deltaY;
             }
             return total;
         }
 
         /// <summary>スムーザが非アクティブになるまで排出を合計する。</summary>
-        private static int DrainSmoother(ScrollInputPipeline p)
+        private static int DrainSmoother(ScrollInputPipeline pipeline)
         {
             var total = 0;
-            for (var k = 0; k < 600 && p.TickSmoother(F, out _, out var dy); k++) total += dy;
+            for (var frameIndex = 0; frameIndex < 600 && pipeline.TickSmoother(FrameInterval, out _, out var deltaY); frameIndex++) total += deltaY;
             return total;
         }
 
@@ -65,27 +65,27 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void WithoutSource_TickResamplerReturnsFalse()
         {
-            var p = new ScrollInputPipeline();
-            Assert.IsFalse(p.HasNativeSource);
-            Assert.IsFalse(p.TickResampler(out var dx, out var dy));
-            Assert.AreEqual(0, dx);
-            Assert.AreEqual(0, dy);
+            var pipeline = new ScrollInputPipeline();
+            Assert.IsFalse(pipeline.HasNativeSource);
+            Assert.IsFalse(pipeline.TickResampler(out var deltaX, out var deltaY));
+            Assert.AreEqual(0, deltaX);
+            Assert.AreEqual(0, deltaY);
         }
 
         [Test]
         public void AddWheelSteps_DrainsStepsTimesPixelsPerStep()
         {
-            var p = new ScrollInputPipeline();
-            p.AddWheelSteps(0f, 2f, 1f); // 2 ステップ = 120px
-            Assert.AreEqual(120, DrainSmoother(p), "総量保存: 2×60px が全て排出される");
+            var pipeline = new ScrollInputPipeline();
+            pipeline.AddWheelSteps(0f, 2f, 1f); // 2 ステップ = 120px
+            Assert.AreEqual(120, DrainSmoother(pipeline), "総量保存: 2×60px が全て排出される");
         }
 
         [Test]
         public void AddWheelSteps_AppliesResolutionScale()
         {
-            var p = new ScrollInputPipeline();
-            p.AddWheelSteps(0f, 1f, 2f); // 1 ステップ × scale2 = 120px
-            Assert.AreEqual(120, DrainSmoother(p));
+            var pipeline = new ScrollInputPipeline();
+            pipeline.AddWheelSteps(0f, 1f, 2f); // 1 ステップ × scale2 = 120px
+            Assert.AreEqual(120, DrainSmoother(pipeline));
         }
 
         // ---- ルーティング: precise はリサンプラ、非 precise はスムーザ ----
@@ -93,46 +93,46 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void PreciseEvents_RouteToResampler()
         {
-            var p = new ScrollInputPipeline();
-            var src = new FakeSource();
-            p.AttachSource(src);
-            Assert.IsTrue(p.HasNativeSource);
+            var pipeline = new ScrollInputPipeline();
+            var source = new FakeSource();
+            pipeline.AttachSource(source);
+            Assert.IsTrue(pipeline.HasNativeSource);
 
             // 実運用同様、ジェスチャは MomentumEnded で閉じる (終端なしで途切れる列は
             // 外挿上限分のオーバーシュートが仕様上残るため、総量比較には使えない)。
-            for (var i = 0; i < 6; i++) src.Enqueue(i * E, 10f, precise: true);
-            src.Enqueue(6 * E, 0f, precise: true, ScrollPhase.MomentumEnded);
-            var total = DrainResampler(p, src, 0.06);
+            for (var eventIndex = 0; eventIndex < 6; eventIndex++) source.Enqueue(eventIndex * EventInterval, 10f, precise: true);
+            source.Enqueue(6 * EventInterval, 0f, precise: true, ScrollPhase.MomentumEnded);
+            var total = DrainResampler(pipeline, source, 0.06);
             Assert.AreEqual(60, total, "precise 6 イベント ×10px が終端スナップで全量排出");
-            Assert.IsFalse(p.TickSmoother(F, out _, out _), "スムーザ側には入らない");
+            Assert.IsFalse(pipeline.TickSmoother(FrameInterval, out _, out _), "スムーザ側には入らない");
         }
 
         [Test]
         public void NotchEvents_RouteToSmootherWithPixelsPerStep()
         {
-            var p = new ScrollInputPipeline();
-            var src = new FakeSource();
-            p.AttachSource(src);
+            var pipeline = new ScrollInputPipeline();
+            var source = new FakeSource();
+            pipeline.AttachSource(source);
 
-            src.Enqueue(0.0, 1f, precise: false); // 1 ノッチ = 60px
-            src.Now = 0.01;
-            p.Drain(true, 1f);
-            p.TickResampler(out _, out var rdy);
-            Assert.AreEqual(0, rdy, "リサンプラ側には入らない");
-            Assert.AreEqual(60, DrainSmoother(p));
+            source.Enqueue(0.0, 1f, precise: false); // 1 ノッチ = 60px
+            source.Now = 0.01;
+            pipeline.Drain(true, 1f);
+            pipeline.TickResampler(out _, out var resamplerDeltaY);
+            Assert.AreEqual(0, resamplerDeltaY, "リサンプラ側には入らない");
+            Assert.AreEqual(60, DrainSmoother(pipeline));
         }
 
         [Test]
         public void PreciseEvents_ScaledByResolutionScale()
         {
-            var p = new ScrollInputPipeline();
-            var src = new FakeSource();
-            p.AttachSource(src);
+            var pipeline = new ScrollInputPipeline();
+            var source = new FakeSource();
+            pipeline.AttachSource(source);
 
             // 終端で閉じた列 (PreciseEvents_RouteToResampler と同じ理由)。
-            for (var i = 0; i < 6; i++) src.Enqueue(i * E, 10f, precise: true);
-            src.Enqueue(6 * E, 0f, precise: true, ScrollPhase.MomentumEnded);
-            var total = DrainResampler(p, src, 0.06, scale: 2f); // scale=2 → 各イベント 20px
+            for (var eventIndex = 0; eventIndex < 6; eventIndex++) source.Enqueue(eventIndex * EventInterval, 10f, precise: true);
+            source.Enqueue(6 * EventInterval, 0f, precise: true, ScrollPhase.MomentumEnded);
+            var total = DrainResampler(pipeline, source, 0.06, scale: 2f); // scale=2 → 各イベント 20px
             Assert.AreEqual(120, total, "scale=2 で総量も 2 倍");
         }
 
@@ -141,16 +141,16 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void EventsOutsideBrowser_AreDropped()
         {
-            var p = new ScrollInputPipeline();
-            var src = new FakeSource();
-            p.AttachSource(src);
+            var pipeline = new ScrollInputPipeline();
+            var source = new FakeSource();
+            pipeline.AttachSource(source);
 
-            for (var i = 0; i < 6; i++) src.Enqueue(i * E, 10f, precise: true);
-            src.Now = 0.02;
-            p.Drain(false, 1f); // カーソルがブラウザ外
-            var total = DrainResampler(p, src, 0.02 + F);
+            for (var eventIndex = 0; eventIndex < 6; eventIndex++) source.Enqueue(eventIndex * EventInterval, 10f, precise: true);
+            source.Now = 0.02;
+            pipeline.Drain(false, 1f); // カーソルがブラウザ外
+            var total = DrainResampler(pipeline, source, 0.02 + FrameInterval);
             Assert.AreEqual(0, total);
-            Assert.IsFalse(p.TickSmoother(F, out _, out _));
+            Assert.IsFalse(pipeline.TickSmoother(FrameInterval, out _, out _));
         }
 
         // ---- Reset は両経路の残距離/履歴を消す ----
@@ -158,19 +158,19 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void Reset_ClearsBothPaths()
         {
-            var p = new ScrollInputPipeline();
-            var src = new FakeSource();
-            p.AttachSource(src);
+            var pipeline = new ScrollInputPipeline();
+            var source = new FakeSource();
+            pipeline.AttachSource(source);
 
-            src.Enqueue(0.0, 100f, precise: true);
-            src.Enqueue(0.0, 3f, precise: false);
-            src.Now = 0.005;
-            p.Drain(true, 1f);
-            p.Reset();
+            source.Enqueue(0.0, 100f, precise: true);
+            source.Enqueue(0.0, 3f, precise: false);
+            source.Now = 0.005;
+            pipeline.Drain(true, 1f);
+            pipeline.Reset();
 
-            var total = DrainResampler(p, src, 0.01);
+            var total = DrainResampler(pipeline, source, 0.01);
             Assert.AreEqual(0, total, "リサンプラ履歴が消えている");
-            Assert.IsFalse(p.TickSmoother(F, out _, out _), "スムーザ残距離が消えている");
+            Assert.IsFalse(pipeline.TickSmoother(FrameInterval, out _, out _), "スムーザ残距離が消えている");
         }
 
         // ---- Predictive プロパティがリサンプラへ届く (既定 true) ----
@@ -178,10 +178,10 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void Predictive_DefaultsTrue_AndIsSettable()
         {
-            var p = new ScrollInputPipeline();
-            Assert.IsTrue(p.Predictive, "予測モードが既定 (2026-07-22 採用)");
-            p.Predictive = false;
-            Assert.IsFalse(p.Predictive);
+            var pipeline = new ScrollInputPipeline();
+            Assert.IsTrue(pipeline.Predictive, "予測モードが既定 (2026-07-22 採用)");
+            pipeline.Predictive = false;
+            Assert.IsFalse(pipeline.Predictive);
         }
     }
 }

@@ -10,7 +10,7 @@ namespace CefUnity.Runtime
     ///     BeginFrame では display compositor が renderer の submit を待たず「前フレーム」を
     ///     即 draw する (構造的 1F 遅延)。サーバーが BF#1 の +3/+6ms に内部 flush (BF#2) を
     ///     発行して最新内容を draw させる (server-side flush、server.rs)。クライアントは
-    ///     描画発行前の recv 位置で flush 結果の到着 (accel_frame_id 増分) を短時間だけ
+    ///     描画発行前の recv 位置で flush 結果の到着 (accelerated_frame_id 増分) を短時間だけ
     ///     待ち、同フレームの present に乗せる (0F)。待ちの上限は BF#1 (EarlyUpdate) からの
     ///     経過時間で cap するため、ゲーム処理が重いフレームでは自動的に待ちゼロになる
     ///     (その場合 flush 結果は自然に到着済み)。間に合わなければ従来通り 1F フォールバック。
@@ -21,21 +21,21 @@ namespace CefUnity.Runtime
     public sealed class CefZeroFramePacer
     {
         // server-side flush#1 は BF#1+3ms に発行される (server.rs FLUSH_THRESHOLDS_MS[0])。
-        // その draw 由来 paint が accel_frame_id に計上され得る最短時刻のマージン。これより
+        // その draw 由来 paint が accelerated_frame_id に計上され得る最短時刻のマージン。これより
         // 前の増分は BF#1 由来の stale paint (#A) とみなして読み捨て、fresh (#B) を待つ。
-        public const float FreshPaintMinDelayMs = 4.5f;
+        public const float FreshPaintMinDelayMilliseconds = 4.5f;
 
         // damage の有無は「flush#1 の draw 由来 paint が届き得る時刻」まで分からない
         // (renderer のタイマー/rAF 発火 → submit +2-4ms → flush#1 draw → paint +5-6ms)。
         // BF#1 からこの時間まで増分ゼロなら「このフレームに damage なし」と判断して
         // 待ちを打ち切る (5Hz 更新ページ等で damage の無いフレームの空回りを短縮)。
-        public const float NoDamageGiveUpMs = 7f;
+        public const float NoDamageGiveUpMilliseconds = 7f;
 
         // 早着 paint (#A、freshMinTime より前の増分) を読み捨てた後、この時刻までに
         // flush 由来 (#B) が来なければ #A の内容を採用して抜ける。#A がタイマー発火由来の
         // fresh な内容 (damage を #A が消費し #B が生成されない) ケースで、絶対上限まで
         // 粘る無駄を防ぐ。#B の標準到着 (+5-6.5ms) を跨ぐ位置に置く。
-        public const float EarlyPaintAdoptMs = 7.5f;
+        public const float EarlyPaintAdoptMilliseconds = 7.5f;
 
         // server は「paint 発生フレーム」が 3 連続すると flush を抑止する (damage streak、
         // server.rs DAMAGE_STREAK_SUPPRESS_FLUSH)。抑止中は fresh (#B) が来ないため、
@@ -68,22 +68,22 @@ namespace CefUnity.Runtime
         private int _framesSinceFreshPaint = int.MaxValue;
 
         /// <summary>BF#1 送信直前の実時刻 (秒)。待ちデッドラインと fresh 判定時刻の基準。</summary>
-        public float Bf1Time { get; private set; }
+        public float BeginFrame1Time { get; private set; }
 
-        /// <summary>BF#1 直前の accel_frame_id (増分検知の基準)。</summary>
-        public ulong AfiAtBf1 { get; private set; }
+        /// <summary>BF#1 直前の accelerated_frame_id (増分検知の基準)。</summary>
+        public ulong AcceleratedFrameIdAtBeginFrame1 { get; private set; }
 
         /// <summary>
         ///     EarlyUpdate 末尾・BF#1 送信の直前に呼ぶ (入力ハンドラ群の後 =
-        ///     inputSentThisFrame 確定済みであること)。afiNow は software 経路では 0 でよい。
+        ///     inputSentThisFrame 確定済みであること)。acceleratedFrameIdNow は software 経路では 0 でよい。
         /// </summary>
-        public void OnBeginFrame(float now, ulong afiNow, bool inputSentThisFrame)
+        public void OnBeginFrame(float now, ulong acceleratedFrameIdNow, bool inputSentThisFrame)
         {
             _consecutiveInputFrames = inputSentThisFrame
                 ? Math.Min(_consecutiveInputFrames + 1, 1000)
                 : 0;
-            AfiAtBf1 = afiNow;
-            Bf1Time = now;
+            AcceleratedFrameIdAtBeginFrame1 = acceleratedFrameIdNow;
+            BeginFrame1Time = now;
         }
 
         /// <summary>
@@ -105,8 +105,8 @@ namespace CefUnity.Runtime
             => _streakScore >= StreakScoreSuppress || _consecutiveInputFrames >= SustainedInputFrames;
 
         /// <summary>busy-wait 窓を開く (BF#1 時刻基準の各デッドラインを確定)。</summary>
-        public ZeroFrameWaitWindow OpenWaitWindow(float zeroFrameWaitMs)
-            => new ZeroFrameWaitWindow(Bf1Time, zeroFrameWaitMs, AfiAtBf1);
+        public ZeroFrameWaitWindow OpenWaitWindow(float zeroFrameWaitMilliseconds)
+            => new ZeroFrameWaitWindow(BeginFrame1Time, zeroFrameWaitMilliseconds, AcceleratedFrameIdAtBeginFrame1);
 
         /// <summary>recv 成功 (新 paint 取得) 時に呼ぶ。</summary>
         public void OnFreshPaint()
@@ -125,7 +125,7 @@ namespace CefUnity.Runtime
 
     /// <summary>
     ///     0F 待ち busy-wait の 1 窓分の判定状態。呼び出し側のループは
-    ///     「now 取得 → DeadlineReached → (Peek して) OnAfiSample → SpinWait」の順を守ること
+    ///     「now 取得 → DeadlineReached → (Peek して) OnAcceleratedFrameIdSample → SpinWait」の順を守ること
     ///     (デッドライン超過時に余分な Peek FFI を発行しない、元実装と同一の順序)。
     /// </summary>
     public struct ZeroFrameWaitWindow
@@ -137,13 +137,13 @@ namespace CefUnity.Runtime
         private ulong _baseline;
         private bool _sawEarlyPaint;
 
-        public ZeroFrameWaitWindow(float bf1Time, float zeroFrameWaitMs, ulong afiAtBf1)
+        public ZeroFrameWaitWindow(float beginFrame1Time, float zeroFrameWaitMilliseconds, ulong acceleratedFrameIdAtBeginFrame1)
         {
-            _deadline = bf1Time + zeroFrameWaitMs * 0.001f;
-            _freshMinTime = bf1Time + CefZeroFramePacer.FreshPaintMinDelayMs * 0.001f;
-            _noDamageGiveUp = bf1Time + CefZeroFramePacer.NoDamageGiveUpMs * 0.001f;
-            _earlyAdopt = bf1Time + CefZeroFramePacer.EarlyPaintAdoptMs * 0.001f;
-            _baseline = afiAtBf1;
+            _deadline = beginFrame1Time + zeroFrameWaitMilliseconds * 0.001f;
+            _freshMinTime = beginFrame1Time + CefZeroFramePacer.FreshPaintMinDelayMilliseconds * 0.001f;
+            _noDamageGiveUp = beginFrame1Time + CefZeroFramePacer.NoDamageGiveUpMilliseconds * 0.001f;
+            _earlyAdopt = beginFrame1Time + CefZeroFramePacer.EarlyPaintAdoptMilliseconds * 0.001f;
+            _baseline = acceleratedFrameIdAtBeginFrame1;
             _sawEarlyPaint = false;
         }
 
@@ -151,14 +151,14 @@ namespace CefUnity.Runtime
         public bool DeadlineReached(float now) => now >= _deadline;
 
         /// <summary>AFI 観測 1 回分の判定。true = 待ち終了 (最新 paint を回収してよい)。</summary>
-        public bool OnAfiSample(float now, ulong afi)
+        public bool OnAcceleratedFrameIdSample(float now, ulong acceleratedFrameId)
         {
-            if (afi != _baseline)
+            if (acceleratedFrameId != _baseline)
             {
                 // 増分検知。flush#1 の draw があり得る時刻 (freshMinTime) より前の増分は
                 // BF#1 由来 stale (#A) とみなして読み捨て、fresh (#B) を待ち続ける。
                 if (now >= _freshMinTime) return true;
-                _baseline = afi;
+                _baseline = acceleratedFrameId;
                 _sawEarlyPaint = true;
                 return false;
             }

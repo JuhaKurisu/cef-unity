@@ -25,14 +25,14 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::core::Interface;
 
-fn log_debug(msg: &str) {
+fn log_debug(message: &str) {
     let path = std::env::temp_dir().join("cef_unity_debug.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "[d3d11] {}", msg);
+        let _ = writeln!(file, "[d3d11] {}", message);
     }
 }
 
@@ -150,15 +150,15 @@ fn try_resolve_d3d11_device() -> *mut c_void {
     }
     unsafe {
         let interfaces = interfaces as *mut IUnityInterfaces;
-        let gd3d11_ptr = ((*interfaces).get_interface_split)(
+        let graphics_d3d11_pointer = ((*interfaces).get_interface_split)(
             UNITY_GRAPHICSD3D11_GUID_HIGH,
             UNITY_GRAPHICSD3D11_GUID_LOW,
         );
-        if gd3d11_ptr.is_null() {
+        if graphics_d3d11_pointer.is_null() {
             return std::ptr::null_mut();
         }
-        let gd3d11 = gd3d11_ptr as *mut IUnityGraphicsD3D11;
-        let device = ((*gd3d11).get_device)();
+        let graphics_d3d11 = graphics_d3d11_pointer as *mut IUnityGraphicsD3D11;
+        let device = ((*graphics_d3d11).get_device)();
         if device.is_null() {
             return std::ptr::null_mut();
         }
@@ -180,37 +180,37 @@ pub fn open_fence(handle_value: u64) -> Result<(), String> {
     if handle_value == 0 {
         return Err("fence handle is 0".to_string());
     }
-    let device_ptr = try_resolve_d3d11_device();
-    if device_ptr.is_null() {
+    let device_pointer = try_resolve_d3d11_device();
+    if device_pointer.is_null() {
         return Err("Unity D3D11 device not yet available".to_string());
     }
 
     let device: ID3D11Device = unsafe {
-        let raw = device_ptr;
+        let raw = device_pointer;
         ID3D11Device::from_raw_borrowed(&raw)
             .ok_or_else(|| "ID3D11Device::from_raw_borrowed failed".to_string())?
             .clone()
     };
     let device5: ID3D11Device5 = device
         .cast()
-        .map_err(|e| format!("cast ID3D11Device5 (Unity device): {:?}", e))?;
-    let mut fence_opt: Option<ID3D11Fence> = None;
+        .map_err(|error| format!("cast ID3D11Device5 (Unity device): {:?}", error))?;
+    let mut fence_option: Option<ID3D11Fence> = None;
     unsafe {
         device5
-            .OpenSharedFence(HANDLE(handle_value as *mut _), &mut fence_opt)
-            .map_err(|e| format!("OpenSharedFence: {:?}", e))?;
+            .OpenSharedFence(HANDLE(handle_value as *mut _), &mut fence_option)
+            .map_err(|error| format!("OpenSharedFence: {:?}", error))?;
     }
-    let fence: ID3D11Fence = fence_opt.ok_or_else(|| "OpenSharedFence returned None".to_string())?;
+    let fence: ID3D11Fence = fence_option.ok_or_else(|| "OpenSharedFence returned None".to_string())?;
 
     // Unity の immediate context を `Wait` 発行用に取得。
     let context: ID3D11DeviceContext = unsafe {
         device
             .GetImmediateContext()
-            .map_err(|e| format!("GetImmediateContext: {:?}", e))?
+            .map_err(|error| format!("GetImmediateContext: {:?}", error))?
     };
     let context4: ID3D11DeviceContext4 = context
         .cast()
-        .map_err(|e| format!("cast ID3D11DeviceContext4 (Unity context): {:?}", e))?;
+        .map_err(|error| format!("cast ID3D11DeviceContext4 (Unity context): {:?}", error))?;
 
     *FENCE.lock().unwrap_or_else(PoisonError::into_inner) = Some(FenceState {
         fence,
@@ -242,7 +242,7 @@ pub fn wait_fence(target_value: u64) -> Result<(), String> {
         state
             .context4
             .Wait(&state.fence, target_value)
-            .map_err(|e| format!("ID3D11DeviceContext4::Wait({}): {:?}", target_value, e))?;
+            .map_err(|error| format!("ID3D11DeviceContext4::Wait({}): {:?}", target_value, error))?;
     }
     state.last_waited = target_value;
     Ok(())
@@ -264,8 +264,8 @@ pub fn open_or_cached(
     if handle_value == 0 {
         return None;
     }
-    let device_ptr = try_resolve_d3d11_device();
-    if device_ptr.is_null() {
+    let device_pointer = try_resolve_d3d11_device();
+    if device_pointer.is_null() {
         return None;
     }
 
@@ -273,53 +273,53 @@ pub fn open_or_cached(
 
     let cache_hit = matches!(
         state.current.as_ref(),
-        Some(c) if c.handle == handle_value && c.width == width && c.height == height
+        Some(cached) if cached.handle == handle_value && cached.width == width && cached.height == height
     );
 
     if !cache_hit {
         let device: ID3D11Device = unsafe {
-            let raw = device_ptr;
+            let raw = device_pointer;
             match ID3D11Device::from_raw_borrowed(&raw) {
-                Some(d) => d.clone(),
+                Some(device) => device.clone(),
                 None => {
                     log_debug(&format!(
-                        "open_or_cached: from_raw_borrowed failed (device_ptr={:p})",
-                        device_ptr
+                        "open_or_cached: from_raw_borrowed failed (device_pointer={:p})",
+                        device_pointer
                     ));
                     return None;
                 }
             }
         };
         let device1: ID3D11Device1 = match device.cast() {
-            Ok(d) => d,
-            Err(e) => {
-                log_debug(&format!("cast to ID3D11Device1 failed: {:?}", e));
+            Ok(device1) => device1,
+            Err(error) => {
+                log_debug(&format!("cast to ID3D11Device1 failed: {:?}", error));
                 return None;
             }
         };
 
         let handle = HANDLE(handle_value as *mut _);
-        let tex: ID3D11Texture2D = match unsafe { device1.OpenSharedResource1(handle) } {
-            Ok(t) => t,
-            Err(e) => {
+        let texture: ID3D11Texture2D = match unsafe { device1.OpenSharedResource1(handle) } {
+            Ok(texture) => texture,
+            Err(error) => {
                 log_debug(&format!(
                     "OpenSharedResource1 failed for handle=0x{:x}: {:?}",
-                    handle_value, e
+                    handle_value, error
                 ));
                 return None;
             }
         };
         log_debug(&format!(
-            "opened handle=0x{:x} tex={:p} {}x{}",
+            "opened handle=0x{:x} texture={:p} {}x{}",
             handle_value,
-            tex.as_raw(),
+            texture.as_raw(),
             width,
             height
         ));
 
         let new_entry = OpenedTexture {
             handle: handle_value,
-            texture: tex,
+            texture,
             width,
             height,
         };

@@ -15,24 +15,24 @@ namespace CefUnity.Editor
     {
         public static void Run()
         {
-            var tmp = System.IO.Path.GetTempPath();
-            var src = System.IO.Path.Combine(tmp, "cef_scroll_events.csv");
-            var dst = System.IO.Path.Combine(tmp, "cef_scroll_replay.csv");
-            if (!System.IO.File.Exists(src))
+            var temporaryDirectory = System.IO.Path.GetTempPath();
+            var source = System.IO.Path.Combine(temporaryDirectory, "cef_scroll_events.csv");
+            var destination = System.IO.Path.Combine(temporaryDirectory, "cef_scroll_replay.csv");
+            if (!System.IO.File.Exists(source))
             {
-                Debug.LogError($"[ScrollReplay] input not found: {src} — cef_scroll_record トグルで録画してから実行すること");
+                Debug.LogError($"[ScrollReplay] input not found: {source} — cef_scroll_record トグルで録画してから実行すること");
                 if (Application.isBatchMode) EditorApplication.Exit(1);
                 return;
             }
-            var result = ScrollReplayRunner.Run(System.IO.File.ReadLines(src));
+            var result = ScrollReplayRunner.Run(System.IO.File.ReadLines(source));
             if (!result.Ok)
             {
                 Debug.LogError($"[ScrollReplay] {result.Error}");
                 if (Application.isBatchMode) EditorApplication.Exit(1);
                 return;
             }
-            System.IO.File.WriteAllText(dst, string.Join("\n", result.OutLines) + "\n");
-            Debug.Log($"[ScrollReplay] events={result.Events} ticks={result.Ticks} fidelity: mismatches={result.Mismatches}/{result.Ticks} out={dst}");
+            System.IO.File.WriteAllText(destination, string.Join("\n", result.OutputLines) + "\n");
+            Debug.Log($"[ScrollReplay] events={result.Events} ticks={result.Ticks} fidelity: mismatches={result.Mismatches}/{result.Ticks} out={destination}");
         }
     }
 }

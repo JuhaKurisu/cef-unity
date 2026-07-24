@@ -25,21 +25,21 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ipc_channel::ipc::{IpcOneShotServer, IpcReceiver, IpcSender};
 
-use cef_unity_ipc::{AudioShmReader, Bootstrap, Command, CommandEnvelope, Response, ShmReader};
+use cef_unity_ipc::{AudioSharedMemoryReader, Bootstrap, Command, CommandEnvelope, Response, SharedMemoryReader};
 
 // ---------------------------------------------------------------------------
 // dylib location helpers
 // ---------------------------------------------------------------------------
 
 /// dylib/DLL 自身のディレクトリを返す。
-fn dylib_dir() -> PathBuf {
-    let info = dl_info().expect("failed to locate dylib/DLL");
+fn dylib_directory() -> PathBuf {
+    let info = dynamic_library_info().expect("failed to locate dylib/DLL");
     PathBuf::from(info).parent().unwrap().to_path_buf()
 }
 
 /// Unix: dladdr で共有ライブラリのパスを取得する。
 #[cfg(unix)]
-fn dl_info() -> Option<String> {
+fn dynamic_library_info() -> Option<String> {
     unsafe extern "C" {
         fn dladdr(addr: *const u8, info: *mut DlInfo) -> i32;
     }
@@ -51,17 +51,17 @@ fn dl_info() -> Option<String> {
         dli_saddr: *const u8,
     }
     let mut info: DlInfo = unsafe { std::mem::zeroed() };
-    let ret = unsafe { dladdr(dylib_dir as *const u8, &mut info) };
-    if ret == 0 || info.dli_fname.is_null() {
+    let result = unsafe { dladdr(dylib_directory as *const u8, &mut info) };
+    if result == 0 || info.dli_fname.is_null() {
         return None;
     }
-    let cstr = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
-    Some(cstr.to_str().ok()?.to_string())
+    let c_string = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) };
+    Some(c_string.to_str().ok()?.to_string())
 }
 
 /// Windows: GetModuleHandleExW + GetModuleFileNameW で DLL のパスを取得する。
 #[cfg(windows)]
-fn dl_info() -> Option<String> {
+fn dynamic_library_info() -> Option<String> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
@@ -83,37 +83,37 @@ fn dl_info() -> Option<String> {
         fn GetModuleFileNameW(hModule: HMODULE, lpFilename: LPWSTR, nSize: DWORD) -> DWORD;
     }
 
-    let mut hmodule: HMODULE = std::ptr::null_mut();
+    let mut module_handle: HMODULE = std::ptr::null_mut();
     let flags =
         GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
-    let ret = unsafe { GetModuleHandleExW(flags, dylib_dir as *const u16, &mut hmodule) };
-    if ret == 0 || hmodule.is_null() {
+    let result = unsafe { GetModuleHandleExW(flags, dylib_directory as *const u16, &mut module_handle) };
+    if result == 0 || module_handle.is_null() {
         return None;
     }
 
-    let mut buf = vec![0u16; 4096];
-    let len = unsafe { GetModuleFileNameW(hmodule, buf.as_mut_ptr(), buf.len() as DWORD) };
-    if len == 0 {
+    let mut buffer = vec![0u16; 4096];
+    let length = unsafe { GetModuleFileNameW(module_handle, buffer.as_mut_ptr(), buffer.len() as DWORD) };
+    if length == 0 {
         return None;
     }
-    let os_str = OsString::from_wide(&buf[..len as usize]);
-    os_str.into_string().ok()
+    let os_string = OsString::from_wide(&buffer[..length as usize]);
+    os_string.into_string().ok()
 }
 
 /// サーバーバイナリのパスを返す。
 #[cfg(target_os = "macos")]
-fn server_binary_path(plugin_dir: &std::path::Path) -> PathBuf {
-    plugin_dir.join("cef-unity-server.app/Contents/MacOS/cef-unity-server")
+fn server_binary_path(plugin_directory: &std::path::Path) -> PathBuf {
+    plugin_directory.join("cef-unity-server.app/Contents/MacOS/cef-unity-server")
 }
 
 #[cfg(target_os = "linux")]
-fn server_binary_path(plugin_dir: &std::path::Path) -> PathBuf {
-    plugin_dir.join("cef-unity-server")
+fn server_binary_path(plugin_directory: &std::path::Path) -> PathBuf {
+    plugin_directory.join("cef-unity-server")
 }
 
 #[cfg(target_os = "windows")]
-fn server_binary_path(plugin_dir: &std::path::Path) -> PathBuf {
-    plugin_dir.join("cef-unity-server.exe")
+fn server_binary_path(plugin_directory: &std::path::Path) -> PathBuf {
+    plugin_directory.join("cef-unity-server.exe")
 }
 
 // ---------------------------------------------------------------------------
@@ -131,10 +131,10 @@ pub struct CefUnityBrowser {
 
 struct ClientBrowserInstance {
     browser_id: u32,
-    shm: ShmReader,
+    shared_memory: SharedMemoryReader,
     /// 音声リングバッファのリーダー。サーバーが flink を返さなかった場合や
     /// open に失敗した場合は None (音声無効)。
-    audio_shm: Option<AudioShmReader>,
+    audio_shared_memory: Option<AudioSharedMemoryReader>,
     /// 音声リングの flink。NativeVoice が独立カーソルの自前リーダーを開くのに使う。
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     audio_flink: String,
@@ -143,7 +143,7 @@ struct ClientBrowserInstance {
     native_voice: Option<native_voice::NativeVoice>,
 }
 
-fn handle_to_ref<'a>(handle: *mut CefUnityBrowser) -> &'a mut ClientBrowserInstance {
+fn handle_to_reference<'a>(handle: *mut CefUnityBrowser) -> &'a mut ClientBrowserInstance {
     unsafe { &mut *(handle as *mut ClientBrowserInstance) }
 }
 
@@ -178,8 +178,8 @@ static PAINT_COUNT: AtomicU64 = AtomicU64::new(0);
 static PUMP_COUNT: AtomicU64 = AtomicU64::new(0);
 
 struct ServerConnection {
-    cmd_tx: IpcSender<CommandEnvelope>,
-    resp_rx: IpcReceiver<Response>,
+    command_sender: IpcSender<CommandEnvelope>,
+    response_receiver: IpcReceiver<Response>,
     /// server プロセスのハンドル。保持しないと終了後にゾンビとして残る
     /// (Editor は長寿命なので Play/Stop の繰り返しで蓄積する)。
     child: std::process::Child,
@@ -187,33 +187,33 @@ struct ServerConnection {
 
 static CONNECTION: Mutex<Option<ServerConnection>> = Mutex::new(None);
 
-fn log_to_file(msg: &str) {
+fn log_to_file(message: &str) {
     if !LOG_ENABLED.load(Ordering::Relaxed) {
         return;
     }
     let path = std::env::temp_dir().join("cef_unity_debug.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "[{:?}] {}", std::time::SystemTime::now(), msg);
+        let _ = writeln!(file, "[{:?}] {}", std::time::SystemTime::now(), message);
     }
 }
 
 /// FFI 境界のパニックガード。extern "C" 越しの unwind は edition 2024 で即 abort
 /// (= Unity Editor ごと落ちる) ため、全エントリポイントの本体をこれで包む。
 /// panic 時は default を返し、原因を試行ログに残す (ログ自体の失敗は無視)。
-fn ffi_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-        Ok(v) => v,
+fn ffi_guard<T>(default: T, function: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(function)) {
+        Ok(value) => value,
         Err(payload) => {
-            let msg = payload
+            let message = payload
                 .downcast_ref::<&str>()
-                .map(|s| s.to_string())
+                .map(|string| string.to_string())
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "<non-string panic payload>".to_string());
-            let _ = std::panic::catch_unwind(|| log_to_file(&format!("FFI panic: {}", msg)));
+            let _ = std::panic::catch_unwind(|| log_to_file(&format!("FFI panic: {}", message)));
             default
         }
     }
@@ -223,20 +223,20 @@ fn ffi_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
 // IPC helpers
 // ---------------------------------------------------------------------------
 
-fn send_command(conn: &ServerConnection, cmd: Command) -> Result<Response, String> {
-    conn.cmd_tx
+fn send_command(connection: &ServerConnection, command: Command) -> Result<Response, String> {
+    connection.command_sender
         .send(CommandEnvelope {
-            command: cmd,
+            command,
             expects_response: true,
         })
-        .map_err(|e| format!("send: {}", e))?;
-    conn.resp_rx.recv().map_err(|e| format!("recv: {}", e))
+        .map_err(|error| format!("send: {}", error))?;
+    connection.response_receiver.recv().map_err(|error| format!("recv: {}", error))
 }
 
 /// Fire-and-forget: send only, don't wait for response.
-fn send_command_no_wait(conn: &ServerConnection, cmd: Command) {
-    let _ = conn.cmd_tx.send(CommandEnvelope {
-        command: cmd,
+fn send_command_no_wait(connection: &ServerConnection, command: Command) {
+    let _ = connection.command_sender.send(CommandEnvelope {
+        command,
         expects_response: false,
     });
 }
@@ -252,7 +252,7 @@ fn send_command_no_wait(conn: &ServerConnection, cmd: Command) {
 /// Unity 側のマスターログフラグから渡す。
 /// Returns 0 on success, non-zero on failure.
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_init(use_gpu: i32, enable_log: i32) -> i32 {
+pub extern "C" fn cef_unity_initialize(use_gpu: i32, enable_log: i32) -> i32 {
     ffi_guard(-1, || {
         // ログ有効/無効を最初に確定させる (以降の log_to_file がこれに従う)。
         LOG_ENABLED.store(enable_log != 0, Ordering::SeqCst);
@@ -264,13 +264,13 @@ pub extern "C" fn cef_unity_init(use_gpu: i32, enable_log: i32) -> i32 {
         let use_gpu_bool = use_gpu != 0;
         USE_GPU_MODE.store(use_gpu_bool, Ordering::SeqCst);
         log_to_file(&format!(
-            "---- cef_unity_init(use_gpu={}) called (IPC client mode) ----",
+            "---- cef_unity_initialize(use_gpu={}) called (IPC client mode) ----",
             use_gpu_bool
         ));
 
         // Find server binary next to dylib
-        let plugin_dir = dylib_dir();
-        let server_app = server_binary_path(&plugin_dir);
+        let plugin_directory = dylib_directory();
+        let server_app = server_binary_path(&plugin_directory);
         if !server_app.exists() {
             log_to_file(&format!(
                 "server binary not found: {}",
@@ -283,8 +283,8 @@ pub extern "C" fn cef_unity_init(use_gpu: i32, enable_log: i32) -> i32 {
         // Create one-shot server for bootstrap
         let (oneshot_server, server_name) = match IpcOneShotServer::<Bootstrap>::new() {
             Ok(pair) => pair,
-            Err(e) => {
-                log_to_file(&format!("failed to create one-shot server: {}", e));
+            Err(error) => {
+                log_to_file(&format!("failed to create one-shot server: {}", error));
                 return -4;
             }
         };
@@ -306,8 +306,8 @@ pub extern "C" fn cef_unity_init(use_gpu: i32, enable_log: i32) -> i32 {
             .spawn()
         {
             Ok(child) => child,
-            Err(e) => {
-                log_to_file(&format!("failed to spawn server: {}", e));
+            Err(error) => {
+                log_to_file(&format!("failed to spawn server: {}", error));
                 return -4;
             }
         };
@@ -317,16 +317,16 @@ pub extern "C" fn cef_unity_init(use_gpu: i32, enable_log: i32) -> i32 {
         // accept() 自体は無期限ブロックするため別スレッドで行い、server の早期死亡
         // (codesign 不備・framework 欠落・CEF 初期化失敗等) とタイムアウトを監視する。
         // これがないと server 起動失敗時に Unity main thread が永久フリーズする。
-        let (boot_tx, boot_rx) = std::sync::mpsc::channel();
+        let (bootstrap_sender, bootstrap_receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = boot_tx.send(oneshot_server.accept());
+            let _ = bootstrap_sender.send(oneshot_server.accept());
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let bootstrap = loop {
-            match boot_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(Ok((_rx, bootstrap))) => break bootstrap,
-                Ok(Err(e)) => {
-                    log_to_file(&format!("failed to accept bootstrap: {}", e));
+            match bootstrap_receiver.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(Ok((_receiver, bootstrap))) => break bootstrap,
+                Ok(Err(error)) => {
+                    log_to_file(&format!("failed to accept bootstrap: {}", error));
                     let _ = child.kill();
                     let _ = child.wait();
                     return -5;
@@ -354,8 +354,8 @@ pub extern "C" fn cef_unity_init(use_gpu: i32, enable_log: i32) -> i32 {
         log_to_file("bootstrap received from server");
 
         *CONNECTION.lock().unwrap_or_else(PoisonError::into_inner) = Some(ServerConnection {
-            cmd_tx: bootstrap.cmd_tx,
-            resp_rx: bootstrap.resp_rx,
+            command_sender: bootstrap.command_sender,
+            response_receiver: bootstrap.response_receiver,
             child,
         });
 
@@ -365,13 +365,13 @@ pub extern "C" fn cef_unity_init(use_gpu: i32, enable_log: i32) -> i32 {
         if use_gpu_bool {
             let service_name = cef_unity_ipc::iosurface_service_name(bootstrap.server_pid);
             log_to_file(&format!("connecting to Mach IOSurface service: {}", service_name));
-            if let Ok(cname) = std::ffi::CString::new(service_name.as_str()) {
-                let ret = unsafe { mach_iosurface_client_connect(cname.as_ptr()) };
-                if ret == 0 {
+            if let Ok(c_service_name) = std::ffi::CString::new(service_name.as_str()) {
+                let result = unsafe { mach_iosurface_client_connect(c_service_name.as_ptr()) };
+                if result == 0 {
                     IOSURFACE_CONNECTED.store(true, Ordering::SeqCst);
                     log_to_file("Mach IOSurface service connected");
                 } else {
-                    log_to_file(&format!("Mach IOSurface service connect failed: {}", ret));
+                    log_to_file(&format!("Mach IOSurface service connect failed: {}", result));
                 }
             } else {
                 // service name に NUL が混入した場合のみ。接続失敗と同じく非致命 (CPU 経路へ)。
@@ -420,17 +420,17 @@ pub extern "C" fn cef_unity_shutdown() {
 
         // 先に take してガードを解放する: 保持したまま 500ms sleep すると
         // 他スレッドの全 FFI 呼び出しがその間ロック待ちになる。
-        let conn = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner).take();
-        if let Some(mut conn) = conn {
+        let connection = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(mut connection) = connection {
             // fire-and-forget: server プロセスが無応答でも Unity main thread を
             // 永久ブロックさせないため、応答は待たない。server 側は
             // expects_response=false でも Shutdown を正しく処理して running=false にする
             // (event_loop/generic.rs の drain_commands 参照)。
-            send_command_no_wait(&conn, Command::Shutdown);
+            send_command_no_wait(&connection, Command::Shutdown);
             // Server が Shutdown を処理して cef::shutdown() を呼び終わるまで少し待つ。
             std::thread::sleep(std::time::Duration::from_millis(500));
             // 終了済みならここで回収してゾンビ化を防ぐ (未終了なら従来どおり放置)。
-            let _ = conn.child.try_wait();
+            let _ = connection.child.try_wait();
         }
 
         INITIALIZED.store(false, Ordering::SeqCst);
@@ -446,8 +446,8 @@ pub extern "C" fn cef_unity_shutdown() {
 #[repr(C)]
 pub struct CefScrollEvent {
     pub timestamp: f64,
-    pub dx: f32,
-    pub dy: f32,
+    pub delta_x: f32,
+    pub delta_y: f32,
     pub phase: u8,
     pub precise: u8,
 }
@@ -533,54 +533,54 @@ pub extern "C" fn cef_unity_create_browser(
             return std::ptr::null_mut();
         }
 
-        let url_str = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
+        let url_string = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
         log_to_file(&format!(
             "cef_unity_create_browser({}x{}, {})",
-            width, height, url_str
+            width, height, url_string
         ));
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        let conn = match guard.as_ref() {
-            Some(c) => c,
+        let connection = match guard.as_ref() {
+            Some(connection) => connection,
             None => return std::ptr::null_mut(),
         };
 
-        let cmd = Command::CreateBrowser {
+        let command = Command::CreateBrowser {
             width,
             height,
-            url: url_str.to_string(),
+            url: url_string.to_string(),
         };
-        let resp = match send_command(conn, cmd) {
-            Ok(r) => r,
-            Err(e) => {
-                log_to_file(&format!("create_browser IPC error: {}", e));
+        let response = match send_command(connection, command) {
+            Ok(response) => response,
+            Err(error) => {
+                log_to_file(&format!("create_browser IPC error: {}", error));
                 return std::ptr::null_mut();
             }
         };
 
-        match resp {
+        match response {
             Response::BrowserCreated {
                 browser_id,
-                shm_flink,
+                shared_memory_flink,
                 d3d11_fence_handle,
-                audio_shm_flink,
+                audio_shared_memory_flink,
             } => {
                 log_to_file(&format!(
                     "browser created: id={}, shm={}, fence_handle=0x{:x}, audio_shm={}",
-                    browser_id, shm_flink, d3d11_fence_handle, audio_shm_flink
+                    browser_id, shared_memory_flink, d3d11_fence_handle, audio_shared_memory_flink
                 ));
-                let shm = match ShmReader::open(&shm_flink) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log_to_file(&format!("shm_open failed: {}", e));
+                let shared_memory = match SharedMemoryReader::open(&shared_memory_flink) {
+                    Ok(reader) => reader,
+                    Err(error) => {
+                        log_to_file(&format!("shm_open failed: {}", error));
                         return std::ptr::null_mut();
                     }
                 };
-                let audio_shm = match AudioShmReader::open(&audio_shm_flink) {
-                    Ok(s) => Some(s),
-                    Err(e) => {
+                let audio_shared_memory = match AudioSharedMemoryReader::open(&audio_shared_memory_flink) {
+                    Ok(reader) => Some(reader),
+                    Err(error) => {
                         // 音声は必須ではないので open 失敗時は警告のみ。
-                        log_to_file(&format!("audio_shm_open failed (audio disabled): {}", e));
+                        log_to_file(&format!("audio_shm_open failed (audio disabled): {}", error));
                         None
                     }
                 };
@@ -590,13 +590,13 @@ pub extern "C" fn cef_unity_create_browser(
                         // Unity の graphics backend に応じて開ける方を試す。
                         // D3D11/D3D12 双方無接続でも fence_handle 自体は同じ NT 共有 HANDLE。
                         if d3d11::is_connected() {
-                            if let Err(e) = d3d11::open_fence(d3d11_fence_handle) {
-                                log_to_file(&format!("d3d11::open_fence failed: {}", e));
+                            if let Err(error) = d3d11::open_fence(d3d11_fence_handle) {
+                                log_to_file(&format!("d3d11::open_fence failed: {}", error));
                             }
                         }
                         if d3d12::is_connected() {
-                            if let Err(e) = d3d12::open_fence(d3d11_fence_handle) {
-                                log_to_file(&format!("d3d12::open_fence failed: {}", e));
+                            if let Err(error) = d3d12::open_fence(d3d11_fence_handle) {
+                                log_to_file(&format!("d3d12::open_fence failed: {}", error));
                             }
                         }
                     }
@@ -605,16 +605,16 @@ pub extern "C" fn cef_unity_create_browser(
                 let _ = d3d11_fence_handle;
                 let instance = Box::new(ClientBrowserInstance {
                     browser_id,
-                    shm,
-                    audio_shm,
-                    audio_flink: audio_shm_flink.clone(),
+                    shared_memory,
+                    audio_shared_memory,
+                    audio_flink: audio_shared_memory_flink.clone(),
                     #[cfg(target_os = "macos")]
                     native_voice: None,
                 });
                 Box::into_raw(instance) as *mut CefUnityBrowser
             }
-            Response::Error { msg } => {
-                log_to_file(&format!("create_browser error: {}", msg));
+            Response::Error { message } => {
+                log_to_file(&format!("create_browser error: {}", message));
                 std::ptr::null_mut()
             }
             _ => {
@@ -636,11 +636,11 @@ pub extern "C" fn cef_unity_destroy_browser(handle: *mut CefUnityBrowser) {
         stop_native_voice(&mut instance);
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
-            let cmd = Command::DestroyBrowser {
+        if let Some(connection) = guard.as_ref() {
+            let command = Command::DestroyBrowser {
                 browser_id: instance.browser_id,
             };
-            send_command_no_wait(conn, cmd);
+            send_command_no_wait(connection, command);
         }
         drop(instance);
     })
@@ -653,16 +653,16 @@ pub extern "C" fn cef_unity_load_url(handle: *mut CefUnityBrowser, url: *const c
         if handle.is_null() || url.is_null() {
             return;
         }
-        let instance = handle_to_ref(handle);
-        let url_str = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
+        let instance = handle_to_reference(handle);
+        let url_string = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
-            let cmd = Command::LoadUrl {
+        if let Some(connection) = guard.as_ref() {
+            let command = Command::LoadUrl {
                 browser_id: instance.browser_id,
-                url: url_str.to_string(),
+                url: url_string.to_string(),
             };
-            send_command_no_wait(conn, cmd);
+            send_command_no_wait(connection, command);
         }
     })
 }
@@ -674,16 +674,16 @@ pub extern "C" fn cef_unity_resize(handle: *mut CefUnityBrowser, width: i32, hei
         if handle.is_null() {
             return;
         }
-        let instance = handle_to_ref(handle);
+        let instance = handle_to_reference(handle);
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
-            let cmd = Command::Resize {
+        if let Some(connection) = guard.as_ref() {
+            let command = Command::Resize {
                 browser_id: instance.browser_id,
                 width,
                 height,
             };
-            send_command_no_wait(conn, cmd);
+            send_command_no_wait(connection, command);
         }
     })
 }
@@ -700,12 +700,12 @@ pub extern "C" fn cef_unity_send_mouse_move(
         if handle.is_null() {
             return;
         }
-        let instance = handle_to_ref(handle);
+        let instance = handle_to_reference(handle);
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             send_command_no_wait(
-                conn,
+                connection,
                 Command::MouseMove {
                     browser_id: instance.browser_id,
                     x,
@@ -732,12 +732,12 @@ pub extern "C" fn cef_unity_send_mouse_click(
         if handle.is_null() {
             return;
         }
-        let instance = handle_to_ref(handle);
+        let instance = handle_to_reference(handle);
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             send_command_no_wait(
-                conn,
+                connection,
                 Command::MouseClick {
                     browser_id: instance.browser_id,
                     x,
@@ -766,12 +766,12 @@ pub extern "C" fn cef_unity_send_mouse_wheel(
         if handle.is_null() {
             return;
         }
-        let instance = handle_to_ref(handle);
+        let instance = handle_to_reference(handle);
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             send_command_no_wait(
-                conn,
+                connection,
                 Command::MouseWheel {
                     browser_id: instance.browser_id,
                     x,
@@ -802,12 +802,12 @@ pub extern "C" fn cef_unity_send_key_event(
         if handle.is_null() {
             return;
         }
-        let instance = handle_to_ref(handle);
+        let instance = handle_to_reference(handle);
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             send_command_no_wait(
-                conn,
+                connection,
                 Command::KeyEvent {
                     browser_id: instance.browser_id,
                     event_type,
@@ -831,16 +831,16 @@ pub extern "C" fn cef_unity_execute_javascript(handle: *mut CefUnityBrowser, cod
         if handle.is_null() || code.is_null() {
             return;
         }
-        let instance = handle_to_ref(handle);
-        let code_str = unsafe { CStr::from_ptr(code) }.to_str().unwrap_or("");
+        let instance = handle_to_reference(handle);
+        let code_string = unsafe { CStr::from_ptr(code) }.to_str().unwrap_or("");
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             send_command_no_wait(
-                conn,
+                connection,
                 Command::ExecuteJavaScript {
                     browser_id: instance.browser_id,
-                    code: code_str.to_string(),
+                    code: code_string.to_string(),
                 },
             );
         }
@@ -855,12 +855,12 @@ pub extern "C" fn cef_unity_edit_command(handle: *mut CefUnityBrowser, command: 
         if handle.is_null() {
             return;
         }
-        let instance = handle_to_ref(handle);
+        let instance = handle_to_reference(handle);
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             send_command_no_wait(
-                conn,
+                connection,
                 Command::EditCommand {
                     browser_id: instance.browser_id,
                     command,
@@ -876,43 +876,43 @@ pub extern "C" fn cef_unity_edit_command(handle: *mut CefUnityBrowser, command: 
 pub extern "C" fn cef_unity_get_url(
     handle: *mut CefUnityBrowser,
     buffer: *mut u8,
-    buffer_len: i32,
+    buffer_length: i32,
 ) -> i32 {
     ffi_guard(0, || {
         if handle.is_null() {
             return 0;
         }
-        let instance = handle_to_ref(handle);
+        let instance = handle_to_reference(handle);
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(conn) = guard.as_ref() else {
+        let Some(connection) = guard.as_ref() else {
             return 0;
         };
 
         let url = match send_command(
-            conn,
+            connection,
             Command::GetCurrentUrl {
                 browser_id: instance.browser_id,
             },
         ) {
             Ok(Response::CurrentUrl { url }) => url,
-            Ok(Response::Error { msg }) => {
-                log_to_file(&format!("get_url error: {}", msg));
+            Ok(Response::Error { message }) => {
+                log_to_file(&format!("get_url error: {}", message));
                 return 0;
             }
             Ok(other) => {
                 log_to_file(&format!("get_url unexpected response: {:?}", other));
                 return 0;
             }
-            Err(e) => {
-                log_to_file(&format!("get_url IPC error: {}", e));
+            Err(error) => {
+                log_to_file(&format!("get_url IPC error: {}", error));
                 return 0;
             }
         };
 
         let bytes = url.as_bytes();
         let required = bytes.len() + 1;
-        if !buffer.is_null() && buffer_len as usize >= required {
+        if !buffer.is_null() && buffer_length as usize >= required {
             unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len());
                 *buffer.add(bytes.len()) = 0;
@@ -936,15 +936,15 @@ pub extern "C" fn cef_unity_get_buffer(
         if handle.is_null() || out_buffer.is_null() || out_width.is_null() || out_height.is_null() {
             return 0;
         }
-        let instance = handle_to_ref(handle);
+        let instance = handle_to_reference(handle);
 
-        match instance.shm.get_active_buffer_ptr() {
-            Some((ptr, w, h)) => {
+        match instance.shared_memory.get_active_buffer_pointer() {
+            Some((pointer, width, height)) => {
                 PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
                 unsafe {
-                    *out_buffer = ptr;
-                    *out_width = w as i32;
-                    *out_height = h as i32;
+                    *out_buffer = pointer;
+                    *out_width = width as i32;
+                    *out_height = height as i32;
                 }
                 1
             }
@@ -966,20 +966,20 @@ pub extern "C" fn cef_unity_get_ime_caret(
     handle: *mut CefUnityBrowser,
     out_x: *mut i32,
     out_y: *mut i32,
-    out_w: *mut i32,
-    out_h: *mut i32,
+    out_width: *mut i32,
+    out_height: *mut i32,
 ) {
     ffi_guard((), || {
         if handle.is_null() {
             return;
         }
-        let instance = handle_to_ref(handle);
-        let (x, y, w, h) = instance.shm.read_ime_caret();
+        let instance = handle_to_reference(handle);
+        let (x, y, width, height) = instance.shared_memory.read_ime_caret();
         unsafe {
             *out_x = x;
             *out_y = y;
-            *out_w = w;
-            *out_h = h;
+            *out_width = width;
+            *out_height = height;
         }
     })
 }
@@ -1002,8 +1002,8 @@ pub extern "C" fn cef_unity_get_audio_format(
         if handle.is_null() {
             return 0;
         }
-        let instance = handle_to_ref(handle);
-        let Some(reader) = instance.audio_shm.as_ref() else {
+        let instance = handle_to_reference(handle);
+        let Some(reader) = instance.audio_shared_memory.as_ref() else {
             return 0;
         };
         let (sample_rate, channels, active) = reader.format();
@@ -1039,8 +1039,8 @@ pub extern "C" fn cef_unity_read_audio(
         if handle.is_null() || out_samples.is_null() || max_frames <= 0 {
             return 0;
         }
-        let instance = handle_to_ref(handle);
-        let Some(reader) = instance.audio_shm.as_mut() else {
+        let instance = handle_to_reference(handle);
+        let Some(reader) = instance.audio_shared_memory.as_mut() else {
             return 0;
         };
         let max_frames = max_frames as usize;
@@ -1068,7 +1068,7 @@ pub extern "C" fn cef_unity_read_audio(
 /// 既存の `cef_unity_read_audio` (録画 tap) とはリングカーソルが独立しており併用可。
 /// CefAudioOutput (Unity ミキサ再生) と同時に有効にすると二重再生になる。
 ///
-/// `target_ms`: jitter buffer の目標滞留量 (推奨 15)。
+/// `target_milliseconds`: jitter buffer の目標滞留量 (推奨 15)。
 /// `io_frames`: CoreAudio IO バッファフレーム数 (推奨 128 ≈ 2.9ms)。0 以下は 128。
 /// 戻り値: 0=成功 (既に再生中も 0)、-1=失敗 (音声無効・フォーマット未確定・
 /// AU 起動失敗・非対応 OS)。フォーマット未確定で失敗するため、呼び出し側は
@@ -1076,7 +1076,7 @@ pub extern "C" fn cef_unity_read_audio(
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_audio_native_start(
     handle: *mut CefUnityBrowser,
-    target_ms: f32,
+    target_milliseconds: f32,
     io_frames: i32,
 ) -> i32 {
     ffi_guard(-1, || {
@@ -1085,31 +1085,31 @@ pub extern "C" fn cef_unity_audio_native_start(
         }
         #[cfg(target_os = "macos")]
         {
-            let instance = handle_to_ref(handle);
+            let instance = handle_to_reference(handle);
             if instance.native_voice.is_some() {
                 return 0;
             }
             if instance.audio_flink.is_empty() {
                 return -1;
             }
-            match native_voice::NativeVoice::start(&instance.audio_flink, target_ms, io_frames) {
-                Ok(v) => {
-                    instance.native_voice = Some(v);
+            match native_voice::NativeVoice::start(&instance.audio_flink, target_milliseconds, io_frames) {
+                Ok(voice) => {
+                    instance.native_voice = Some(voice);
                     log_to_file(&format!(
                         "native audio started (target={}ms io_frames={})",
-                        target_ms, io_frames
+                        target_milliseconds, io_frames
                     ));
                     0
                 }
-                Err(e) => {
-                    log_to_file(&format!("native audio start failed: {}", e));
+                Err(error) => {
+                    log_to_file(&format!("native audio start failed: {}", error));
                     -1
                 }
             }
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (target_ms, io_frames);
+            let _ = (target_milliseconds, io_frames);
             -1
         }
     })
@@ -1124,7 +1124,7 @@ pub extern "C" fn cef_unity_audio_native_stop(handle: *mut CefUnityBrowser) {
         }
         #[cfg(target_os = "macos")]
         {
-            let instance = handle_to_ref(handle);
+            let instance = handle_to_reference(handle);
             if instance.native_voice.take().is_some() {
                 log_to_file("native audio stopped");
             }
@@ -1141,9 +1141,9 @@ pub extern "C" fn cef_unity_audio_native_set_volume(handle: *mut CefUnityBrowser
         }
         #[cfg(target_os = "macos")]
         {
-            let instance = handle_to_ref(handle);
-            if let Some(v) = instance.native_voice.as_ref() {
-                v.set_volume(volume);
+            let instance = handle_to_reference(handle);
+            if let Some(voice) = instance.native_voice.as_ref() {
+                voice.set_volume(volume);
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -1154,13 +1154,13 @@ pub extern "C" fn cef_unity_audio_native_set_volume(handle: *mut CefUnityBrowser
 }
 
 /// ネイティブ音声出力の診断値を取得する。
-/// `out_occupancy_ms`: jitter buffer の滞留量 (ms)。
+/// `out_occupancy_milliseconds`: jitter buffer の滞留量 (ms)。
 /// `out_underrun_frames` / `out_overflow_frames`: 累積フレーム数。
 /// 戻り値: 0=再生中、-1=停止中/非対応 OS (out には書き込まない)。
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_audio_native_stats(
+pub extern "C" fn cef_unity_audio_native_statistics(
     handle: *mut CefUnityBrowser,
-    out_occupancy_ms: *mut f32,
+    out_occupancy_milliseconds: *mut f32,
     out_underrun_frames: *mut u64,
     out_overflow_frames: *mut u64,
 ) -> i32 {
@@ -1170,27 +1170,27 @@ pub extern "C" fn cef_unity_audio_native_stats(
         }
         #[cfg(target_os = "macos")]
         {
-            let instance = handle_to_ref(handle);
-            let Some(v) = instance.native_voice.as_ref() else {
+            let instance = handle_to_reference(handle);
+            let Some(voice) = instance.native_voice.as_ref() else {
                 return -1;
             };
-            let (occ_ms, under, over) = v.stats();
+            let (occupancy_milliseconds, underrun, overflow) = voice.statistics();
             unsafe {
-                if !out_occupancy_ms.is_null() {
-                    *out_occupancy_ms = occ_ms;
+                if !out_occupancy_milliseconds.is_null() {
+                    *out_occupancy_milliseconds = occupancy_milliseconds;
                 }
                 if !out_underrun_frames.is_null() {
-                    *out_underrun_frames = under;
+                    *out_underrun_frames = underrun;
                 }
                 if !out_overflow_frames.is_null() {
-                    *out_overflow_frames = over;
+                    *out_overflow_frames = overflow;
                 }
             }
             0
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (out_occupancy_ms, out_underrun_frames, out_overflow_frames);
+            let _ = (out_occupancy_milliseconds, out_underrun_frames, out_overflow_frames);
             -1
         }
     })
@@ -1201,16 +1201,16 @@ pub extern "C" fn cef_unity_audio_native_stats(
 // ---------------------------------------------------------------------------
 
 /// Helper: send a command and wait for Response. Returns 0 on Ok, -1 on error.
-fn blocking_simple(conn: &ServerConnection, cmd: Command) -> i32 {
-    match send_command(conn, cmd) {
+fn blocking_simple(connection: &ServerConnection, command: Command) -> i32 {
+    match send_command(connection, command) {
         Ok(Response::Ok) => 0,
-        Ok(Response::Error { msg }) => {
-            log_to_file(&format!("blocking command error: {}", msg));
+        Ok(Response::Error { message }) => {
+            log_to_file(&format!("blocking command error: {}", message));
             -1
         }
         Ok(_) => 0,
-        Err(e) => {
-            log_to_file(&format!("blocking command IPC error: {}", e));
+        Err(error) => {
+            log_to_file(&format!("blocking command IPC error: {}", error));
             -1
         }
     }
@@ -1226,9 +1226,9 @@ pub extern "C" fn cef_unity_destroy_browser_blocking(handle: *mut CefUnityBrowse
         let mut instance = unsafe { Box::from_raw(handle as *mut ClientBrowserInstance) };
         stop_native_voice(&mut instance);
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        let result = if let Some(conn) = guard.as_ref() {
+        let result = if let Some(connection) = guard.as_ref() {
             blocking_simple(
-                conn,
+                connection,
                 Command::DestroyBrowser {
                     browser_id: instance.browser_id,
                 },
@@ -1251,15 +1251,15 @@ pub extern "C" fn cef_unity_load_url_blocking(
         if handle.is_null() || url.is_null() {
             return -1;
         }
-        let instance = handle_to_ref(handle);
-        let url_str = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
+        let instance = handle_to_reference(handle);
+        let url_string = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             blocking_simple(
-                conn,
+                connection,
                 Command::LoadUrl {
                     browser_id: instance.browser_id,
-                    url: url_str.to_string(),
+                    url: url_string.to_string(),
                 },
             )
         } else {
@@ -1279,11 +1279,11 @@ pub extern "C" fn cef_unity_resize_blocking(
         if handle.is_null() {
             return -1;
         }
-        let instance = handle_to_ref(handle);
+        let instance = handle_to_reference(handle);
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             blocking_simple(
-                conn,
+                connection,
                 Command::Resize {
                     browser_id: instance.browser_id,
                     width,
@@ -1308,11 +1308,11 @@ pub extern "C" fn cef_unity_send_mouse_move_blocking(
         if handle.is_null() {
             return -1;
         }
-        let instance = handle_to_ref(handle);
+        let instance = handle_to_reference(handle);
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             blocking_simple(
-                conn,
+                connection,
                 Command::MouseMove {
                     browser_id: instance.browser_id,
                     x,
@@ -1341,11 +1341,11 @@ pub extern "C" fn cef_unity_send_mouse_click_blocking(
         if handle.is_null() {
             return -1;
         }
-        let instance = handle_to_ref(handle);
+        let instance = handle_to_reference(handle);
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             blocking_simple(
-                conn,
+                connection,
                 Command::MouseClick {
                     browser_id: instance.browser_id,
                     x,
@@ -1376,11 +1376,11 @@ pub extern "C" fn cef_unity_send_mouse_wheel_blocking(
         if handle.is_null() {
             return -1;
         }
-        let instance = handle_to_ref(handle);
+        let instance = handle_to_reference(handle);
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             blocking_simple(
-                conn,
+                connection,
                 Command::MouseWheel {
                     browser_id: instance.browser_id,
                     x,
@@ -1413,11 +1413,11 @@ pub extern "C" fn cef_unity_send_key_event_blocking(
         if handle.is_null() {
             return -1;
         }
-        let instance = handle_to_ref(handle);
+        let instance = handle_to_reference(handle);
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             blocking_simple(
-                conn,
+                connection,
                 Command::KeyEvent {
                     browser_id: instance.browser_id,
                     event_type,
@@ -1448,16 +1448,16 @@ pub extern "C" fn cef_unity_ime_set_composition(
         if handle.is_null() || text.is_null() {
             return;
         }
-        let instance = handle_to_ref(handle);
-        let text_str = unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("");
+        let instance = handle_to_reference(handle);
+        let text_string = unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("");
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             send_command_no_wait(
-                conn,
+                connection,
                 Command::ImeSetComposition {
                     browser_id: instance.browser_id,
-                    text: text_str.to_string(),
+                    text: text_string.to_string(),
                     selection_start,
                     selection_end,
                 },
@@ -1473,16 +1473,16 @@ pub extern "C" fn cef_unity_ime_commit_text(handle: *mut CefUnityBrowser, text: 
         if handle.is_null() || text.is_null() {
             return;
         }
-        let instance = handle_to_ref(handle);
-        let text_str = unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("");
+        let instance = handle_to_reference(handle);
+        let text_string = unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("");
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             send_command_no_wait(
-                conn,
+                connection,
                 Command::ImeCommitText {
                     browser_id: instance.browser_id,
-                    text: text_str.to_string(),
+                    text: text_string.to_string(),
                 },
             );
         }
@@ -1499,12 +1499,12 @@ pub extern "C" fn cef_unity_ime_finish_composing_text(
         if handle.is_null() {
             return;
         }
-        let instance = handle_to_ref(handle);
+        let instance = handle_to_reference(handle);
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             send_command_no_wait(
-                conn,
+                connection,
                 Command::ImeFinishComposingText {
                     browser_id: instance.browser_id,
                     keep_selection: keep_selection != 0,
@@ -1518,7 +1518,7 @@ pub extern "C" fn cef_unity_ime_finish_composing_text(
 /// Unity の Update 冒頭で呼ぶ。Init 時に WindowInfo::external_begin_frame_enabled=1
 /// が立っているブラウザに対してのみ意味を持つ。fire-and-forget。
 /// `unity_frame` には Time.frameCount を渡す。on_accelerated_paint 経由で shm に転送され、
-/// `cef_unity_get_accel_paint_unity_frame` で読み取ることで end-to-end の遅延フレーム数を測れる。
+/// `cef_unity_get_accelerated_paint_unity_frame` で読み取ることで end-to-end の遅延フレーム数を測れる。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_send_external_begin_frame(
     handle: *mut CefUnityBrowser,
@@ -1528,12 +1528,12 @@ pub extern "C" fn cef_unity_send_external_begin_frame(
         if handle.is_null() {
             return;
         }
-        let instance = handle_to_ref(handle);
+        let instance = handle_to_reference(handle);
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             send_command_no_wait(
-                conn,
+                connection,
                 Command::SendExternalBeginFrame {
                     browser_id: instance.browser_id,
                     unity_frame,
@@ -1547,28 +1547,28 @@ pub extern "C" fn cef_unity_send_external_begin_frame(
 /// 番号を返す。Unity 側は `Time.frameCount - 戻り値` で end-to-end の遅延フレーム数
 /// (BeginFrame 発行から実際にテクスチャが使えるようになるまで) を計算できる。
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_get_accel_paint_unity_frame(handle: *mut CefUnityBrowser) -> u64 {
+pub extern "C" fn cef_unity_get_accelerated_paint_unity_frame(handle: *mut CefUnityBrowser) -> u64 {
     ffi_guard(0, || {
         if handle.is_null() {
             return 0;
         }
-        let instance = handle_to_ref(handle);
-        instance.shm.read_paint_unity_frame()
+        let instance = handle_to_reference(handle);
+        instance.shared_memory.read_paint_unity_frame()
     })
 }
 
-/// accelerated paint の単調増加カウンタ (accel_frame_id) を消費せずに返す。
+/// accelerated paint の単調増加カウンタ (accelerated_frame_id) を消費せずに返す。
 /// double-pump 同期に使う: flush BeginFrame の直前にこの値を記録し、flush 後に
 /// この値を超えるまで待てば、flush が生成した最新 paint の IOSurface が
 /// 受信ポートに届いていることが保証される (server は Mach 送信完了後に +1 する)。
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_peek_accel_frame_id(handle: *mut CefUnityBrowser) -> u64 {
+pub extern "C" fn cef_unity_peek_accelerated_frame_id(handle: *mut CefUnityBrowser) -> u64 {
     ffi_guard(0, || {
         if handle.is_null() {
             return 0;
         }
-        let instance = handle_to_ref(handle);
-        instance.shm.peek_accel_frame_id()
+        let instance = handle_to_reference(handle);
+        instance.shared_memory.peek_accelerated_frame_id()
     })
 }
 
@@ -1579,12 +1579,12 @@ pub extern "C" fn cef_unity_ime_cancel_composition(handle: *mut CefUnityBrowser)
         if handle.is_null() {
             return;
         }
-        let instance = handle_to_ref(handle);
+        let instance = handle_to_reference(handle);
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             send_command_no_wait(
-                conn,
+                connection,
                 Command::ImeCancelComposition {
                     browser_id: instance.browser_id,
                 },
@@ -1606,11 +1606,11 @@ unsafe extern "C" {
         format: u32,
     ) -> *mut std::ffi::c_void;
 
-    fn cef_unity_release_metal_texture_objc(texture_ptr: *mut std::ffi::c_void);
+    fn cef_unity_release_metal_texture_objc(texture_pointer: *mut std::ffi::c_void);
 
     fn mach_iosurface_client_connect(service_name: *const std::ffi::c_char) -> i32;
 
-    fn mach_iosurface_recv_texture(
+    fn mach_iosurface_receive_texture(
         out_width: *mut i32,
         out_height: *mut i32,
         out_format: *mut u32,
@@ -1629,7 +1629,7 @@ pub extern "C" fn cef_unity_get_iosurface_info(
     out_format: *mut u32,
 ) -> i32 {
     ffi_guard(0, || {
-        static ACCEL_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
+        static ACCELERATED_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 
         if handle.is_null()
             || out_surface_id.is_null()
@@ -1639,21 +1639,21 @@ pub extern "C" fn cef_unity_get_iosurface_info(
         {
             return 0;
         }
-        let instance = handle_to_ref(handle);
+        let instance = handle_to_reference(handle);
 
-        match instance.shm.get_iosurface_info() {
-            Some((surface_id, w, h, format)) => {
-                let count = ACCEL_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        match instance.shared_memory.get_iosurface_info() {
+            Some((surface_id, width, height, format)) => {
+                let count = ACCELERATED_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                 if count <= 5 || count % 100 == 0 {
                     log_to_file(&format!(
                         "get_iosurface_info #{}: surface_id={} {}x{} fmt={}",
-                        count, surface_id, w, h, format
+                        count, surface_id, width, height, format
                     ));
                 }
                 unsafe {
                     *out_surface_id = surface_id;
-                    *out_width = w as i32;
-                    *out_height = h as i32;
+                    *out_width = width as i32;
+                    *out_height = height as i32;
                     *out_format = format;
                 }
                 1
@@ -1690,7 +1690,7 @@ pub extern "C" fn cef_unity_create_metal_texture(
 /// Returns an opaque MTLTexture pointer, or null if no new frame.
 /// The caller must release the returned texture with cef_unity_release_metal_texture.
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_recv_iosurface_texture(
+pub extern "C" fn cef_unity_receive_iosurface_texture(
     out_width: *mut i32,
     out_height: *mut i32,
     out_format: *mut u32,
@@ -1705,7 +1705,7 @@ pub extern "C" fn cef_unity_recv_iosurface_texture(
                 return std::ptr::null_mut();
             }
             unsafe {
-                mach_iosurface_recv_texture(out_width, out_height, out_format)
+                mach_iosurface_receive_texture(out_width, out_height, out_format)
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -1756,7 +1756,7 @@ static CACHED_LOGS: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 /// If buffer is null, sends GetLogs via IPC, caches result, and returns required size.
 /// If buffer is non-null, copies cached data into buffer and clears the cache.
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_get_logs(buffer: *mut u8, buffer_len: i32) -> i32 {
+pub extern "C" fn cef_unity_get_logs(buffer: *mut u8, buffer_length: i32) -> i32 {
     ffi_guard(0, || {
         if !INITIALIZED.load(Ordering::SeqCst) {
             return 0;
@@ -1765,11 +1765,11 @@ pub extern "C" fn cef_unity_get_logs(buffer: *mut u8, buffer_len: i32) -> i32 {
         if buffer.is_null() {
             // Phase 1: fetch from server and cache
             let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-            let Some(conn) = guard.as_ref() else {
+            let Some(connection) = guard.as_ref() else {
                 return 0;
             };
 
-            let entries = match send_command(conn, Command::GetLogs) {
+            let entries = match send_command(connection, Command::GetLogs) {
                 Ok(Response::Logs { entries }) => entries,
                 _ => return 0,
             };
@@ -1796,11 +1796,11 @@ pub extern "C" fn cef_unity_get_logs(buffer: *mut u8, buffer_len: i32) -> i32 {
                 return 0;
             };
 
-            let copy_len = data.len().min(buffer_len as usize);
+            let copy_length = data.len().min(buffer_length as usize);
             unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), buffer, copy_len);
+                std::ptr::copy_nonoverlapping(data.as_ptr(), buffer, copy_length);
             }
-            copy_len as i32
+            copy_length as i32
         }
     })
 }
@@ -1815,15 +1815,15 @@ pub extern "C" fn cef_unity_execute_javascript_blocking(
         if handle.is_null() || code.is_null() {
             return -1;
         }
-        let instance = handle_to_ref(handle);
-        let code_str = unsafe { CStr::from_ptr(code) }.to_str().unwrap_or("");
+        let instance = handle_to_reference(handle);
+        let code_string = unsafe { CStr::from_ptr(code) }.to_str().unwrap_or("");
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(conn) = guard.as_ref() {
+        if let Some(connection) = guard.as_ref() {
             blocking_simple(
-                conn,
+                connection,
                 Command::ExecuteJavaScript {
                     browser_id: instance.browser_id,
-                    code: code_str.to_string(),
+                    code: code_string.to_string(),
                 },
             )
         } else {
@@ -1896,7 +1896,7 @@ pub extern "C" fn cef_unity_is_d3d11_connected() -> i32 {
 }
 
 /// Windows: Unity の D3D12 device に接続済みなら 1 を返す。
-/// C# 側はこちらが 1 のとき `cef_unity_recv_d3d12_texture` を呼ぶ。
+/// C# 側はこちらが 1 のとき `cef_unity_receive_d3d12_texture` を呼ぶ。
 /// CPU モード (Init で use_gpu=0) のときは常に 0 を返す。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_is_d3d12_connected() -> i32 {
@@ -1922,7 +1922,7 @@ pub extern "C" fn cef_unity_is_d3d12_connected() -> i32 {
 /// 戻り値ポインタは内部で AddRef 済みのキャッシュであり、次に handle が変わるか
 /// プラグイン unload までは Unity 側で再 AddRef せずに使ってよい。
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_recv_d3d11_texture(
+pub extern "C" fn cef_unity_receive_d3d11_texture(
     handle: *mut CefUnityBrowser,
     out_width: *mut i32,
     out_height: *mut i32,
@@ -1935,27 +1935,27 @@ pub extern "C" fn cef_unity_recv_d3d11_texture(
 
         #[cfg(target_os = "windows")]
         {
-            let instance = handle_to_ref(handle);
-            let Some((handle_value, w, h, format, fence_value)) = instance.shm.get_d3d11_handle()
+            let instance = handle_to_reference(handle);
+            let Some((handle_value, width, height, format, fence_value)) = instance.shared_memory.get_d3d11_handle()
             else {
                 // 新フレーム無し: 前回開いたテクスチャを Unity 側で使い続けてもらう (null 返却)。
                 return std::ptr::null_mut();
             };
             // GPU-side wait: Unity の immediate context に fence_value 到達待ちを発行する。
             // CPU はブロックせず、Unity の以降の描画コマンドが GPU 上で server.Copy 完了を待つ。
-            if let Err(e) = d3d11::wait_fence(fence_value) {
-                log_to_file(&format!("d3d11::wait_fence({}) failed: {}", fence_value, e));
+            if let Err(error) = d3d11::wait_fence(fence_value) {
+                log_to_file(&format!("d3d11::wait_fence({}) failed: {}", fence_value, error));
             }
-            let Some((tex_ptr, w_out, h_out)) = d3d11::open_or_cached(handle_value, w, h) else {
+            let Some((texture_pointer, opened_width, opened_height)) = d3d11::open_or_cached(handle_value, width, height) else {
                 return std::ptr::null_mut();
             };
             unsafe {
-                *out_width = w_out as i32;
-                *out_height = h_out as i32;
+                *out_width = opened_width as i32;
+                *out_height = opened_height as i32;
                 *out_format = format;
             }
             PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
-            tex_ptr
+            texture_pointer
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -1971,7 +1971,7 @@ pub extern "C" fn cef_unity_recv_d3d11_texture(
 /// 初回のみ COMMON → PIXEL_SHADER_RESOURCE 状態遷移を Unity に宣言する。
 /// 新フレームが無い場合は null。
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_recv_d3d12_texture(
+pub extern "C" fn cef_unity_receive_d3d12_texture(
     handle: *mut CefUnityBrowser,
     out_width: *mut i32,
     out_height: *mut i32,
@@ -1984,27 +1984,27 @@ pub extern "C" fn cef_unity_recv_d3d12_texture(
 
         #[cfg(target_os = "windows")]
         {
-            let instance = handle_to_ref(handle);
-            let Some((handle_value, w, h, format, fence_value)) = instance.shm.get_d3d11_handle()
+            let instance = handle_to_reference(handle);
+            let Some((handle_value, width, height, format, fence_value)) = instance.shared_memory.get_d3d11_handle()
             else {
                 // 新フレーム無し: 前回開いたテクスチャを Unity 側で使い続けてもらう (null 返却)。
                 return std::ptr::null_mut();
             };
             // GPU-side wait: Unity の D3D12 queue に fence_value 到達待ちを発行する。
             // CPU はブロックせず、Unity の以降の queue 操作が GPU 上で server.Copy 完了を待つ。
-            if let Err(e) = d3d12::wait_fence(fence_value) {
-                log_to_file(&format!("d3d12::wait_fence({}) failed: {}", fence_value, e));
+            if let Err(error) = d3d12::wait_fence(fence_value) {
+                log_to_file(&format!("d3d12::wait_fence({}) failed: {}", fence_value, error));
             }
-            let Some((res_ptr, w_out, h_out)) = d3d12::open_or_cached(handle_value, w, h) else {
+            let Some((resource_pointer, opened_width, opened_height)) = d3d12::open_or_cached(handle_value, width, height) else {
                 return std::ptr::null_mut();
             };
             unsafe {
-                *out_width = w_out as i32;
-                *out_height = h_out as i32;
+                *out_width = opened_width as i32;
+                *out_height = opened_height as i32;
                 *out_format = format;
             }
             PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
-            res_ptr
+            resource_pointer
         }
         #[cfg(not(target_os = "windows"))]
         {

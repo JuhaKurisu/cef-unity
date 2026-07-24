@@ -3,20 +3,20 @@
 
 use std::ffi::c_void;
 
-pub type AuPullFn = unsafe extern "C" fn(ctx: *mut c_void, out: *mut f32, frames: i32) -> i32;
+pub type AudioUnitPullFunction = unsafe extern "C" fn(context: *mut c_void, out: *mut f32, frames: i32) -> i32;
 
 unsafe extern "C" {
     /// AU を起動し再生を開始する。失敗時は NULL。
-    pub fn au_output_start(
-        src_rate: f64,
+    pub fn audio_unit_output_start(
+        source_rate: f64,
         channels: i32,
         io_frames: i32,
-        pull: AuPullFn,
-        ctx: *mut c_void,
+        pull: AudioUnitPullFunction,
+        context: *mut c_void,
     ) -> *mut c_void;
     /// 同期停止。返った後 pull は二度と呼ばれない (排水待ち済み)。
-    pub fn au_output_stop(handle: *mut c_void);
-    pub fn au_output_set_volume(handle: *mut c_void, volume: f32);
+    pub fn audio_unit_output_stop(handle: *mut c_void);
+    pub fn audio_unit_output_set_volume(handle: *mut c_void, volume: f32);
 }
 
 #[cfg(test)]
@@ -26,30 +26,30 @@ mod tests {
 
     static PULL_COUNT: AtomicU64 = AtomicU64::new(0);
 
-    unsafe extern "C" fn sine_pull(_ctx: *mut c_void, out: *mut f32, frames: i32) -> i32 {
-        let n = PULL_COUNT.fetch_add(1, Ordering::Relaxed);
-        let buf = unsafe { std::slice::from_raw_parts_mut(out, frames as usize * 2) };
-        for f in 0..frames as usize {
-            let t = (n * frames as u64 + f as u64) as f64 / 48000.0;
-            let s = (2.0 * std::f64::consts::PI * 440.0 * t).sin() as f32 * 0.1;
-            buf[f * 2] = s;
-            buf[f * 2 + 1] = s;
+    unsafe extern "C" fn sine_pull(_context: *mut c_void, out: *mut f32, frames: i32) -> i32 {
+        let call_index = PULL_COUNT.fetch_add(1, Ordering::Relaxed);
+        let buffer = unsafe { std::slice::from_raw_parts_mut(out, frames as usize * 2) };
+        for frame_index in 0..frames as usize {
+            let time_seconds = (call_index * frames as u64 + frame_index as u64) as f64 / 48000.0;
+            let sample = (2.0 * std::f64::consts::PI * 440.0 * time_seconds).sin() as f32 * 0.1;
+            buffer[frame_index * 2] = sample;
+            buffer[frame_index * 2 + 1] = sample;
         }
         frames
     }
 
     /// 実機スモーク: 440Hz を 300ms 鳴らして止める。オーディオデバイスが必要なので
     /// 通常の cargo test では走らせない。手動実行:
-    /// `cargo test -p cef-unity-client au_smoke -- --ignored`
+    /// `cargo test -p cef-unity-client audio_unit_smoke -- --ignored`
     #[test]
     #[ignore]
-    fn au_smoke_start_pull_stop() {
+    fn audio_unit_smoke_start_pull_stop() {
         PULL_COUNT.store(0, Ordering::Relaxed);
-        let h = unsafe { au_output_start(48000.0, 2, 128, sine_pull, std::ptr::null_mut()) };
-        assert!(!h.is_null(), "au_output_start が失敗した");
-        unsafe { au_output_set_volume(h, 0.5) };
+        let handle = unsafe { audio_unit_output_start(48000.0, 2, 128, sine_pull, std::ptr::null_mut()) };
+        assert!(!handle.is_null(), "audio_unit_output_start が失敗した");
+        unsafe { audio_unit_output_set_volume(handle, 0.5) };
         std::thread::sleep(std::time::Duration::from_millis(300));
-        unsafe { au_output_stop(h) };
+        unsafe { audio_unit_output_stop(handle) };
         let pulls = PULL_COUNT.load(Ordering::Relaxed);
         // 128 フレーム @48kHz ≈ 2.67ms 周期 → 300ms で ~112 回。半分以上あれば動作している。
         assert!(pulls > 50, "pull 回数が少なすぎる: {}", pulls);

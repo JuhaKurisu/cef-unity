@@ -34,14 +34,14 @@ use windows::Win32::Graphics::Direct3D12::{
 };
 use windows::core::Interface;
 
-fn log_debug(msg: &str) {
+fn log_debug(message: &str) {
     let path = std::env::temp_dir().join("cef_unity_debug.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "[d3d12] {}", msg);
+        let _ = writeln!(file, "[d3d12] {}", message);
     }
 }
 
@@ -88,7 +88,7 @@ const UNITY_GRAPHICSD3D12_V5_GUID_LOW: u64 = 0xB02D_FE93_B506_4A27;
 // ---- 状態 ----
 
 static UNITY_INTERFACES: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-static UNITY_GFX_D3D12: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static UNITY_GRAPHICS_D3D12: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static UNITY_DEVICE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static UNITY_QUEUE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
@@ -107,16 +107,16 @@ struct OpenedState {
     declared: Vec<usize>,
     /// 状態遷移用の小さなコマンドアロケータ + コマンドリスト。
     /// Unity から取得した ID3D12Device で 1 度だけ作る。
-    cmd_allocator: Option<ID3D12CommandAllocator>,
-    cmd_list: Option<ID3D12GraphicsCommandList>,
+    command_allocator: Option<ID3D12CommandAllocator>,
+    command_list: Option<ID3D12GraphicsCommandList>,
 }
 
 static OPENED: Mutex<OpenedState> = Mutex::new(OpenedState {
     current: None,
     previous: None,
     declared: Vec::new(),
-    cmd_allocator: None,
-    cmd_list: None,
+    command_allocator: None,
+    command_list: None,
 });
 
 struct FenceState {
@@ -137,7 +137,7 @@ pub fn set_unity_interfaces(unity_interfaces: *mut c_void) {
 
 pub fn clear_unity_interfaces() {
     UNITY_INTERFACES.store(std::ptr::null_mut(), Ordering::Release);
-    UNITY_GFX_D3D12.store(std::ptr::null_mut(), Ordering::Release);
+    UNITY_GRAPHICS_D3D12.store(std::ptr::null_mut(), Ordering::Release);
     UNITY_DEVICE.store(std::ptr::null_mut(), Ordering::Release);
     UNITY_QUEUE.store(std::ptr::null_mut(), Ordering::Release);
     {
@@ -145,8 +145,8 @@ pub fn clear_unity_interfaces() {
         state.current = None;
         state.previous = None;
         state.declared.clear();
-        state.cmd_list = None;
-        state.cmd_allocator = None;
+        state.command_list = None;
+        state.command_allocator = None;
     }
     *FENCE.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
@@ -164,22 +164,22 @@ fn try_resolve_d3d12_device() -> *mut c_void {
     }
     unsafe {
         let interfaces = interfaces as *mut IUnityInterfaces;
-        let gfx_ptr = ((*interfaces).get_interface_split)(
+        let graphics_pointer = ((*interfaces).get_interface_split)(
             UNITY_GRAPHICSD3D12_V5_GUID_HIGH,
             UNITY_GRAPHICSD3D12_V5_GUID_LOW,
         );
-        if gfx_ptr.is_null() {
+        if graphics_pointer.is_null() {
             return std::ptr::null_mut();
         }
-        UNITY_GFX_D3D12.store(gfx_ptr, Ordering::Release);
-        let gfx = gfx_ptr as *mut IUnityGraphicsD3D12v5;
-        let device = ((*gfx).get_device)();
+        UNITY_GRAPHICS_D3D12.store(graphics_pointer, Ordering::Release);
+        let graphics = graphics_pointer as *mut IUnityGraphicsD3D12v5;
+        let device = ((*graphics).get_device)();
         if device.is_null() {
             return std::ptr::null_mut();
         }
         UNITY_DEVICE.store(device, Ordering::Release);
         // queue も同時に取得しておく (毎フレーム取り直す必要なし)。
-        let queue = ((*gfx).get_command_queue)();
+        let queue = ((*graphics).get_command_queue)();
         if !queue.is_null() {
             UNITY_QUEUE.store(queue, Ordering::Release);
             log_debug(&format!(
@@ -198,49 +198,49 @@ pub fn is_connected() -> bool {
 }
 
 fn unity_device() -> Option<ID3D12Device> {
-    let ptr = try_resolve_d3d12_device();
-    if ptr.is_null() {
+    let pointer = try_resolve_d3d12_device();
+    if pointer.is_null() {
         return None;
     }
-    unsafe { ID3D12Device::from_raw_borrowed(&ptr).map(|d| d.clone()) }
+    unsafe { ID3D12Device::from_raw_borrowed(&pointer).map(|device| device.clone()) }
 }
 
 fn unity_queue() -> Option<ID3D12CommandQueue> {
-    let ptr = UNITY_QUEUE.load(Ordering::Acquire);
-    if ptr.is_null() {
+    let pointer = UNITY_QUEUE.load(Ordering::Acquire);
+    if pointer.is_null() {
         // device resolve のついでに取りに行く
         let _ = try_resolve_d3d12_device();
-        let ptr = UNITY_QUEUE.load(Ordering::Acquire);
-        if ptr.is_null() {
+        let pointer = UNITY_QUEUE.load(Ordering::Acquire);
+        if pointer.is_null() {
             return None;
         }
-        return unsafe { ID3D12CommandQueue::from_raw_borrowed(&ptr).map(|q| q.clone()) };
+        return unsafe { ID3D12CommandQueue::from_raw_borrowed(&pointer).map(|queue| queue.clone()) };
     }
-    unsafe { ID3D12CommandQueue::from_raw_borrowed(&ptr).map(|q| q.clone()) }
+    unsafe { ID3D12CommandQueue::from_raw_borrowed(&pointer).map(|queue| queue.clone()) }
 }
 
-fn ensure_cmd_objects(state: &mut OpenedState, device: &ID3D12Device) -> Result<(), String> {
-    if state.cmd_allocator.is_some() && state.cmd_list.is_some() {
+fn ensure_command_objects(state: &mut OpenedState, device: &ID3D12Device) -> Result<(), String> {
+    if state.command_allocator.is_some() && state.command_list.is_some() {
         return Ok(());
     }
     let allocator: ID3D12CommandAllocator = unsafe {
         device
             .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-            .map_err(|e| format!("CreateCommandAllocator: {:?}", e))?
+            .map_err(|error| format!("CreateCommandAllocator: {:?}", error))?
     };
-    let cmd_list: ID3D12GraphicsCommandList = unsafe {
+    let command_list: ID3D12GraphicsCommandList = unsafe {
         device
             .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
-            .map_err(|e| format!("CreateCommandList: {:?}", e))?
+            .map_err(|error| format!("CreateCommandList: {:?}", error))?
     };
     // CreateCommandList は record 状態で返すので、即 Close して以降は Reset から始める。
     unsafe {
-        cmd_list
+        command_list
             .Close()
-            .map_err(|e| format!("CommandList.Close (initial): {:?}", e))?;
+            .map_err(|error| format!("CommandList.Close (initial): {:?}", error))?;
     }
-    state.cmd_allocator = Some(allocator);
-    state.cmd_list = Some(cmd_list);
+    state.command_allocator = Some(allocator);
+    state.command_list = Some(command_list);
     Ok(())
 }
 
@@ -276,37 +276,37 @@ fn execute_barriers(
     expected: D3D12_RESOURCE_STATES,
     current: D3D12_RESOURCE_STATES,
 ) -> Result<(), String> {
-    ensure_cmd_objects(state, device)?;
+    ensure_command_objects(state, device)?;
 
-    let allocator = state.cmd_allocator.as_ref().unwrap();
-    let cmd_list = state.cmd_list.as_ref().unwrap();
+    let allocator = state.command_allocator.as_ref().unwrap();
+    let command_list = state.command_list.as_ref().unwrap();
 
     unsafe {
         allocator
             .Reset()
-            .map_err(|e| format!("CommandAllocator.Reset: {:?}", e))?;
-        cmd_list
+            .map_err(|error| format!("CommandAllocator.Reset: {:?}", error))?;
+        command_list
             .Reset(allocator, None)
-            .map_err(|e| format!("CommandList.Reset: {:?}", e))?;
-        cmd_list.ResourceBarrier(barriers);
-        cmd_list
+            .map_err(|error| format!("CommandList.Reset: {:?}", error))?;
+        command_list.ResourceBarrier(barriers);
+        command_list
             .Close()
-            .map_err(|e| format!("CommandList.Close: {:?}", e))?;
+            .map_err(|error| format!("CommandList.Close: {:?}", error))?;
     }
 
-    let state_decl = UnityGraphicsD3D12ResourceState {
+    let state_declaration = UnityGraphicsD3D12ResourceState {
         resource: resource.as_raw(),
         expected: expected.0,
         current: current.0,
     };
 
-    let gfx_ptr = UNITY_GFX_D3D12.load(Ordering::Acquire);
-    if gfx_ptr.is_null() {
+    let graphics_pointer = UNITY_GRAPHICS_D3D12.load(Ordering::Acquire);
+    if graphics_pointer.is_null() {
         return Err("IUnityGraphicsD3D12v5 not available".to_string());
     }
     unsafe {
-        let gfx = gfx_ptr as *mut IUnityGraphicsD3D12v5;
-        ((*gfx).execute_command_list)(cmd_list.as_raw(), 1, &state_decl);
+        let graphics = graphics_pointer as *mut IUnityGraphicsD3D12v5;
+        ((*graphics).execute_command_list)(command_list.as_raw(), 1, &state_declaration);
     }
     Ok(())
 }
@@ -346,13 +346,13 @@ pub fn open_fence(handle_value: u64) -> Result<(), String> {
     }
     let device = unity_device().ok_or_else(|| "Unity D3D12 device not available".to_string())?;
 
-    let mut fence_opt: Option<ID3D12Fence> = None;
+    let mut fence_option: Option<ID3D12Fence> = None;
     unsafe {
         device
-            .OpenSharedHandle(HANDLE(handle_value as *mut _), &mut fence_opt)
-            .map_err(|e| format!("ID3D12Device::OpenSharedHandle (fence): {:?}", e))?;
+            .OpenSharedHandle(HANDLE(handle_value as *mut _), &mut fence_option)
+            .map_err(|error| format!("ID3D12Device::OpenSharedHandle (fence): {:?}", error))?;
     }
-    let fence = fence_opt.ok_or_else(|| "OpenSharedHandle (fence) returned None".to_string())?;
+    let fence = fence_option.ok_or_else(|| "OpenSharedHandle (fence) returned None".to_string())?;
 
     *FENCE.lock().unwrap_or_else(PoisonError::into_inner) = Some(FenceState {
         fence,
@@ -383,7 +383,7 @@ pub fn wait_fence(target_value: u64) -> Result<(), String> {
     unsafe {
         queue
             .Wait(&state.fence, target_value)
-            .map_err(|e| format!("ID3D12CommandQueue::Wait({}): {:?}", target_value, e))?;
+            .map_err(|error| format!("ID3D12CommandQueue::Wait({}): {:?}", target_value, error))?;
     }
     state.last_waited = target_value;
     Ok(())
@@ -408,22 +408,22 @@ pub fn open_or_cached(
 
     let cache_hit = matches!(
         state.current.as_ref(),
-        Some(c) if c.handle == handle_value && c.width == width && c.height == height
+        Some(cached) if cached.handle == handle_value && cached.width == width && cached.height == height
     );
 
     let is_new = !cache_hit;
     if is_new {
-        let mut res_opt: Option<ID3D12Resource> = None;
-        if let Err(e) = unsafe {
-            device.OpenSharedHandle(HANDLE(handle_value as *mut _), &mut res_opt)
+        let mut resource_option: Option<ID3D12Resource> = None;
+        if let Err(error) = unsafe {
+            device.OpenSharedHandle(HANDLE(handle_value as *mut _), &mut resource_option)
         } {
             log_debug(&format!(
                 "OpenSharedHandle (D3D12) failed for handle=0x{:x}: {:?}",
-                handle_value, e
+                handle_value, error
             ));
             return None;
         }
-        let resource = res_opt?;
+        let resource = resource_option?;
         log_debug(&format!(
             "opened handle=0x{:x} d3d12_resource={:p} {}x{}",
             handle_value,
@@ -447,8 +447,8 @@ pub fn open_or_cached(
     // 1 度宣言すれば以後 Unity が状態を踏襲するので追加 barrier は不要。
     if is_new {
         let resource = state.current.as_ref()?.resource.clone();
-        if let Err(e) = declare_initial_state(&mut state, &device, &resource) {
-            log_debug(&format!("declare_initial_state failed: {}", e));
+        if let Err(error) = declare_initial_state(&mut state, &device, &resource) {
+            log_debug(&format!("declare_initial_state failed: {}", error));
             // 初期状態が宣言できないと Unity のサンプルで validation error になりうる。
             // とりあえずポインタは返すが、issue は ログに記録。
         }
@@ -459,6 +459,6 @@ pub fn open_or_cached(
 }
 
 #[allow(dead_code)]
-fn _unused_state_types(s: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_STATES {
-    s
+fn _unused_state_types(state: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_STATES {
+    state
 }

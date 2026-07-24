@@ -10,6 +10,7 @@ using UnityEngine;
 using UnityEngine.LowLevel;
 using UnityEngine.PlayerLoop;
 using UnityEngine.Rendering;
+using UnityEngine.Serialization;
 using UnityEngine.UI;
 
 namespace CefUnity.Runtime
@@ -61,13 +62,13 @@ namespace CefUnity.Runtime
         private int _clickCount;
         private int _currentHeight;
         private int _currentWidth;
-        private float _diagTimer;
+        private float _diagnosticsTimer;
         private bool _imeActive;
         private bool _imeSuppressKeys;
 
         // Accelerated paint (IOSurface / Metal via Mach port)
         private bool _useAcceleratedPaint;
-        private IntPtr _lastAccelTexPtr;
+        private IntPtr _lastAcceleratedTexturePointer;
 
         // End-to-end frame delay measurement (BeginFrame frame - paint frame)
         private int _delaySampleCount;
@@ -90,33 +91,34 @@ namespace CefUnity.Runtime
         // 自然に到着済み)。間に合わなければ従来通り 1F フォールバック。
         [SerializeField, Tooltip("BF#1 発行からこの時間 (ms) までは flush 結果の到着を待って 0F 化する " +
             "(0 で待ち無効 = 常にノンブロッキング受信)。60fps 予算 16.7ms 内に収まる 10ms 程度を推奨。")]
-        private float _zeroFrameWaitMs = 10f;
+        [FormerlySerializedAs("_zeroFrameWaitMs")]
+        private float _zeroFrameWaitMilliseconds = 10f;
         // 待ち判定の状態機械 (定数・streak 推定・プローブ窓は CefZeroFramePacer に集約)。
         private readonly CefZeroFramePacer _pacer = new CefZeroFramePacer();
         // このフレームで CEF へ入力イベントを送ったか (アクティブ判定の即時トリガー)。
         private bool _inputSentThisFrame;
         // 0F 待ち検証メトリクス
-        private int _dpFreshCount;     // 待ちの後 (or 待ちゼロで) 新 paint を取得できた回数
-        private int _dpFallbackCount;  // デッドラインまでに届かず諦めた回数 (前フレーム内容を継続表示)
-        private int _dpIdleCount;      // 非アクティブで待ちをスキップした回数
-        private double _dpBlockSumMs;  // recv hook でのブロック時間合計
-        private double _dpBlockMaxMs;
+        private int _doublePumpFreshCount;     // 待ちの後 (or 待ちゼロで) 新 paint を取得できた回数
+        private int _doublePumpFallbackCount;  // デッドラインまでに届かず諦めた回数 (前フレーム内容を継続表示)
+        private int _doublePumpIdleCount;      // 非アクティブで待ちをスキップした回数
+        private double _doublePumpBlockSumMilliseconds;  // recv hook でのブロック時間合計
+        private double _doublePumpBlockMaxMilliseconds;
 
         // -----------------------------------------------------------------------
         // Jitter 計装 (機構切り分け用)
         // -----------------------------------------------------------------------
         // 機構1: フレーム時間 (present 間隔) の分布。double-pump のブロックが present 直前に
         //        入るため、ブロック量のジッタがそのままフレーム間隔のジッタ = ジャダーになる。
-        private double _ftSum, _ftSumSq, _ftMax;
-        private int _ftCount, _ftOver18, _ftOver20, _ftOver25; // 18=16.67ms+余裕,20,25ms 超過数
+        private double _frameTimeSum, _frameTimeSumSquared, _frameTimeMax;
+        private int _frameTimeCount, _frameTimeOver18, _frameTimeOver20, _frameTimeOver25; // 18=16.67ms+余裕,20,25ms 超過数
         // 機構2: コンテンツ更新間隔 (fresh paint を取得した実時刻の連続差) の分布。
         //        Chromium のスクロール曲線はこの実時刻でサンプルされるので、間隔のジッタが
         //        見かけのスクロール速度のジッタ = judder に直結する。
         private float _lastFreshRealtime = -1f;
-        private double _ciSum, _ciSumSq, _ciMax;
-        private int _ciCount;
+        private double _contentIntervalSum, _contentIntervalSumSquared, _contentIntervalMax;
+        private int _contentIntervalCount;
 #if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
-        private bool _navTestDone; // 計測用
+        private bool _navigationTestDone; // 計測用
         private bool _audioTestDone; // 音声テスト用 (cef_load_url トリガー)
 #endif
 
@@ -132,11 +134,11 @@ namespace CefUnity.Runtime
         ///     診断用: CEF 内部 paint の累積数 (accel_frame_id)。CEF は damage 駆動で
         ///     paint するため、静止ページでは増えないのが正常。
         /// </summary>
-        public ulong DiagAccelFrameId =>
-            _browser != null && _useAcceleratedPaint ? _browser.PeekAccelFrameId() : 0;
+        public ulong DiagnosticsAcceleratedFrameId =>
+            _browser != null && _useAcceleratedPaint ? _browser.PeekAcceleratedFrameId() : 0;
 
         /// <summary>診断用: Unity テクスチャへ実際に適用した paint の累積数。</summary>
-        public ulong DiagTexturesApplied { get; private set; }
+        public ulong DiagnosticsTexturesApplied { get; private set; }
         // PlayerLoop hook を install したかどうか
         private bool _playerLoopHooked;
 
@@ -146,9 +148,9 @@ namespace CefUnity.Runtime
         // 検証用メトリクス
         private int _postLateUpdateInvokeCount;  // PostLateUpdate hook の呼び出し回数
         private int _gotInPostLateUpdateCount;   // PostLateUpdate で取得成功した回数
-        private int _recvFailCount;              // 取得失敗 (1 frame 遅延扱い)
+        private int _receiveFailCount;              // 取得失敗 (1 frame 遅延扱い)
         // 最近の生サンプルを保持 (frame_count, paint_unity_frame, delta) でログ出力
-        private readonly System.Collections.Generic.Queue<(int fc, ulong pf, int delta)> _recentSamples
+        private readonly System.Collections.Generic.Queue<(int frameCount, ulong paintFrame, int delta)> _recentSamples
             = new System.Collections.Generic.Queue<(int, ulong, int)>();
 
         // スクロール入力パイプライン: ソース drain・ルーティング・平滑・リサンプル・録画は
@@ -163,8 +165,8 @@ namespace CefUnity.Runtime
 
 #if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
         // --- 分析用 (開発ビルドのみ): 毎フレームの scroll 量/frame time/paint を CSV 記録 ---
-        private readonly System.Collections.Generic.List<string> _perfLog = new();
-        private int _frameSentDy;
+        private readonly System.Collections.Generic.List<string> _performanceLog = new();
+        private int _frameSentDeltaY;
 #endif
 
         // Double/triple click detection
@@ -201,7 +203,7 @@ namespace CefUnity.Runtime
                 // シーンの serialized 値は Editor が外部変更を再読込しないため、既存の開発
                 // トグル群と同じ temp ファイル方式で切り替える。
                 if (System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_no_zero_wait")))
-                    _zeroFrameWaitMs = 0f;
+                    _zeroFrameWaitMilliseconds = 0f;
 #endif
 
                 // ログのマスタースイッチ: Unity 側 (CefLog) と Rust 側 (client/server)
@@ -209,7 +211,7 @@ namespace CefUnity.Runtime
                 CefLog.Enabled = _enableLog;
                 // GPU 経路 (macOS: IOSurface / Windows: D3D11 共有テクスチャ) を常に要求する。
                 // サーバー側がプール構築に失敗した場合は software paint へ自動フォールバックする。
-                CefRuntime.Init(useGpu: true, enableLog: _enableLog);
+                CefRuntime.Initialize(useGpu: true, enableLog: _enableLog);
                 _browser = new Browser(_currentWidth, _currentHeight, _url);
 
                 // PlayerLoop に EarlyUpdate / PostLateUpdate の hook を挿入。
@@ -230,9 +232,9 @@ namespace CefUnity.Runtime
                 SetupAudioOutput();
                 SetupScrollInput();
             }
-            catch (Exception e)
+            catch (Exception exception)
             {
-                CefLog.LogError($"[CefUnity] Init failed: {e}");
+                CefLog.LogError($"[CefUnity] Init failed: {exception}");
             }
         }
 
@@ -274,24 +276,24 @@ namespace CefUnity.Runtime
 
 #if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
             // 開発トグル: temp ファイルで testufo 遷移 + 擬似ゲーム負荷 (8ms 空回し)。
-            var tmpDir = System.IO.Path.GetTempPath();
-            if (!_navTestDone && System.IO.File.Exists(System.IO.Path.Combine(tmpDir, "cef_load_testufo")))
+            var temporaryDirectory = System.IO.Path.GetTempPath();
+            if (!_navigationTestDone && System.IO.File.Exists(System.IO.Path.Combine(temporaryDirectory, "cef_load_testufo")))
             {
-                _navTestDone = true;
+                _navigationTestDone = true;
                 LoadUrl("https://testufo.com/mouserate");
             }
             // 計測用 (一時): cef_load_url にファイル内容の URL を書くとそこへ遷移する。
             // 音声テスト (440Hz トーンの data: URI 等) を実行中の PlayMode へ渡すために使う。
             // Time.frameCount > 60: 初期 URL のナビゲーションと競合すると LoadUrl が
             // 負けて遷移しないことがあるため、初期ロードが落ち着いてから発火させる。
-            var navUrlFile = System.IO.Path.Combine(tmpDir, "cef_load_url");
-            if (!_audioTestDone && Time.frameCount > 60 && System.IO.File.Exists(navUrlFile))
+            var navigationUrlFile = System.IO.Path.Combine(temporaryDirectory, "cef_load_url");
+            if (!_audioTestDone && Time.frameCount > 60 && System.IO.File.Exists(navigationUrlFile))
             {
                 _audioTestDone = true;
-                var u = System.IO.File.ReadAllText(navUrlFile).Trim();
-                if (!string.IsNullOrEmpty(u)) LoadUrl(u);
+                var url = System.IO.File.ReadAllText(navigationUrlFile).Trim();
+                if (!string.IsNullOrEmpty(url)) LoadUrl(url);
             }
-            if (System.IO.File.Exists(System.IO.Path.Combine(tmpDir, "cef_fake_work")))
+            if (System.IO.File.Exists(System.IO.Path.Combine(temporaryDirectory, "cef_fake_work")))
             {
                 var until = Time.realtimeSinceStartup + 0.008f;
                 while (Time.realtimeSinceStartup < until) { }
@@ -299,40 +301,40 @@ namespace CefUnity.Runtime
 #endif
 
             // 機構1 計装: フレーム時間 (present 間隔) の分布を毎フレーム集計。
-            var ft = Time.unscaledDeltaTime;
-            _ftSum += ft;
-            _ftSumSq += (double)ft * ft;
-            _ftCount++;
-            if (ft > _ftMax) _ftMax = ft;
-            if (ft > 0.018) _ftOver18++;
-            if (ft > 0.020) _ftOver20++;
-            if (ft > 0.025) _ftOver25++;
+            var frameTime = Time.unscaledDeltaTime;
+            _frameTimeSum += frameTime;
+            _frameTimeSumSquared += (double)frameTime * frameTime;
+            _frameTimeCount++;
+            if (frameTime > _frameTimeMax) _frameTimeMax = frameTime;
+            if (frameTime > 0.018) _frameTimeOver18++;
+            if (frameTime > 0.020) _frameTimeOver20++;
+            if (frameTime > 0.025) _frameTimeOver25++;
 
 #if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
             // 開発トグル: cef_perf_probe がある間、毎フレーム記録し 30 フレームごとに CSV 追記。
-            if (System.IO.File.Exists(System.IO.Path.Combine(tmpDir, "cef_perf_probe")))
+            if (System.IO.File.Exists(System.IO.Path.Combine(temporaryDirectory, "cef_perf_probe")))
             {
-                long afiNow = _useAcceleratedPaint && _browser != null ? (long)_browser.PeekAccelFrameId() : 0;
-                _perfLog.Add($"{Time.frameCount},{ft * 1000f:F2},{afiNow},{_frameSentDy}");
-                _frameSentDy = 0;
-                if (_perfLog.Count >= 30)
+                long acceleratedFrameIdNow = _useAcceleratedPaint && _browser != null ? (long)_browser.PeekAcceleratedFrameId() : 0;
+                _performanceLog.Add($"{Time.frameCount},{frameTime * 1000f:F2},{acceleratedFrameIdNow},{_frameSentDeltaY}");
+                _frameSentDeltaY = 0;
+                if (_performanceLog.Count >= 30)
                 {
                     try
                     {
                         System.IO.File.AppendAllText(
-                            System.IO.Path.Combine(tmpDir, "cef_perf.csv"),
-                            string.Join("\n", _perfLog) + "\n");
+                            System.IO.Path.Combine(temporaryDirectory, "cef_perf.csv"),
+                            string.Join("\n", _performanceLog) + "\n");
                     }
                     catch { }
-                    _perfLog.Clear();
+                    _performanceLog.Clear();
                 }
             }
 #endif
 
-            _diagTimer += Time.deltaTime;
-            if (_diagTimer >= 2f)
+            _diagnosticsTimer += Time.deltaTime;
+            if (_diagnosticsTimer >= 2f)
             {
-                _diagTimer = 0f;
+                _diagnosticsTimer = 0f;
 
                 if (_enableLog)
                 {
@@ -341,69 +343,69 @@ namespace CefUnity.Runtime
                     // afi = accel_frame_id (server が Mach 送信を完了した paint の累積数)。
                     // 2 秒窓の増分が「CEF が Unity へ届けた paint レート」= CEF 出力 fps。
                     // paint= は software 経路のカウンタなので GPU 経路では常に 0。
-                    var afi = _useAcceleratedPaint ? _browser.PeekAccelFrameId() : 0;
-                    CefLog.Log($"[CefUnity] diag: paint={paintCount} pump={pumpCount} afi={afi}");
+                    var acceleratedFrameId = _useAcceleratedPaint ? _browser.PeekAcceleratedFrameId() : 0;
+                    CefLog.Log($"[CefUnity] diag: paint={paintCount} pump={pumpCount} afi={acceleratedFrameId}");
                     var logs = CefRuntime.GetLogs();
                     foreach (var line in logs)
                         CefLog.Log($"[CefServer] {line}");
 
                     if (_delaySampleCount > 0)
                     {
-                        var avg = (float)_delaySumFrames / _delaySampleCount;
-                        var sb = new StringBuilder();
-                        sb.Append($"[CefUnity] end-to-end frame delay (n={_delaySampleCount}): avg={avg:F2} min={_delayMinFrames} max={_delayMaxFrames} buckets=[");
-                        for (int i = 0; i < _delayBuckets.Length; i++)
+                        var average = (float)_delaySumFrames / _delaySampleCount;
+                        var stringBuilder = new StringBuilder();
+                        stringBuilder.Append($"[CefUnity] end-to-end frame delay (n={_delaySampleCount}): avg={average:F2} min={_delayMinFrames} max={_delayMaxFrames} buckets=[");
+                        for (int bucketIndex = 0; bucketIndex < _delayBuckets.Length; bucketIndex++)
                         {
-                            if (i > 0) sb.Append(' ');
-                            sb.Append($"{i}{(i == _delayBuckets.Length - 1 ? "+" : "")}:{_delayBuckets[i]}");
+                            if (bucketIndex > 0) stringBuilder.Append(' ');
+                            stringBuilder.Append($"{bucketIndex}{(bucketIndex == _delayBuckets.Length - 1 ? "+" : "")}:{_delayBuckets[bucketIndex]}");
                         }
-                        sb.Append(']');
-                        CefLog.Log(sb.ToString());
+                        stringBuilder.Append(']');
+                        CefLog.Log(stringBuilder.ToString());
 
                         // 検証メトリクス: PostLateUpdate hook での取得統計
-                        CefLog.Log($"[CefUnity] verify: PostLateUpdate={_postLateUpdateInvokeCount} recv_ok={_gotInPostLateUpdateCount} recv_fail={_recvFailCount}");
-                        var sb2 = new StringBuilder("[CefUnity] verify samples (fc, paint_fc, delta):");
-                        foreach (var s in _recentSamples)
-                            sb2.Append($" ({s.fc},{s.pf},{s.delta})");
-                        CefLog.Log(sb2.ToString());
+                        CefLog.Log($"[CefUnity] verify: PostLateUpdate={_postLateUpdateInvokeCount} recv_ok={_gotInPostLateUpdateCount} recv_fail={_receiveFailCount}");
+                        var stringBuilder2 = new StringBuilder("[CefUnity] verify samples (fc, paint_fc, delta):");
+                        foreach (var sample in _recentSamples)
+                            stringBuilder2.Append($" ({sample.frameCount},{sample.paintFrame},{sample.delta})");
+                        CefLog.Log(stringBuilder2.ToString());
 
                         _delaySampleCount = 0;
                         _delaySumFrames = 0;
                         _delayMaxFrames = 0;
                         _delayMinFrames = int.MaxValue;
-                        for (int i = 0; i < _delayBuckets.Length; i++) _delayBuckets[i] = 0;
+                        for (int bucketIndex = 0; bucketIndex < _delayBuckets.Length; bucketIndex++) _delayBuckets[bucketIndex] = 0;
                         _postLateUpdateInvokeCount = 0;
                         _gotInPostLateUpdateCount = 0;
-                        _recvFailCount = 0;
+                        _receiveFailCount = 0;
                         _recentSamples.Clear();
                     }
 
                     // 0F 待ち専用メトリクス (fresh=新paint取得 / fallback=届かず1F / idle=待ちスキップ)。
-                    if (_zeroFrameWaitMs > 0f && _useAcceleratedPaint)
+                    if (_zeroFrameWaitMilliseconds > 0f && _useAcceleratedPaint)
                     {
-                        var dpActive = _dpFreshCount + _dpFallbackCount;
-                        var blockAvg = dpActive > 0 ? _dpBlockSumMs / dpActive : 0.0;
-                        CefLog.Log($"[CefUnity] 0F-wait: fresh={_dpFreshCount} fallback(1F)={_dpFallbackCount} idle={_dpIdleCount} block_avg={blockAvg:F2}ms block_max={_dpBlockMaxMs:F2}ms");
-                        _dpFreshCount = 0;
-                        _dpFallbackCount = 0;
-                        _dpIdleCount = 0;
-                        _dpBlockSumMs = 0;
-                        _dpBlockMaxMs = 0;
+                        var doublePumpActive = _doublePumpFreshCount + _doublePumpFallbackCount;
+                        var blockAverage = doublePumpActive > 0 ? _doublePumpBlockSumMilliseconds / doublePumpActive : 0.0;
+                        CefLog.Log($"[CefUnity] 0F-wait: fresh={_doublePumpFreshCount} fallback(1F)={_doublePumpFallbackCount} idle={_doublePumpIdleCount} block_avg={blockAverage:F2}ms block_max={_doublePumpBlockMaxMilliseconds:F2}ms");
+                        _doublePumpFreshCount = 0;
+                        _doublePumpFallbackCount = 0;
+                        _doublePumpIdleCount = 0;
+                        _doublePumpBlockSumMilliseconds = 0;
+                        _doublePumpBlockMaxMilliseconds = 0;
                     }
 
                     // jitter 計装: 機構1 (フレーム時間=present 間隔) と 機構2 (content 更新間隔)。
                     // 0F 待ち ON/OFF どちらでも出力して比較できるようにする。
-                    var dp = (_zeroFrameWaitMs > 0f && _useAcceleratedPaint) ? "ON " : "OFF";
-                    var ftMean = _ftCount > 0 ? _ftSum / _ftCount : 0.0;
-                    var ftStd = _ftCount > 0 ? Math.Sqrt(Math.Max(0, _ftSumSq / _ftCount - ftMean * ftMean)) : 0.0;
-                    var ciMean = _ciCount > 0 ? _ciSum / _ciCount : 0.0;
-                    var ciStd = _ciCount > 0 ? Math.Sqrt(Math.Max(0, _ciSumSq / _ciCount - ciMean * ciMean)) : 0.0;
+                    var doublePump = (_zeroFrameWaitMilliseconds > 0f && _useAcceleratedPaint) ? "ON " : "OFF";
+                    var frameTimeMean = _frameTimeCount > 0 ? _frameTimeSum / _frameTimeCount : 0.0;
+                    var frameTimeStandardDeviation = _frameTimeCount > 0 ? Math.Sqrt(Math.Max(0, _frameTimeSumSquared / _frameTimeCount - frameTimeMean * frameTimeMean)) : 0.0;
+                    var contentIntervalMean = _contentIntervalCount > 0 ? _contentIntervalSum / _contentIntervalCount : 0.0;
+                    var contentIntervalStandardDeviation = _contentIntervalCount > 0 ? Math.Sqrt(Math.Max(0, _contentIntervalSumSquared / _contentIntervalCount - contentIntervalMean * contentIntervalMean)) : 0.0;
                     CefLog.Log(
-                        $"[CefUnity] jitter dp={dp}: " +
-                        $"frame(n={_ftCount}) mean={ftMean * 1000:F2}ms std={ftStd * 1000:F2}ms max={_ftMax * 1000:F1}ms over18/20/25={_ftOver18}/{_ftOver20}/{_ftOver25} | " +
-                        $"content(n={_ciCount}) mean={ciMean * 1000:F2}ms std={ciStd * 1000:F2}ms max={_ciMax * 1000:F1}ms");
-                    _ftSum = _ftSumSq = _ftMax = 0; _ftCount = _ftOver18 = _ftOver20 = _ftOver25 = 0;
-                    _ciSum = _ciSumSq = _ciMax = 0; _ciCount = 0;
+                        $"[CefUnity] jitter dp={doublePump}: " +
+                        $"frame(n={_frameTimeCount}) mean={frameTimeMean * 1000:F2}ms std={frameTimeStandardDeviation * 1000:F2}ms max={_frameTimeMax * 1000:F1}ms over18/20/25={_frameTimeOver18}/{_frameTimeOver20}/{_frameTimeOver25} | " +
+                        $"content(n={_contentIntervalCount}) mean={contentIntervalMean * 1000:F2}ms std={contentIntervalStandardDeviation * 1000:F2}ms max={_contentIntervalMax * 1000:F1}ms");
+                    _frameTimeSum = _frameTimeSumSquared = _frameTimeMax = 0; _frameTimeCount = _frameTimeOver18 = _frameTimeOver20 = _frameTimeOver25 = 0;
+                    _contentIntervalSum = _contentIntervalSumSquared = _contentIntervalMax = 0; _contentIntervalCount = 0;
                 }
             }
 
@@ -464,10 +466,10 @@ namespace CefUnity.Runtime
             _browser?.Dispose();
             _browser = null;
 
-            if (_lastAccelTexPtr != IntPtr.Zero)
+            if (_lastAcceleratedTexturePointer != IntPtr.Zero)
             {
-                Browser.ReleaseMetalTexture(_lastAccelTexPtr);
-                _lastAccelTexPtr = IntPtr.Zero;
+                Browser.ReleaseMetalTexture(_lastAcceleratedTexturePointer);
+                _lastAcceleratedTexturePointer = IntPtr.Zero;
             }
 
             if (_texture != null)
@@ -505,8 +507,8 @@ namespace CefUnity.Runtime
             // 冒頭のリセットで消え、連続入力判定・アクティブ判定に乗らない)。
             if (System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_scroll_test")))
             {
-                var dir = ((int)(Time.realtimeSinceStartup / 3f)) % 2 == 0 ? -1 : 1;
-                self._browser.SendMouseWheel(self._currentWidth / 2, self._currentHeight / 2, 0, dir * 60);
+                var direction = ((int)(Time.realtimeSinceStartup / 3f)) % 2 == 0 ? -1 : 1;
+                self._browser.SendMouseWheel(self._currentWidth / 2, self._currentHeight / 2, 0, direction * 60);
                 self._inputSentThisFrame = true;
             }
             // 開発トグル: cef_scroll_slow が在る間、毎フレーム正確に -10px の均一スクロールを注入。
@@ -514,7 +516,7 @@ namespace CefUnity.Runtime
             if (System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_scroll_slow")))
             {
                 self._browser.SendMouseWheel(self._currentWidth / 2, self._currentHeight / 2, 0, -10);
-                self._frameSentDy = -10;
+                self._frameSentDeltaY = -10;
                 self._inputSentThisFrame = true;
             }
 #endif
@@ -523,14 +525,14 @@ namespace CefUnity.Runtime
             // スクロール平滑の排出 (非 precise / フォールバック)。BeginFrame#1 の前なので
             // 同フレームの paint に乗る。
             self.TickScrollSmoother();
-            self.UpdateCompositionCursorPos();
+            self.UpdateCompositionCursorPosition();
             self.HandleImeInput();
             self.HandleKeyboardInput();
             // BeginFrame#1 直前の paint カウンタと時刻を記録 (recv 側の増分検知・待ち基準)。
             // 入力ハンドラ群の後なので _inputSentThisFrame は確定済み。Peek → 時刻取得の
             // 順序は旧実装と同一に保つ。
-            var afiNow = self._useAcceleratedPaint ? self._browser.PeekAccelFrameId() : 0UL;
-            self._pacer.OnBeginFrame(Time.realtimeSinceStartup, afiNow, self._inputSentThisFrame);
+            var acceleratedFrameIdNow = self._useAcceleratedPaint ? self._browser.PeekAcceleratedFrameId() : 0UL;
+            self._pacer.OnBeginFrame(Time.realtimeSinceStartup, acceleratedFrameIdNow, self._inputSentThisFrame);
             // BeginFrame#1: renderer に「このフレームの入力を反映した内容」を作らせる。
             self._browser.SendExternalBeginFrame((ulong)Time.frameCount);
         }
@@ -542,27 +544,27 @@ namespace CefUnity.Runtime
         /// リスト末尾への Append は PresentAfterDraw より後になり反映が次フレームへずれる
         /// (実画面 +1F) ため不可。
         /// </summary>
-        private static void OnPostLateUpdateRecv()
+        private static void OnPostLateUpdateReceive()
         {
             var self = s_instance;
             if (self == null || self._browser == null) return;
             self._postLateUpdateInvokeCount++;
-            self.RecvBeforeRender();
+            self.ReceiveBeforeRender();
         }
 
         /// <summary>
         /// 描画発行前の recv 本体。server-side flush の結果 (accel_frame_id 増分) を
-        /// _zeroFrameWaitMs (BF#1 からの経過時間 cap) まで待ち、届いた最新 paint を
+        /// _zeroFrameWaitMilliseconds (BF#1 からの経過時間 cap) まで待ち、届いた最新 paint を
         /// 同フレームの present に乗せる (0F)。ゲーム処理が重いフレームではここへの到達が
         /// 遅く cap を過ぎているため自動的に待ちゼロ (flush 結果は自然に到着済み)。
         /// デッドラインまでに届かなければ従来通り 1F フォールバック。待ちは SHM カウンタの
         /// busy-wait のみで IPC を発行しない (旧 client-side double-pump の reflush による
         /// IPC フラッディング → 46ms ブロック問題は構造的に発生しない)。
         /// </summary>
-        private void RecvBeforeRender()
+        private void ReceiveBeforeRender()
         {
             // software 経路 / 待ち無効時は従来のノンブロッキング受信のみ。
-            if (!_useAcceleratedPaint || _zeroFrameWaitMs <= 0f)
+            if (!_useAcceleratedPaint || _zeroFrameWaitMilliseconds <= 0f)
             {
                 if (TryUpdateTextureOnce()) OnFreshPaint();
                 else OnNoPaint();
@@ -576,24 +578,24 @@ namespace CefUnity.Runtime
             {
                 if (TryUpdateTextureOnce()) OnFreshPaint();
                 else OnNoPaint();
-                _dpIdleCount++;
+                _doublePumpIdleCount++;
                 return;
             }
 
             // damage streak 抑止推定・連続入力中は待ちスキップ (根拠は CefZeroFramePacer 参照)。
             if (_pacer.ShouldSkipAsSuppressed())
             {
-                if (TryUpdateTextureOnce()) { OnFreshPaint(); _dpFreshCount++; }
-                else { OnNoPaint(); _dpFallbackCount++; }
+                if (TryUpdateTextureOnce()) { OnFreshPaint(); _doublePumpFreshCount++; }
+                else { OnNoPaint(); _doublePumpFallbackCount++; }
                 return;
             }
 
-            var window = _pacer.OpenWaitWindow(_zeroFrameWaitMs);
+            var window = _pacer.OpenWaitWindow(_zeroFrameWaitMilliseconds);
             while (true)
             {
                 var now = Time.realtimeSinceStartup;
                 if (window.DeadlineReached(now)) break;
-                if (window.OnAfiSample(now, _browser.PeekAccelFrameId())) break;
+                if (window.OnAcceleratedFrameIdSample(now, _browser.PeekAcceleratedFrameId())) break;
                 // Peek (FFI + SHM read) のフル回転を避けて CPU/メモリバス圧を下げる。
                 // SpinWait はデスケジュールされない (Thread.Sleep(1) は macOS で 10ms+
                 // オーバースリープするため使用不可)。時間精度は ~µs で十分。
@@ -601,13 +603,13 @@ namespace CefUnity.Runtime
             }
 
             // 増分で抜けた場合はその paint を、デッドライン切れでも直前に届いた分があれば拾う
-            // (TryRecv は queue を drain して最新を返すため、どちらでも最新が取れる)。
-            if (TryUpdateTextureOnce()) { OnFreshPaint(); _dpFreshCount++; }
-            else { OnNoPaint(); _dpFallbackCount++; }
+            // (TryReceive は queue を drain して最新を返すため、どちらでも最新が取れる)。
+            if (TryUpdateTextureOnce()) { OnFreshPaint(); _doublePumpFreshCount++; }
+            else { OnNoPaint(); _doublePumpFallbackCount++; }
 
-            var blockMs = (Time.realtimeSinceStartup - blockStart) * 1000.0;
-            _dpBlockSumMs += blockMs;
-            if (blockMs > _dpBlockMaxMs) _dpBlockMaxMs = blockMs;
+            var blockMilliseconds = (Time.realtimeSinceStartup - blockStart) * 1000.0;
+            _doublePumpBlockSumMilliseconds += blockMilliseconds;
+            if (blockMilliseconds > _doublePumpBlockMaxMilliseconds) _doublePumpBlockMaxMilliseconds = blockMilliseconds;
         }
 
         /// <summary>recv 成功時の共通処理 (verify 計装 + activity/streak カウンタ更新)。</summary>
@@ -621,7 +623,7 @@ namespace CefUnity.Runtime
         /// <summary>recv 失敗 (新 paint なし) 時の共通処理。</summary>
         private void OnNoPaint()
         {
-            if (_textureUpdatedFrame != Time.frameCount) _recvFailCount++;
+            if (_textureUpdatedFrame != Time.frameCount) _receiveFailCount++;
             _pacer.OnNoPaint();
         }
 
@@ -630,16 +632,16 @@ namespace CefUnity.Runtime
         /// この間隔のジッタが見かけのスクロール速度のジッタ (judder) に直結する。</summary>
         private void RecordContentInterval()
         {
-            var nowRt = Time.realtimeSinceStartup;
+            var nowRealtime = Time.realtimeSinceStartup;
             if (_lastFreshRealtime >= 0f)
             {
-                double ci = nowRt - _lastFreshRealtime;
-                _ciSum += ci;
-                _ciSumSq += ci * ci;
-                _ciCount++;
-                if (ci > _ciMax) _ciMax = ci;
+                double contentInterval = nowRealtime - _lastFreshRealtime;
+                _contentIntervalSum += contentInterval;
+                _contentIntervalSumSquared += contentInterval * contentInterval;
+                _contentIntervalCount++;
+                if (contentInterval > _contentIntervalMax) _contentIntervalMax = contentInterval;
             }
-            _lastFreshRealtime = nowRt;
+            _lastFreshRealtime = nowRealtime;
         }
 
         // recv フックの挿入先アンカー (優先順)。受信テクスチャを同フレームの present に
@@ -647,7 +649,7 @@ namespace CefUnity.Runtime
         // テクスチャを差し替える必要がある。Unity 6000.3 では描画発行 (FinishFrameRendering)
         // と present (PresentAfterDraw) が PostLateUpdate 内にあるため、リスト末尾への
         // Append は present より後 = 反映が次フレームの描画にずれる (実画面 +1F)。
-        private static readonly Type[] RecvAnchorTypes =
+        private static readonly Type[] ReceiveAnchorTypes =
         {
             typeof(PostLateUpdate.PlayerUpdateCanvases),
             typeof(PostLateUpdate.PlayerEmitCanvasGeometry),
@@ -657,12 +659,12 @@ namespace CefUnity.Runtime
         private static void InstallPlayerLoopHooks()
         {
             var loop = PlayerLoop.GetCurrentPlayerLoop();
-            for (int i = 0; i < loop.subSystemList.Length; i++)
+            for (int index = 0; index < loop.subSystemList.Length; index++)
             {
-                if (loop.subSystemList[i].type == typeof(EarlyUpdate))
-                    loop.subSystemList[i] = AppendSubsystem(loop.subSystemList[i], typeof(CefUnityEarlyUpdate), OnEarlyUpdateLast);
-                else if (loop.subSystemList[i].type == typeof(PostLateUpdate))
-                    loop.subSystemList[i] = InsertSubsystemBeforeAnchor(loop.subSystemList[i], RecvAnchorTypes, typeof(CefUnityPostLateUpdate), OnPostLateUpdateRecv);
+                if (loop.subSystemList[index].type == typeof(EarlyUpdate))
+                    loop.subSystemList[index] = AppendSubsystem(loop.subSystemList[index], typeof(CefUnityEarlyUpdate), OnEarlyUpdateLast);
+                else if (loop.subSystemList[index].type == typeof(PostLateUpdate))
+                    loop.subSystemList[index] = InsertSubsystemBeforeAnchor(loop.subSystemList[index], ReceiveAnchorTypes, typeof(CefUnityPostLateUpdate), OnPostLateUpdateReceive);
             }
             PlayerLoop.SetPlayerLoop(loop);
         }
@@ -670,12 +672,12 @@ namespace CefUnity.Runtime
         private static void UninstallPlayerLoopHooks()
         {
             var loop = PlayerLoop.GetCurrentPlayerLoop();
-            for (int i = 0; i < loop.subSystemList.Length; i++)
+            for (int index = 0; index < loop.subSystemList.Length; index++)
             {
-                if (loop.subSystemList[i].type == typeof(EarlyUpdate))
-                    loop.subSystemList[i] = RemoveSubsystem(loop.subSystemList[i], typeof(CefUnityEarlyUpdate));
-                else if (loop.subSystemList[i].type == typeof(PostLateUpdate))
-                    loop.subSystemList[i] = RemoveSubsystem(loop.subSystemList[i], typeof(CefUnityPostLateUpdate));
+                if (loop.subSystemList[index].type == typeof(EarlyUpdate))
+                    loop.subSystemList[index] = RemoveSubsystem(loop.subSystemList[index], typeof(CefUnityEarlyUpdate));
+                else if (loop.subSystemList[index].type == typeof(PostLateUpdate))
+                    loop.subSystemList[index] = RemoveSubsystem(loop.subSystemList[index], typeof(CefUnityPostLateUpdate));
             }
             PlayerLoop.SetPlayerLoop(loop);
         }
@@ -684,8 +686,8 @@ namespace CefUnity.Runtime
         {
             var oldList = parent.subSystemList ?? Array.Empty<PlayerLoopSystem>();
             // 既に同 marker が入っていたら何もしない (二重 install 防止)
-            for (int i = 0; i < oldList.Length; i++)
-                if (oldList[i].type == marker) return parent;
+            for (int index = 0; index < oldList.Length; index++)
+                if (oldList[index].type == marker) return parent;
             var newList = new PlayerLoopSystem[oldList.Length + 1];
             Array.Copy(oldList, newList, oldList.Length);
             newList[oldList.Length] = new PlayerLoopSystem { type = marker, updateDelegate = update };
@@ -699,13 +701,13 @@ namespace CefUnity.Runtime
         {
             var oldList = parent.subSystemList ?? Array.Empty<PlayerLoopSystem>();
             // 既に同 marker が入っていたら何もしない (二重 install 防止)
-            for (int i = 0; i < oldList.Length; i++)
-                if (oldList[i].type == marker) return parent;
+            for (int index = 0; index < oldList.Length; index++)
+                if (oldList[index].type == marker) return parent;
 
             int insertAt = -1;
             foreach (var anchor in anchors)
             {
-                insertAt = Array.FindIndex(oldList, s => s.type == anchor);
+                insertAt = Array.FindIndex(oldList, subsystem => subsystem.type == anchor);
                 if (insertAt >= 0) break;
             }
             if (insertAt < 0)
@@ -726,11 +728,11 @@ namespace CefUnity.Runtime
         {
             var oldList = parent.subSystemList;
             if (oldList == null) return parent;
-            var idx = Array.FindIndex(oldList, s => s.type == marker);
-            if (idx < 0) return parent;
+            var index = Array.FindIndex(oldList, subsystem => subsystem.type == marker);
+            if (index < 0) return parent;
             var newList = new PlayerLoopSystem[oldList.Length - 1];
-            Array.Copy(oldList, 0, newList, 0, idx);
-            Array.Copy(oldList, idx + 1, newList, idx, oldList.Length - idx - 1);
+            Array.Copy(oldList, 0, newList, 0, index);
+            Array.Copy(oldList, index + 1, newList, index, oldList.Length - index - 1);
             parent.subSystemList = newList;
             return parent;
         }
@@ -797,29 +799,29 @@ namespace CefUnity.Runtime
         {
             if (_browser == null) return;
 
-            var comp = Input.compositionString;
+            var composition = Input.compositionString;
             var input = Input.inputString;
 
-            if (!string.IsNullOrEmpty(comp))
+            if (!string.IsNullOrEmpty(composition))
             {
                 // IME が暗黙的に確定して新しい composition を開始した場合を検出
                 // (例: "嗚呼亜" → Enter なしで次の文字 → "あ")
                 // この場合 Input.inputString に確定テキストが入っている
                 if (_imeActive && !string.IsNullOrEmpty(input))
                 {
-                    var commitSb = new StringBuilder();
-                    foreach (var c in input)
-                        if (!char.IsControl(c))
-                            commitSb.Append(c);
-                    if (commitSb.Length > 0)
+                    var commitStringBuilder = new StringBuilder();
+                    foreach (var character in input)
+                        if (!char.IsControl(character))
+                            commitStringBuilder.Append(character);
+                    if (commitStringBuilder.Length > 0)
                     {
-                        var commitText = commitSb.ToString();
+                        var commitText = commitStringBuilder.ToString();
                         _browser.ImeCommitText(commitText);
                     }
                 }
 
                 // composition 開始/変更
-                _browser.ImeSetComposition(comp, (uint)comp.Length, (uint)comp.Length);
+                _browser.ImeSetComposition(composition, (uint)composition.Length, (uint)composition.Length);
                 _imeActive = true;
                 _imeSuppressKeys = true;
                 _inputSentThisFrame = true;
@@ -829,8 +831,8 @@ namespace CefUnity.Runtime
                 _inputSentThisFrame = true;
                 // composition 終了 (非空 → 空に変化)
                 var committed = false;
-                foreach (var c in input)
-                    if (!char.IsControl(c))
+                foreach (var character in input)
+                    if (!char.IsControl(character))
                     {
                         committed = true;
                         break;
@@ -839,11 +841,11 @@ namespace CefUnity.Runtime
                 if (committed)
                 {
                     // 制御文字を除いた確定テキストを取得
-                    var sb = new StringBuilder();
-                    foreach (var c in input)
-                        if (!char.IsControl(c))
-                            sb.Append(c);
-                    var text = sb.ToString();
+                    var stringBuilder = new StringBuilder();
+                    foreach (var character in input)
+                        if (!char.IsControl(character))
+                            stringBuilder.Append(character);
+                    var text = stringBuilder.ToString();
                     _browser.ImeCommitText(text);
                 }
                 else
@@ -861,51 +863,51 @@ namespace CefUnity.Runtime
             }
         }
 
-        private void UpdateCompositionCursorPos()
+        private void UpdateCompositionCursorPosition()
         {
             if (_browser == null || _rawImage == null) return;
 
-            _browser.GetImeCaret(out var cx, out var cy, out var cw, out var ch);
+            _browser.GetImeCaret(out var caretX, out var caretY, out var caretWidth, out var caretHeight);
 
             // まだキャレット位置が報告されていない場合はスキップ
-            if (cx == 0 && cy == 0 && cw == 0 && ch == 0) return;
+            if (caretX == 0 && caretY == 0 && caretWidth == 0 && caretHeight == 0) return;
 
-            var rt = _rawImage.rectTransform;
-            var rect = rt.rect;
+            var rectTransform = _rawImage.rectTransform;
+            var rect = rectTransform.rect;
 
-            var nx = (float)cx / _currentWidth;
-            var ny = (float)(cy + ch) / _currentHeight;
+            var normalizedX = (float)caretX / _currentWidth;
+            var normalizedY = (float)(caretY + caretHeight) / _currentHeight;
 
-            var localX = rect.x + nx * rect.width;
-            var localY = rect.y + (1f - ny) * rect.height;
+            var localX = rect.x + normalizedX * rect.width;
+            var localY = rect.y + (1f - normalizedY) * rect.height;
             var localPoint = new Vector3(localX, localY, 0);
 
             var canvas = _rawImage.canvas;
-            var cam = canvas.renderMode == RenderMode.ScreenSpaceOverlay ? null : canvas.worldCamera;
-            var worldPoint = rt.TransformPoint(localPoint);
-            var screenPos = RectTransformUtility.WorldToScreenPoint(cam, worldPoint);
+            var camera = canvas.renderMode == RenderMode.ScreenSpaceOverlay ? null : canvas.worldCamera;
+            var worldPoint = rectTransform.TransformPoint(localPoint);
+            var screenPosition = RectTransformUtility.WorldToScreenPoint(camera, worldPoint);
 
 #if UNITY_EDITOR
             // Editor の Game View Scale 補正: Scale 2x では表示が2倍ズームされるため
             // compositionCursorPos もスケール倍する必要がある
             var scale = GetEditorGameViewScale();
-            screenPos *= scale;
+            screenPosition *= scale;
 #endif
 
-            Input.compositionCursorPos = screenPos;
+            Input.compositionCursorPos = screenPosition;
         }
 
         private uint GetCefModifiers()
         {
-            uint m = 0;
-            if (Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift)) m |= (uint)CefEventFlags.ShiftDown;
-            if (Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl)) m |= (uint)CefEventFlags.ControlDown;
-            if (Input.GetKey(KeyCode.LeftAlt) || Input.GetKey(KeyCode.RightAlt)) m |= (uint)CefEventFlags.AltDown;
-            if (Input.GetKey(KeyCode.LeftCommand) || Input.GetKey(KeyCode.RightCommand)) m |= (uint)CefEventFlags.CommandDown;
-            if (Input.GetMouseButton(0)) m |= (uint)CefEventFlags.LeftMouseDown;
-            if (Input.GetMouseButton(1)) m |= (uint)CefEventFlags.RightMouseDown;
-            if (Input.GetMouseButton(2)) m |= (uint)CefEventFlags.MiddleMouseDown;
-            return m;
+            uint modifiers = 0;
+            if (Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift)) modifiers |= (uint)CefEventFlags.ShiftDown;
+            if (Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl)) modifiers |= (uint)CefEventFlags.ControlDown;
+            if (Input.GetKey(KeyCode.LeftAlt) || Input.GetKey(KeyCode.RightAlt)) modifiers |= (uint)CefEventFlags.AltDown;
+            if (Input.GetKey(KeyCode.LeftCommand) || Input.GetKey(KeyCode.RightCommand)) modifiers |= (uint)CefEventFlags.CommandDown;
+            if (Input.GetMouseButton(0)) modifiers |= (uint)CefEventFlags.LeftMouseDown;
+            if (Input.GetMouseButton(1)) modifiers |= (uint)CefEventFlags.RightMouseDown;
+            if (Input.GetMouseButton(2)) modifiers |= (uint)CefEventFlags.MiddleMouseDown;
+            return modifiers;
         }
 
         // -----------------------------------------------------------------------
@@ -915,22 +917,22 @@ namespace CefUnity.Runtime
         {
             if (_browser == null || _rawImage == null) return;
 
-            if (!TryGetBrowserCoord(out var bx, out var by))
+            if (!TryGetBrowserCoordinates(out var browserX, out var browserY))
                 return;
 
-            var mods = GetCefModifiers();
+            var modifiers = GetCefModifiers();
 
-            if (bx != _lastMouseX || by != _lastMouseY)
+            if (browserX != _lastMouseX || browserY != _lastMouseY)
             {
-                _lastMouseX = bx;
-                _lastMouseY = by;
-                _browser.SendMouseMove(bx, by, mods);
+                _lastMouseX = browserX;
+                _lastMouseY = browserY;
+                _browser.SendMouseMove(browserX, browserY, modifiers);
                 _inputSentThisFrame = true;
             }
 
-            HandleButton(bx, by, 0, MouseButton.Left, mods);
-            HandleButton(bx, by, 1, MouseButton.Right, mods);
-            HandleButton(bx, by, 2, MouseButton.Middle, mods);
+            HandleButton(browserX, browserY, 0, MouseButton.Left, modifiers);
+            HandleButton(browserX, browserY, 1, MouseButton.Right, modifiers);
+            HandleButton(browserX, browserY, 2, MouseButton.Middle, modifiers);
 
             // native ソース有効時は生イベント経路 (TickNativeScroll) が担うため、
             // フレーム量子化された Input.mouseScrollDelta は読まない (二重計上防止)。
@@ -958,47 +960,47 @@ namespace CefUnity.Runtime
             if (--_scrollToggleCheckCountdown <= 0)
             {
                 _scrollToggleCheckCountdown = 60;
-                var tmp = System.IO.Path.GetTempPath();
+                var temporaryDirectory = System.IO.Path.GetTempPath();
                 // 既定は予測モード。cef_scroll_interp で補間モードに切替 (A/B 比較用オプトアウト)。
                 _scrollInput.Predictive = !System.IO.File.Exists(
-                    System.IO.Path.Combine(tmp, "cef_scroll_interp"));
+                    System.IO.Path.Combine(temporaryDirectory, "cef_scroll_interp"));
                 _scrollInput.RecordingEnabled = System.IO.File.Exists(
-                    System.IO.Path.Combine(tmp, "cef_scroll_record"));
+                    System.IO.Path.Combine(temporaryDirectory, "cef_scroll_record"));
             }
 #endif
-            _scrollInput.Drain(TryGetBrowserCoord(out _, out _), _resolutionScale);
-            if (!_scrollInput.TickResampler(out var dx, out var dy)) return;
-            if (dx == 0 && dy == 0) return;
-            SendWheelAtLastCursor(dx, dy);
+            _scrollInput.Drain(TryGetBrowserCoordinates(out _, out _), _resolutionScale);
+            if (!_scrollInput.TickResampler(out var deltaX, out var deltaY)) return;
+            if (deltaX == 0 && deltaY == 0) return;
+            SendWheelAtLastCursor(deltaX, deltaY);
         }
 
         /// <summary>
         /// スムーザの 1 フレーム分排出 (per-frame スクロール量ジッターの平滑)。
         /// HandleMouseInput の外に置くのは、カーソルがブラウザ外に出ても
-        /// (TryGetBrowserCoord 失敗でも) グライド途中の排出を最後の有効座標で
+        /// (TryGetBrowserCoordinates 失敗でも) グライド途中の排出を最後の有効座標で
         /// 継続するため。
         /// </summary>
         private void TickScrollSmoother()
         {
             if (_browser == null) return;
-            if (!_scrollInput.TickSmoother(Time.unscaledDeltaTime, out var dx, out var dy)) return;
-            if (dx == 0 && dy == 0) return;
-            SendWheelAtLastCursor(dx, dy);
+            if (!_scrollInput.TickSmoother(Time.unscaledDeltaTime, out var deltaX, out var deltaY)) return;
+            if (deltaX == 0 && deltaY == 0) return;
+            SendWheelAtLastCursor(deltaX, deltaY);
         }
 
         /// <summary>最後の有効マウス座標 (未取得なら画面中央) へホイールを送る。</summary>
-        private void SendWheelAtLastCursor(int dx, int dy)
+        private void SendWheelAtLastCursor(int deltaX, int deltaY)
         {
-            var bx = _lastMouseX >= 0 ? _lastMouseX : _currentWidth / 2;
-            var by = _lastMouseY >= 0 ? _lastMouseY : _currentHeight / 2;
-            _browser.SendMouseWheel(bx, by, dx, dy, GetCefModifiers());
+            var browserX = _lastMouseX >= 0 ? _lastMouseX : _currentWidth / 2;
+            var browserY = _lastMouseY >= 0 ? _lastMouseY : _currentHeight / 2;
+            _browser.SendMouseWheel(browserX, browserY, deltaX, deltaY, GetCefModifiers());
             _inputSentThisFrame = true;
 #if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
-            _frameSentDy = dy; // 分析用: 平滑/リサンプル後の実送信量
+            _frameSentDeltaY = deltaY; // 分析用: 平滑/リサンプル後の実送信量
 #endif
         }
 
-        private void HandleButton(int bx, int by, int unityButton, MouseButton cefButton, uint mods)
+        private void HandleButton(int browserX, int browserY, int unityButton, MouseButton cefButton, uint modifiers)
         {
             if (Input.GetMouseButtonDown(unityButton))
             {
@@ -1006,27 +1008,27 @@ namespace CefUnity.Runtime
                 {
                     var now = Time.unscaledTime;
                     if (now - _lastClickTime < DoubleClickTime
-                        && Math.Abs(bx - _lastClickX) <= DoubleClickDistance
-                        && Math.Abs(by - _lastClickY) <= DoubleClickDistance)
+                        && Math.Abs(browserX - _lastClickX) <= DoubleClickDistance
+                        && Math.Abs(browserY - _lastClickY) <= DoubleClickDistance)
                         _clickCount = _clickCount >= 3 ? 1 : _clickCount + 1;
                     else
                         _clickCount = 1;
                     _lastClickTime = now;
-                    _lastClickX = bx;
-                    _lastClickY = by;
+                    _lastClickX = browserX;
+                    _lastClickY = browserY;
                 }
                 else
                 {
                     _clickCount = 1;
                 }
 
-                _browser.SendMouseClick(bx, by, cefButton, false, _clickCount, mods);
+                _browser.SendMouseClick(browserX, browserY, cefButton, false, _clickCount, modifiers);
                 _inputSentThisFrame = true;
             }
 
             if (Input.GetMouseButtonUp(unityButton))
             {
-                _browser.SendMouseClick(bx, by, cefButton, true, _clickCount, mods);
+                _browser.SendMouseClick(browserX, browserY, cefButton, true, _clickCount, modifiers);
                 _inputSentThisFrame = true;
             }
         }
@@ -1035,32 +1037,32 @@ namespace CefUnity.Runtime
         ///     スクリーン上のマウス座標を RawImage のローカル座標経由でブラウザ座標 (0..width, 0..height) に変換する。
         ///     RawImage 外なら false を返す。
         /// </summary>
-        private bool TryGetBrowserCoord(out int bx, out int by)
+        private bool TryGetBrowserCoordinates(out int browserX, out int browserY)
         {
-            bx = by = 0;
-            var rt = _rawImage.rectTransform;
+            browserX = browserY = 0;
+            var rectTransform = _rawImage.rectTransform;
 
             // Canvas 内の Camera を取得（Overlay なら null）
             var canvas = _rawImage.canvas;
-            var cam = canvas.renderMode == RenderMode.ScreenSpaceOverlay ? null : canvas.worldCamera;
+            var camera = canvas.renderMode == RenderMode.ScreenSpaceOverlay ? null : canvas.worldCamera;
 
             if (!RectTransformUtility.ScreenPointToLocalPointInRectangle(
-                    rt, Input.mousePosition, cam, out var local))
+                    rectTransform, Input.mousePosition, camera, out var local))
                 return false;
 
-            var rect = rt.rect;
+            var rect = rectTransform.rect;
             // rect 内の 0..1 正規化座標
-            var nx = (local.x - rect.x) / rect.width;
-            var ny = (local.y - rect.y) / rect.height;
+            var normalizedX = (local.x - rect.x) / rect.width;
+            var normalizedY = (local.y - rect.y) / rect.height;
 
-            if (nx < 0f || nx > 1f || ny < 0f || ny > 1f)
+            if (normalizedX < 0f || normalizedX > 1f || normalizedY < 0f || normalizedY > 1f)
                 return false;
 
             // uvRect (0,1,1,-1) で Y 反転しているので補正
-            ny = 1f - ny;
+            normalizedY = 1f - normalizedY;
 
-            bx = Mathf.Clamp((int)(nx * _currentWidth), 0, _currentWidth - 1);
-            by = Mathf.Clamp((int)(ny * _currentHeight), 0, _currentHeight - 1);
+            browserX = Mathf.Clamp((int)(normalizedX * _currentWidth), 0, _currentWidth - 1);
+            browserY = Mathf.Clamp((int)(normalizedY * _currentHeight), 0, _currentHeight - 1);
             return true;
         }
 
@@ -1071,55 +1073,55 @@ namespace CefUnity.Runtime
             // IME composition 中・終了直後は全キー入力を抑制 (OS の IME が処理する)
             if (_imeSuppressKeys) return;
 
-            var mods = GetCefModifiers();
-            var cmd = (mods & (uint)CefEventFlags.CommandDown) != 0;
-            var ctrl = (mods & (uint)CefEventFlags.ControlDown) != 0;
-            var alt = (mods & (uint)CefEventFlags.AltDown) != 0;
+            var modifiers = GetCefModifiers();
+            var commandKeyDown = (modifiers & (uint)CefEventFlags.CommandDown) != 0;
+            var controlKeyDown = (modifiers & (uint)CefEventFlags.ControlDown) != 0;
+            var alt = (modifiers & (uint)CefEventFlags.AltDown) != 0;
 
             // 1) 印字可能文字 — Input.inputString 経由 (RAWKEYDOWN + CHAR + KEYUP)
             //    IME 変換中・commit 直後は抑制（preedit/commit は別経路で CEF に送信される）
             if (string.IsNullOrEmpty(Input.compositionString))
-                foreach (var c in Input.inputString)
+                foreach (var character in Input.inputString)
                 {
-                    if (char.IsControl(c)) continue;
+                    if (char.IsControl(character)) continue;
                     // 英数/かなキーが生成する偽スペースをフィルタ
-                    if (c == ' ' && !Input.GetKey(KeyCode.Space)) continue;
-                    _browser.SendCharEvent(c, mods);
+                    if (character == ' ' && !Input.GetKey(KeyCode.Space)) continue;
+                    _browser.SendCharEvent(character, modifiers);
                     _inputSentThisFrame = true;
                 }
 
             // 2) macOS キー変換: CEF OSR は interpretKeyEvents: パイプラインが無いため手動変換
             //    Cmd+Arrow → Home/End, Alt+Arrow → Ctrl+Arrow (単語移動)
-            //    Shift が併用された場合は選択操作になる (ShiftDown は baseMods に残る)
-            var suppressHArrows = cmd || alt;
-            var suppressVArrows = cmd;
-            if (cmd)
+            //    Shift が併用された場合は選択操作になる (ShiftDown は baseModifiers に残る)
+            var suppressHorizontalArrows = commandKeyDown || alt;
+            var suppressVerticalArrows = commandKeyDown;
+            if (commandKeyDown)
             {
-                var baseMods = mods & ~(uint)CefEventFlags.CommandDown;
-                SendKeyWithRepeat(KeyCode.LeftArrow, CefKeyCodes.Home, baseMods);
-                SendKeyWithRepeat(KeyCode.RightArrow, CefKeyCodes.End, baseMods);
-                SendKeyWithRepeat(KeyCode.UpArrow, CefKeyCodes.Home, baseMods | (uint)CefEventFlags.ControlDown);
-                SendKeyWithRepeat(KeyCode.DownArrow, CefKeyCodes.End, baseMods | (uint)CefEventFlags.ControlDown);
+                var baseModifiers = modifiers & ~(uint)CefEventFlags.CommandDown;
+                SendKeyWithRepeat(KeyCode.LeftArrow, CefKeyCodes.Home, baseModifiers);
+                SendKeyWithRepeat(KeyCode.RightArrow, CefKeyCodes.End, baseModifiers);
+                SendKeyWithRepeat(KeyCode.UpArrow, CefKeyCodes.Home, baseModifiers | (uint)CefEventFlags.ControlDown);
+                SendKeyWithRepeat(KeyCode.DownArrow, CefKeyCodes.End, baseModifiers | (uint)CefEventFlags.ControlDown);
             }
             else if (alt)
             {
-                var wordMods = (mods & ~(uint)CefEventFlags.AltDown) | (uint)CefEventFlags.ControlDown;
-                SendKeyWithRepeat(KeyCode.LeftArrow, CefKeyCodes.LeftArrow, wordMods);
-                SendKeyWithRepeat(KeyCode.RightArrow, CefKeyCodes.RightArrow, wordMods);
+                var wordModifiers = (modifiers & ~(uint)CefEventFlags.AltDown) | (uint)CefEventFlags.ControlDown;
+                SendKeyWithRepeat(KeyCode.LeftArrow, CefKeyCodes.LeftArrow, wordModifiers);
+                SendKeyWithRepeat(KeyCode.RightArrow, CefKeyCodes.RightArrow, wordModifiers);
             }
 
             // 3) 非印字キー — 長押しリピート対応
             foreach (var (key, cef) in CefKeyboardMapper.SpecialKeyTable)
             {
-                if (suppressHArrows && (key == KeyCode.LeftArrow || key == KeyCode.RightArrow)) continue;
-                if (suppressVArrows && (key == KeyCode.UpArrow || key == KeyCode.DownArrow)) continue;
+                if (suppressHorizontalArrows && (key == KeyCode.LeftArrow || key == KeyCode.RightArrow)) continue;
+                if (suppressVerticalArrows && (key == KeyCode.UpArrow || key == KeyCode.DownArrow)) continue;
 
-                SendKeyWithRepeat(key, cef, mods);
+                SendKeyWithRepeat(key, cef, modifiers);
             }
 
             // 4) Cmd/Ctrl + 編集コマンド
             //    CEF OSR では send_key_event でショートカットが処理されないため Frame の編集メソッドを直接呼ぶ
-            if (cmd || ctrl)
+            if (commandKeyDown || controlKeyDown)
             {
                 if (Input.GetKeyDown(KeyCode.C)) { _browser.Copy(); _inputSentThisFrame = true; }
                 if (Input.GetKeyDown(KeyCode.V)) { _browser.Paste(); _inputSentThisFrame = true; }
@@ -1127,18 +1129,18 @@ namespace CefUnity.Runtime
                 if (Input.GetKeyDown(KeyCode.A)) { _browser.SelectAll(); _inputSentThisFrame = true; }
                 if (Input.GetKeyDown(KeyCode.Z))
                 {
-                    if ((mods & (uint)CefEventFlags.ShiftDown) != 0) _browser.Redo();
+                    if ((modifiers & (uint)CefEventFlags.ShiftDown) != 0) _browser.Redo();
                     else _browser.Undo();
                     _inputSentThisFrame = true;
                 }
             }
         }
 
-        private void SendKeyWithRepeat(KeyCode unityKey, CefKeyCode cefKey, uint mods)
+        private void SendKeyWithRepeat(KeyCode unityKey, CefKeyCode cefKey, uint modifiers)
         {
             if (Input.GetKeyDown(unityKey))
             {
-                _browser.SendKeyEvent(KeyEventType.RawKeyDown, cefKey, mods);
+                _browser.SendKeyEvent(KeyEventType.RawKeyDown, cefKey, modifiers);
                 _keyDownTime[unityKey] = Time.unscaledTime;
                 _keyLastRepeat[unityKey] = Time.unscaledTime;
                 _inputSentThisFrame = true;
@@ -1151,7 +1153,7 @@ namespace CefUnity.Runtime
                     && _keyLastRepeat.TryGetValue(unityKey, out var lastRepeat)
                     && now - lastRepeat >= CefKeyboardMapper.KeyRepeatRate)
                 {
-                    _browser.SendKeyEvent(KeyEventType.RawKeyDown, cefKey, mods);
+                    _browser.SendKeyEvent(KeyEventType.RawKeyDown, cefKey, modifiers);
                     _keyLastRepeat[unityKey] = now;
                     _inputSentThisFrame = true;
                 }
@@ -1159,7 +1161,7 @@ namespace CefUnity.Runtime
 
             if (Input.GetKeyUp(unityKey))
             {
-                _browser.SendKeyEvent(KeyEventType.KeyUp, cefKey, mods);
+                _browser.SendKeyEvent(KeyEventType.KeyUp, cefKey, modifiers);
                 _keyDownTime.Remove(unityKey);
                 _keyLastRepeat.Remove(unityKey);
                 _inputSentThisFrame = true;
@@ -1168,54 +1170,54 @@ namespace CefUnity.Runtime
 
         private void CheckScreenResize()
         {
-            var sw = Mathf.CeilToInt(Screen.width * _resolutionScale);
-            var sh = Mathf.CeilToInt(Screen.height * _resolutionScale);
-            if (sw != _currentWidth || sh != _currentHeight)
+            var scaledWidth = Mathf.CeilToInt(Screen.width * _resolutionScale);
+            var scaledHeight = Mathf.CeilToInt(Screen.height * _resolutionScale);
+            if (scaledWidth != _currentWidth || scaledHeight != _currentHeight)
             {
-                _currentWidth = sw;
-                _currentHeight = sh;
+                _currentWidth = scaledWidth;
+                _currentHeight = scaledHeight;
                 _browser?.Resize(_currentWidth, _currentHeight);
                 if (_enableLog) CefLog.Log($"[CefUnity] Resized to {_currentWidth}x{_currentHeight}");
             }
         }
 
         // Profiling for accelerated texture path
-        private int _accelProfCount;
-        private float _accelProfRecvTotal;
-        private float _accelProfUpdateTotal;
-        private float _accelProfReleaseTotal;
+        private int _acceleratedProfilingCount;
+        private float _acceleratedProfilingReceiveTotal;
+        private float _acceleratedProfilingUpdateTotal;
+        private float _acceleratedProfilingReleaseTotal;
 
         /// <summary>spin / block なしで accelerated texture の取得を試みる。
         /// 取得成功 = 同フレーム内反映できた場合は true、その他 (新フレーム未到着等) は false。</summary>
         private bool TryUpdateTextureAcceleratedNonBlocking()
         {
-            var t0 = Time.realtimeSinceStartup;
+            var timeStart = Time.realtimeSinceStartup;
 
-            IntPtr newTexPtr;
-            int w, h;
+            IntPtr newTexturePointer;
+            int width, height;
             uint format;
 
 #if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
             // macOS: IOSurface 経由で毎フレーム新しい Metal テクスチャを受信 → Release が必要
-            if (!Browser.TryRecvIOSurfaceTexture(out newTexPtr, out w, out h, out format))
+            if (!Browser.TryReceiveIOSurfaceTexture(out newTexturePointer, out width, out height, out format))
                 return false;
 #elif UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
             // Windows: Unity の graphics backend に応じて D3D11/D3D12 を使い分け。
             // ポインタはサイズ変更時以外は安定 (client lib 側でキャッシュ管理)、Release 不要。
             var gotFrame = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D12
-                ? _browser.TryRecvD3D12Texture(out newTexPtr, out w, out h, out format)
-                : _browser.TryRecvD3D11Texture(out newTexPtr, out w, out h, out format);
+                ? _browser.TryReceiveD3D12Texture(out newTexturePointer, out width, out height, out format)
+                : _browser.TryReceiveD3D11Texture(out newTexturePointer, out width, out height, out format);
             if (!gotFrame) return false;
 #else
             return false;
 #endif
 
-            var t1 = Time.realtimeSinceStartup;
+            var timeAfterReceive = Time.realtimeSinceStartup;
 
-            if (w <= 0 || h <= 0)
+            if (width <= 0 || height <= 0)
             {
 #if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
-                Browser.ReleaseMetalTexture(newTexPtr);
+                Browser.ReleaseMetalTexture(newTexturePointer);
 #endif
                 return false;
             }
@@ -1223,31 +1225,31 @@ namespace CefUnity.Runtime
             // End-to-end frame delay 計測: server が「この paint は Unity frame N の
             // BeginFrame に対応する」とマークした N を読み、現在の frameCount との差で
             // 何 Unity フレーム遅れて画面に出るかを測る。0 = 同一フレーム取得 = 0 遅延。
-            var paintUnityFrame = _browser.GetAccelPaintUnityFrame();
+            var paintUnityFrame = _browser.GetAcceleratedPaintUnityFrame();
             if (paintUnityFrame > 0)
             {
                 long delta = Time.frameCount - (long)paintUnityFrame;
                 if (delta >= -10 && delta < 1000) // delta<0 は理論的にはあり得ないが念のため
                 {
-                    int d = (int)delta;
-                    _delaySumFrames += d;
+                    int deltaFrames = (int)delta;
+                    _delaySumFrames += deltaFrames;
                     _delaySampleCount++;
-                    if (d > _delayMaxFrames) _delayMaxFrames = d;
-                    if (d < _delayMinFrames) _delayMinFrames = d;
-                    int bucket = d >= 0 && d < _delayBuckets.Length ? d : _delayBuckets.Length - 1;
+                    if (deltaFrames > _delayMaxFrames) _delayMaxFrames = deltaFrames;
+                    if (deltaFrames < _delayMinFrames) _delayMinFrames = deltaFrames;
+                    int bucket = deltaFrames >= 0 && deltaFrames < _delayBuckets.Length ? deltaFrames : _delayBuckets.Length - 1;
                     _delayBuckets[bucket]++;
                     // 生サンプルを 5 件まで保持 (検証用)
                     if (_recentSamples.Count >= 5) _recentSamples.Dequeue();
-                    _recentSamples.Enqueue((Time.frameCount, paintUnityFrame, d));
+                    _recentSamples.Enqueue((Time.frameCount, paintUnityFrame, deltaFrames));
                 }
             }
 
-            if (_texture == null || _texture.width != w || _texture.height != h)
+            if (_texture == null || _texture.width != width || _texture.height != height)
             {
                 if (_texture != null) Destroy(_texture);
                 // Windows: 共有テクスチャは DXGI_FORMAT_B8G8R8A8_UNORM_SRGB なので linear=false (sRGB)。
                 // macOS: Metal 経路も sRGB 解釈なので linear=false。
-                _texture = Texture2D.CreateExternalTexture(w, h, TextureFormat.BGRA32, false, false, newTexPtr);
+                _texture = Texture2D.CreateExternalTexture(width, height, TextureFormat.BGRA32, false, false, newTexturePointer);
                 if (_rawImage != null)
                 {
                     _rawImage.texture = _texture;
@@ -1256,51 +1258,51 @@ namespace CefUnity.Runtime
             }
             else
             {
-                _texture.UpdateExternalTexture(newTexPtr);
+                _texture.UpdateExternalTexture(newTexturePointer);
             }
 
-            var t2 = Time.realtimeSinceStartup;
+            var timeAfterUpdate = Time.realtimeSinceStartup;
 
 #if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
             // macOS のみ: 前フレームの retain を解放 (Windows は client lib 側で管理)
-            if (_lastAccelTexPtr != IntPtr.Zero)
-                Browser.ReleaseMetalTexture(_lastAccelTexPtr);
-            _lastAccelTexPtr = newTexPtr;
+            if (_lastAcceleratedTexturePointer != IntPtr.Zero)
+                Browser.ReleaseMetalTexture(_lastAcceleratedTexturePointer);
+            _lastAcceleratedTexturePointer = newTexturePointer;
 #endif
 
-            var t3 = Time.realtimeSinceStartup;
+            var timeAfterRelease = Time.realtimeSinceStartup;
 
-            _accelProfCount++;
-            _accelProfRecvTotal += t1 - t0;
-            _accelProfUpdateTotal += t2 - t1;
-            _accelProfReleaseTotal += t3 - t2;
+            _acceleratedProfilingCount++;
+            _acceleratedProfilingReceiveTotal += timeAfterReceive - timeStart;
+            _acceleratedProfilingUpdateTotal += timeAfterUpdate - timeAfterReceive;
+            _acceleratedProfilingReleaseTotal += timeAfterRelease - timeAfterUpdate;
 
-            if (_accelProfCount >= 120)
+            if (_acceleratedProfilingCount >= 120)
             {
-                if (_enableLog) CefLog.Log($"[CefUnity-Prof] C# accel x{_accelProfCount}: recv={_accelProfRecvTotal * 1000f:F2}ms update={_accelProfUpdateTotal * 1000f:F2}ms release={_accelProfReleaseTotal * 1000f:F2}ms total={(_accelProfRecvTotal + _accelProfUpdateTotal + _accelProfReleaseTotal) * 1000f:F2}ms");
-                _accelProfCount = 0;
-                _accelProfRecvTotal = _accelProfUpdateTotal = _accelProfReleaseTotal = 0;
+                if (_enableLog) CefLog.Log($"[CefUnity-Prof] C# accel x{_acceleratedProfilingCount}: recv={_acceleratedProfilingReceiveTotal * 1000f:F2}ms update={_acceleratedProfilingUpdateTotal * 1000f:F2}ms release={_acceleratedProfilingReleaseTotal * 1000f:F2}ms total={(_acceleratedProfilingReceiveTotal + _acceleratedProfilingUpdateTotal + _acceleratedProfilingReleaseTotal) * 1000f:F2}ms");
+                _acceleratedProfilingCount = 0;
+                _acceleratedProfilingReceiveTotal = _acceleratedProfilingUpdateTotal = _acceleratedProfilingReleaseTotal = 0;
             }
             _textureUpdatedFrame = Time.frameCount;
-            DiagTexturesApplied++;
+            DiagnosticsTexturesApplied++;
             return true;
         }
 
         private void UpdateTextureSoftware()
         {
             // TryGetBuffer は新しいフレームがある場合のみ true を返す
-            if (!_browser.TryGetBuffer(out var buffer, out var w, out var h))
+            if (!_browser.TryGetBuffer(out var buffer, out var width, out var height))
                 return;
 
-            if (w <= 0 || h <= 0) return;
+            if (width <= 0 || height <= 0) return;
 
-            if (_texture == null || _texture.width != w || _texture.height != h)
+            if (_texture == null || _texture.width != width || _texture.height != height)
             {
                 // 古いテクスチャを破棄して GPU メモリリークを防ぐ
                 if (_texture != null)
                     Destroy(_texture);
 
-                _texture = new Texture2D(w, h, TextureFormat.BGRA32, false);
+                _texture = new Texture2D(width, height, TextureFormat.BGRA32, false);
                 if (_rawImage != null)
                 {
                     _rawImage.texture = _texture;
@@ -1310,14 +1312,14 @@ namespace CefUnity.Runtime
 
             unsafe
             {
-                fixed (byte* ptr = buffer)
+                fixed (byte* pointer = buffer)
                 {
-                    _texture.LoadRawTextureData((IntPtr)ptr, buffer.Length);
+                    _texture.LoadRawTextureData((IntPtr)pointer, buffer.Length);
                 }
             }
 
             _texture.Apply(false);
-            DiagTexturesApplied++;
+            DiagnosticsTexturesApplied++;
         }
 
         // -----------------------------------------------------------------------

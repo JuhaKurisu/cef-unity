@@ -52,7 +52,7 @@ namespace CefUnity.Runtime
         // Predictive=true 既定: 低遅延 (~5ms) の予測リサンプル。ビルド A/B で採用 (2026-07-22)。
         private readonly ScrollResampler _resampler = new ScrollResampler { Predictive = true };
 
-        private readonly ScrollInputEvent[] _eventBuf = new ScrollInputEvent[256];
+        private readonly ScrollInputEvent[] _eventBuffer = new ScrollInputEvent[256];
         private IScrollEventSource _source;
 
         /// <summary>native ソースが有効か。false なら呼び出し側はフォールバック経路を使う。</summary>
@@ -74,23 +74,23 @@ namespace CefUnity.Runtime
             error = null;
             if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.OSX))
             {
-                var src = new MacNativeScrollSource();
+                var source = new MacNativeScrollSource();
                 try
                 {
-                    if (src.Start())
+                    if (source.Start())
                     {
-                        _source = src;
+                        _source = source;
                         return NativeScrollSourceStart.Started;
                     }
                 }
-                catch (Exception e)
+                catch (Exception exception)
                 {
                     // dylib 不在等の P/Invoke 例外は回復可能 — フォールバックに落とす。
-                    error = e;
-                    src.Dispose();
+                    error = exception;
+                    source.Dispose();
                     return NativeScrollSourceStart.Failed;
                 }
-                src.Dispose();
+                source.Dispose();
                 return NativeScrollSourceStart.Unavailable;
             }
             return NativeScrollSourceStart.NotSupported;
@@ -125,28 +125,28 @@ namespace CefUnity.Runtime
         public void Drain(bool overBrowser, float resolutionScale)
         {
             if (_source == null) return;
-            var n = _source.Poll(_eventBuf);
-            for (var i = 0; i < n; i++)
+            var count = _source.Poll(_eventBuffer);
+            for (var index = 0; index < count; index++)
             {
-                ref var e = ref _eventBuf[i];
+                ref var inputEvent = ref _eventBuffer[index];
 #if CEF_UNITY_DEV_TOOLS
-                RecordEvent(in e, overBrowser, resolutionScale);
+                RecordEvent(in inputEvent, overBrowser, resolutionScale);
 #endif
                 if (!overBrowser) continue;
-                if (e.Precise)
+                if (inputEvent.Precise)
                 {
                     // precise delta は CSS px 相当 → view 座標へ resolutionScale を掛ける。
-                    var scaled = e;
-                    scaled.DxPx *= resolutionScale;
-                    scaled.DyPx *= resolutionScale;
+                    var scaled = inputEvent;
+                    scaled.DeltaXPixels *= resolutionScale;
+                    scaled.DeltaYPixels *= resolutionScale;
                     _resampler.AddEvent(in scaled);
                 }
                 else
                 {
                     // ノッチ (ライン単位) はスムーザでグライドさせる (Chrome 層3相当)。
                     _smoother.AddInput(
-                        e.DxPx * WheelPixelsPerStep * resolutionScale,
-                        e.DyPx * WheelPixelsPerStep * resolutionScale);
+                        inputEvent.DeltaXPixels * WheelPixelsPerStep * resolutionScale,
+                        inputEvent.DeltaYPixels * WheelPixelsPerStep * resolutionScale);
                 }
             }
         }
@@ -155,27 +155,27 @@ namespace CefUnity.Runtime
         ///     リサンプラの 1 フレーム排出。native ソースが無ければ false。
         ///     排出 0 でも毎フレーム呼ぶこと (リサンプラ状態と録画の前提)。
         /// </summary>
-        public bool TickResampler(out int dx, out int dy)
+        public bool TickResampler(out int deltaX, out int deltaY)
         {
-            dx = 0;
-            dy = 0;
+            deltaX = 0;
+            deltaY = 0;
             if (_source == null) return false;
             // Tick と録画で同一の now を使う (リプレイ照合の系統誤差防止)。
             var now = _source.Now;
-            _resampler.Tick(now, out dx, out dy);
+            _resampler.Tick(now, out deltaX, out deltaY);
 #if CEF_UNITY_DEV_TOOLS
-            RecordTick(now, dx, dy);
+            RecordTick(now, deltaX, deltaY);
 #endif
             return true;
         }
 
         /// <summary>スムーザの 1 フレーム排出。非アクティブなら false (排出なし)。</summary>
-        public bool TickSmoother(float dt, out int dx, out int dy)
+        public bool TickSmoother(float deltaTime, out int deltaX, out int deltaY)
         {
-            dx = 0;
-            dy = 0;
+            deltaX = 0;
+            deltaY = 0;
             if (!_smoother.IsActive) return false;
-            _smoother.Tick(dt, SmoothTau, out dx, out dy);
+            _smoother.Tick(deltaTime, SmoothTau, out deltaX, out deltaY);
             return true;
         }
 
@@ -218,7 +218,7 @@ namespace CefUnity.Runtime
             }
         }
 
-        private void RecordEvent(in ScrollInputEvent e, bool overBrowser, float resolutionScale)
+        private void RecordEvent(in ScrollInputEvent inputEvent, bool overBrowser, float resolutionScale)
         {
             if (!_recordEnabled) return;
             if (_recordedScale != resolutionScale)
@@ -227,13 +227,13 @@ namespace CefUnity.Runtime
                 AddRecordLine($"S,{resolutionScale:R}");
             }
             AddRecordLine(
-                $"E,{e.Timestamp:R},{e.DxPx:R},{e.DyPx:R},{(byte)e.Phase},{(e.Precise ? 1 : 0)},{(overBrowser ? 1 : 0)}");
+                $"E,{inputEvent.Timestamp:R},{inputEvent.DeltaXPixels:R},{inputEvent.DeltaYPixels:R},{(byte)inputEvent.Phase},{(inputEvent.Precise ? 1 : 0)},{(overBrowser ? 1 : 0)}");
         }
 
-        private void RecordTick(double now, int dx, int dy)
+        private void RecordTick(double now, int deltaX, int deltaY)
         {
             if (!_recordEnabled) return;
-            AddRecordLine($"T,{now:R},{dx},{dy},{(_resampler.Predictive ? 1 : 0)}");
+            AddRecordLine($"T,{now:R},{deltaX},{deltaY},{(_resampler.Predictive ? 1 : 0)}");
         }
 
         private void AddRecordLine(string line)

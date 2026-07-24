@@ -1,10 +1,10 @@
 //! 2160px 超ビューポートの回帰テスト (2026-07-23 のテクスチャ縦伸びリグレッション)。
 //!
-//! server が viewport を MAX_W/MAX_H (software shm の制約) に clamp すると、
+//! server が viewport を MAX_W/MAX_H (software shared_memory の制約) に clamp すると、
 //! GPU (IOSurface) 経路でもクライアント申告サイズと乖離し、Unity 側で
 //! テクスチャ引き伸ばし + マウス座標ズレになる (Retina の縦長 Game view は
 //! 2160px を超える — 実セッションで CreateBrowser 1706x2762 を確認)。
-//! GPU 経路は任意サイズを受理し、accel paint の寸法 (shm の accel_width/height)
+//! GPU 経路は任意サイズを受理し、accel paint の寸法 (shared_memory の accelerated_width/height)
 //! が申告サイズにそのまま一致することを検証する。
 //!
 //! 実行 (バンドル済みサーバー必須・CEF は同時 1 インスタンスのみ):
@@ -19,11 +19,11 @@ use std::time::{Duration, Instant};
 
 use ipc_channel::ipc::{self, IpcOneShotServer};
 
-use cef_unity_ipc::{Bootstrap, Command, CommandEnvelope, Response, ShmReader};
+use cef_unity_ipc::{Bootstrap, Command, CommandEnvelope, Response, SharedMemoryReader};
 
 struct TestCefServer {
-    cmd_tx: ipc::IpcSender<CommandEnvelope>,
-    resp_rx: ipc::IpcReceiver<Response>,
+    command_sender: ipc::IpcSender<CommandEnvelope>,
+    response_receiver: ipc::IpcReceiver<Response>,
     child: std::process::Child,
 }
 
@@ -42,31 +42,31 @@ impl TestCefServer {
             .arg("--ipc-server")
             .arg(&server_name)
             .spawn()
-            .unwrap_or_else(|e| panic!("{}: {}", server_bin.display(), e));
+            .unwrap_or_else(|error| panic!("{}: {}", server_bin.display(), error));
 
-        let (_rx, bootstrap) = oneshot_server.accept().expect("bootstrap");
+        let (_receiver, bootstrap) = oneshot_server.accept().expect("bootstrap");
 
         TestCefServer {
-            cmd_tx: bootstrap.cmd_tx,
-            resp_rx: bootstrap.resp_rx,
+            command_sender: bootstrap.command_sender,
+            response_receiver: bootstrap.response_receiver,
             child,
         }
     }
 
-    fn send(&self, cmd: Command) -> Response {
-        self.cmd_tx
+    fn send(&self, command: Command) -> Response {
+        self.command_sender
             .send(CommandEnvelope {
-                command: cmd,
+                command: command,
                 expects_response: true,
             })
             .unwrap();
-        self.resp_rx.recv().unwrap()
+        self.response_receiver.recv().unwrap()
     }
 
-    fn fire(&self, cmd: Command) {
-        self.cmd_tx
+    fn fire(&self, command: Command) {
+        self.command_sender
             .send(CommandEnvelope {
-                command: cmd,
+                command: command,
                 expects_response: false,
             })
             .unwrap();
@@ -76,7 +76,7 @@ impl TestCefServer {
 /// panic 時にもサーバーを確実に終了させる (CEF シングルトンロック残留防止)。
 impl Drop for TestCefServer {
     fn drop(&mut self) {
-        let _ = self.cmd_tx.send(CommandEnvelope {
+        let _ = self.command_sender.send(CommandEnvelope {
             command: Command::Shutdown,
             expects_response: false,
         });
@@ -88,9 +88,9 @@ impl Drop for TestCefServer {
 
 fn find_server_app() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("CEF_SERVER_APP") {
-        let p = PathBuf::from(&path);
-        if p.exists() {
-            return Some(p);
+        let path = PathBuf::from(&path);
+        if path.exists() {
+            return Some(path);
         }
     }
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -103,16 +103,16 @@ fn find_server_app() -> Option<PathBuf> {
             .parent()?
             .join("cef-unity-unityproject/Assets/CefUnity/Plugins/osx-arm64/cef-unity-server.app"),
     ];
-    candidates.into_iter().find(|p| p.exists())
+    candidates.into_iter().find(|path| path.exists())
 }
 
-/// accel_width/height が (want_w, want_h) になるまで BeginFrame を送りつつ待つ。
-fn wait_for_accel_dims(
+/// accelerated_width/height が (want_width, want_height) になるまで BeginFrame を送りつつ待つ。
+fn wait_for_accelerated_dimensions(
     server: &TestCefServer,
-    shm: &ShmReader,
+    shared_memory: &SharedMemoryReader,
     browser_id: u32,
-    want_w: u32,
-    want_h: u32,
+    want_width: u32,
+    want_height: u32,
     timeout: Duration,
 ) -> (u32, u32) {
     let deadline = Instant::now() + timeout;
@@ -124,9 +124,9 @@ fn wait_for_accel_dims(
             unity_frame: frame,
         });
         frame += 1;
-        let (w, h) = shm.read_accel_dims();
-        last = (w, h);
-        if w == want_w && h == want_h {
+        let (width, height) = shared_memory.read_accelerated_dimensions();
+        last = (width, height);
+        if width == want_width && height == want_height {
             return last;
         }
         thread::sleep(Duration::from_millis(16));
@@ -140,23 +140,23 @@ fn oversize_viewport_paints_at_full_size() {
     let server = TestCefServer::start();
 
     // 縦 2400px (> MAX_H 2160) で作成 — GPU 経路は clamp してはならない
-    let (browser_id, shm_flink) = match server.send(Command::CreateBrowser {
+    let (browser_id, shared_memory_flink) = match server.send(Command::CreateBrowser {
         width: 1200,
         height: 2400,
         url: "about:blank".to_string(),
     }) {
         Response::BrowserCreated {
             browser_id,
-            shm_flink,
+            shared_memory_flink,
             ..
-        } => (browser_id, shm_flink),
+        } => (browser_id, shared_memory_flink),
         other => panic!("expected BrowserCreated, got {:?}", other),
     };
-    let shm = ShmReader::open(&shm_flink).expect("open shm");
+    let shared_memory = SharedMemoryReader::open(&shared_memory_flink).expect("open shared_memory");
 
-    let (w, h) = wait_for_accel_dims(&server, &shm, browser_id, 1200, 2400, Duration::from_secs(15));
+    let (width, height) = wait_for_accelerated_dimensions(&server, &shared_memory, browser_id, 1200, 2400, Duration::from_secs(15));
     assert_eq!(
-        (w, h),
+        (width, height),
         (1200, 2400),
         "accel paint 寸法が申告 viewport と一致すべき (clamp があると 2160 になる)"
     );
@@ -167,9 +167,9 @@ fn oversize_viewport_paints_at_full_size() {
         width: 1000,
         height: 2600,
     });
-    let (w, h) = wait_for_accel_dims(&server, &shm, browser_id, 1000, 2600, Duration::from_secs(15));
+    let (width, height) = wait_for_accelerated_dimensions(&server, &shared_memory, browser_id, 1000, 2600, Duration::from_secs(15));
     assert_eq!(
-        (w, h),
+        (width, height),
         (1000, 2600),
         "Resize 後の accel paint 寸法も申告サイズに追従すべき"
     );

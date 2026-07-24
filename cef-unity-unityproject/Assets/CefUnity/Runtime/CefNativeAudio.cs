@@ -1,6 +1,7 @@
 using System;
 using CefUnity.Interop;
 using UnityEngine;
+using UnityEngine.Serialization;
 
 namespace CefUnity.Runtime
 {
@@ -25,7 +26,8 @@ namespace CefUnity.Runtime
         [SerializeField] [Range(0f, 1f)] private float _volume = 1f;
 
         [Tooltip("jitter buffer の目標滞留量 (ms)。下げるほど低遅延だがスパイクに弱い")]
-        [SerializeField] private float _targetLatencyMs = 12f;
+        [FormerlySerializedAs("_targetLatencyMs")]
+        [SerializeField] private float _targetLatencyMilliseconds = 12f;
 
         [Tooltip("CoreAudio IO バッファフレーム数 (128 ≈ 2.9ms)。デバイス共有設定なので他アプリにも影響する")]
         [SerializeField] private int _ioFrames = 128;
@@ -36,9 +38,9 @@ namespace CefUnity.Runtime
         /// <summary>ネイティブ再生中か。</summary>
         public bool IsPlaying { get; private set; }
 
-        private int _srcChannels;
+        private int _sourceChannels;
         private float _lastSentVolume = float.NaN;
-        private float _diagTimer;
+        private float _diagnosticsTimer;
         private ulong _lastUnderrun;
         private ulong _lastOverflow;
 
@@ -57,7 +59,7 @@ namespace CefUnity.Runtime
             // (サンプルは Browser=null → dispose の順序を保証するが、単体利用に備える)。
             try
             {
-                if (Browser.TryGetAudioFormat(out _, out int ch) && ch > 0 && ch != _srcChannels)
+                if (Browser.TryGetAudioFormat(out _, out int channels) && channels > 0 && channels != _sourceChannels)
                 {
                     Stop();
                     TryStart();
@@ -88,14 +90,14 @@ namespace CefUnity.Runtime
             }
 
             if (!active || sampleRate <= 0 || channels <= 0) return;
-            if (!Browser.StartNativeAudio(_targetLatencyMs, _ioFrames)) return;
+            if (!Browser.StartNativeAudio(_targetLatencyMilliseconds, _ioFrames)) return;
 
-            _srcChannels = channels;
+            _sourceChannels = channels;
             IsPlaying = true;
             _lastSentVolume = float.NaN; // 次の Update で必ず音量を送る
             if (CefLog.Enabled)
                 CefLog.Log($"[CefAudio-NAT] start {sampleRate}Hz x{channels}ch " +
-                           $"target={_targetLatencyMs}ms ioFrames={_ioFrames}");
+                           $"target={_targetLatencyMilliseconds}ms ioFrames={_ioFrames}");
         }
 
         /// <summary>
@@ -105,21 +107,21 @@ namespace CefUnity.Runtime
         /// </summary>
         private float CurrentVolume()
         {
-            float v = AudioListener.pause ? 0f : AudioListener.volume * _volume;
+            float volume = AudioListener.pause ? 0f : AudioListener.volume * _volume;
 #if UNITY_EDITOR
             if (UnityEditor.EditorUtility.audioMasterMute || UnityEditor.EditorApplication.isPaused)
-                v = 0f;
+                volume = 0f;
 #endif
-            return v;
+            return volume;
         }
 
         // AudioListener の音量/ポーズと Inspector 音量を native 側へ同期する。
         private void SyncVolume()
         {
-            float v = CurrentVolume();
-            if (!float.IsNaN(_lastSentVolume) && Mathf.Approximately(v, _lastSentVolume)) return;
-            Browser.SetNativeAudioVolume(v);
-            _lastSentVolume = v;
+            float volume = CurrentVolume();
+            if (!float.IsNaN(_lastSentVolume) && Mathf.Approximately(volume, _lastSentVolume)) return;
+            Browser.SetNativeAudioVolume(volume);
+            _lastSentVolume = volume;
         }
 
 #if UNITY_EDITOR
@@ -135,9 +137,9 @@ namespace CefUnity.Runtime
             if (!IsPlaying || Browser == null) return;
             try
             {
-                float v = CurrentVolume();
-                Browser.SetNativeAudioVolume(v);
-                _lastSentVolume = v;
+                float volume = CurrentVolume();
+                Browser.SetNativeAudioVolume(volume);
+                _lastSentVolume = volume;
             }
             catch (Exception)
             {
@@ -150,18 +152,18 @@ namespace CefUnity.Runtime
         private void LogDiagnostics()
         {
             if (!CefLog.Enabled) return;
-            _diagTimer += Time.unscaledDeltaTime;
-            if (_diagTimer < 1f) return;
-            _diagTimer = 0f;
+            _diagnosticsTimer += Time.unscaledDeltaTime;
+            if (_diagnosticsTimer < 1f) return;
+            _diagnosticsTimer = 0f;
 
-            if (!Browser.TryGetNativeAudioStats(out float occMs, out ulong under, out ulong over))
+            if (!Browser.TryGetNativeAudioStatistics(out float occupancyMilliseconds, out ulong under, out ulong over))
                 return;
             ulong underDelta = under - _lastUnderrun;
             ulong overDelta = over - _lastOverflow;
             _lastUnderrun = under;
             _lastOverflow = over;
             CefLog.Log(
-                $"[CefAudio-NAT] occ={occMs:F1}ms (target={_targetLatencyMs:F1}ms) | " +
+                $"[CefAudio-NAT] occ={occupancyMilliseconds:F1}ms (target={_targetLatencyMilliseconds:F1}ms) | " +
                 $"underrun/s={underDelta} overflow/s={overDelta} (total under={under} over={over})");
         }
 

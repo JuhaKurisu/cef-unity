@@ -13,22 +13,22 @@ namespace CefUnity.Runtime.Tests
     /// </summary>
     public class ScrollSmootherTests
     {
-        private const float Dt60 = 1f / 60f;   // 60fps のフレーム時間
-        private const float Tau = 0.045f;      // 既定の時定数 45ms
+        private const float DeltaTime60 = 1f / 60f;   // 60fps のフレーム時間
+        private const float Tau = 0.045f;             // 既定の時定数 45ms
 
         // ---- 平滑 OFF (tau <= 0): 従来挙動 (int 切り捨て + 端数繰り越し) ----
 
         [Test]
         public void TauZero_EmitsImmediately_WithFractionCarry()
         {
-            var s = new ScrollSmoother();
-            s.AddInput(0f, 100.7f);
-            s.Tick(Dt60, 0f, out _, out var dy);
-            Assert.AreEqual(100, dy, "切り捨てで 100 を即時排出");
+            var smoother = new ScrollSmoother();
+            smoother.AddInput(0f, 100.7f);
+            smoother.Tick(DeltaTime60, 0f, out _, out var deltaY);
+            Assert.AreEqual(100, deltaY, "切り捨てで 100 を即時排出");
             // 端数 0.7 が繰り越され、次の 0.5 と合算で 1.2 → 1 排出
-            s.AddInput(0f, 0.5f);
-            s.Tick(Dt60, 0f, out _, out dy);
-            Assert.AreEqual(1, dy, "繰り越し端数 0.7 + 0.5 = 1.2 → 1");
+            smoother.AddInput(0f, 0.5f);
+            smoother.Tick(DeltaTime60, 0f, out _, out deltaY);
+            Assert.AreEqual(1, deltaY, "繰り越し端数 0.7 + 0.5 = 1.2 → 1");
         }
 
         // ---- 幾何減衰: 大入力が単調減少のグライドに分散される ----
@@ -36,16 +36,16 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void Smoothing_LargeInput_DecaysMonotonically()
         {
-            var s = new ScrollSmoother();
-            s.AddInput(0f, 1000f);
-            s.Tick(Dt60, Tau, out _, out var e1);
-            s.Tick(Dt60, Tau, out _, out var e2);
-            s.Tick(Dt60, Tau, out _, out var e3);
-            Assert.Greater(e1, e2);
-            Assert.Greater(e2, e3);
-            Assert.Greater(e3, 0);
+            var smoother = new ScrollSmoother();
+            smoother.AddInput(0f, 1000f);
+            smoother.Tick(DeltaTime60, Tau, out _, out var emit1);
+            smoother.Tick(DeltaTime60, Tau, out _, out var emit2);
+            smoother.Tick(DeltaTime60, Tau, out _, out var emit3);
+            Assert.Greater(emit1, emit2);
+            Assert.Greater(emit2, emit3);
+            Assert.Greater(emit3, 0);
             // τ=45ms, 60fps では初フレームで残りの約 31% が出る (食いつき確認)
-            Assert.That(e1, Is.InRange(280, 340));
+            Assert.That(emit1, Is.InRange(280, 340));
         }
 
         // ---- 総量保存: 小数部ゼロの入力なら排出合計が入力と厳密一致 ----
@@ -53,15 +53,15 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void Smoothing_IntegerInput_ConservesTotal()
         {
-            var s = new ScrollSmoother();
-            s.AddInput(0f, 1000f);
+            var smoother = new ScrollSmoother();
+            smoother.AddInput(0f, 1000f);
             var total = 0;
-            for (var i = 0; i < 200 && s.IsActive; i++)
+            for (var frameIndex = 0; frameIndex < 200 && smoother.IsActive; frameIndex++)
             {
-                s.Tick(Dt60, Tau, out _, out var dy);
-                total += dy;
+                smoother.Tick(DeltaTime60, Tau, out _, out var deltaY);
+                total += deltaY;
             }
-            Assert.IsFalse(s.IsActive, "200 フレーム以内に排出し切る");
+            Assert.IsFalse(smoother.IsActive, "200 フレーム以内に排出し切る");
             Assert.AreEqual(1000, total);
         }
 
@@ -70,16 +70,16 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void Smoothing_Reversal_NetTotalMatches()
         {
-            var s = new ScrollSmoother();
-            s.AddInput(0f, 100f);
+            var smoother = new ScrollSmoother();
+            smoother.AddInput(0f, 100f);
             var total = 0;
-            s.Tick(Dt60, Tau, out _, out var dy);
-            total += dy;
-            s.AddInput(0f, -200f); // 反転 (残距離 ≈ 69 - 200 = -131)
-            for (var i = 0; i < 200 && s.IsActive; i++)
+            smoother.Tick(DeltaTime60, Tau, out _, out var deltaY);
+            total += deltaY;
+            smoother.AddInput(0f, -200f); // 反転 (残距離 ≈ 69 - 200 = -131)
+            for (var frameIndex = 0; frameIndex < 200 && smoother.IsActive; frameIndex++)
             {
-                s.Tick(Dt60, Tau, out _, out dy);
-                total += dy;
+                smoother.Tick(DeltaTime60, Tau, out _, out deltaY);
+                total += deltaY;
             }
             Assert.AreEqual(-100, total, "正味 100 - 200 = -100");
         }
@@ -89,16 +89,16 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void Smoothing_TinyResidual_SnapsToZeroAfterStarvation()
         {
-            var s = new ScrollSmoother();
-            s.AddInput(0f, 0.4f);
+            var smoother = new ScrollSmoother();
+            smoother.AddInput(0f, 0.4f);
             var total = 0;
-            for (var i = 0; i < 3; i++)
+            for (var frameIndex = 0; frameIndex < 3; frameIndex++)
             {
-                s.Tick(Dt60, Tau, out _, out var dy);
-                total += dy;
+                smoother.Tick(DeltaTime60, Tau, out _, out var deltaY);
+                total += deltaY;
             }
             Assert.AreEqual(0, total, "0.5px 未満は破棄");
-            Assert.IsFalse(s.IsActive, "入力途絶 (StarvedTicks 経過) 後にスナップされる");
+            Assert.IsFalse(smoother.IsActive, "入力途絶 (StarvedTicks 経過) 後にスナップされる");
         }
 
         // ---- 停滞防止: 入力途絶後、排出0丸め帯域の残距離もテールとして排出し切る ----
@@ -106,16 +106,16 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void Smoothing_MidTailBand_DoesNotStall()
         {
-            var s = new ScrollSmoother();
-            s.AddInput(0f, 1.4f); // k≈0.31 では 1.4×k≈0.43 → Round=0 の停滞帯域
+            var smoother = new ScrollSmoother();
+            smoother.AddInput(0f, 1.4f); // emissionRate≈0.31 では 1.4×emissionRate≈0.43 → Round=0 の停滞帯域
             var total = 0;
-            for (var i = 0; i < 5; i++)
+            for (var frameIndex = 0; frameIndex < 5; frameIndex++)
             {
-                s.Tick(Dt60, Tau, out _, out var dy);
-                total += dy;
+                smoother.Tick(DeltaTime60, Tau, out _, out var deltaY);
+                total += deltaY;
             }
             Assert.AreEqual(1, total, "停滞せずテールを排出し切る");
-            Assert.IsFalse(s.IsActive);
+            Assert.IsFalse(smoother.IsActive);
         }
 
         // ---- 定常サブピクセル入力: スナップ過剰排出 (+25%) も取りこぼし (100%) も起きない ----
@@ -123,21 +123,21 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void Smoothing_SteadySubPixelStream_ConservesTotal()
         {
-            var s = new ScrollSmoother();
+            var smoother = new ScrollSmoother();
             var total = 0;
-            for (var i = 0; i < 100; i++)
+            for (var frameIndex = 0; frameIndex < 100; frameIndex++)
             {
-                s.AddInput(0f, 0.8f); // 毎フレーム 0.8px の定常入力 (合計 80px)
-                s.Tick(Dt60, Tau, out _, out var dy);
-                total += dy;
+                smoother.AddInput(0f, 0.8f); // 毎フレーム 0.8px の定常入力 (合計 80px)
+                smoother.Tick(DeltaTime60, Tau, out _, out var deltaY);
+                total += deltaY;
             }
             // 入力停止後のテールを排出し切る
-            for (var i = 0; i < 10 && s.IsActive; i++)
+            for (var frameIndex = 0; frameIndex < 10 && smoother.IsActive; frameIndex++)
             {
-                s.Tick(Dt60, Tau, out _, out var dy);
-                total += dy;
+                smoother.Tick(DeltaTime60, Tau, out _, out var deltaY);
+                total += deltaY;
             }
-            Assert.IsFalse(s.IsActive);
+            Assert.IsFalse(smoother.IsActive);
             Assert.That(total, Is.EqualTo(80).Within(1), "過剰排出なら ~100、取りこぼしなら 0 になる");
         }
 
@@ -146,31 +146,31 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void Smoothing_ProductionTau15ms_ConservesTotal()
         {
-            var s = new ScrollSmoother();
-            s.AddInput(0f, 1000f);
+            var smoother = new ScrollSmoother();
+            smoother.AddInput(0f, 1000f);
             var total = 0;
-            for (var i = 0; i < 200 && s.IsActive; i++)
+            for (var frameIndex = 0; frameIndex < 200 && smoother.IsActive; frameIndex++)
             {
-                s.Tick(Dt60, 0.015f, out _, out var dy);
-                total += dy;
+                smoother.Tick(DeltaTime60, 0.015f, out _, out var deltaY);
+                total += deltaY;
             }
-            Assert.IsFalse(s.IsActive);
+            Assert.IsFalse(smoother.IsActive);
             Assert.AreEqual(1000, total);
         }
 
-        // ---- dt=0 (ポーズ等) では何も排出せず残距離を保持する ----
+        // ---- deltaTime=0 (ポーズ等) では何も排出せず残距離を保持する ----
 
         [Test]
         public void Smoothing_ZeroDt_EmitsNothingAndKeepsRemainder()
         {
-            var s = new ScrollSmoother();
-            s.AddInput(0f, 500f);
-            s.Tick(0f, Tau, out _, out var dy);
-            Assert.AreEqual(0, dy);
-            Assert.IsTrue(s.IsActive, "残距離は保持される");
+            var smoother = new ScrollSmoother();
+            smoother.AddInput(0f, 500f);
+            smoother.Tick(0f, Tau, out _, out var deltaY);
+            Assert.AreEqual(0, deltaY);
+            Assert.IsTrue(smoother.IsActive, "残距離は保持される");
         }
 
-        // ---- dt 非依存: 同じ実時間なら分割数に依らずほぼ同量を排出 ----
+        // ---- deltaTime 非依存: 同じ実時間なら分割数に依らずほぼ同量を排出 ----
 
         [Test]
         public void Smoothing_DtInvariance_WithinTolerance()
@@ -181,10 +181,10 @@ namespace CefUnity.Runtime.Tests
 
             var two = new ScrollSmoother();
             two.AddInput(0f, 1000f);
-            two.Tick(Dt60, Tau, out _, out var a);
-            two.Tick(Dt60, Tau, out _, out var b);
+            two.Tick(DeltaTime60, Tau, out _, out var firstEmit);
+            two.Tick(DeltaTime60, Tau, out _, out var secondEmit);
 
-            Assert.That(single, Is.EqualTo(a + b).Within(2), "int 丸め分の誤差 ±2px まで許容");
+            Assert.That(single, Is.EqualTo(firstEmit + secondEmit).Within(2), "int 丸め分の誤差 ±2px まで許容");
         }
 
         // ---- X 軸も同一機構で処理される ----
@@ -192,13 +192,13 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void Smoothing_XAxis_Works()
         {
-            var s = new ScrollSmoother();
-            s.AddInput(50f, 0f);
+            var smoother = new ScrollSmoother();
+            smoother.AddInput(50f, 0f);
             var total = 0;
-            for (var i = 0; i < 200 && s.IsActive; i++)
+            for (var frameIndex = 0; frameIndex < 200 && smoother.IsActive; frameIndex++)
             {
-                s.Tick(Dt60, Tau, out var dx, out _);
-                total += dx;
+                smoother.Tick(DeltaTime60, Tau, out var deltaX, out _);
+                total += deltaX;
             }
             Assert.AreEqual(50, total);
         }
@@ -208,12 +208,12 @@ namespace CefUnity.Runtime.Tests
         [Test]
         public void Reset_DiscardsRemainder()
         {
-            var s = new ScrollSmoother();
-            s.AddInput(0f, 500f);
-            s.Reset();
-            Assert.IsFalse(s.IsActive);
-            s.Tick(Dt60, Tau, out _, out var dy);
-            Assert.AreEqual(0, dy);
+            var smoother = new ScrollSmoother();
+            smoother.AddInput(0f, 500f);
+            smoother.Reset();
+            Assert.IsFalse(smoother.IsActive);
+            smoother.Tick(DeltaTime60, Tau, out _, out var deltaY);
+            Assert.AreEqual(0, deltaY);
         }
     }
 }

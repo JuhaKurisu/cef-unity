@@ -25,10 +25,10 @@ namespace CefUnity.Runtime
         ///     ScrollInputPipeline が行うので、ソース実装は変換せずそのまま渡すこと
         ///     (Windows: WM_MOUSEWHEEL の delta/120 をここに入れる)。
         /// </summary>
-        public float DxPx;
+        public float DeltaXPixels;
 
-        /// <inheritdoc cref="DxPx" />
-        public float DyPx;
+        /// <inheritdoc cref="DeltaXPixels" />
+        public float DeltaYPixels;
 
         /// <summary>true = ピクセル精度 (トラックパッド)、false = ライン単位 (ホイールノッチ)。</summary>
         public bool Precise;

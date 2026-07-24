@@ -16,8 +16,8 @@ use crate::server::CefServer;
 pub struct ServerState {
     pub cef_server: CefServer,
     /// IPC bridge thread がコマンドを転送してくる mpsc チャネル。
-    pub cmd_rx: mpsc::Receiver<CommandEnvelope>,
-    pub resp_tx: IpcSender<Response>,
+    pub command_receiver: mpsc::Receiver<CommandEnvelope>,
+    pub response_sender: IpcSender<Response>,
     pub running: bool,
     pub pump_count: u64,
 }

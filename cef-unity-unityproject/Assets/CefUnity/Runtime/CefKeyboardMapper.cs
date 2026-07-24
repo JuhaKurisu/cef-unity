@@ -73,19 +73,19 @@ namespace CefUnity.Runtime
         private static extern IntPtr ObjcGetClass([MarshalAs(UnmanagedType.LPStr)] string name);
 
         [DllImport("/usr/lib/libobjc.dylib", EntryPoint = "sel_registerName")]
-        private static extern IntPtr ObjcSelRegisterName([MarshalAs(UnmanagedType.LPStr)] string name);
+        private static extern IntPtr ObjcSelectorRegisterName([MarshalAs(UnmanagedType.LPStr)] string name);
 
         [DllImport("/usr/lib/libobjc.dylib", EntryPoint = "objc_msgSend")]
-        private static extern double ObjcMsgSendDouble(IntPtr receiver, IntPtr selector);
+        private static extern double ObjcMessageSendDouble(IntPtr receiver, IntPtr selector);
 
         private static float GetOSKeyRepeatDelay()
         {
             try
             {
                 var nsEvent = ObjcGetClass("NSEvent");
-                var sel = ObjcSelRegisterName("keyRepeatDelay");
-                var val = ObjcMsgSendDouble(nsEvent, sel);
-                return val > 0 ? (float)val : 0.5f;
+                var selector = ObjcSelectorRegisterName("keyRepeatDelay");
+                var value = ObjcMessageSendDouble(nsEvent, selector);
+                return value > 0 ? (float)value : 0.5f;
             }
             catch
             {
@@ -98,9 +98,9 @@ namespace CefUnity.Runtime
             try
             {
                 var nsEvent = ObjcGetClass("NSEvent");
-                var sel = ObjcSelRegisterName("keyRepeatInterval");
-                var val = ObjcMsgSendDouble(nsEvent, sel);
-                return val > 0 ? (float)val : 0.035f;
+                var selector = ObjcSelectorRegisterName("keyRepeatInterval");
+                var value = ObjcMessageSendDouble(nsEvent, selector);
+                return value > 0 ? (float)value : 0.035f;
             }
             catch
             {

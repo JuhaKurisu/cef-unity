@@ -17,18 +17,18 @@ namespace CefUnity.Tests
                 "T,0.016,0,-4,0",
                 "T,0.032,0,-4,0",
             };
-            var r = ScrollReplayRunner.Run(lines);
-            Assert.That(r.Ok, Is.True, r.Error);
-            Assert.That(r.Events, Is.EqualTo(2));
-            Assert.That(r.Ticks, Is.EqualTo(2));
-            Assert.That(r.OutLines.Count, Is.EqualTo(2));
+            var result = ScrollReplayRunner.Run(lines);
+            Assert.That(result.Ok, Is.True, result.Error);
+            Assert.That(result.Events, Is.EqualTo(2));
+            Assert.That(result.Ticks, Is.EqualTo(2));
+            Assert.That(result.OutputLines.Count, Is.EqualTo(2));
         }
 
         [Test]
         public void NoTickLines_Fails()
         {
-            var r = ScrollReplayRunner.Run(new[] { "S,1", "E,0.0,0,-8,2,1" });
-            Assert.That(r.Ok, Is.False);
+            var result = ScrollReplayRunner.Run(new[] { "S,1", "E,0.0,0,-8,2,1" });
+            Assert.That(result.Ok, Is.False);
         }
     }
 }

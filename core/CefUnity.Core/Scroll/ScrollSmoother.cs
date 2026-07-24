@@ -4,7 +4,7 @@ namespace CefUnity.Runtime
 {
     /// <summary>
     ///     スクロール入力の平滑器 (指数追従)。生の wheel delta を「未送信の残距離」に
-    ///     蓄積し、毎フレーム残距離の一定割合 (k = 1 - exp(-dt/τ)) を int px で排出する。
+    ///     蓄積し、毎フレーム残距離の一定割合 (emissionRate = 1 - exp(-deltaTime/τ)) を int px で排出する。
     ///     per-frame のスクロール送信量が均一化され、トラックパッド生 delta の
     ///     ジッター/フリック巨大単発 (診断: CoV 0.82, 最大 1138px/frame) が
     ///     幾何減衰のグライドに変わる。Chrome の入力リサンプリング (層2) 相当の
@@ -26,10 +26,10 @@ namespace CefUnity.Runtime
         public bool IsActive => _remainX != 0f || _remainY != 0f;
 
         /// <summary>入力 delta (px) を残距離に加算する。方向反転は符号の相殺で自然に処理。</summary>
-        public void AddInput(float dxPx, float dyPx)
+        public void AddInput(float deltaXPixels, float deltaYPixels)
         {
-            _remainX += dxPx;
-            _remainY += dyPx;
+            _remainX += deltaXPixels;
+            _remainY += deltaYPixels;
             _idleTicks = 0;
         }
 
@@ -42,24 +42,24 @@ namespace CefUnity.Runtime
         }
 
         /// <summary>
-        ///     dt 秒経過分の排出量を計算する。tau &lt;= 0 は平滑 OFF
+        ///     deltaTime 秒経過分の排出量を計算する。tau &lt;= 0 は平滑 OFF
         ///     (従来挙動: int 切り捨て + 端数繰り越しで即時全量排出)。
         /// </summary>
-        public void Tick(float dt, float tau, out int dx, out int dy)
+        public void Tick(float deltaTime, float tau, out int deltaX, out int deltaY)
         {
             var starved = _idleTicks >= StarvedTicks;
             if (_idleTicks < int.MaxValue) _idleTicks++;
-            // k < 0 を「平滑 OFF」の番兵に使う (排出率としての k は常に [0,1))。
-            var k = tau <= 0f ? -1f : 1f - (float)Math.Exp(-dt / tau);
-            dx = TickAxis(ref _remainX, k, starved);
-            dy = TickAxis(ref _remainY, k, starved);
+            // emissionRate < 0 を「平滑 OFF」の番兵に使う (排出率としての emissionRate は常に [0,1))。
+            var emissionRate = tau <= 0f ? -1f : 1f - (float)Math.Exp(-deltaTime / tau);
+            deltaX = TickAxis(ref _remainX, emissionRate, starved);
+            deltaY = TickAxis(ref _remainY, emissionRate, starved);
         }
 
-        private static int TickAxis(ref float remain, float k, bool starved)
+        private static int TickAxis(ref float remain, float emissionRate, bool starved)
         {
             if (remain == 0f) return 0;
             int emit;
-            if (k < 0f)
+            if (emissionRate < 0f)
             {
                 // 平滑 OFF: 旧 _wheelAccum と同じ「切り捨て + 端数繰り越し」。
                 emit = (int)remain;
@@ -80,13 +80,13 @@ namespace CefUnity.Runtime
                 remain = 0f;
                 return emit;
             }
-            emit = (int)Math.Round(remain * k);
+            emit = (int)Math.Round(remain * emissionRate);
             if (emit == 0)
             {
-                // 排出が 0 に丸まる帯域 (|remain| < 0.5/k)。入力継続中は次フレームの
+                // 排出が 0 に丸まる帯域 (|remain| < 0.5/emissionRate)。入力継続中は次フレームの
                 // 入力を待ち、途絶時のみテールとして排出し切る (スタック防止)。
-                // dt=0 (k=0) は除外。
-                if (!starved || k <= 0f) return 0;
+                // deltaTime=0 (emissionRate=0) は除外。
+                if (!starved || emissionRate <= 0f) return 0;
                 emit = (int)Math.Round(remain);
                 remain = 0f;
                 return emit;

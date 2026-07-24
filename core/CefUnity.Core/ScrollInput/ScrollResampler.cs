@@ -60,24 +60,24 @@ namespace CefUnity.Runtime
 
         // イベント履歴 (時刻昇順、[_count-1] が最新)。オフセットが 1 イベント間隔を
         // 超えても補間できるよう 2 点ではなく 4 点持つ。
-        private const int HistoryCap = 4;
-        private readonly double[] _t = new double[HistoryCap];
-        private readonly double[] _pX = new double[HistoryCap];
-        private readonly double[] _pY = new double[HistoryCap];
+        private const int HistoryCapacity = 4;
+        private readonly double[] _times = new double[HistoryCapacity];
+        private readonly double[] _positionsX = new double[HistoryCapacity];
+        private readonly double[] _positionsY = new double[HistoryCapacity];
         private int _count;
 
         // 前回サンプル位置と、int 排出の端数繰り越し。
-        private double _sampX, _sampY;
-        private double _fracX, _fracY;
+        private double _sampleX, _sampleY;
+        private double _fractionX, _fractionY;
 
         // momentum Ended/Cancelled 受信済み。次の Tick で残差を排出して停止する。
         private bool _ended;
 
         // イベント間隔の EMA (秒)。適応サンプルオフセットの元 (初期値 8ms ≒ 120Hz)。
-        private double _intervalEma = 0.008;
+        private double _intervalExponentialMovingAverage = 0.008;
 
         // 直近の進行方向 (+1/-1、segment slope の符号)。予測モードの no-backtrack 用。
-        private double _lastDirX, _lastDirY;
+        private double _lastDirectionX, _lastDirectionY;
 
         // 直近イベントが慣性フェーズ (MomentumBegan/Changed) か。欠落橋渡しの適用条件。
         private bool _momentum;
@@ -100,17 +100,17 @@ namespace CefUnity.Runtime
         public void Reset()
         {
             _count = 0;
-            _sampX = _sampY = 0;
-            _fracX = _fracY = 0;
+            _sampleX = _sampleY = 0;
+            _fractionX = _fractionY = 0;
             _ended = false;
-            _intervalEma = 0.008;
-            _lastDirX = _lastDirY = 0;
+            _intervalExponentialMovingAverage = 0.008;
+            _lastDirectionX = _lastDirectionY = 0;
             _momentum = false;
             _lastTickTime = 0;
         }
 
         /// <summary>イベントを取り込む (delta は view px スケール済みであること)。</summary>
-        public void AddEvent(in ScrollInputEvent e)
+        public void AddEvent(in ScrollInputEvent inputEvent)
         {
             if (_ended)
             {
@@ -118,53 +118,53 @@ namespace CefUnity.Runtime
                 // 残差を端数バッファへ退避してから履歴を作り直す (排出は次の Tick)。
                 FlushResidualToFraction();
             }
-            Accumulate(e);
-            _momentum = e.Phase == ScrollPhase.MomentumBegan || e.Phase == ScrollPhase.MomentumChanged;
-            if (e.Phase == ScrollPhase.MomentumEnded || e.Phase == ScrollPhase.Cancelled)
+            Accumulate(inputEvent);
+            _momentum = inputEvent.Phase == ScrollPhase.MomentumBegan || inputEvent.Phase == ScrollPhase.MomentumChanged;
+            if (inputEvent.Phase == ScrollPhase.MomentumEnded || inputEvent.Phase == ScrollPhase.Cancelled)
                 _ended = true;
         }
 
-        private void Accumulate(in ScrollInputEvent e)
+        private void Accumulate(in ScrollInputEvent inputEvent)
         {
             if (_count == 0)
             {
-                _t[0] = e.Timestamp;
+                _times[0] = inputEvent.Timestamp;
                 // 前回サンプル位置から連続に開始する (位置ジャンプ防止)。
-                _pX[0] = _sampX + e.DxPx;
-                _pY[0] = _sampY + e.DyPx;
+                _positionsX[0] = _sampleX + inputEvent.DeltaXPixels;
+                _positionsY[0] = _sampleY + inputEvent.DeltaYPixels;
                 _count = 1;
                 return;
             }
             var last = _count - 1;
-            if (e.Timestamp <= _t[last] + MergeEpsilon)
+            if (inputEvent.Timestamp <= _times[last] + MergeEpsilon)
             {
                 // 近接イベント (同フレーム複数配送・phase 遷移ペア等) は最新点へ合算。
                 // 退化セグメント (極小 dt) を作らないことで補間/外挿の傾き発散を防ぐ。
-                _pX[last] += e.DxPx;
-                _pY[last] += e.DyPx;
+                _positionsX[last] += inputEvent.DeltaXPixels;
+                _positionsY[last] += inputEvent.DeltaYPixels;
                 return;
             }
             // 新しい時刻へ進む: イベント間隔 EMA を更新 (適応オフセットの元)。
             // ジェスチャ間の休止 (50ms 超の途切れ) はデバイス周期ではないので除外
             // (混入すると予測モードの外挿上限が膨らみ、再開直後のオーバーシュートが増える)。
-            var interval = e.Timestamp - _t[last];
+            var interval = inputEvent.Timestamp - _times[last];
             if (interval < 0.05)
-                _intervalEma += (interval - _intervalEma) * 0.2;
-            if (_count == HistoryCap)
+                _intervalExponentialMovingAverage += (interval - _intervalExponentialMovingAverage) * 0.2;
+            if (_count == HistoryCapacity)
             {
                 // 履歴が満杯: 最古を捨てて左詰め。
-                for (var i = 1; i < HistoryCap; i++)
+                for (var index = 1; index < HistoryCapacity; index++)
                 {
-                    _t[i - 1] = _t[i];
-                    _pX[i - 1] = _pX[i];
-                    _pY[i - 1] = _pY[i];
+                    _times[index - 1] = _times[index];
+                    _positionsX[index - 1] = _positionsX[index];
+                    _positionsY[index - 1] = _positionsY[index];
                 }
                 _count--;
                 last--;
             }
-            _t[_count] = e.Timestamp;
-            _pX[_count] = _pX[last] + e.DxPx;
-            _pY[_count] = _pY[last] + e.DyPx;
+            _times[_count] = inputEvent.Timestamp;
+            _positionsX[_count] = _positionsX[last] + inputEvent.DeltaXPixels;
+            _positionsY[_count] = _positionsY[last] + inputEvent.DeltaYPixels;
             _count++;
         }
 
@@ -176,26 +176,26 @@ namespace CefUnity.Runtime
         private void FlushResidualToFraction()
         {
             var last = _count - 1;
-            var rx = _pX[last] - _sampX;
-            var ry = _pY[last] - _sampY;
-            // 進行方向は永続値 _lastDir で判定する。終端イベントは delta=0 で直近
+            var residualX = _positionsX[last] - _sampleX;
+            var residualY = _positionsY[last] - _sampleY;
+            // 進行方向は永続値 _lastDirection で判定する。終端イベントは delta=0 で直近
             // セグメントの傾きが 0 になるため、その場の傾きで判定すると外挿オーバー
             // シュートの負残差がすり抜けて端数に溜まり、次ジェスチャ開始時に
             // 「位置が飛ぶ」(実測バグ)。方向未確定 (0) のときのみ無条件に保存する。
-            if (_lastDirX == 0 || rx * _lastDirX >= 0) _fracX += rx;
-            if (_lastDirY == 0 || ry * _lastDirY >= 0) _fracY += ry;
+            if (_lastDirectionX == 0 || residualX * _lastDirectionX >= 0) _fractionX += residualX;
+            if (_lastDirectionY == 0 || residualY * _lastDirectionY >= 0) _fractionY += residualY;
             _count = 0;
-            _sampX = _sampY = 0;
+            _sampleX = _sampleY = 0;
             _ended = false;
         }
 
         /// <summary>1 フレーム分の排出量を計算する。now はイベントと同一クロック (秒)。</summary>
-        public void Tick(double now, out int dx, out int dy)
+        public void Tick(double now, out int deltaX, out int deltaY)
         {
             if (_count > 0)
             {
                 var last = _count - 1;
-                if (_ended || now - _t[last] > GraceTimeout)
+                if (_ended || now - _times[last] > GraceTimeout)
                 {
                     FlushResidualToFraction();
                 }
@@ -203,94 +203,94 @@ namespace CefUnity.Runtime
                 {
                     var offset = Predictive
                         ? MinSampleOffset
-                        : Math.Min(MaxSampleOffset, Math.Max(MinSampleOffset, _intervalEma * 1.25));
+                        : Math.Min(MaxSampleOffset, Math.Max(MinSampleOffset, _intervalExponentialMovingAverage * 1.25));
                     var sampleTime = now - offset;
-                    double sx, sy;
-                    if (_count >= 2 && sampleTime > _t[last])
+                    double sampleX, sampleY;
+                    if (_count >= 2 && sampleTime > _times[last])
                     {
                         // 最新イベント以後: 履歴窓全体 (最大4点) の平均速度で外挿 (上限 cap)。
                         // 直近2点だと近接タイムスタンプで傾きが発散する (ノイズ増幅) ため、
                         // 窓の端点間で算出する。慣性中 (予測モード) はイベント欠落の
                         // 橋渡しとして上限を MomentumBridgeCap まで拡大する (定義箇所の
-                        // コメント参照。通常運転では sampleTime−t[last] ≦ ~12ms なので
+                        // コメント参照。通常運転では sampleTime−times[last] ≦ ~12ms なので
                         // この拡大は欠落フレームにしか効かない)。
-                        var cap = Predictive
+                        var extrapolationLimit = Predictive
                             ? (_momentum
                                 ? MomentumBridgeCap
-                                : Math.Min(MaxSampleOffset, _intervalEma * 1.25))
+                                : Math.Min(MaxSampleOffset, _intervalExponentialMovingAverage * 1.25))
                             : ExtrapolationCap;
-                        var dt = Math.Min(sampleTime - _t[last], cap);
-                        var span = _t[last] - _t[0];
-                        sx = _pX[last] + (_pX[last] - _pX[0]) / span * dt;
-                        sy = _pY[last] + (_pY[last] - _pY[0]) / span * dt;
+                        var deltaTime = Math.Min(sampleTime - _times[last], extrapolationLimit);
+                        var span = _times[last] - _times[0];
+                        sampleX = _positionsX[last] + (_positionsX[last] - _positionsX[0]) / span * deltaTime;
+                        sampleY = _positionsY[last] + (_positionsY[last] - _positionsY[0]) / span * deltaTime;
                     }
-                    else if (_count < 2 || sampleTime >= _t[last])
+                    else if (_count < 2 || sampleTime >= _times[last])
                     {
                         // 補間に足る2点が無い: 最新位置をそのまま使う (即時排出)。
-                        sx = _pX[last];
-                        sy = _pY[last];
+                        sampleX = _positionsX[last];
+                        sampleY = _positionsY[last];
                     }
-                    else if (sampleTime <= _t[0])
+                    else if (sampleTime <= _times[0])
                     {
-                        sx = _pX[0];
-                        sy = _pY[0];
+                        sampleX = _positionsX[0];
+                        sampleY = _positionsY[0];
                     }
                     else
                     {
                         // 履歴内: sampleTime を含む区間を探して線形補間 (リサンプリングの本体)。
-                        var i = last;
-                        while (_t[i - 1] > sampleTime) i--;
-                        var a = (sampleTime - _t[i - 1]) / (_t[i] - _t[i - 1]);
-                        sx = _pX[i - 1] + (_pX[i] - _pX[i - 1]) * a;
-                        sy = _pY[i - 1] + (_pY[i] - _pY[i - 1]) * a;
+                        var index = last;
+                        while (_times[index - 1] > sampleTime) index--;
+                        var interpolationFactor = (sampleTime - _times[index - 1]) / (_times[index] - _times[index - 1]);
+                        sampleX = _positionsX[index - 1] + (_positionsX[index] - _positionsX[index - 1]) * interpolationFactor;
+                        sampleY = _positionsY[index - 1] + (_positionsY[index] - _positionsY[index - 1]) * interpolationFactor;
                     }
                     // 追いつき上限 (CatchUpHeadroom の定義コメント参照): 観測速度を超える
                     // 一括放出を数フレームに分散する。定常状態では上限に当たらない。
                     if (_count >= 2 && _lastTickTime > 0)
                     {
-                        var dtTick = Math.Min(0.1, Math.Max(0.001, now - _lastTickTime));
-                        var spanW = _t[last] - _t[0];
-                        if (spanW > 0)
+                        var tickDeltaTime = Math.Min(0.1, Math.Max(0.001, now - _lastTickTime));
+                        var windowSpan = _times[last] - _times[0];
+                        if (windowSpan > 0)
                         {
-                            var maxX = Math.Abs(_pX[last] - _pX[0]) / spanW * dtTick * CatchUpHeadroom;
-                            var maxY = Math.Abs(_pY[last] - _pY[0]) / spanW * dtTick * CatchUpHeadroom;
-                            sx = Math.Clamp(sx, _sampX - maxX, _sampX + maxX);
-                            sy = Math.Clamp(sy, _sampY - maxY, _sampY + maxY);
+                            var maxX = Math.Abs(_positionsX[last] - _positionsX[0]) / windowSpan * tickDeltaTime * CatchUpHeadroom;
+                            var maxY = Math.Abs(_positionsY[last] - _positionsY[0]) / windowSpan * tickDeltaTime * CatchUpHeadroom;
+                            sampleX = Math.Clamp(sampleX, _sampleX - maxX, _sampleX + maxX);
+                            sampleY = Math.Clamp(sampleY, _sampleY - maxY, _sampleY + maxY);
                         }
                     }
                     if (_count >= 2)
                     {
                         // 進行方向を更新 (非ゼロ傾きのみ。終端の delta=0 では保持)。
                         // 予測モードの no-backtrack と、フラッシュ時の巻き戻し防止の両方が使う。
-                        var segX = _pX[last] - _pX[last - 1];
-                        var segY = _pY[last] - _pY[last - 1];
-                        if (segX != 0) _lastDirX = segX > 0 ? 1 : -1;
-                        if (segY != 0) _lastDirY = segY > 0 ? 1 : -1;
+                        var segmentX = _positionsX[last] - _positionsX[last - 1];
+                        var segmentY = _positionsY[last] - _positionsY[last - 1];
+                        if (segmentX != 0) _lastDirectionX = segmentX > 0 ? 1 : -1;
+                        if (segmentY != 0) _lastDirectionY = segmentY > 0 ? 1 : -1;
                         if (Predictive)
                         {
                             // no-backtrack: 逆向きの微小補正 (外挿オーバーシュートの
                             // 巻き戻し) は排出せず位置を保持する。実イベントによる方向
                             // 反転は segment slope が反転するので追従する。
-                            if ((sx - _sampX) * _lastDirX < 0) sx = _sampX;
-                            if ((sy - _sampY) * _lastDirY < 0) sy = _sampY;
+                            if ((sampleX - _sampleX) * _lastDirectionX < 0) sampleX = _sampleX;
+                            if ((sampleY - _sampleY) * _lastDirectionY < 0) sampleY = _sampleY;
                         }
                     }
-                    _fracX += sx - _sampX;
-                    _fracY += sy - _sampY;
-                    _sampX = sx;
-                    _sampY = sy;
+                    _fractionX += sampleX - _sampleX;
+                    _fractionY += sampleY - _sampleY;
+                    _sampleX = sampleX;
+                    _sampleY = sampleY;
                 }
             }
             _lastTickTime = now;
-            dx = TakeInt(ref _fracX);
-            dy = TakeInt(ref _fracY);
+            deltaX = TakeInt(ref _fractionX);
+            deltaY = TakeInt(ref _fractionY);
         }
 
-        private static int TakeInt(ref double frac)
+        private static int TakeInt(ref double fraction)
         {
-            var v = (int)Math.Round(frac);
-            frac -= v;
-            return v;
+            var value = (int)Math.Round(fraction);
+            fraction -= value;
+            return value;
         }
     }
 }

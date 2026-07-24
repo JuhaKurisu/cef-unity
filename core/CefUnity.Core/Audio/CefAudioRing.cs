@@ -22,8 +22,8 @@ namespace CefUnity.Runtime
     /// </summary>
     public sealed class CefAudioRing
     {
-        private readonly float[] _buf; // interleaved
-        private readonly int _capFrames;
+        private readonly float[] _buffer; // interleaved
+        private readonly int _capacityFrames;
         private readonly int _channels;
         private readonly int _targetFrames;
         private readonly double _maxRateAdjust; // 消費レート操作の上限 (例 0.01 = ±1%)
@@ -37,11 +37,11 @@ namespace CefUnity.Runtime
         {
             if (capacityFrames < 2) capacityFrames = 2;
             if (channels < 1) channels = 1;
-            _capFrames = capacityFrames;
+            _capacityFrames = capacityFrames;
             _channels = channels;
             _targetFrames = Math.Min(Math.Max(1, targetFrames), capacityFrames - 1);
             _maxRateAdjust = maxRateAdjust;
-            _buf = new float[capacityFrames * channels];
+            _buffer = new float[capacityFrames * channels];
         }
 
         // ----- 診断カウンタ -----
@@ -60,7 +60,7 @@ namespace CefUnity.Runtime
 
         public int Channels => _channels;
         public int TargetFrames => _targetFrames;
-        public int CapacityFrames => _capFrames;
+        public int CapacityFrames => _capacityFrames;
 
         /// <summary>現在の滞留フレーム数 (producer が書いて consumer がまだ消費していない量)。</summary>
         public double OccupancyFrames
@@ -72,27 +72,27 @@ namespace CefUnity.Runtime
         }
 
         /// <summary>
-        ///     producer: interleaved サンプル <paramref name="src" />[offsetSamples ..
+        ///     producer: interleaved サンプル <paramref name="source" />[offsetSamples ..
         ///     +frameCount*channels] を書く。容量を超える場合は最古フレームを捨てる
         ///     (バックストップ。steering が効いていれば通常起きない)。
         /// </summary>
-        public void Write(float[] src, int offsetSamples, int frameCount)
+        public void Write(float[] source, int offsetSamples, int frameCount)
         {
             if (frameCount <= 0) return;
             lock (_lock)
             {
                 // パケット自体が容量を超える: 最新側だけ残す。
-                if (frameCount > _capFrames)
+                if (frameCount > _capacityFrames)
                 {
-                    int skip = frameCount - _capFrames;
+                    int skip = frameCount - _capacityFrames;
                     offsetSamples += skip * _channels;
                     OverflowDropFrames += skip;
-                    frameCount = _capFrames;
+                    frameCount = _capacityFrames;
                 }
 
                 // 空き不足: 最古を捨てる = read 位置を前進。
-                long occ = _writeFrame - (long)Math.Floor(_readFrame);
-                long free = _capFrames - occ;
+                long occupancy = _writeFrame - (long)Math.Floor(_readFrame);
+                long free = _capacityFrames - occupancy;
                 if (frameCount > free)
                 {
                     long drop = frameCount - free;
@@ -100,12 +100,12 @@ namespace CefUnity.Runtime
                     OverflowDropFrames += drop;
                 }
 
-                for (int f = 0; f < frameCount; f++)
+                for (int frameIndex = 0; frameIndex < frameCount; frameIndex++)
                 {
-                    int dstBase = (int)(_writeFrame % _capFrames) * _channels;
-                    int srcBase = offsetSamples + f * _channels;
-                    for (int c = 0; c < _channels; c++)
-                        _buf[dstBase + c] = src[srcBase + c];
+                    int destinationBase = (int)(_writeFrame % _capacityFrames) * _channels;
+                    int sourceBase = offsetSamples + frameIndex * _channels;
+                    for (int channelIndex = 0; channelIndex < _channels; channelIndex++)
+                        _buffer[destinationBase + channelIndex] = source[sourceBase + channelIndex];
                     _writeFrame++;
                 }
 
@@ -114,30 +114,30 @@ namespace CefUnity.Runtime
         }
 
         /// <summary>
-        ///     consumer: <paramref name="dst" /> を <paramref name="frameCount" /> フレーム分
+        ///     consumer: <paramref name="destination" /> を <paramref name="frameCount" /> フレーム分
         ///     (interleaved) 埋める。<paramref name="baseStep" /> = srcRate/outRate
         ///     (出力1フレームあたり進める src フレーム数)。滞留量が目標から外れていれば
         ///     step を ±<see cref="_maxRateAdjust" /> だけ操作して収束させる。
         ///     データ不足時は無音で埋め <see cref="UnderrunFrames" /> を加算する。
         /// </summary>
-        public void Read(float[] dst, int frameCount, double baseStep)
+        public void Read(float[] destination, int frameCount, double baseStep)
         {
             if (frameCount <= 0) return;
             lock (_lock)
             {
-                for (int f = 0; f < frameCount; f++)
+                for (int frameIndex = 0; frameIndex < frameCount; frameIndex++)
                 {
-                    int ob = f * _channels;
-                    double occ = _writeFrame - _readFrame;
+                    int outputBase = frameIndex * _channels;
+                    double occupancy = _writeFrame - _readFrame;
 
                     // 初回プライミング: 目標滞留量に達するまでは無音 (read を進めない)。
                     // steering で徐々に溜める手もあるが、開始直後のピッチ揺れを避けるため
                     // クリーンに目標まで貯めてから再生開始する。
                     if (!_primed)
                     {
-                        if (occ < _targetFrames)
+                        if (occupancy < _targetFrames)
                         {
-                            for (int c = 0; c < _channels; c++) dst[ob + c] = 0f;
+                            for (int channelIndex = 0; channelIndex < _channels; channelIndex++) destination[outputBase + channelIndex] = 0f;
                             UnderrunFrames++;
                             continue;
                         }
@@ -146,33 +146,33 @@ namespace CefUnity.Runtime
                     }
 
                     // 線形補間には floor と floor+1 の 2 フレームが要る。
-                    if (occ < 2.0)
+                    if (occupancy < 2.0)
                     {
-                        for (int c = 0; c < _channels; c++) dst[ob + c] = 0f;
+                        for (int channelIndex = 0; channelIndex < _channels; channelIndex++) destination[outputBase + channelIndex] = 0f;
                         UnderrunFrames++;
                         continue;
                     }
 
-                    long i0 = (long)Math.Floor(_readFrame);
-                    float frac = (float)(_readFrame - i0);
-                    int b0 = (int)(i0 % _capFrames) * _channels;
-                    int b1 = (int)((i0 + 1) % _capFrames) * _channels;
-                    for (int c = 0; c < _channels; c++)
+                    long index0 = (long)Math.Floor(_readFrame);
+                    float fraction = (float)(_readFrame - index0);
+                    int base0 = (int)(index0 % _capacityFrames) * _channels;
+                    int base1 = (int)((index0 + 1) % _capacityFrames) * _channels;
+                    for (int channelIndex = 0; channelIndex < _channels; channelIndex++)
                     {
-                        float s0 = _buf[b0 + c];
-                        float s1 = _buf[b1 + c];
-                        dst[ob + c] = s0 + (s1 - s0) * frac;
+                        float sample0 = _buffer[base0 + channelIndex];
+                        float sample1 = _buffer[base1 + channelIndex];
+                        destination[outputBase + channelIndex] = sample0 + (sample1 - sample0) * fraction;
                     }
 
                     // レート操作: 滞留量誤差を [-1,1] に正規化し ±maxRateAdjust を掛ける。
-                    // occ > target → step を大きく (速く消費) して滞留を減らす。逆も同様。
-                    double err = (occ - _targetFrames) / _targetFrames;
-                    if (err > 1.0) err = 1.0;
-                    else if (err < -1.0) err = -1.0;
-                    double step = baseStep * (1.0 + _maxRateAdjust * err);
+                    // occupancy > target → step を大きく (速く消費) して滞留を減らす。逆も同様。
+                    double error = (occupancy - _targetFrames) / _targetFrames;
+                    if (error > 1.0) error = 1.0;
+                    else if (error < -1.0) error = -1.0;
+                    double step = baseStep * (1.0 + _maxRateAdjust * error);
 
                     // 補間に floor+1 が要るので利用可能量を食い尽くさないようガード。
-                    double maxAdvance = occ - 1.0;
+                    double maxAdvance = occupancy - 1.0;
                     if (step > maxAdvance) step = maxAdvance;
                     if (step < 0.0) step = 0.0;
                     _readFrame += step;

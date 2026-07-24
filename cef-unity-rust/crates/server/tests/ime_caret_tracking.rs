@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use ipc_channel::ipc::{self, IpcOneShotServer};
 
-use cef_unity_ipc::{Bootstrap, Command, CommandEnvelope, Response, ShmReader};
+use cef_unity_ipc::{Bootstrap, Command, CommandEnvelope, Response, SharedMemoryReader};
 
 // ---------------------------------------------------------------------------
 // CEF サーバーは同時に 1 つしか起動できないため、テストを直列化する。
@@ -77,28 +77,28 @@ impl TestHttpServer {
                     if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
                         break;
                     }
-                    if let Some(val) = header.strip_prefix("Content-Length: ") {
-                        content_length = val.trim().parse().unwrap_or(0);
+                    if let Some(value) = header.strip_prefix("Content-Length: ") {
+                        content_length = value.trim().parse().unwrap_or(0);
                     }
                 }
 
                 if request_line.starts_with("GET / ") {
-                    let resp = format!(
+                    let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
                         TEST_HTML.len(),
                         TEST_HTML
                     );
-                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.write_all(response.as_bytes());
                 } else if request_line.starts_with("POST /value") {
                     let mut body = vec![0u8; content_length];
                     let _ = reader.read_exact(&mut body);
-                    let body_str = String::from_utf8_lossy(&body).to_string();
-                    *value_clone.lock().unwrap() = Some(body_str);
-                    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nAccess-Control-Allow-Origin: *\r\n\r\nOK";
-                    let _ = stream.write_all(resp.as_bytes());
+                    let body_string = String::from_utf8_lossy(&body).to_string();
+                    *value_clone.lock().unwrap() = Some(body_string);
+                    let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nAccess-Control-Allow-Origin: *\r\n\r\nOK";
+                    let _ = stream.write_all(response.as_bytes());
                 } else {
-                    let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-                    let _ = stream.write_all(resp.as_bytes());
+                    let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                    let _ = stream.write_all(response.as_bytes());
                 }
             }
         });
@@ -124,8 +124,8 @@ impl TestHttpServer {
 // ---------------------------------------------------------------------------
 
 struct TestCefServer {
-    cmd_tx: ipc::IpcSender<CommandEnvelope>,
-    resp_rx: ipc::IpcReceiver<Response>,
+    command_sender: ipc::IpcSender<CommandEnvelope>,
+    response_receiver: ipc::IpcReceiver<Response>,
     child: std::process::Child,
 }
 
@@ -147,31 +147,31 @@ impl TestCefServer {
             .arg("--ipc-server")
             .arg(&server_name)
             .spawn()
-            .unwrap_or_else(|e| panic!("{}: {}", server_bin.display(), e));
+            .unwrap_or_else(|error| panic!("{}: {}", server_bin.display(), error));
 
-        let (_rx, bootstrap) = oneshot_server.accept().expect("bootstrap");
+        let (_receiver, bootstrap) = oneshot_server.accept().expect("bootstrap");
 
         TestCefServer {
-            cmd_tx: bootstrap.cmd_tx,
-            resp_rx: bootstrap.resp_rx,
+            command_sender: bootstrap.command_sender,
+            response_receiver: bootstrap.response_receiver,
             child,
         }
     }
 
-    fn send(&self, cmd: Command) -> Response {
-        self.cmd_tx
+    fn send(&self, command: Command) -> Response {
+        self.command_sender
             .send(CommandEnvelope {
-                command: cmd,
+                command: command,
                 expects_response: true,
             })
             .unwrap();
-        self.resp_rx.recv().unwrap()
+        self.response_receiver.recv().unwrap()
     }
 
-    fn fire(&self, cmd: Command) {
-        self.cmd_tx
+    fn fire(&self, command: Command) {
+        self.command_sender
             .send(CommandEnvelope {
-                command: cmd,
+                command: command,
                 expects_response: false,
             })
             .unwrap();
@@ -183,34 +183,34 @@ impl TestCefServer {
     /// SendExternalBeginFrame を定期送信しないと rAF アラインの入力
     /// (マウスクリック等) がレンダラーでディスパッチされない。
     /// ここで 60Hz のポンプスレッドを起動して実環境を模す。
-    fn setup_browser(&self, url: &str) -> (u32, ShmReader) {
-        let (browser_id, shm_flink) = match self.send(Command::CreateBrowser {
+    fn setup_browser(&self, url: &str) -> (u32, SharedMemoryReader) {
+        let (browser_id, shared_memory_flink) = match self.send(Command::CreateBrowser {
             width: 800,
             height: 600,
             url: url.to_string(),
         }) {
             Response::BrowserCreated {
                 browser_id,
-                shm_flink,
+                shared_memory_flink,
                 ..
-            } => (browser_id, shm_flink),
+            } => (browser_id, shared_memory_flink),
             other => panic!("expected BrowserCreated, got {:?}", other),
         };
 
         // BeginFrame ポンプ (Unity の毎フレーム送信を模す)。
         // Shutdown 後は send が失敗してスレッドが自然終了する。
-        let tx = self.cmd_tx.clone();
+        let sender = self.command_sender.clone();
         thread::spawn(move || {
             let mut frame: u64 = 1;
             loop {
-                let env = CommandEnvelope {
+                let envelope = CommandEnvelope {
                     command: Command::SendExternalBeginFrame {
                         browser_id,
                         unity_frame: frame,
                     },
                     expects_response: false,
                 };
-                if tx.send(env).is_err() {
+                if sender.send(envelope).is_err() {
                     break;
                 }
                 frame += 1;
@@ -221,8 +221,8 @@ impl TestCefServer {
         // ページロード + CARET_TRACKING_JS 注入 (on_load_end) 待ち
         thread::sleep(Duration::from_secs(3));
 
-        let shm = ShmReader::open(&shm_flink).expect("open shm");
-        (browser_id, shm)
+        let shared_memory = SharedMemoryReader::open(&shared_memory_flink).expect("open shared_memory");
+        (browser_id, shared_memory)
     }
 
     /// 指定座標をクリック (down→up)。
@@ -246,17 +246,17 @@ impl TestCefServer {
             mouse_up: true,
             click_count: 1,
         });
-        // click ハンドラ (setTimeout 0) → console.log → on_console_message → shm 書込 待ち
+        // click ハンドラ (setTimeout 0) → console.log → on_console_message → shared_memory 書込 待ち
         thread::sleep(Duration::from_millis(700));
     }
 
     /// JS 式を評価して結果 (文字列化) を HTTP サーバーへ POST させ、その値を返す。
     /// ページ内の状態 (activeElement, selection など) の観測用。
-    fn eval_js(&self, browser_id: u32, http: &TestHttpServer, expr: &str) -> String {
+    fn eval_js(&self, browser_id: u32, http: &TestHttpServer, expression: &str) -> String {
         let js = format!(
             r#"(function(){{
                 var v;
-                try {{ v = String({expr}); }} catch(e) {{ v = "ERR:" + e; }}
+                try {{ v = String({expression}); }} catch(error) {{ v = "ERR:" + error; }}
                 var xhr = new XMLHttpRequest();
                 xhr.open('POST', 'http://127.0.0.1:{}/value', false);
                 xhr.send(v);
@@ -279,7 +279,7 @@ impl TestCefServer {
 /// シングルトンロックと衝突し、次のテストの CEF 起動がハングする。
 impl Drop for TestCefServer {
     fn drop(&mut self) {
-        let _ = self.cmd_tx.send(CommandEnvelope {
+        let _ = self.command_sender.send(CommandEnvelope {
             command: Command::Shutdown,
             expects_response: false,
         });
@@ -291,14 +291,14 @@ impl Drop for TestCefServer {
 
 /// Mutex が前のテストの panic で poison されていても続行する。
 fn lock_serial() -> std::sync::MutexGuard<'static, ()> {
-    TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+    TEST_MUTEX.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 fn find_server_app() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("CEF_SERVER_APP") {
-        let p = PathBuf::from(&path);
-        if p.exists() {
-            return Some(p);
+        let path = PathBuf::from(&path);
+        if path.exists() {
+            return Some(path);
         }
     }
 
@@ -313,7 +313,7 @@ fn find_server_app() -> Option<PathBuf> {
             .join("cef-unity-csharp/Interop/cef-unity-server.app"),
     ];
 
-    candidates.into_iter().find(|p| p.exists())
+    candidates.into_iter().find(|path| path.exists())
 }
 
 // ---------------------------------------------------------------------------
@@ -331,29 +331,29 @@ fn diagnose_caret_pipeline() {
     let _lock = lock_serial();
     let http = TestHttpServer::start();
     let cef = TestCefServer::start();
-    let (bid, shm) = cef.setup_browser(&http.url());
+    let (browser_id, shared_memory) = cef.setup_browser(&http.url());
 
     // 境界 1: トラッカー注入確認
-    let injected = cef.eval_js(bid, &http, "window.__cefUnityCaretTracker");
+    let injected = cef.eval_js(browser_id, &http, "window.__cefUnityCaretTracker");
     println!("[1] tracker injected: {}", injected);
 
     // 境界 4 (先に確認): console.log → SHM 経路
     cef.fire(Command::ExecuteJavaScript {
-        browser_id: bid,
+        browser_id: browser_id,
         code: "console.log('__CARET__:11:22:0:33');".to_string(),
     });
     thread::sleep(Duration::from_millis(700));
-    let (x, y, w, h) = shm.read_ime_caret();
-    println!("[4] console->shm: ({}, {}, {}, {})", x, y, w, h);
+    let (x, y, width, height) = shared_memory.read_ime_caret();
+    println!("[4] console->shared_memory: ({}, {}, {}, {})", x, y, width, height);
 
     // 境界 2: クリックでフォーカスが移るか
-    cef.click(bid, 60, 518);
-    let active = cef.eval_js(bid, &http, "document.activeElement && document.activeElement.id");
+    cef.click(browser_id, 60, 518);
+    let active = cef.eval_js(browser_id, &http, "document.activeElement && document.activeElement.id");
     println!("[2] activeElement after ce click: {}", active);
 
     // 境界 3: selection rect
-    let sel = cef.eval_js(
-        bid,
+    let selection = cef.eval_js(
+        browser_id,
         &http,
         r#"(function(){
             var s = window.getSelection();
@@ -364,10 +364,10 @@ fn diagnose_caret_pipeline() {
             return b.x + "," + b.y + "," + b.width + "," + b.height;
         })()"#,
     );
-    println!("[3] selection rect after ce click: {}", sel);
+    println!("[3] selection rect after ce click: {}", selection);
 
-    let (x2, y2, w2, h2) = shm.read_ime_caret();
-    println!("[final] shm caret: ({}, {}, {}, {})", x2, y2, w2, h2);
+    let (final_x, final_y, final_width, final_height) = shared_memory.read_ime_caret();
+    println!("[final] shared_memory caret: ({}, {}, {}, {})", final_x, final_y, final_width, final_height);
 
     cef.shutdown();
 }
@@ -380,20 +380,20 @@ fn caret_reported_on_click_in_contenteditable() {
     let _lock = lock_serial();
     let http = TestHttpServer::start();
     let cef = TestCefServer::start();
-    let (bid, shm) = cef.setup_browser(&http.url());
+    let (browser_id, shared_memory) = cef.setup_browser(&http.url());
 
     // "あいうえお" の途中 (x=60) をクリック → キャレットは y∈[500,536] 付近のはず
-    cef.click(bid, 60, 518);
+    cef.click(browser_id, 60, 518);
 
-    let (x, y, w, h) = shm.read_ime_caret();
-    println!("contenteditable caret: x={} y={} w={} h={}", x, y, w, h);
+    let (x, y, width, height) = shared_memory.read_ime_caret();
+    println!("contenteditable caret: x={} y={} width={} height={}", x, y, width, height);
     assert!(
-        (500..=560).contains(&y) && h > 0,
+        (500..=560).contains(&y) && height > 0,
         "contenteditable クリックでキャレットが報告されるべき: got ({}, {}, {}, {})",
         x,
         y,
-        w,
-        h
+        width,
+        height
     );
 
     cef.shutdown();
@@ -408,24 +408,24 @@ fn caret_reported_on_click_in_input() {
     let _lock = lock_serial();
     let http = TestHttpServer::start();
     let cef = TestCefServer::start();
-    let (bid, shm) = cef.setup_browser(&http.url());
+    let (browser_id, shared_memory) = cef.setup_browser(&http.url());
 
     // 上部の input #t1 (top=0, height=36) をクリック
-    cef.click(bid, 200, 18);
+    cef.click(browser_id, 200, 18);
 
-    let (x, y, w, h) = shm.read_ime_caret();
-    println!("input caret: x={} y={} w={} h={}", x, y, w, h);
+    let (x, y, width, height) = shared_memory.read_ime_caret();
+    println!("input caret: x={} y={} width={} height={}", x, y, width, height);
     assert!(
-        !(x == 0 && y == 0 && w == 0 && h == 0),
+        !(x == 0 && y == 0 && width == 0 && height == 0),
         "input クリックでキャレットが報告されるべきだが SHM が未更新 (0,0,0,0)"
     );
     assert!(
-        (0..=45).contains(&y) && h > 0,
+        (0..=45).contains(&y) && height > 0,
         "キャレット y は input #t1 の範囲 [0,45] にあるべき: got ({}, {}, {}, {})",
         x,
         y,
-        w,
-        h
+        width,
+        height
     );
 
     cef.shutdown();
@@ -441,38 +441,38 @@ fn caret_follows_focus_change_to_second_input() {
     let _lock = lock_serial();
     let http = TestHttpServer::start();
     let cef = TestCefServer::start();
-    let (bid, shm) = cef.setup_browser(&http.url());
+    let (browser_id, shared_memory) = cef.setup_browser(&http.url());
 
     // #t1 をクリックして IME 入力 → 確定
-    cef.click(bid, 200, 18);
+    cef.click(browser_id, 200, 18);
     cef.fire(Command::ImeSetComposition {
-        browser_id: bid,
+        browser_id: browser_id,
         text: "かん".to_string(),
         selection_start: 2,
         selection_end: 2,
     });
     thread::sleep(Duration::from_millis(300));
     cef.fire(Command::ImeCommitText {
-        browser_id: bid,
+        browser_id: browser_id,
         text: "感".to_string(),
     });
     thread::sleep(Duration::from_millis(500));
 
-    let (_, y1, _, _) = shm.read_ime_caret();
-    println!("caret after composition in #t1: y={}", y1);
+    let (_, first_y, _, _) = shared_memory.read_ime_caret();
+    println!("caret after composition in #t1: y={}", first_y);
 
     // #t2 (top=300) をクリック → キャレットは #t2 へ移動するべき
-    cef.click(bid, 200, 318);
+    cef.click(browser_id, 200, 318);
 
-    let (x, y, w, h) = shm.read_ime_caret();
-    println!("caret after click on #t2: x={} y={} w={} h={}", x, y, w, h);
+    let (x, y, width, height) = shared_memory.read_ime_caret();
+    println!("caret after click on #t2: x={} y={} width={} height={}", x, y, width, height);
     assert!(
         (300..=345).contains(&y),
         "#t2 クリック後のキャレット y は [300,345] にあるべき (前のフィールド位置が残っている): got ({}, {}, {}, {})",
         x,
         y,
-        w,
-        h
+        width,
+        height
     );
 
     cef.shutdown();

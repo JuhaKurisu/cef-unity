@@ -19,30 +19,30 @@ namespace CefUnity.Runtime
     public sealed class CefAudioSink : MonoBehaviour
     {
         private CefAudioRing _ring;
-        private double _baseStep;  // srcRate / outRate
-        private int _srcChannels;
+        private double _baseStep;  // sourceRate / outputRate
+        private int _sourceChannels;
         private float[] _scratch;  // src チャネル interleaved (オーディオスレッドでの確保を避ける)
         private AudioSource _source;
 
         // 計装 (オーディオスレッド ⇄ メインスレッド)。
-        private readonly object _statsLock = new object();
+        private readonly object _statisticsLock = new object();
         private int _calls;
         private int _frames;
         private int _maxBlock;
-        private double _outSumSq;
+        private double _outSumSquared;
         private long _outSamples;
 
         /// <summary>
         ///     リング・レート・チャネルを設定し、無音キャリアクリップを再生して
         ///     <see cref="OnAudioFilterRead" /> の DSP コールバックを駆動する。再呼び出し可。
         /// </summary>
-        public void Configure(CefAudioRing ring, double baseStep, int srcChannels, int outRate, int maxFrames)
+        public void Configure(CefAudioRing ring, double baseStep, int sourceChannels, int outputRate, int maxFrames)
         {
             _ring = ring;
             _baseStep = baseStep;
-            _srcChannels = Mathf.Max(1, srcChannels);
-            if (_scratch == null || _scratch.Length < maxFrames * _srcChannels)
-                _scratch = new float[maxFrames * _srcChannels];
+            _sourceChannels = Mathf.Max(1, sourceChannels);
+            if (_scratch == null || _scratch.Length < maxFrames * _sourceChannels)
+                _scratch = new float[maxFrames * _sourceChannels];
 
             if (_source == null) _source = GetComponent<AudioSource>();
             _source.playOnAwake = false;
@@ -52,8 +52,8 @@ namespace CefUnity.Runtime
             // OnAudioFilterRead を駆動するための無音ループクリップ。中身は使わない (0 のまま)。
             if (_source.clip == null)
             {
-                int len = Mathf.Max(256, outRate / 10);
-                _source.clip = AudioClip.Create("CefAudioCarrier", len, _srcChannels, outRate, false);
+                int length = Mathf.Max(256, outputRate / 10);
+                _source.clip = AudioClip.Create("CefAudioCarrier", length, _sourceChannels, outputRate, false);
             }
 
             if (!_source.isPlaying) _source.Play();
@@ -66,19 +66,19 @@ namespace CefUnity.Runtime
         }
 
         /// <summary>consumer 計装のスナップショットを取得してリセットする (メインスレッドから呼ぶ)。</summary>
-        public void SnapshotStats(out int calls, out int frames, out int maxBlock, out double outSumSq, out long outSamples)
+        public void SnapshotStatistics(out int calls, out int frames, out int maxBlock, out double outSumSquared, out long outSamples)
         {
-            lock (_statsLock)
+            lock (_statisticsLock)
             {
                 calls = _calls;
                 frames = _frames;
                 maxBlock = _maxBlock;
-                outSumSq = _outSumSq;
+                outSumSquared = _outSumSquared;
                 outSamples = _outSamples;
                 _calls = 0;
                 _frames = 0;
                 _maxBlock = 0;
-                _outSumSq = 0.0;
+                _outSumSquared = 0.0;
                 _outSamples = 0;
             }
         }
@@ -89,11 +89,11 @@ namespace CefUnity.Runtime
         {
             var ring = _ring;
             var scratch = _scratch;
-            if (ring == null || _srcChannels <= 0 || scratch == null || channels <= 0)
+            if (ring == null || _sourceChannels <= 0 || scratch == null || channels <= 0)
                 return; // 何もしない = 無音 (キャリアの 0) のまま
 
             int frames = data.Length / channels;
-            int need = frames * _srcChannels;
+            int need = frames * _sourceChannels;
             if (need > scratch.Length) return; // 想定外の巨大ブロックは安全側でスキップ
 
             // src チャネルで補間しつつ取り出す。
@@ -101,34 +101,34 @@ namespace CefUnity.Runtime
 
             // 出力検証用の RMS は per-sample コストになるため診断ログ有効時のみ集計する。
             bool log = CefLog.Enabled;
-            double sumSq = 0.0;
+            double sumSquared = 0.0;
             if (log)
-                for (int i = 0; i < need; i++)
+                for (int sampleIndex = 0; sampleIndex < need; sampleIndex++)
                 {
-                    float s = scratch[i];
-                    sumSq += (double)s * s;
+                    float sample = scratch[sampleIndex];
+                    sumSquared += (double)sample * sample;
                 }
 
             // 最終ミックスへ加算。src と出力のチャネル数が同じなら直接、違えば写像する。
-            if (channels == _srcChannels)
+            if (channels == _sourceChannels)
             {
-                int n = frames * channels;
-                for (int i = 0; i < n; i++) data[i] += scratch[i];
+                int sampleCount = frames * channels;
+                for (int sampleIndex = 0; sampleIndex < sampleCount; sampleIndex++) data[sampleIndex] += scratch[sampleIndex];
             }
             else
             {
-                for (int f = 0; f < frames; f++)
-                for (int c = 0; c < channels; c++)
-                    data[f * channels + c] += scratch[f * _srcChannels + c % _srcChannels];
+                for (int frameIndex = 0; frameIndex < frames; frameIndex++)
+                for (int channelIndex = 0; channelIndex < channels; channelIndex++)
+                    data[frameIndex * channels + channelIndex] += scratch[frameIndex * _sourceChannels + channelIndex % _sourceChannels];
             }
 
             if (log)
-                lock (_statsLock)
+                lock (_statisticsLock)
                 {
                     _calls++;
                     _frames += frames;
                     if (frames > _maxBlock) _maxBlock = frames;
-                    _outSumSq += sumSq;
+                    _outSumSquared += sumSquared;
                     _outSamples += need;
                 }
         }

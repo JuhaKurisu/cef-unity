@@ -24,7 +24,7 @@ static int _surfaceCacheCount = 0;
 // Mach port IOSurface client
 // ---------------------------------------------------------------------------
 
-// Must match server's iosurface_msg_t layout
+// Must match server's iosurface_message_t layout
 typedef struct {
     mach_msg_header_t header;
     mach_msg_body_t body;
@@ -32,58 +32,58 @@ typedef struct {
     uint32_t width;
     uint32_t height;
     uint32_t format;
-} iosurface_msg_t;
+} iosurface_message_t;
 
 // Subscribe message (client → server)
 typedef struct {
     mach_msg_header_t header;
     mach_msg_body_t body;
     mach_msg_port_descriptor_t client_port;
-} subscribe_msg_t;
+} subscribe_message_t;
 
 static mach_port_t g_receive_port = MACH_PORT_NULL;
 
 /// Connect to the server's Mach IOSurface service and send subscription.
 /// Returns 0 on success, negative on error.
 int mach_iosurface_client_connect(const char* service_name) {
-    kern_return_t kr;
+    kern_return_t kern_return_value;
     mach_port_t server_port;
 
-    kr = bootstrap_look_up(bootstrap_port, service_name, &server_port);
-    if (kr != KERN_SUCCESS) {
-        NSLog(@"[CefUnity-Mach] bootstrap_look_up('%s') failed: %s", service_name, mach_error_string(kr));
+    kern_return_value = bootstrap_look_up(bootstrap_port, service_name, &server_port);
+    if (kern_return_value != KERN_SUCCESS) {
+        NSLog(@"[CefUnity-Mach] bootstrap_look_up('%s') failed: %s", service_name, mach_error_string(kern_return_value));
         return -1;
     }
 
     // Create our receive port
-    kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_receive_port);
-    if (kr != KERN_SUCCESS) {
-        NSLog(@"[CefUnity-Mach] mach_port_allocate failed: %s", mach_error_string(kr));
+    kern_return_value = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_receive_port);
+    if (kern_return_value != KERN_SUCCESS) {
+        NSLog(@"[CefUnity-Mach] mach_port_allocate failed: %s", mach_error_string(kern_return_value));
         mach_port_deallocate(mach_task_self(), server_port);
         return -2;
     }
 
     // Send subscription message with our port (as a send right)
-    subscribe_msg_t msg;
-    __builtin_memset(&msg, 0, sizeof(msg));
+    subscribe_message_t message;
+    __builtin_memset(&message, 0, sizeof(message));
 
-    msg.header.msgh_bits = MACH_MSGH_BITS_COMPLEX |
+    message.header.msgh_bits = MACH_MSGH_BITS_COMPLEX |
                            MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
-    msg.header.msgh_size = sizeof(msg);
-    msg.header.msgh_remote_port = server_port;
-    msg.header.msgh_local_port = MACH_PORT_NULL;
-    msg.header.msgh_id = 0x53554253;  // 'SUBS'
+    message.header.msgh_size = sizeof(message);
+    message.header.msgh_remote_port = server_port;
+    message.header.msgh_local_port = MACH_PORT_NULL;
+    message.header.msgh_id = 0x53554253;  // 'SUBS'
 
-    msg.body.msgh_descriptor_count = 1;
+    message.body.msgh_descriptor_count = 1;
 
-    msg.client_port.name = g_receive_port;
-    msg.client_port.disposition = MACH_MSG_TYPE_MAKE_SEND;
-    msg.client_port.type = MACH_MSG_PORT_DESCRIPTOR;
+    message.client_port.name = g_receive_port;
+    message.client_port.disposition = MACH_MSG_TYPE_MAKE_SEND;
+    message.client_port.type = MACH_MSG_PORT_DESCRIPTOR;
 
-    kr = mach_msg(
-        &msg.header,
+    kern_return_value = mach_msg(
+        &message.header,
         MACH_SEND_MSG | MACH_SEND_TIMEOUT,
-        sizeof(msg),
+        sizeof(message),
         0,
         MACH_PORT_NULL,
         5000,  // 5s timeout
@@ -92,8 +92,8 @@ int mach_iosurface_client_connect(const char* service_name) {
 
     mach_port_deallocate(mach_task_self(), server_port);
 
-    if (kr != KERN_SUCCESS) {
-        NSLog(@"[CefUnity-Mach] subscribe send failed: %s", mach_error_string(kr));
+    if (kern_return_value != KERN_SUCCESS) {
+        NSLog(@"[CefUnity-Mach] subscribe send failed: %s", mach_error_string(kern_return_value));
         return -3;
     }
 
@@ -108,7 +108,7 @@ int mach_iosurface_client_connect(const char* service_name) {
 /// Server-side pool copy ensures the IOSurface content is stable (won't be
 /// overwritten by CEF). We just create a sRGB texture view and return it
 /// directly — no client-side GPU blit or waitUntilCompleted needed.
-void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint32_t* out_format) {
+void* mach_iosurface_receive_texture(int32_t* out_width, int32_t* out_height, uint32_t* out_format) {
     if (g_receive_port == MACH_PORT_NULL) return NULL;
 
     // Drain all pending messages, keep only the latest
@@ -116,33 +116,33 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
     uint32_t latest_width = 0, latest_height = 0, latest_format = 0;
     for (;;) {
         struct {
-            iosurface_msg_t msg;
+            iosurface_message_t message;
             mach_msg_trailer_t trailer;
-        } recv_buf;
-        __builtin_memset(&recv_buf, 0, sizeof(recv_buf));
+        } receive_buffer;
+        __builtin_memset(&receive_buffer, 0, sizeof(receive_buffer));
 
-        kern_return_t kr = mach_msg(
-            &recv_buf.msg.header,
+        kern_return_t kern_return_value = mach_msg(
+            &receive_buffer.message.header,
             MACH_RCV_MSG | MACH_RCV_TIMEOUT,
             0,
-            sizeof(recv_buf),
+            sizeof(receive_buffer),
             g_receive_port,
             0,
             MACH_PORT_NULL
         );
 
-        if (kr != MACH_MSG_SUCCESS) break;
+        if (kern_return_value != MACH_MSG_SUCCESS) break;
 
-        mach_port_t surface_port = recv_buf.msg.surface_port.name;
+        mach_port_t surface_port = receive_buffer.message.surface_port.name;
         IOSurfaceRef surface = IOSurfaceLookupFromMachPort(surface_port);
         mach_port_deallocate(mach_task_self(), surface_port);
 
         if (surface) {
             if (latest_surface) CFRelease(latest_surface);
             latest_surface = surface;
-            latest_width = recv_buf.msg.width;
-            latest_height = recv_buf.msg.height;
-            latest_format = recv_buf.msg.format;
+            latest_width = receive_buffer.message.width;
+            latest_height = receive_buffer.message.height;
+            latest_format = receive_buffer.message.format;
         }
     }
 
@@ -163,10 +163,10 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
     IOSurfaceID latestID = IOSurfaceGetID(latest_surface);
     id<MTLTexture> srgbView = nil;
 
-    for (int i = 0; i < _surfaceCacheCount; i++) {
-        if (_surfaceCache[i].surfaceID == latestID && _surfaceCache[i].srgbView) {
+    for (int cache_index = 0; cache_index < _surfaceCacheCount; cache_index++) {
+        if (_surfaceCache[cache_index].surfaceID == latestID && _surfaceCache[cache_index].srgbView) {
             CFRelease(latest_surface);
-            srgbView = _surfaceCache[i].srgbView;
+            srgbView = _surfaceCache[cache_index].srgbView;
             break;
         }
     }
@@ -174,22 +174,22 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
     if (!srgbView) {
         @autoreleasepool {
             // キャッシュミス: IOSurface テクスチャを作成
-            MTLPixelFormat iosfFormat = (latest_format == 1)
+            MTLPixelFormat iosurfaceFormat = (latest_format == 1)
                 ? MTLPixelFormatRGBA8Unorm
                 : MTLPixelFormatBGRA8Unorm;
 
-            MTLTextureDescriptor *desc = [MTLTextureDescriptor
-                texture2DDescriptorWithPixelFormat:iosfFormat
+            MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:iosurfaceFormat
                                              width:(NSUInteger)latest_width
                                             height:(NSUInteger)latest_height
                                          mipmapped:NO];
-            desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-            desc.storageMode = MTLStorageModeShared;
+            descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+            descriptor.storageMode = MTLStorageModeShared;
 
-            id<MTLTexture> iosTex = [_sharedDevice newTextureWithDescriptor:desc
+            id<MTLTexture> iosurfaceTexture = [_sharedDevice newTextureWithDescriptor:descriptor
                                                                   iosurface:latest_surface
                                                                       plane:0];
-            if (!iosTex) {
+            if (!iosurfaceTexture) {
                 NSLog(@"[CefUnity-Mach] newTextureWithDescriptor:iosurface: returned nil");
                 CFRelease(latest_surface);
                 return NULL;
@@ -199,8 +199,8 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
                 ? MTLPixelFormatRGBA8Unorm_sRGB
                 : MTLPixelFormatBGRA8Unorm_sRGB;
 
-            srgbView = [iosTex newTextureViewWithPixelFormat:srgbFormat];
-            if (!srgbView) srgbView = iosTex;
+            srgbView = [iosurfaceTexture newTextureViewWithPixelFormat:srgbFormat];
+            if (!srgbView) srgbView = iosurfaceTexture;
 
             // キャッシュに追加
             int slot;
@@ -208,8 +208,8 @@ void* mach_iosurface_recv_texture(int32_t* out_width, int32_t* out_height, uint3
                 slot = _surfaceCacheCount++;
             } else {
                 if (_surfaceCache[0].surface) CFRelease(_surfaceCache[0].surface);
-                for (int i = 0; i < IOSURFACE_CACHE_SIZE - 1; i++)
-                    _surfaceCache[i] = _surfaceCache[i + 1];
+                for (int cache_index = 0; cache_index < IOSURFACE_CACHE_SIZE - 1; cache_index++)
+                    _surfaceCache[cache_index] = _surfaceCache[cache_index + 1];
                 slot = IOSURFACE_CACHE_SIZE - 1;
             }
             _surfaceCache[slot].surfaceID = latestID;
@@ -251,14 +251,14 @@ void* cef_unity_create_metal_texture_objc(
             ? MTLPixelFormatRGBA8Unorm
             : MTLPixelFormatBGRA8Unorm;
 
-        MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
+        MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
                                                                                        width:(NSUInteger)width
                                                                                       height:(NSUInteger)height
                                                                                    mipmapped:NO];
-        desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-        desc.storageMode = MTLStorageModeShared;
+        descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+        descriptor.storageMode = MTLStorageModeShared;
 
-        id<MTLTexture> texture = [_sharedDevice newTextureWithDescriptor:desc
+        id<MTLTexture> texture = [_sharedDevice newTextureWithDescriptor:descriptor
                                                                 iosurface:surface
                                                                     plane:0];
         CFRelease(surface);
@@ -268,9 +268,9 @@ void* cef_unity_create_metal_texture_objc(
     }
 }
 
-void cef_unity_release_metal_texture_objc(void* texture_ptr)
+void cef_unity_release_metal_texture_objc(void* texture_pointer)
 {
-    if (!texture_ptr) return;
-    id<MTLTexture> texture = (__bridge_transfer id<MTLTexture>)texture_ptr;
+    if (!texture_pointer) return;
+    id<MTLTexture> texture = (__bridge_transfer id<MTLTexture>)texture_pointer;
     (void)texture;
 }

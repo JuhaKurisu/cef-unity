@@ -132,13 +132,13 @@ namespace CefUnity.Interop
         /// <summary>
         ///     印字可能文字の Windows 仮想キーコードを返す。
         /// </summary>
-        public static int CharToWindowsVk(char c)
+        public static int CharToWindowsVirtualKey(char character)
         {
-            return c switch
+            return character switch
             {
-                >= 'a' and <= 'z' => c - 32, // VK_A..VK_Z (0x41-0x5A)
-                >= 'A' and <= 'Z' => c,
-                >= '0' and <= '9' => c, // VK_0..VK_9 (0x30-0x39)
+                >= 'a' and <= 'z' => character - 32, // VK_A..VK_Z (0x41-0x5A)
+                >= 'A' and <= 'Z' => character,
+                >= '0' and <= '9' => character, // VK_0..VK_9 (0x30-0x39)
                 ' ' => 0x20,
                 ';' or ':' => 0xBA,
                 '=' or '+' => 0xBB,
@@ -151,7 +151,7 @@ namespace CefUnity.Interop
                 '\\' or '|' => 0xDC,
                 ']' or '}' => 0xDD,
                 '\'' or '"' => 0xDE,
-                _ => c
+                _ => character
             };
         }
     }
@@ -164,12 +164,12 @@ namespace CefUnity.Interop
         ///     Windows の D3D11/D3D12 共有テクスチャ) を使い、false なら CPU 経路 (software paint:
         ///     共有メモリ経由の BGRA 転送) を強制する。
         /// </summary>
-        public static void Init(bool useGpu = true, bool enableLog = false)
+        public static void Initialize(bool useGpu = true, bool enableLog = false)
         {
             int result;
             try
             {
-                result = NativeMethods.cef_unity_init(useGpu ? 1 : 0, enableLog ? 1 : 0);
+                result = NativeMethods.cef_unity_initialize(useGpu ? 1 : 0, enableLog ? 1 : 0);
             }
             catch (DllNotFoundException)
             {
@@ -207,9 +207,9 @@ namespace CefUnity.Interop
                 var required = NativeMethods.cef_unity_get_logs(null, 0);
                 if (required <= 1) return Array.Empty<string>();
                 var buffer = new byte[required];
-                fixed (byte* ptr = buffer)
+                fixed (byte* pointer = buffer)
                 {
-                    var written = NativeMethods.cef_unity_get_logs(ptr, buffer.Length);
+                    var written = NativeMethods.cef_unity_get_logs(pointer, buffer.Length);
                     if (written <= 1) return Array.Empty<string>();
                     var raw = Encoding.UTF8.GetString(buffer, 0, written - 1);
                     return raw.Split('\0', StringSplitOptions.RemoveEmptyEntries);
@@ -227,9 +227,9 @@ namespace CefUnity.Interop
         {
             unsafe
             {
-                fixed (byte* urlPtr = ToUtf8Null(url))
+                fixed (byte* urlPointer = ToUtf8Null(url))
                 {
-                    _handle = NativeMethods.cef_unity_create_browser(width, height, urlPtr);
+                    _handle = NativeMethods.cef_unity_create_browser(width, height, urlPointer);
                 }
 
                 if (_handle == null)
@@ -257,9 +257,9 @@ namespace CefUnity.Interop
             ThrowIfDisposed();
             unsafe
             {
-                fixed (byte* urlPtr = ToUtf8Null(url))
+                fixed (byte* urlPointer = ToUtf8Null(url))
                 {
-                    NativeMethods.cef_unity_load_url(_handle, urlPtr);
+                    NativeMethods.cef_unity_load_url(_handle, urlPointer);
                 }
             }
         }
@@ -282,15 +282,15 @@ namespace CefUnity.Interop
         {
             ThrowIfDisposed();
 
-            byte* bufferPtr;
-            int w, h;
-            var hasNew = NativeMethods.cef_unity_get_buffer(_handle, &bufferPtr, &w, &h);
+            byte* bufferPointer;
+            int nativeWidth, nativeHeight;
+            var hasNew = NativeMethods.cef_unity_get_buffer(_handle, &bufferPointer, &nativeWidth, &nativeHeight);
 
-            width = w;
-            height = h;
+            width = nativeWidth;
+            height = nativeHeight;
 
-            if (w > 0 && h > 0 && bufferPtr != null)
-                buffer = new ReadOnlySpan<byte>(bufferPtr, w * h * 4);
+            if (nativeWidth > 0 && nativeHeight > 0 && bufferPointer != null)
+                buffer = new ReadOnlySpan<byte>(bufferPointer, nativeWidth * nativeHeight * 4);
             else
                 buffer = default;
 
@@ -401,12 +401,12 @@ namespace CefUnity.Interop
         /// <summary>
         ///     印字可能文字の RAWKEYDOWN + CHAR + KEYUP を一括送信する。
         /// </summary>
-        public void SendCharEvent(char c, uint modifiers = 0)
+        public void SendCharEvent(char character, uint modifiers = 0)
         {
-            var vk = CefKeyCodes.CharToWindowsVk(c);
-            SendKeyEvent(KeyEventType.RawKeyDown, vk, modifiers: modifiers, character: c, unmodifiedCharacter: c);
-            SendKeyEvent(KeyEventType.Char, c, modifiers: modifiers, character: c, unmodifiedCharacter: c);
-            SendKeyEvent(KeyEventType.KeyUp, vk, modifiers: modifiers, character: c, unmodifiedCharacter: c);
+            var virtualKey = CefKeyCodes.CharToWindowsVirtualKey(character);
+            SendKeyEvent(KeyEventType.RawKeyDown, virtualKey, modifiers: modifiers, character: character, unmodifiedCharacter: character);
+            SendKeyEvent(KeyEventType.Char, character, modifiers: modifiers, character: character, unmodifiedCharacter: character);
+            SendKeyEvent(KeyEventType.KeyUp, virtualKey, modifiers: modifiers, character: character, unmodifiedCharacter: character);
         }
 
         // ----- IOSurface / Metal texture -----
@@ -418,14 +418,14 @@ namespace CefUnity.Interop
         public unsafe bool TryGetIOSurfaceInfo(out uint surfaceId, out int width, out int height, out uint format)
         {
             ThrowIfDisposed();
-            uint sid;
-            int w, h;
-            uint fmt;
-            var result = NativeMethods.cef_unity_get_iosurface_info(_handle, &sid, &w, &h, &fmt);
-            surfaceId = sid;
-            width = w;
-            height = h;
-            format = fmt;
+            uint nativeSurfaceId;
+            int nativeWidth, nativeHeight;
+            uint nativeFormat;
+            var result = NativeMethods.cef_unity_get_iosurface_info(_handle, &nativeSurfaceId, &nativeWidth, &nativeHeight, &nativeFormat);
+            surfaceId = nativeSurfaceId;
+            width = nativeWidth;
+            height = nativeHeight;
+            format = nativeFormat;
             return result != 0;
         }
 
@@ -452,16 +452,16 @@ namespace CefUnity.Interop
         ///     新フレームがあれば MTLTexture ポインタと寸法を返す。なければ IntPtr.Zero。
         ///     返されたテクスチャは ReleaseMetalTexture で解放すること。
         /// </summary>
-        public static unsafe bool TryRecvIOSurfaceTexture(out IntPtr texturePtr, out int width, out int height, out uint format)
+        public static unsafe bool TryReceiveIOSurfaceTexture(out IntPtr texturePointer, out int width, out int height, out uint format)
         {
-            int w, h;
-            uint fmt;
-            var ptr = NativeMethods.cef_unity_recv_iosurface_texture(&w, &h, &fmt);
-            texturePtr = (IntPtr)ptr;
-            width = w;
-            height = h;
-            format = fmt;
-            return ptr != null;
+            int nativeWidth, nativeHeight;
+            uint nativeFormat;
+            var pointer = NativeMethods.cef_unity_receive_iosurface_texture(&nativeWidth, &nativeHeight, &nativeFormat);
+            texturePointer = (IntPtr)pointer;
+            width = nativeWidth;
+            height = nativeHeight;
+            format = nativeFormat;
+            return pointer != null;
         }
 
 
@@ -490,17 +490,17 @@ namespace CefUnity.Interop
         ///     クライアントライブラリ内で AddRef/Release 管理されるため、Unity 側で
         ///     解放処理を書く必要はない (プラグイン unload 時に自動解放)。
         /// </summary>
-        public unsafe bool TryRecvD3D11Texture(out IntPtr texturePtr, out int width, out int height, out uint format)
+        public unsafe bool TryReceiveD3D11Texture(out IntPtr texturePointer, out int width, out int height, out uint format)
         {
             ThrowIfDisposed();
-            int w, h;
-            uint fmt;
-            var ptr = NativeMethods.cef_unity_recv_d3d11_texture(_handle, &w, &h, &fmt);
-            texturePtr = (IntPtr)ptr;
-            width = w;
-            height = h;
-            format = fmt;
-            return ptr != null;
+            int nativeWidth, nativeHeight;
+            uint nativeFormat;
+            var pointer = NativeMethods.cef_unity_receive_d3d11_texture(_handle, &nativeWidth, &nativeHeight, &nativeFormat);
+            texturePointer = (IntPtr)pointer;
+            width = nativeWidth;
+            height = nativeHeight;
+            format = nativeFormat;
+            return pointer != null;
         }
 
         /// <summary>
@@ -517,17 +517,17 @@ namespace CefUnity.Interop
         /// 状態は PIXEL_SHADER_RESOURCE に Unity に宣言済み。
         /// Texture2D.CreateExternalTexture / UpdateExternalTexture にそのまま渡せる。
         /// </summary>
-        public unsafe bool TryRecvD3D12Texture(out IntPtr texturePtr, out int width, out int height, out uint format)
+        public unsafe bool TryReceiveD3D12Texture(out IntPtr texturePointer, out int width, out int height, out uint format)
         {
             ThrowIfDisposed();
-            int w, h;
-            uint fmt;
-            var ptr = NativeMethods.cef_unity_recv_d3d12_texture(_handle, &w, &h, &fmt);
-            texturePtr = (IntPtr)ptr;
-            width = w;
-            height = h;
-            format = fmt;
-            return ptr != null;
+            int nativeWidth, nativeHeight;
+            uint nativeFormat;
+            var pointer = NativeMethods.cef_unity_receive_d3d12_texture(_handle, &nativeWidth, &nativeHeight, &nativeFormat);
+            texturePointer = (IntPtr)pointer;
+            width = nativeWidth;
+            height = nativeHeight;
+            format = nativeFormat;
+            return pointer != null;
         }
 
         // ----- 統一: Accelerated paint (macOS + Windows) -----
@@ -554,10 +554,10 @@ namespace CefUnity.Interop
         public unsafe bool TryGetAudioFormat(out int sampleRate, out int channels)
         {
             ThrowIfDisposed();
-            uint sr, ch;
-            var active = NativeMethods.cef_unity_get_audio_format(_handle, &sr, &ch);
-            sampleRate = (int)sr;
-            channels = (int)ch;
+            uint nativeSampleRate, nativeChannels;
+            var active = NativeMethods.cef_unity_get_audio_format(_handle, &nativeSampleRate, &nativeChannels);
+            sampleRate = (int)nativeSampleRate;
+            channels = (int)nativeChannels;
             return active != 0;
         }
 
@@ -577,13 +577,13 @@ namespace CefUnity.Interop
         public unsafe int ReadAudio(float[] buffer, int maxFrames, out int channels)
         {
             ThrowIfDisposed();
-            uint ch = 0;
+            uint nativeChannels = 0;
             int frames;
-            fixed (float* ptr = buffer)
+            fixed (float* pointer = buffer)
             {
-                frames = NativeMethods.cef_unity_read_audio(_handle, ptr, maxFrames, &ch);
+                frames = NativeMethods.cef_unity_read_audio(_handle, pointer, maxFrames, &nativeChannels);
             }
-            channels = (int)ch;
+            channels = (int)nativeChannels;
             return frames;
         }
 
@@ -600,13 +600,13 @@ namespace CefUnity.Interop
         ///     PCM の取得 (<see cref="ReadAudio" />) はカーソル独立なので併用できる。
         ///     </para>
         /// </summary>
-        /// <param name="targetLatencyMs">jitter buffer の目標滞留量 (ms)。</param>
+        /// <param name="targetLatencyMilliseconds">jitter buffer の目標滞留量 (ms)。</param>
         /// <param name="ioFrames">CoreAudio IO バッファフレーム数 (128 ≈ 2.9ms)。</param>
         /// <returns>開始できたら true (既に再生中も true)。非対応 OS・音声無効・フォーマット未確定は false。</returns>
-        public unsafe bool StartNativeAudio(float targetLatencyMs = 15f, int ioFrames = 128)
+        public unsafe bool StartNativeAudio(float targetLatencyMilliseconds = 15f, int ioFrames = 128)
         {
             ThrowIfDisposed();
-            return NativeMethods.cef_unity_audio_native_start(_handle, targetLatencyMs, ioFrames) == 0;
+            return NativeMethods.cef_unity_audio_native_start(_handle, targetLatencyMilliseconds, ioFrames) == 0;
         }
 
         /// <summary>ネイティブ音声出力を停止する (再生していなければ何もしない)。</summary>
@@ -627,17 +627,17 @@ namespace CefUnity.Interop
         ///     ネイティブ音声出力の診断値を取得する。再生中でなければ false。
         ///     underrun/overflow は累積フレーム数 (0 以外ならぶつ切り/破棄発生)。
         /// </summary>
-        public unsafe bool TryGetNativeAudioStats(
-            out float occupancyMs, out ulong underrunFrames, out ulong overflowFrames)
+        public unsafe bool TryGetNativeAudioStatistics(
+            out float occupancyMilliseconds, out ulong underrunFrames, out ulong overflowFrames)
         {
             ThrowIfDisposed();
-            float occ;
-            ulong under, over;
-            int ok = NativeMethods.cef_unity_audio_native_stats(_handle, &occ, &under, &over);
-            occupancyMs = occ;
-            underrunFrames = under;
-            overflowFrames = over;
-            return ok == 0;
+            float occupancy;
+            ulong underrun, overflow;
+            int resultCode = NativeMethods.cef_unity_audio_native_statistics(_handle, &occupancy, &underrun, &overflow);
+            occupancyMilliseconds = occupancy;
+            underrunFrames = underrun;
+            overflowFrames = overflow;
+            return resultCode == 0;
         }
 
         // ----- IME -----
@@ -647,9 +647,9 @@ namespace CefUnity.Interop
             ThrowIfDisposed();
             unsafe
             {
-                fixed (byte* textPtr = ToUtf8Null(text))
+                fixed (byte* textPointer = ToUtf8Null(text))
                 {
-                    NativeMethods.cef_unity_ime_set_composition(_handle, textPtr, selectionStart, selectionEnd);
+                    NativeMethods.cef_unity_ime_set_composition(_handle, textPointer, selectionStart, selectionEnd);
                 }
             }
         }
@@ -659,9 +659,9 @@ namespace CefUnity.Interop
             ThrowIfDisposed();
             unsafe
             {
-                fixed (byte* textPtr = ToUtf8Null(text))
+                fixed (byte* textPointer = ToUtf8Null(text))
                 {
-                    NativeMethods.cef_unity_ime_commit_text(_handle, textPtr);
+                    NativeMethods.cef_unity_ime_commit_text(_handle, textPointer);
                 }
             }
         }
@@ -689,7 +689,7 @@ namespace CefUnity.Interop
         /// Unity の Update 冒頭で毎フレーム呼ぶことで、CEF と Unity のフレーム周期が
         /// 同期する (自発的 windowless_frame_rate 駆動の置き換え)。
         /// <paramref name="unityFrame"/> には Time.frameCount を渡す。on_accelerated_paint
-        /// で shm に転送され、GetAccelPaintUnityFrame() で読むことで end-to-end の
+        /// で shm に転送され、GetAcceleratedPaintUnityFrame() で読むことで end-to-end の
         /// 遅延フレーム数を測定できる。
         /// </summary>
         public void SendExternalBeginFrame(ulong unityFrame)
@@ -705,39 +705,39 @@ namespace CefUnity.Interop
         /// 最後の on_accelerated_paint に対応する SendExternalBeginFrame の Time.frameCount を返す。
         /// 現在の Time.frameCount との差が end-to-end の遅延フレーム数 (0 = 同一フレーム取得)。
         /// </summary>
-        public ulong GetAccelPaintUnityFrame()
+        public ulong GetAcceleratedPaintUnityFrame()
         {
             ThrowIfDisposed();
             unsafe
             {
-                return NativeMethods.cef_unity_get_accel_paint_unity_frame(_handle);
+                return NativeMethods.cef_unity_get_accelerated_paint_unity_frame(_handle);
             }
         }
 
         /// <summary>
-        /// accelerated paint の単調増加カウンタ (accel_frame_id) を消費せずに返す。
+        /// accelerated paint の単調増加カウンタ (accelerated_frame_id) を消費せずに返す。
         /// double-pump で flush BeginFrame 後の新規 paint 到着を検出する同期に使う。
         /// この値が増えた時点で、対応する IOSurface の Mach メッセージは受信ポートに
-        /// enqueue 済みなので、次の TryRecvIOSurfaceTexture で確実に取得できる。
+        /// enqueue 済みなので、次の TryReceiveIOSurfaceTexture で確実に取得できる。
         /// </summary>
-        public ulong PeekAccelFrameId()
+        public ulong PeekAcceleratedFrameId()
         {
             ThrowIfDisposed();
             unsafe
             {
-                return NativeMethods.cef_unity_peek_accel_frame_id(_handle);
+                return NativeMethods.cef_unity_peek_accelerated_frame_id(_handle);
             }
         }
 
-        public unsafe void GetImeCaret(out int x, out int y, out int w, out int h)
+        public unsafe void GetImeCaret(out int x, out int y, out int width, out int height)
         {
             ThrowIfDisposed();
-            int ox, oy, ow, oh;
-            NativeMethods.cef_unity_get_ime_caret(_handle, &ox, &oy, &ow, &oh);
-            x = ox;
-            y = oy;
-            w = ow;
-            h = oh;
+            int caretX, caretY, caretWidth, caretHeight;
+            NativeMethods.cef_unity_get_ime_caret(_handle, &caretX, &caretY, &caretWidth, &caretHeight);
+            x = caretX;
+            y = caretY;
+            width = caretWidth;
+            height = caretHeight;
         }
 
         // ----- Blocking variants -----
@@ -747,9 +747,9 @@ namespace CefUnity.Interop
             ThrowIfDisposed();
             unsafe
             {
-                fixed (byte* urlPtr = ToUtf8Null(url))
+                fixed (byte* urlPointer = ToUtf8Null(url))
                 {
-                    return NativeMethods.cef_unity_load_url_blocking(_handle, urlPtr);
+                    return NativeMethods.cef_unity_load_url_blocking(_handle, urlPointer);
                 }
             }
         }
@@ -821,9 +821,9 @@ namespace CefUnity.Interop
             ThrowIfDisposed();
             unsafe
             {
-                fixed (byte* codePtr = ToUtf8Null(code))
+                fixed (byte* codePointer = ToUtf8Null(code))
                 {
-                    return NativeMethods.cef_unity_execute_javascript_blocking(_handle, codePtr);
+                    return NativeMethods.cef_unity_execute_javascript_blocking(_handle, codePointer);
                 }
             }
         }
@@ -838,9 +838,9 @@ namespace CefUnity.Interop
                     return string.Empty;
 
                 var buffer = new byte[required];
-                fixed (byte* ptr = buffer)
+                fixed (byte* pointer = buffer)
                 {
-                    var written = NativeMethods.cef_unity_get_url(_handle, ptr, buffer.Length);
+                    var written = NativeMethods.cef_unity_get_url(_handle, pointer, buffer.Length);
                     if (written <= 1)
                         return string.Empty;
 
@@ -856,10 +856,10 @@ namespace CefUnity.Interop
             if (_disposed) throw new ObjectDisposedException(nameof(Browser));
         }
 
-        private static byte[] ToUtf8Null(string s)
+        private static byte[] ToUtf8Null(string text)
         {
-            var bytes = new byte[Encoding.UTF8.GetByteCount(s) + 1];
-            Encoding.UTF8.GetBytes(s, bytes);
+            var bytes = new byte[Encoding.UTF8.GetByteCount(text) + 1];
+            Encoding.UTF8.GetBytes(text, bytes);
             // bytes[^1] is already 0 (null terminator)
             return bytes;
         }

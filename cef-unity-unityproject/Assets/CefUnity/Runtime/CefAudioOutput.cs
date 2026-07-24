@@ -73,10 +73,10 @@ namespace CefUnity.Runtime
         public float LastPulledPeak { get; private set; }
 
         /// <summary>現在のストリームのサンプリングレート (Hz)。未確定は 0。</summary>
-        public int SourceSampleRate => _srcSampleRate;
+        public int SourceSampleRate => _sourceSampleRate;
 
         /// <summary>現在のストリームのチャネル数。未確定は 0。</summary>
-        public int SourceChannels => _srcChannels;
+        public int SourceChannels => _sourceChannels;
 
         /// <summary>累積アンダーラン (無音埋め) フレーム数。0 以外ならぶつ切り発生。</summary>
         public long UnderrunFrames => _ring?.UnderrunFrames ?? 0;
@@ -94,9 +94,9 @@ namespace CefUnity.Runtime
         // 専用の子 GameObject 上に分離する。
         private CefAudioSink _sink;
 
-        private int _srcSampleRate;
-        private int _srcChannels;
-        private double _baseStep; // srcRate / outRate (出力1フレームあたり進める src フレーム数)
+        private int _sourceSampleRate;
+        private int _sourceChannels;
+        private double _baseStep; // sourceRate / outputRate (出力1フレームあたり進める src フレーム数)
         private bool _streamReady;
 
         private void Awake()
@@ -111,7 +111,7 @@ namespace CefUnity.Runtime
             // フォーマット確定前: ストリーム開始を待つ。
             if (!_streamReady)
             {
-                if (!TryInitStream()) return;
+                if (!TryInitializeStream()) return;
             }
 
             PullFromBrowser();
@@ -120,7 +120,7 @@ namespace CefUnity.Runtime
         }
 
         // 1 秒ごとに音声経路の状態をログ出力する診断 (マスターログフラグ CefLog.Enabled に従う)。
-        private float _diagTimer;
+        private float _diagnosticsTimer;
         private float[] _spectrum;
         private long _lastUnderrun;
         private long _lastOverflow;
@@ -135,31 +135,31 @@ namespace CefUnity.Runtime
         private void LogDiagnostics()
         {
             if (!CefLog.Enabled) return;
-            _diagTimer += Time.unscaledDeltaTime;
-            if (_diagTimer < 1f) return;
-            _diagTimer = 0f;
+            _diagnosticsTimer += Time.unscaledDeltaTime;
+            if (_diagnosticsTimer < 1f) return;
+            _diagnosticsTimer = 0f;
 
             // 出力スペクトルのピーク周波数を求める (Unity 出力 → スピーカー経路の確認)。
             _spectrum ??= new float[1024];
-            float peakFreq = 0f, peakMag = 0f;
+            float peakFrequency = 0f, peakMagnitude = 0f;
             AudioListener.GetSpectrumData(_spectrum, 0, FFTWindow.BlackmanHarris);
-            int n = _spectrum.Length;
-            int outRate = AudioSettings.outputSampleRate;
-            for (int i = 1; i < n; i++)
+            int spectrumLength = _spectrum.Length;
+            int outputRate = AudioSettings.outputSampleRate;
+            for (int binIndex = 1; binIndex < spectrumLength; binIndex++)
             {
-                if (_spectrum[i] > peakMag)
+                if (_spectrum[binIndex] > peakMagnitude)
                 {
-                    peakMag = _spectrum[i];
-                    // bin i の中心周波数 = i * (outRate/2) / n
-                    peakFreq = i * (outRate * 0.5f) / n;
+                    peakMagnitude = _spectrum[binIndex];
+                    // bin binIndex の中心周波数 = binIndex * (outputRate/2) / spectrumLength
+                    peakFrequency = binIndex * (outputRate * 0.5f) / spectrumLength;
                 }
             }
 
             // ----- 遅延・健全性の実測 -----
-            double occFrames = _ring?.OccupancyFrames ?? 0;
-            float ringMs = _srcSampleRate > 0 ? (float)(occFrames / _srcSampleRate * 1000.0) : 0f;
-            float targetMs = (_ring != null && _srcSampleRate > 0)
-                ? (float)_ring.TargetFrames / _srcSampleRate * 1000f
+            double occupancyFrames = _ring?.OccupancyFrames ?? 0;
+            float ringMilliseconds = _sourceSampleRate > 0 ? (float)(occupancyFrames / _sourceSampleRate * 1000.0) : 0f;
+            float targetMilliseconds = (_ring != null && _sourceSampleRate > 0)
+                ? (float)_ring.TargetFrames / _sourceSampleRate * 1000f
                 : 0f;
 
             // 直近 1 秒のアンダーラン / オーバーフロー (= ぶつ切りの直接指標)。
@@ -170,36 +170,36 @@ namespace CefUnity.Runtime
             _lastUnderrun = under;
             _lastOverflow = over;
 
-            // Unity DSP ミキサのバッファリング (= ⑧)。dspLen サンプル × numBuffers 段。
-            AudioSettings.GetDSPBufferSize(out int dspLen, out int dspNum);
-            float dspMs = outRate > 0 ? (float)dspLen * dspNum / outRate * 1000f : 0f;
+            // Unity DSP ミキサのバッファリング (= ⑧)。dspLength サンプル × numBuffers 段。
+            AudioSettings.GetDSPBufferSize(out int dspLength, out int dspNumber);
+            float dspMilliseconds = outputRate > 0 ? (float)dspLength * dspNumber / outputRate * 1000f : 0f;
 
             // メインスレッドのフレーム間隔 (= ④ポーリング周期の実測)。
-            float frameMs = Time.smoothDeltaTime * 1000f;
+            float frameMilliseconds = Time.smoothDeltaTime * 1000f;
 
             // CEF キャプチャバッファ (= ①)。frames_per_buffer=512 固定 (server.rs と要同期)。
-            float cefCaptureMs = _srcSampleRate > 0 ? 512f / _srcSampleRate * 1000f : 0f;
+            float cefCaptureMilliseconds = _sourceSampleRate > 0 ? 512f / _sourceSampleRate * 1000f : 0f;
 
             CefLog.Log(
-                $"[CefAudio] {_srcSampleRate}Hz x{_srcChannels}ch recvFrames={TotalFramesReceived} " +
-                $"rms={LastPulledRms:F3} peak={LastPulledPeak:F3} spec={peakFreq:F0}Hz(m={peakMag:F3})");
+                $"[CefAudio] {_sourceSampleRate}Hz x{_sourceChannels}ch recvFrames={TotalFramesReceived} " +
+                $"rms={LastPulledRms:F3} peak={LastPulledPeak:F3} spec={peakFrequency:F0}Hz(m={peakMagnitude:F3})");
             CefLog.Log(
-                $"[CefAudio-LAT] ringOcc={ringMs:F1}ms (target={targetMs:F1}ms) | " +
+                $"[CefAudio-LAT] ringOcc={ringMilliseconds:F1}ms (target={targetMilliseconds:F1}ms) | " +
                 $"underrun/s={underDelta} overflow/s={overDelta} (total under={under} over={over}) | " +
-                $"frameInterval={frameMs:F1}ms | " +
-                $"dspBuf={dspLen}x{dspNum}={dspMs:F1}ms@{outRate}Hz | " +
-                $"cefCapture={cefCaptureMs:F1}ms | " +
-                $"sum(①④⑤⑧)≈{cefCaptureMs + frameMs + ringMs + dspMs:F1}ms (excl. Unity stream readahead + HW)");
+                $"frameInterval={frameMilliseconds:F1}ms | " +
+                $"dspBuf={dspLength}x{dspNumber}={dspMilliseconds:F1}ms@{outputRate}Hz | " +
+                $"cefCapture={cefCaptureMilliseconds:F1}ms | " +
+                $"sum(①④⑤⑧)≈{cefCaptureMilliseconds + frameMilliseconds + ringMilliseconds + dspMilliseconds:F1}ms (excl. Unity stream readahead + HW)");
 
             // producer (ReadAudio) のバースト性。理想は毎フレーム ~800 frames (16.7ms@48k) で
             // min≒max。min が 0 近く / max が大きく振れるならバースト供給 = 滞留量振動の原因。
             int nonZero = _pullCalls - _pullZero;
-            float avgPull = nonZero > 0 ? (float)_pullFramesSum / nonZero : 0f;
+            float averagePull = nonZero > 0 ? (float)_pullFramesSum / nonZero : 0f;
             int pullMin = _pullMin == int.MaxValue ? 0 : _pullMin;
-            float pullMaxMs = _srcSampleRate > 0 ? _pullMax / (float)_srcSampleRate * 1000f : 0f;
+            float pullMaxMilliseconds = _sourceSampleRate > 0 ? _pullMax / (float)_sourceSampleRate * 1000f : 0f;
             CefLog.Log(
-                $"[CefAudio-PROD] pulls/s={_pullCalls} zero={_pullZero} | framesGot avg={avgPull:F0} " +
-                $"min={pullMin} max={_pullMax} (max={pullMaxMs:F1}ms) | sum={_pullFramesSum} (~{(_srcSampleRate > 0 ? _pullFramesSum / (float)_srcSampleRate * 1000f : 0f):F0}ms/s)");
+                $"[CefAudio-PROD] pulls/s={_pullCalls} zero={_pullZero} | framesGot avg={averagePull:F0} " +
+                $"min={pullMin} max={_pullMax} (max={pullMaxMilliseconds:F1}ms) | sum={_pullFramesSum} (~{(_sourceSampleRate > 0 ? _pullFramesSum / (float)_sourceSampleRate * 1000f : 0f):F0}ms/s)");
             _pullCalls = 0;
             _pullZero = 0;
             _pullFramesSum = 0;
@@ -210,12 +210,12 @@ namespace CefUnity.Runtime
             // 固定なら一定ペースで消費できている。outRms>0 ならミックスへ音声が出ている。
             if (_sink != null)
             {
-                _sink.SnapshotStats(out int pcmCalls, out int pcmFrames, out int pcmMax, out double outSumSq, out long outSamples);
-                float pcmAvg = pcmCalls > 0 ? (float)pcmFrames / pcmCalls : 0f;
-                float outRms = outSamples > 0 ? (float)Math.Sqrt(outSumSq / outSamples) : 0f;
+                _sink.SnapshotStatistics(out int pcmCalls, out int pcmFrames, out int pcmMax, out double outSumSquared, out long outSamples);
+                float pcmAverage = pcmCalls > 0 ? (float)pcmFrames / pcmCalls : 0f;
+                float outRms = outSamples > 0 ? (float)Math.Sqrt(outSumSquared / outSamples) : 0f;
                 CefLog.Log(
-                    $"[CefAudio-CONS] calls/s={pcmCalls} framesOut/s={pcmFrames} (~{(outRate > 0 ? pcmFrames / (float)outRate * 1000f : 0f):F0}ms/s) " +
-                    $"avg={pcmAvg:F0} maxBlock={pcmMax} | outRms={outRms:F3} (ミックスへ加算した音声; 0なら出力経路断)");
+                    $"[CefAudio-CONS] calls/s={pcmCalls} framesOut/s={pcmFrames} (~{(outputRate > 0 ? pcmFrames / (float)outputRate * 1000f : 0f):F0}ms/s) " +
+                    $"avg={pcmAverage:F0} maxBlock={pcmMax} | outRms={outRms:F3} (ミックスへ加算した音声; 0なら出力経路断)");
             }
         }
 
@@ -223,7 +223,7 @@ namespace CefUnity.Runtime
         ///     ストリームフォーマットが確定したら AudioClip を生成して再生開始する。
         ///     成功したら true。
         /// </summary>
-        private bool TryInitStream()
+        private bool TryInitializeStream()
         {
             bool active;
             int sampleRate, channels;
@@ -238,29 +238,29 @@ namespace CefUnity.Runtime
 
             if (!active || sampleRate <= 0 || channels <= 0) return false;
 
-            int outRate = AudioSettings.outputSampleRate;
-            if (outRate <= 0) outRate = sampleRate;
+            int outputRate = AudioSettings.outputSampleRate;
+            if (outputRate <= 0) outputRate = sampleRate;
 
-            _srcSampleRate = sampleRate;
-            _srcChannels = channels;
-            _baseStep = (double)sampleRate / outRate;
+            _sourceSampleRate = sampleRate;
+            _sourceChannels = channels;
+            _baseStep = (double)sampleRate / outputRate;
 
             // レート変換つきリングを確保。容量 = _bufferSeconds、目標 = _targetLatencySeconds。
-            int capFrames = Mathf.Max(2, Mathf.CeilToInt(_bufferSeconds * sampleRate));
-            int targetFrames = Mathf.Clamp(Mathf.CeilToInt(_targetLatencySeconds * sampleRate), 1, capFrames - 1);
-            _ring = new CefAudioRing(capFrames, channels, targetFrames, _maxRateAdjust);
+            int capacityFrames = Mathf.Max(2, Mathf.CeilToInt(_bufferSeconds * sampleRate));
+            int targetFrames = Mathf.Clamp(Mathf.CeilToInt(_targetLatencySeconds * sampleRate), 1, capacityFrames - 1);
+            _ring = new CefAudioRing(capacityFrames, channels, targetFrames, _maxRateAdjust);
 
             // 消費は専用子 GameObject 上の CefAudioSink (OnAudioFilterRead) が行う。
             // AudioListener を持つ本 GameObject 上に OnAudioFilterRead を置くとバインド先が
             // 非決定的になり動作が不安定になるため、AudioSource とだけ同居する子に分離する。
             if (_sink == null)
             {
-                var go = new GameObject("CefAudioSink");
-                go.transform.SetParent(transform, false);
-                _sink = go.AddComponent<CefAudioSink>();
+                var sinkGameObject = new GameObject("CefAudioSink");
+                sinkGameObject.transform.SetParent(transform, false);
+                _sink = sinkGameObject.AddComponent<CefAudioSink>();
             }
 
-            _sink.Configure(_ring, _baseStep, channels, outRate, MaxPullFrames);
+            _sink.Configure(_ring, _baseStep, channels, outputRate, MaxPullFrames);
             _streamReady = true;
             return true;
         }
@@ -271,10 +271,10 @@ namespace CefUnity.Runtime
         private void PullFromBrowser()
         {
             int got;
-            int ch;
+            int channels;
             try
             {
-                got = Browser.ReadAudio(_pullScratch, MaxPullFrames, out ch);
+                got = Browser.ReadAudio(_pullScratch, MaxPullFrames, out channels);
             }
             catch (Exception)
             {
@@ -294,7 +294,7 @@ namespace CefUnity.Runtime
             if (got <= 0) return;
 
             // ストリームのチャネル数が変わったら作り直す (稀)。
-            if (ch != _srcChannels && ch > 0)
+            if (channels != _sourceChannels && channels > 0)
             {
                 _streamReady = false;
                 _ring = null;
@@ -302,21 +302,21 @@ namespace CefUnity.Runtime
                 return;
             }
 
-            int samples = got * _srcChannels;
+            int samples = got * _sourceChannels;
 
             // 診断: 受信量と直近 RMS/ピークを更新。
             TotalFramesReceived += got;
-            double sumSq = 0.0;
+            double sumSquared = 0.0;
             float peak = 0f;
-            for (int i = 0; i < samples; i++)
+            for (int sampleIndex = 0; sampleIndex < samples; sampleIndex++)
             {
-                float s = _pullScratch[i];
-                sumSq += (double)s * s;
-                float a = s < 0f ? -s : s;
-                if (a > peak) peak = a;
+                float sample = _pullScratch[sampleIndex];
+                sumSquared += (double)sample * sample;
+                float absoluteValue = sample < 0f ? -sample : sample;
+                if (absoluteValue > peak) peak = absoluteValue;
             }
 
-            LastPulledRms = samples > 0 ? (float)Math.Sqrt(sumSq / samples) : 0f;
+            LastPulledRms = samples > 0 ? (float)Math.Sqrt(sumSquared / samples) : 0f;
             LastPulledPeak = peak;
 
             _ring?.Write(_pullScratch, 0, got);
