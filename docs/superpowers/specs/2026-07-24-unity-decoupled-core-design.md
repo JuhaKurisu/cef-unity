@@ -18,21 +18,23 @@
         ┌────────── CefUnity.Core (純 .NET, netstandard2.1, UnityEngine 禁止) ──────────┐
         │  Interop(P/Invoke 一本化)   ScrollSmoother / Resampler / Pipeline / Event    │
         │  CefZeroFramePacer   CefAudioRing   ScrollReplay(ロジック)                    │
-        │  ── ポート(interface)──  ILogSink(新規)  IScrollEventSource(既存)  IAudioSink(既存) │
+        │  ── ポート(interface)──  IScrollEventSource(既存・移設)                        │
         └───────────▲───────────────────────────────────────────────▲──────────────────┘
                     │ 注入(adapter)                                  │ 注入(adapter)
    ┌────────────────┴──────────────────┐             ┌───────────────┴───────────────────┐
    │ Unity(UnityEngine 参照, Core.dll 消費)│             │ CefUnity.Harness(Console, net10)  │
    │  MonoBehaviour ホスト(旧 Sample)   │             │  ヘッドレス擬似 Unity ループ        │
-   │  UnityLogSink → Debug.Log           │             │  ConsoleLogSink / 録画リプレイ源     │
-   │  Texture2D アップロード / Unity 音声  │             │  PPM 出力 / スクリプト注入           │
-   │  Unity Input → IScrollEventSource   │             └───────────────┬───────────────────┘
-   │  CefKeyboardMapper(UnityEngine.KeyCode)│           ┌──────────────┴───────────────────┐
-   └─────────────────────────────────────┘             │ CefUnity.Tests(NUnit, net10, 60件)│
-                                                        └───────────────────────────────────┘
+   │  CefLog → Debug.Log(残置)          │             │  録画リプレイ源(IScrollEventSource) │
+   │  CefAudioSink/Output/NativeAudio    │             │  PPM 出力 / スクリプト注入           │
+   │  Texture2D アップロード              │             └───────────────┬───────────────────┘
+   │  Unity Input → IScrollEventSource   │           ┌─────────────────┴───────────────────┐
+   │  CefKeyboardMapper(UnityEngine.KeyCode)│         │ CefUnity.Tests(NUnit, net10, 60件)│
+   └─────────────────────────────────────┘           └───────────────────────────────────┘
 ```
 
 **設計原則**: コアは Unity の存在を知らない。純度は `asmdef` の `noEngineReferences: true` 相当を **コアには適用しない**(コアは Unity プロジェクト外の .NET ライブラリなのでそもそも UnityEngine を参照できない)。Unity 側で誤って UnityEngine 依存をコアへ持ち込むことは、コアが独立 .csproj であるため構造的に不可能。
+
+**名前空間**: Core は Unity 側の既存名前空間 `CefUnity`(NativeMethods)/ `CefUnity.Interop`(Browser・CefRuntime)/ `CefUnity.Runtime`(スクロール・音声リング等)を**そのまま採用**する。これにより Unity 消費側の `using` 変更が最小化される(名前空間はアセンブリを跨げるので、`CefUnity.Runtime` が Core.dll と Unity asmdef に分かれても問題ない。型名の重複だけ避ける)。Harness/Tests は `using Interop;` を `using CefUnity.Interop;` に更新する。
 
 ## 3. リポジトリ構成(after)
 
@@ -44,9 +46,8 @@ core/
       Scroll/   (ScrollSmoother, CefZeroFramePacer)
       ScrollInput/ (ScrollInputEvent, ScrollResampler, ScrollInputPipeline,
                     IScrollEventSource, MacNativeScrollSource)
-      Audio/    (CefAudioRing, IAudioSink)
+      Audio/    (CefAudioRing)
       Replay/   (ScrollReplay ロジック — Editor から移設)
-      Ports/    (ILogSink, CefLog ファサード)
   CefUnity.Harness/CefUnity.Harness.csproj  ← net10・擬似 Unity ループ・PPM・録画リプレイ
   CefUnity.Tests/CefUnity.Tests.csproj      ← net10・NUnit・60 テスト(dotnet test)
   CefUnity.sln
@@ -55,7 +56,7 @@ cef-unity-unityproject/Assets/CefUnity/
   Plugins/CefUnity.Core.dll (+ .meta)    ← 消費物(LFS コミット)
   Plugins/osx-arm64/{libcef_unity_rust.dylib, cef-unity-server.app}   ← 案B で Interop から移設
   Plugins/win-x64/{libcef.dll, cef-unity-server.exe, …}               ← 案B で Interop から移設
-  Unity/    (MonoBehaviour ホスト=旧 CefUnityBrowserSample, UnityLogSink,
+  Runtime/  (Unity 残置: CefUnityBrowserSample[MonoBehaviour], CefLog,
              CefKeyboardMapper, CefAudioOutput/Sink/NativeAudio, Texture 転送)
   Editor/   (ScrollReplay.Run 薄ラッパ, CefQuickBuild, CefFpsMonitorWindow, CefBuildPostProcessor)
 ```
@@ -70,23 +71,24 @@ cef-unity-unityproject/Assets/CefUnity/
 | `Runtime/ScrollInput/*`(`IScrollEventSource` 含む) | **Core** | ロジック無改変 |
 | `Interop/*`(Unity 側と `cef-unity-csharp/` 側の**二重を1本化**) | **Core** | `[DllImport("cef_unity_rust")]`。§6 の `#if` 対処を付帯 |
 | `Editor/ScrollReplay.cs` の**ロジック部** | **Core/Replay** | Unity 側は batchmode `Run()` 薄ラッパのみ残置(`CefUnity.Core` を参照) |
-| `Runtime/CefLog.cs`(`Debug.Log` ラッパ) | Core=`ILogSink` + 静的ファサード / Unity=`UnityLogSink` | ログ出力を差込化 |
+| `Runtime/CefAudioRing.cs`(`using System` のみ) | **Core** | ロジック無改変。単体テスト対象 |
+| `Runtime/CefLog.cs`(`Debug.Log` ラッパ) | **Unity 側に残置** | Core へ移す純ロジックは CefLog を呼ばない(呼ぶのは Unity 側4ファイルのみ)。logging ポート新設は不要 |
 | `Runtime/CefKeyboardMapper.cs`(`UnityEngine.KeyCode` 使用) | **Unity 側に残置** | 本質的に Unity 入力アダプタ。Core は `CefKeyCode`/`CefKeyCodes` を公開 |
-| `Runtime/CefUnityBrowserSample.cs`(MonoBehaviour), `CefAudioOutput.cs`, `CefAudioSink.cs`(具象), `CefNativeAudio.cs` | **Unity 側に残置** | Core.dll を参照して駆動。ポートの Unity 実装 |
+| `Runtime/CefUnityBrowserSample.cs`(MonoBehaviour), `CefAudioOutput.cs`, `CefAudioSink.cs`(MonoBehaviour), `CefNativeAudio.cs` | **Unity 側に残置** | Core.dll を参照して駆動 |
 | **ネイティブ Plugins**(`Interop/Plugins/{osx-arm64,win-x64}`) | **`Assets/CefUnity/Plugins/` へ移設(案B)** | `.meta` ごと移動して GUID/プラットフォーム設定を保持 |
 
 ## 5. 注入ポート(= Unity 固有機能の差込口)
 
-新設する抽象は実質 **`ILogSink` 1本だけ**。他は既存 interface か引数注入で足りる。
+調査の結果、**新設する抽象はゼロ**。Core が実際に必要とする差込口は既存の `IScrollEventSource` 1本のみで、時間は既に引数注入されている。ログ・音声出力の抽象は Core 側に不要と判明した(下表)。
 
-| ポート | 種別 | Unity アダプタ | Harness アダプタ |
+| 差込口 | 種別 | Unity アダプタ | Harness アダプタ |
 |---|---|---|---|
-| `IScrollEventSource` | 既存 | `MacNativeScrollSource` / Unity Input フォールバック | 録画/スクリプト源 |
-| `IAudioSink` | 既存 | AudioSource / native 出力 | 破棄 or WAV 書き出し |
-| `ILogSink` | **新規** | `UnityLogSink` → `Debug.Log/LogWarning/LogError` | `ConsoleLogSink` → `Console` |
-| 時間 `dt` | 引数注入(既存) | `Time.deltaTime` を渡す | 固定 16.67ms or 実時計 |
+| `IScrollEventSource` | 既存 interface(Core へ移設) | `MacNativeScrollSource` / Unity Input フォールバック | 録画/スクリプト源 |
+| 時間 `dt` | 引数注入(既存 `Tick(dt,…)`) | `Time.deltaTime` を渡す | 固定 16.67ms or 実時計 |
 
-`CefLog` は静的ファサードのまま残し、内部の実出力先を注入された `ILogSink` に委譲する(既定は no-op)。呼び出し側コードの変更を最小化する。
+**ログ**: Core へ移す純ロジック(ScrollSmoother/Resampler/Pipeline/Pacer/AudioRing)は `CefLog` を一切呼ばない(呼ぶのは Unity 側の CefNativeAudio/CefAudioOutput/CefAudioSink/CefUnityBrowserSample のみ)。よって `CefLog` は Unity 側にそのまま残し、Core に logging ポートは設けない。
+
+**音声**: `CefAudioSink` は `MonoBehaviour`(AudioSource / `OnAudioFilterRead` 依存)であり interface ではない。Unity 側にそのまま残す。Core へ移すのは純粋な `CefAudioRing`(リングバッファ本体、`using System` のみ)だけで、これは sink に依存しない。よって `IAudioSink` 抽象は不要。
 
 ## 6. Interop の DLL 化(削除可能性の担保)
 
