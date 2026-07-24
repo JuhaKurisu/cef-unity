@@ -1,6 +1,5 @@
 using System.Globalization;
 using NUnit.Framework;
-using UnityEngine;
 
 namespace CefUnity.Runtime.Tests
 {
@@ -23,9 +22,8 @@ namespace CefUnity.Runtime.Tests
             // 発生しており Tick 自体が止まっている (橋渡しの出番がない)。nozerowait は
             // フレームが健全 (tick 間隔 >25ms = 2.2%) なまま慣性中の入力欠落 18 回を
             // 含み、橋渡しの効果を分離検証できる。
-            var path = System.IO.Path.GetFullPath(
-                System.IO.Path.Combine(Application.dataPath, "..", "..",
-                    "test-results/scroll-drought-2026-07-23/cef_scroll_events_nozerowait.csv"));
+            var path = System.IO.Path.Combine(
+                System.AppContext.BaseDirectory, "fixtures", "cef_scroll_events_nozerowait.csv");
             if (!System.IO.File.Exists(path))
                 Assert.Ignore($"録画が無い環境ではスキップ: {path}");
 
