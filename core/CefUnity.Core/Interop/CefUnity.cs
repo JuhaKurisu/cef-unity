@@ -537,13 +537,11 @@ namespace CefUnity.Interop
         /// </summary>
         public static bool IsAcceleratedConnected()
         {
-#if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
-            return IsIOSurfaceConnected();
-#elif UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
-            return IsD3D11Connected() || IsD3D12Connected();
-#else
+            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.OSX))
+                return IsIOSurfaceConnected();
+            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+                return IsD3D11Connected() || IsD3D12Connected();
             return false;
-#endif
         }
 
         // ----- Audio (CEF → Unity PCM ストリーム) -----
