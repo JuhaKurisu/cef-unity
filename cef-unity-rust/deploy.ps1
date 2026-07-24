@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ScriptDir
 
-$Dest = Join-Path $ScriptDir '..\cef-unity-unityproject\Assets\CefUnity\Interop\Plugins\win-x64'
+$Dest = Join-Path $ScriptDir '..\cef-unity-unityproject\Assets\CefUnity\Plugins\win-x64'
 $Dest = [System.IO.Path]::GetFullPath($Dest)
 
 Write-Host "[deploy] cargo build --release"

@@ -8,7 +8,7 @@
 //! が申告サイズにそのまま一致することを検証する。
 //!
 //! 実行 (バンドル済みサーバー必須・CEF は同時 1 インスタンスのみ):
-//!   CEF_SERVER_APP=../cef-unity-unityproject/Assets/CefUnity/Interop/Plugins/osx-arm64/cef-unity-server.app \
+//!   CEF_SERVER_APP=../cef-unity-unityproject/Assets/CefUnity/Plugins/osx-arm64/cef-unity-server.app \
 //!     cargo test -p cef-unity-server --test oversize_viewport -- --ignored
 
 #![cfg(target_os = "macos")]
@@ -101,7 +101,7 @@ fn find_server_app() -> Option<PathBuf> {
         workspace_root.join("target/debug/test-bundle/cef-unity-server.app"),
         workspace_root
             .parent()?
-            .join("cef-unity-unityproject/Assets/CefUnity/Interop/Plugins/osx-arm64/cef-unity-server.app"),
+            .join("cef-unity-unityproject/Assets/CefUnity/Plugins/osx-arm64/cef-unity-server.app"),
     ];
     candidates.into_iter().find(|p| p.exists())
 }

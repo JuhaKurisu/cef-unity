@@ -1,4 +1,0 @@
-<Solution>
-  <Project Path="Interop\Interop.csproj" Type="Classic C#" />
-  <Project Path="Sandbox\Sandbox.csproj" Type="Classic C#" />
-</Solution>

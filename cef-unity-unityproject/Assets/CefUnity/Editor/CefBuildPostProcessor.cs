@@ -44,7 +44,7 @@ namespace CefUnity.Editor
 
             var src = Path.Combine(
                 Application.dataPath,
-                "CefUnity", "Interop", "Plugins", "osx-arm64", "cef-unity-server.app");
+                "CefUnity", "Plugins", "osx-arm64", "cef-unity-server.app");
 
             if (!Directory.Exists(src))
             {
@@ -89,7 +89,7 @@ namespace CefUnity.Editor
 
             var src = Path.Combine(
                 Application.dataPath,
-                "CefUnity", "Interop", "Plugins", "win-x64");
+                "CefUnity", "Plugins", "win-x64");
 
             if (!Directory.Exists(src))
             {
