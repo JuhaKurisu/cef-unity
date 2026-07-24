@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RustProjectDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\cef-unity-rust'))</RustProjectDir>
+    <RustTargetDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\cef-unity-rust\target\debug'))</RustTargetDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\CefUnity.Core\CefUnity.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="$(RustTargetDir)/libcef_unity_rust.dylib"
+          CopyToOutputDirectory="PreserveNewest" Link="libcef_unity_rust.dylib" />
+  </ItemGroup>
+  <!-- cef-unity-server.app bundle を出力先に用意(旧 Sandbox と同じ) -->
+  <Target Name="CopyServerApp" AfterTargets="Build">
+    <Exec Command="bash '$(RustProjectDir)/build-server-sandbox.sh' '$(OutputPath)'" />
+  </Target>
+</Project>
