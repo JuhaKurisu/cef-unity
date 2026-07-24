@@ -6,6 +6,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>CefUnity.Core</AssemblyName>
     <RootNamespace>CefUnity</RootNamespace>
+    <DefineConstants>$(DefineConstants);CEF_UNITY_DEV_TOOLS</DefineConstants>
   </PropertyGroup>
   <Target Name="CopyToUnityPlugins" AfterTargets="Build" Condition="'$(Configuration)'=='Release'">
     <Copy SourceFiles="$(OutputPath)CefUnity.Core.dll"

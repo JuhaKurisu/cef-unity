@@ -72,28 +72,28 @@ namespace CefUnity.Runtime
         public NativeScrollSourceStart StartNativeSource(out Exception error)
         {
             error = null;
-#if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
-            var src = new MacNativeScrollSource();
-            try
+            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.OSX))
             {
-                if (src.Start())
+                var src = new MacNativeScrollSource();
+                try
                 {
-                    _source = src;
-                    return NativeScrollSourceStart.Started;
+                    if (src.Start())
+                    {
+                        _source = src;
+                        return NativeScrollSourceStart.Started;
+                    }
                 }
-            }
-            catch (Exception e)
-            {
-                // dylib 不在等の P/Invoke 例外は回復可能 — フォールバックに落とす。
-                error = e;
+                catch (Exception e)
+                {
+                    // dylib 不在等の P/Invoke 例外は回復可能 — フォールバックに落とす。
+                    error = e;
+                    src.Dispose();
+                    return NativeScrollSourceStart.Failed;
+                }
                 src.Dispose();
-                return NativeScrollSourceStart.Failed;
+                return NativeScrollSourceStart.Unavailable;
             }
-            src.Dispose();
-            return NativeScrollSourceStart.Unavailable;
-#else
             return NativeScrollSourceStart.NotSupported;
-#endif
         }
 
         /// <summary>
@@ -129,7 +129,7 @@ namespace CefUnity.Runtime
             for (var i = 0; i < n; i++)
             {
                 ref var e = ref _eventBuf[i];
-#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
+#if CEF_UNITY_DEV_TOOLS
                 RecordEvent(in e, overBrowser, resolutionScale);
 #endif
                 if (!overBrowser) continue;
@@ -163,7 +163,7 @@ namespace CefUnity.Runtime
             // Tick と録画で同一の now を使う (リプレイ照合の系統誤差防止)。
             var now = _source.Now;
             _resampler.Tick(now, out dx, out dy);
-#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
+#if CEF_UNITY_DEV_TOOLS
             RecordTick(now, dx, dy);
 #endif
             return true;
@@ -190,13 +190,13 @@ namespace CefUnity.Runtime
         {
             _source?.Dispose();
             _source = null;
-#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
+#if CEF_UNITY_DEV_TOOLS
             // 末尾 <30 行 (ジェスチャ終端が乗りやすい) を失わないための最終フラッシュ。
             FlushRecording();
 #endif
         }
 
-#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)
+#if CEF_UNITY_DEV_TOOLS
         // --- 生イベント録画 (cef_scroll_record): オフラインリプレイ検証用 ---
         // 形式 ($TMPDIR/cef_scroll_events.csv に追記):
         //   S,resolutionScale                     … scale 変化時 (リプレイ側で乗算する)
