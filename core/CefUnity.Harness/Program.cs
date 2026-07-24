@@ -25,5 +25,13 @@ if (cmd == "smoke")
     CefRuntime.Shutdown();
     return frames > 0 ? 0 : 1;
 }
+if (cmd == "replay")
+{
+    if (args.Length < 2) { Console.Error.WriteLine("usage: replay <recording-csv>"); return 2; }
+    var result = CefUnity.Runtime.ScrollReplayRunner.Run(File.ReadLines(args[1]));
+    if (!result.Ok) { Console.Error.WriteLine($"REPLAY FAIL: {result.Error}"); return 1; }
+    Console.WriteLine($"REPLAY ok events={result.Events} ticks={result.Ticks} mismatches={result.Mismatches}/{result.Ticks}");
+    return 0;
+}
 Console.Error.WriteLine($"unknown command: {cmd}");
 return 2;
