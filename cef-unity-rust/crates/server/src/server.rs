@@ -875,6 +875,14 @@ fn server_flush_enabled() -> bool {
     *V.get_or_init(|| !std::env::temp_dir().join("cef_no_server_flush").exists())
 }
 
+/// 計測用トグル: `<temp_dir>/cef_no_streak_cooldown` が在ると抑止トライアルの
+/// クールダウン (SUPPRESSION_RETRY_FRAMES) を無効化し旧挙動 (常時トライアル =
+/// 低速ドラッグで 4 フレーム周期の発振) に戻す。A/B 比較用。
+fn streak_cooldown_enabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| !std::env::temp_dir().join("cef_no_streak_cooldown").exists())
+}
+
 pub struct CefServer {
     browsers: HashMap<u32, BrowserState>,
     next_browser_id: AtomicU32,
@@ -892,7 +900,21 @@ pub struct CefServer {
     /// 「paint が発生したフレーム」の連続数。スクロールや rAF アニメーション中は
     /// 毎フレーム damage が出るためこの値が伸び続ける。
     damage_streak: u32,
+    /// 前回の BF#1 が「streak 抑止で flush なし」だったか (抑止トライアルの成否判定用)。
+    last_bf1_suppressed: bool,
+    /// 抑止トライアル失敗後のクールダウン残フレーム数。0 なら抑止を試してよい。
+    suppression_cooldown: u32,
 }
+
+/// 抑止トライアル失敗 (抑止フレームで paint が来ない = BF#1-only パイプラインが
+/// 流れていない) 後に flush 常用へ戻す期間 (フレーム数 ≒ 1 秒)。
+/// 低速の指ドラッグ帯域では抑止に定着せず 0F↔1F を 4 フレーム周期で発振し、遷移の
+/// たびに 1 paint 落ちる (実測 2026-07-23 build: paint パターン 1,1,1,0 の規則周期 =
+/// 低速スクロールのガタつきの正体)。この帯域は damage が軽く flush 常用でも GPU は
+/// 飽和しないため、失敗を検出したら試行を 1 秒に 1 回まで抑える。抑止が成立する帯域
+/// (高速スクロール/momentum = 52fps 回帰の実測があった保護領域) ではトライアルが
+/// 即座に成功しクールダウンは発生しない = 従来挙動と完全に同一。
+const SUPPRESSION_RETRY_FRAMES: u32 = 60;
 
 impl CefServer {
     pub fn new(client_pid: Option<u32>, use_gpu: bool) -> Self {
@@ -905,6 +927,8 @@ impl CefServer {
             pending_flush: None,
             paints_at_last_bf1: 0,
             damage_streak: 0,
+            last_bf1_suppressed: false,
+            suppression_cooldown: 0,
         }
     }
 
@@ -1626,9 +1650,22 @@ impl CefServer {
             0
         };
 
+        // 抑止トライアルの失敗検出 (SUPPRESSION_RETRY_FRAMES の定義コメント参照):
+        // 前フレームを抑止したのに paint が来なかった = BF#1-only パイプラインが
+        // 流れていない帯域。クールダウンを置いて flush 常用に戻す。
+        // 開発トグル cef_no_streak_cooldown で旧挙動 (常時トライアル) に戻せる。
+        if self.last_bf1_suppressed && !painted_last_frame && streak_cooldown_enabled() {
+            self.suppression_cooldown = SUPPRESSION_RETRY_FRAMES;
+        } else if self.suppression_cooldown > 0 {
+            self.suppression_cooldown -= 1;
+        }
+        let suppress = self.damage_streak >= DAMAGE_STREAK_SUPPRESS_FLUSH
+            && self.suppression_cooldown == 0;
+        self.last_bf1_suppressed = suppress && server_flush_enabled();
+
         if self.issue_begin_frame(browser_id, unity_frame)
             && server_flush_enabled()
-            && self.damage_streak < DAMAGE_STREAK_SUPPRESS_FLUSH
+            && !suppress
         {
             // flush を予約 (tick で +3ms, +6ms に発行)。
             self.pending_flush = Some(PendingFlush {
