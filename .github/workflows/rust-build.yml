@@ -9,10 +9,12 @@ on:
     paths:
       - "cef-unity-rust/**"
       - ".github/workflows/rust-build.yml"
+      - "core/**"
   pull_request:
     paths:
       - "cef-unity-rust/**"
       - ".github/workflows/rust-build.yml"
+      - "core/**"
   workflow_dispatch:
 
 concurrency:
@@ -41,13 +43,20 @@ jobs:
         run: cargo test --workspace --lib --release || cargo test --workspace --lib --release
 
       # 既存スクリプト再利用: release ビルド + server.app バンドル + ad-hoc 署名 +
-      # cef-unity-unityproject/Assets/CefUnity/Interop/Plugins/osx-arm64/ へ配置
+      # cef-unity-unityproject/Assets/CefUnity/Plugins/osx-arm64/ へ配置
       - name: Build and bundle (deploy.sh)
         working-directory: cef-unity-rust
         run: ./deploy.sh
 
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Core unit tests (no Unity)
+        run: dotnet test core/CefUnity.Tests -c Release --logger "console;verbosity=minimal"
+
       - name: Zip artifact
-        working-directory: cef-unity-unityproject/Assets/CefUnity/Interop/Plugins
+        working-directory: cef-unity-unityproject/Assets/CefUnity/Plugins
         run: zip -qry "$GITHUB_WORKSPACE/cef-unity-macos-arm64.zip" osx-arm64
 
       - uses: actions/upload-artifact@v4
@@ -155,16 +164,25 @@ jobs:
         with:
           path: artifacts
 
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build & stage CefUnity.Core.dll
+        run: |
+          bash core/build-core.sh
+          git add cef-unity-unityproject/Assets/CefUnity/Plugins/CefUnity.Core.dll
+
       - name: Update Plugins (mac)
         run: |
           unzip -oq artifacts/cef-unity-macos-arm64/cef-unity-macos-arm64.zip -d /tmp/mac
           # .meta は Unity 管理なので保持 (--delete は excluded を消さない)
           rsync -a --delete --exclude '*.meta' /tmp/mac/osx-arm64/ \
-            cef-unity-unityproject/Assets/CefUnity/Interop/Plugins/osx-arm64/
+            cef-unity-unityproject/Assets/CefUnity/Plugins/osx-arm64/
 
       - name: Update Plugins (win, フラット展開)
         run: |
-          WD=cef-unity-unityproject/Assets/CefUnity/Interop/Plugins/win-x64
+          WD=cef-unity-unityproject/Assets/CefUnity/Plugins/win-x64
           SRC=artifacts/cef-unity-windows-x64
           cp "$SRC/cef_unity_rust.dll" "$SRC/cef-unity-server.exe" "$SRC/cef-unity-rust-helper.exe" "$WD/"
           rsync -a --exclude archive.json "$SRC/cef/" "$WD/"
@@ -174,7 +192,7 @@ jobs:
           MISSING=0
           while IFS= read -r f; do
             if [ ! -f "$f.meta" ]; then echo "META なし: $f"; MISSING=1; fi
-          done < <(find cef-unity-unityproject/Assets/CefUnity/Interop/Plugins -type f ! -name '*.meta')
+          done < <(find cef-unity-unityproject/Assets/CefUnity/Plugins -type f ! -name '*.meta')
           [ "$MISSING" = 0 ] && echo "全ファイルに .meta あり" || echo "(警告のみ — コミットは続行)"
 
       - name: Commit and push via LFS
@@ -182,7 +200,7 @@ jobs:
           git config user.name "Juha"
           git config user.email "juhasapps@gmail.com"
           git config lfs.url "${{ secrets.LFS_URL }}"
-          git add cef-unity-unityproject/Assets/CefUnity/Interop/Plugins
+          git add cef-unity-unityproject/Assets/CefUnity/Plugins
           if git diff --staged --quiet; then
             echo "変更なし — コミットをスキップ"
           else
