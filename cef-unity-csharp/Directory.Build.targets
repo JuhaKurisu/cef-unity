@@ -1,3 +1,0 @@
-<Project>
-    <Import Project="Interop/CefUnity.targets" />
-</Project>
