@@ -30,7 +30,7 @@ FFI 関数の追加・変更時は以下の **両方** を更新する:
 bash deploy.sh
 ```
 
-成果物は `cef-unity-unityproject/Assets/CefUnity/Interop/Plugins/osx-arm64/cef-unity-server.app` に配置される。
+成果物は `cef-unity-unityproject/Assets/CefUnity/Plugins/osx-arm64/cef-unity-server.app` に配置される。
 
 #### Windows (x86_64)
 
@@ -47,7 +47,7 @@ Visual Studio Build Tools 2022 がある場合は VS Developer PowerShell から
 .\deploy.ps1
 ```
 
-成果物は `cef-unity-unityproject/Assets/CefUnity/Interop/Plugins/win-x64/` にフラット配置される
+成果物は `cef-unity-unityproject/Assets/CefUnity/Plugins/win-x64/` にフラット配置される
 (`cef_unity_rust.dll`, `cef-unity-server.exe`, `cef-unity-rust-helper.exe`, `libcef.dll`, 各種 `.pak` / `.dat` / `.bin`, `locales/`)。
 
 Windows ではゼロコピー GPU 経路 (IOSurface/Mach/Metal) は無効で、software paint (共有メモリ経由の BGRA 転送) で動作する。
