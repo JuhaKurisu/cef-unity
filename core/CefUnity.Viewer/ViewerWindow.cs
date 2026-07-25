@@ -28,12 +28,14 @@ namespace CefUnity.Viewer
         private double _elapsedSeconds;
         private int _lastSentDeltaY;
         private int _lastClickCount = 1;
+        private readonly CefUnity.Runtime.ScrollReplaySource? _replaySource;
 
-        public ViewerWindow(ViewerOptions options, CefFrameSource frameSource, ScrollInputMatrix scrollMatrix)
+        public ViewerWindow(ViewerOptions options, CefFrameSource frameSource, ScrollInputMatrix scrollMatrix, CefUnity.Runtime.ScrollReplaySource? replaySource = null)
         {
             _options = options;
             _frameSource = frameSource;
             _scrollMatrix = scrollMatrix;
+            _replaySource = replaySource;
             SdlWindowing.Use();
             _window = SilkWindow.Create(WindowOptions.Default with
             {
@@ -112,6 +114,7 @@ namespace CefUnity.Viewer
                 if (!_firstFrameShown)
                 {
                     _firstFrameShown = true;
+                    _replaySource?.Start();
                     UpdateTitle();
                 }
             }

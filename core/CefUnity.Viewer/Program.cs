@@ -20,10 +20,11 @@ try
 {
     using var frameSource = new CefFrameSource(viewerOptions.Width, viewerOptions.Height, viewerOptions.Url);
     using var scrollMatrix = new ScrollInputMatrix();
+    CefUnity.Runtime.ScrollReplaySource? replaySource = null;
     if (viewerOptions.ReplayPath != null)
     {
-        var replaySource = new ScrollReplaySource(File.ReadLines(viewerOptions.ReplayPath));
-        if (!replaySource.Start())
+        replaySource = new ScrollReplaySource(File.ReadLines(viewerOptions.ReplayPath));
+        if (replaySource.TotalEvents == 0)
         {
             Console.Error.WriteLine($"replay: {viewerOptions.ReplayPath} に over=1 の E 行がない");
             return 2;
@@ -31,7 +32,7 @@ try
         Console.WriteLine($"replay: {replaySource.TotalEvents} events");
         scrollMatrix.AttachSource(replaySource);
     }
-    using var viewerWindow = new ViewerWindow(viewerOptions, frameSource, scrollMatrix);
+    using var viewerWindow = new ViewerWindow(viewerOptions, frameSource, scrollMatrix, replaySource);
     viewerWindow.Run();
 }
 catch (Exception exception)
