@@ -26,6 +26,7 @@ namespace CefUnity.Viewer
         private int _mouseY;
         private double _elapsedSeconds;
         private int _lastSentDeltaY;
+        private int _lastClickCount = 1;
 
         public ViewerWindow(ViewerOptions options, CefFrameSource frameSource, ScrollInputMatrix scrollMatrix)
         {
@@ -48,12 +49,19 @@ namespace CefUnity.Viewer
             _renderer = new MetalFrameRenderer(sdl);
             _window.Load += OnLoad;
             _window.Render += OnRender;
+            _window.Resize += OnWindowResize;
         }
 
         public void Run() => _window.Run();
 
         private void OnLoad()
         {
+            // SDL は生成後に Retina スケーリングやウィンドウ保存サイズを適用することがあるため
+            // Load コールバック内で明示的にサイズを再設定する (Defect A 修正)。
+            _window.Size = new Vector2D<int>(_options.Width, _options.Height);
+            // 実際のウィンドウサイズが options と異なる場合はブラウザ側を合わせる (Defect B 修正)。
+            if (_window.Size.X != _options.Width || _window.Size.Y != _options.Height)
+                _frameSource.Resize(_window.Size.X, _window.Size.Y);
             _renderer.Initialize(_window);
             _input = _window.CreateInput();
             _mouse = _input.Mice.Count > 0 ? _input.Mice[0] : null;
@@ -121,6 +129,12 @@ namespace CefUnity.Viewer
             _window.Dispose();
         }
 
+        private void OnWindowResize(Vector2D<int> newSize)
+        {
+            if (newSize.X <= 0 || newSize.Y <= 0) return;
+            _frameSource.Resize(newSize.X, newSize.Y);
+        }
+
         private void OnMouseMove(IMouse mouse, System.Numerics.Vector2 position)
         {
             _mouseX = (int)position.X;
@@ -137,13 +151,13 @@ namespace CefUnity.Viewer
 
         private void OnMouseDown(IMouse mouse, Silk.NET.Input.MouseButton button)
         {
-            var clickCount = _clickCounter.OnMouseDown(_elapsedSeconds, _mouseX, _mouseY);
-            _frameSource.Browser.SendMouseClick(_mouseX, _mouseY, ToCefMouseButton(button), mouseUp: false, clickCount);
+            _lastClickCount = _clickCounter.OnMouseDown(_elapsedSeconds, _mouseX, _mouseY);
+            _frameSource.Browser.SendMouseClick(_mouseX, _mouseY, ToCefMouseButton(button), mouseUp: false, _lastClickCount);
         }
 
         private void OnMouseUp(IMouse mouse, Silk.NET.Input.MouseButton button)
         {
-            _frameSource.Browser.SendMouseClick(_mouseX, _mouseY, ToCefMouseButton(button), mouseUp: true);
+            _frameSource.Browser.SendMouseClick(_mouseX, _mouseY, ToCefMouseButton(button), mouseUp: true, _lastClickCount);
         }
 
         private void OnMouseScroll(IMouse mouse, ScrollWheel wheel)

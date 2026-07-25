@@ -41,6 +41,9 @@ namespace CefUnity.Viewer
 
             window.Load += () =>
             {
+                // SDL は生成後に Retina スケーリングやウィンドウ保存サイズを適用することがあるため
+                // Load コールバック内で明示的にサイズを再設定する。
+                window.Size = new Vector2D<int>(640, 480);
                 renderer.Initialize(window);
                 sdl.StartTextInput();
                 sdl.AddEventWatch(new PfnEventFilter(EventWatch), null);
