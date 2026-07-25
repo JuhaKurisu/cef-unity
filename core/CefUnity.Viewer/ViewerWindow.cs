@@ -1,3 +1,4 @@
+using CefUnity.Interop;
 using Silk.NET.Input;
 using Silk.NET.Maths;
 using Silk.NET.SDL;
@@ -17,6 +18,7 @@ namespace CefUnity.Viewer
         private bool _firstFrameShown;
         private IInputContext? _input;
         private IMouse? _mouse;
+        private IKeyboard? _keyboard;
         private readonly ClickCounter _clickCounter = new ClickCounter();
         private int _mouseX;
         private int _mouseY;
@@ -57,6 +59,12 @@ namespace CefUnity.Viewer
                 _mouse.MouseDown += OnMouseDown;
                 _mouse.MouseUp += OnMouseUp;
                 _mouse.Scroll += OnMouseScroll;
+            }
+            _keyboard = _input.Keyboards.Count > 0 ? _input.Keyboards[0] : null;
+            if (_keyboard != null)
+            {
+                _keyboard.KeyDown += OnKeyDown;
+                _keyboard.KeyUp += OnKeyUp;
             }
         }
 
@@ -117,6 +125,18 @@ namespace CefUnity.Viewer
             _frameSource.Browser.SendMouseWheel(_mouseX, _mouseY,
                 (int)(wheel.X * CefUnity.Runtime.ScrollInputPipeline.WheelPixelsPerStep),
                 (int)(wheel.Y * CefUnity.Runtime.ScrollInputPipeline.WheelPixelsPerStep));
+        }
+
+        private void OnKeyDown(IKeyboard keyboard, Key key, int scanCode)
+        {
+            if (!SilkKeyboardMapper.TryMap(key, out var code)) return;
+            _frameSource.Browser.SendKeyEvent(KeyEventType.RawKeyDown, code, SilkKeyboardMapper.BuildModifiers(keyboard));
+        }
+
+        private void OnKeyUp(IKeyboard keyboard, Key key, int scanCode)
+        {
+            if (!SilkKeyboardMapper.TryMap(key, out var code)) return;
+            _frameSource.Browser.SendKeyEvent(KeyEventType.KeyUp, code, SilkKeyboardMapper.BuildModifiers(keyboard));
         }
     }
 }
