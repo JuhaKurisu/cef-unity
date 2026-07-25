@@ -62,6 +62,7 @@ namespace CefUnity.Viewer
             _window.Load += OnLoad;
             _window.Render += OnRender;
             _window.Resize += OnWindowResize;
+            _window.FocusChanged += OnFocusChanged;
         }
 
         public void Run() => _window.Run();
@@ -167,6 +168,11 @@ namespace CefUnity.Viewer
         {
             if (newSize.X <= 0 || newSize.Y <= 0) return;
             _frameSource.Resize(newSize.X, newSize.Y);
+        }
+
+        private void OnFocusChanged(bool focused)
+        {
+            if (!focused) _imeBridge?.OnFocusLost();
         }
 
         private void OnMouseMove(IMouse mouse, System.Numerics.Vector2 position)
