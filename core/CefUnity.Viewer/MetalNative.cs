@@ -8,6 +8,17 @@ namespace CefUnity.Viewer
         private const string LibraryObjC = "/usr/lib/libobjc.A.dylib";
         private const string LibraryMetal = "/System/Library/Frameworks/Metal.framework/Metal";
 
+        /// <summary>
+        ///     CoreGraphics の CGSize (width, height の double ペア)。
+        ///     arm64 ABI では HFA として d0/d1 に返るため、通常の P/Invoke で正しく受け取れる。
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct CGSize
+        {
+            public double Width;
+            public double Height;
+        }
+
         [StructLayout(LayoutKind.Sequential)]
         internal struct MTLOrigin
         {
@@ -47,6 +58,14 @@ namespace CefUnity.Viewer
 
         [DllImport(LibraryObjC, EntryPoint = "objc_msgSend")]
         internal static extern nuint NuintMessage(IntPtr receiver, IntPtr selector);
+
+        /// <summary>CGSize を返すセレクター (drawableSize 等) の呼び出し。</summary>
+        [DllImport(LibraryObjC, EntryPoint = "objc_msgSend")]
+        internal static extern CGSize CGSizeMessage(IntPtr receiver, IntPtr selector);
+
+        /// <summary>CGSize を引数に取るセレクター (setDrawableSize: 等) の呼び出し。</summary>
+        [DllImport(LibraryObjC, EntryPoint = "objc_msgSend")]
+        internal static extern void VoidCGSizeMessage(IntPtr receiver, IntPtr selector, CGSize size);
 
         // copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:
         [DllImport(LibraryObjC, EntryPoint = "objc_msgSend")]

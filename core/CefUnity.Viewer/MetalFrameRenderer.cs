@@ -12,11 +12,14 @@ namespace CefUnity.Viewer
     ///     色: CEF の BGRA バイトは sRGB エンコード済み。BGRA8Unorm どうしの blit は
     ///     変換なしでバイトがそのまま表示され、ウィンドウ既定色空間 (sRGB) で正しく見える。
     ///
-    ///     SDL は CAMetalLayer の drawableSize をバッキングピクセルサイズで管理するため、
-    ///     setDrawableSize: を呼んでも SDL がフレームごとに上書きする。
-    ///     そのため全テクスチャコピーはサイズ非依存の領域 blit
-    ///     (copyFromTexture:sourceSlice:…:sourceOrigin:sourceSize:toTexture:…:destinationOrigin:)
-    ///     を使い、drawable サイズの変動に対して安全に動作させる。
+    ///     drawableSize 収束方式:
+    ///     SDL の Metal view はウィンドウ表示・リサイズ等のレイアウトイベントで
+    ///     drawableSize を bounds×contentsScale (Retina では 2×) に上書きする。
+    ///     そのため毎フレーム drawableSize を読み出し、テクスチャサイズと不一致なら
+    ///     setDrawableSize: でテクスチャサイズに再設定して今フレームの blit を skip する。
+    ///     次フレームでサイズが一致していれば blit を実行する (通常 1 フレームの skip で収束)。
+    ///     drawableSize == テクスチャサイズ のとき CoreAnimation がレイヤーを窓全体に拡縮表示するため
+    ///     Retina でのぼかしは生じるが全面表示になる。
     /// </summary>
     internal sealed unsafe class MetalFrameRenderer : IFrameRenderer
     {
@@ -35,6 +38,8 @@ namespace CefUnity.Viewer
         private static readonly IntPtr SelectorRelease = MetalNative.Selector("release");
         private static readonly IntPtr SelectorWidth = MetalNative.Selector("width");
         private static readonly IntPtr SelectorHeight = MetalNative.Selector("height");
+        private static readonly IntPtr SelectorDrawableSize = MetalNative.Selector("drawableSize");
+        private static readonly IntPtr SelectorSetDrawableSize = MetalNative.Selector("setDrawableSize:");
 
         private readonly Sdl _sdl;
         private void* _metalView;
@@ -67,6 +72,24 @@ namespace CefUnity.Viewer
             var pool = MetalNative.AutoreleasePoolPush();
             try
             {
+                // drawableSize 収束: SDL がレイアウトイベントで drawableSize を上書きするため
+                // 毎フレーム現在値を読み出し、テクスチャサイズと異なればテクスチャサイズへ再設定して
+                // このフレームの blit を skip する。フィールドにキャッシュしないことで
+                // SDL による上書きを次フレームで自動検出・再収束できる。
+                if (texturePointer != IntPtr.Zero && width > 0 && height > 0)
+                {
+                    var currentDrawableSize = MetalNative.CGSizeMessage(_layer, SelectorDrawableSize);
+                    if (currentDrawableSize.Width != width || currentDrawableSize.Height != height)
+                    {
+                        MetalNative.VoidCGSizeMessage(
+                            _layer,
+                            SelectorSetDrawableSize,
+                            new MetalNative.CGSize { Width = width, Height = height });
+                        // in-flight drawable が古いサイズを持つ可能性があるため今フレームは skip
+                        return;
+                    }
+                }
+
                 var drawable = MetalNative.IntPtrMessage(_layer, SelectorNextDrawable);
                 if (drawable == IntPtr.Zero) return;
                 var commandBuffer = MetalNative.IntPtrMessage(_commandQueue, SelectorCommandBuffer);
@@ -79,7 +102,8 @@ namespace CefUnity.Viewer
                     var drawableWidth = (nuint)MetalNative.NuintMessage(drawableTexture, SelectorWidth);
                     var drawableHeight = (nuint)MetalNative.NuintMessage(drawableTexture, SelectorHeight);
 
-                    // コピー領域はソース全体だが、drawable に収まるようにクランプする
+                    // drawableSize 収束済みなのでソースと drawable のサイズは一致しているはずだが、
+                    // 安全のため最小値でクランプする
                     var copyWidth = Math.Min(sourceWidth, drawableWidth);
                     var copyHeight = Math.Min(sourceHeight, drawableHeight);
 
