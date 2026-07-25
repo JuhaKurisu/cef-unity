@@ -1,5 +1,6 @@
 <Solution>
   <Project Path="CefUnity.Core/CefUnity.Core.csproj" />
   <Project Path="CefUnity.Harness/CefUnity.Harness.csproj" />
+  <Project Path="CefUnity.Viewer/CefUnity.Viewer.csproj" />
   <Project Path="CefUnity.Tests/CefUnity.Tests.csproj" />
 </Solution>

@@ -12,6 +12,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\CefUnity.Core\CefUnity.Core.csproj" />
+    <ProjectReference Include="..\CefUnity.Viewer\CefUnity.Viewer.csproj" />
   </ItemGroup>
   <ItemGroup>
     <None Include="fixtures/**" CopyToOutputDirectory="PreserveNewest" />
