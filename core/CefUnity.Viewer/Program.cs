@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using CefUnity.Interop;
 using CefUnity.Runtime;
 using CefUnity.Viewer;
@@ -13,6 +15,19 @@ if (viewerOptions == null)
 {
     Console.Error.WriteLine(ViewerOptions.Usage);
     return 2;
+}
+
+if (viewerOptions.AnalyzePath != null)
+{
+    var sentDeltaY = new List<int>();
+    foreach (var line in File.ReadLines(viewerOptions.AnalyzePath).Skip(1))
+    {
+        var columns = line.Split(',');
+        if (columns.Length >= 5) sentDeltaY.Add(int.Parse(columns[4]));
+    }
+    var roughness = ScrollRoughnessAnalyzer.ComputeRoughness(sentDeltaY);
+    Console.WriteLine(FormattableString.Invariant($"frames={sentDeltaY.Count} roughness={roughness:F4}"));
+    return 0;
 }
 
 CefRuntime.Initialize(useGpu: true);
@@ -32,7 +47,9 @@ try
         Console.WriteLine($"replay: {replaySource.TotalEvents} events");
         scrollMatrix.AttachSource(replaySource);
     }
-    using var viewerWindow = new ViewerWindow(viewerOptions, frameSource, scrollMatrix, replaySource);
+    using var statistics = viewerOptions.StatisticsPath != null
+        ? new StatisticsRecorder(viewerOptions.StatisticsPath) : null;
+    using var viewerWindow = new ViewerWindow(viewerOptions, frameSource, scrollMatrix, statistics, replaySource);
     viewerWindow.Run();
 }
 catch (Exception exception)

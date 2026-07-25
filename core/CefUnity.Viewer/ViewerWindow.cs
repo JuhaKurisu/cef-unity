@@ -26,15 +26,19 @@ namespace CefUnity.Viewer
         private int _mouseX;
         private int _mouseY;
         private double _elapsedSeconds;
+        private int _lastSentDeltaX;
         private int _lastSentDeltaY;
         private int _lastClickCount = 1;
+        private readonly StatisticsRecorder? _statistics;
+        private long _statisticsFrameIndex;
         private readonly CefUnity.Runtime.ScrollReplaySource? _replaySource;
 
-        public ViewerWindow(ViewerOptions options, CefFrameSource frameSource, ScrollInputMatrix scrollMatrix, CefUnity.Runtime.ScrollReplaySource? replaySource = null)
+        public ViewerWindow(ViewerOptions options, CefFrameSource frameSource, ScrollInputMatrix scrollMatrix, StatisticsRecorder? statistics, CefUnity.Runtime.ScrollReplaySource? replaySource = null)
         {
             _options = options;
             _frameSource = frameSource;
             _scrollMatrix = scrollMatrix;
+            _statistics = statistics;
             _replaySource = replaySource;
             SdlWindowing.Use();
             _window = SilkWindow.Create(WindowOptions.Default with
@@ -107,6 +111,7 @@ namespace CefUnity.Viewer
                 _frameSource.Browser.SendMouseWheel(_mouseX, _mouseY, primaryDeltaX, primaryDeltaY);
             if (secondaryDeltaX != 0 || secondaryDeltaY != 0)
                 _frameSource.Browser.SendMouseWheel(_mouseX, _mouseY, secondaryDeltaX, secondaryDeltaY);
+            _lastSentDeltaX = primaryDeltaX + secondaryDeltaX;
             _lastSentDeltaY = primaryDeltaY + secondaryDeltaY; // Task 8 の統計用
             if (_frameSource.TickFrame(out var texturePointer, out var textureWidth, out var textureHeight))
             {
@@ -123,6 +128,8 @@ namespace CefUnity.Viewer
                 // まだ 1 枚も来ていない: drawable だけ回す (黒画面)
                 _renderer.Present(IntPtr.Zero, _options.Width, _options.Height);
             }
+            _statistics?.RecordFrame(_statisticsFrameIndex++, deltaSeconds * 1000.0,
+                _frameSource.Browser.PeekAcceleratedFrameId(), _lastSentDeltaX, _lastSentDeltaY, _scrollMatrix.Mode);
         }
 
         private void UpdateTitle()
@@ -133,6 +140,7 @@ namespace CefUnity.Viewer
 
         public void Dispose()
         {
+            _statistics?.Dispose();
             _input?.Dispose();
             _renderer.Dispose();
             _window.Dispose();
