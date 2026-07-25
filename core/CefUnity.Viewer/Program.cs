@@ -1,4 +1,7 @@
+using System;
+using System.IO;
 using CefUnity.Interop;
+using CefUnity.Runtime;
 using CefUnity.Viewer;
 
 MacMomentumScrollSupport.Enable();
@@ -17,6 +20,17 @@ try
 {
     using var frameSource = new CefFrameSource(viewerOptions.Width, viewerOptions.Height, viewerOptions.Url);
     using var scrollMatrix = new ScrollInputMatrix();
+    if (viewerOptions.ReplayPath != null)
+    {
+        var replaySource = new ScrollReplaySource(File.ReadLines(viewerOptions.ReplayPath));
+        if (!replaySource.Start())
+        {
+            Console.Error.WriteLine($"replay: {viewerOptions.ReplayPath} に over=1 の E 行がない");
+            return 2;
+        }
+        Console.WriteLine($"replay: {replaySource.TotalEvents} events");
+        scrollMatrix.AttachSource(replaySource);
+    }
     using var viewerWindow = new ViewerWindow(viewerOptions, frameSource, scrollMatrix);
     viewerWindow.Run();
 }
