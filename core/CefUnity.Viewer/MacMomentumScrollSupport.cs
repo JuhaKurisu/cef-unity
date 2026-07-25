@@ -33,9 +33,21 @@ namespace CefUnity.Viewer
 
         public static void Enable()
         {
-            var defaults = IntPtrMessage(GetClass("NSUserDefaults"), Selector("standardUserDefaults"));
+            NativeLibrary.Load("/System/Library/Frameworks/Foundation.framework/Foundation");
+
+            var userDefaultsClass = GetClass("NSUserDefaults");
+            if (userDefaultsClass == IntPtr.Zero)
+            {
+                Console.Error.WriteLine("MacMomentumScrollSupport: NSUserDefaults class not found — momentum restore skipped");
+                return;
+            }
+
+            var defaults = IntPtrMessage(userDefaultsClass, Selector("standardUserDefaults"));
             var key = IntPtrStringMessage(GetClass("NSString"), Selector("stringWithUTF8String:"), "AppleMomentumScrollSupported");
             VoidBoolKeyMessage(defaults, Selector("setBool:forKey:"), true, key);
+
+            var resolvedValue = BoolKeyMessage(defaults, Selector("boolForKey:"), key);
+            Console.WriteLine($"MacMomentumScrollSupport: AppleMomentumScrollSupported resolved={resolvedValue}");
         }
     }
 }
