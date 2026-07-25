@@ -1,3 +1,4 @@
+using Silk.NET.Input;
 using Silk.NET.Maths;
 using Silk.NET.SDL;
 using Silk.NET.Windowing;
@@ -14,6 +15,12 @@ namespace CefUnity.Viewer
         private readonly IWindow _window;
         private readonly IFrameRenderer _renderer;
         private bool _firstFrameShown;
+        private IInputContext? _input;
+        private IMouse? _mouse;
+        private readonly ClickCounter _clickCounter = new ClickCounter();
+        private int _mouseX;
+        private int _mouseY;
+        private double _elapsedSeconds;
 
         public ViewerWindow(ViewerOptions options, CefFrameSource frameSource)
         {
@@ -42,10 +49,20 @@ namespace CefUnity.Viewer
         private void OnLoad()
         {
             _renderer.Initialize(_window);
+            _input = _window.CreateInput();
+            _mouse = _input.Mice.Count > 0 ? _input.Mice[0] : null;
+            if (_mouse != null)
+            {
+                _mouse.MouseMove += OnMouseMove;
+                _mouse.MouseDown += OnMouseDown;
+                _mouse.MouseUp += OnMouseUp;
+                _mouse.Scroll += OnMouseScroll;
+            }
         }
 
         private void OnRender(double deltaSeconds)
         {
+            _elapsedSeconds += deltaSeconds;
             if (_frameSource.TickFrame(out var texturePointer, out var textureWidth, out var textureHeight))
             {
                 _renderer.Present(texturePointer, textureWidth, textureHeight);
@@ -64,8 +81,42 @@ namespace CefUnity.Viewer
 
         public void Dispose()
         {
+            _input?.Dispose();
             _renderer.Dispose();
             _window.Dispose();
+        }
+
+        private void OnMouseMove(IMouse mouse, System.Numerics.Vector2 position)
+        {
+            _mouseX = (int)position.X;
+            _mouseY = (int)position.Y;
+            _frameSource.Browser.SendMouseMove(_mouseX, _mouseY);
+        }
+
+        private static CefUnity.Interop.MouseButton ToCefMouseButton(Silk.NET.Input.MouseButton button) => button switch
+        {
+            Silk.NET.Input.MouseButton.Right => CefUnity.Interop.MouseButton.Right,
+            Silk.NET.Input.MouseButton.Middle => CefUnity.Interop.MouseButton.Middle,
+            _ => CefUnity.Interop.MouseButton.Left,
+        };
+
+        private void OnMouseDown(IMouse mouse, Silk.NET.Input.MouseButton button)
+        {
+            var clickCount = _clickCounter.OnMouseDown(_elapsedSeconds, _mouseX, _mouseY);
+            _frameSource.Browser.SendMouseClick(_mouseX, _mouseY, ToCefMouseButton(button), mouseUp: false, clickCount);
+        }
+
+        private void OnMouseUp(IMouse mouse, Silk.NET.Input.MouseButton button)
+        {
+            _frameSource.Browser.SendMouseClick(_mouseX, _mouseY, ToCefMouseButton(button), mouseUp: true);
+        }
+
+        private void OnMouseScroll(IMouse mouse, ScrollWheel wheel)
+        {
+            // Task 6 で ScrollInputMatrix に置き換える。まずは raw 直送 (Unity 旧経路相当)
+            _frameSource.Browser.SendMouseWheel(_mouseX, _mouseY,
+                (int)(wheel.X * CefUnity.Runtime.ScrollInputPipeline.WheelPixelsPerStep),
+                (int)(wheel.Y * CefUnity.Runtime.ScrollInputPipeline.WheelPixelsPerStep));
         }
     }
 }
