@@ -18,6 +18,7 @@ namespace CefUnity.Viewer
         private readonly IWindow _window;
         private readonly IFrameRenderer _renderer;
         private bool _firstFrameShown;
+        private bool _applicationActivated;
         private IInputContext? _input;
         private IMouse? _mouse;
         private IKeyboard? _keyboard;
@@ -90,6 +91,11 @@ namespace CefUnity.Viewer
 
         private void OnRender(double deltaSeconds)
         {
+            if (!_applicationActivated)
+            {
+                _applicationActivated = true;
+                MacApplicationActivator.ActivateCurrentApplication();
+            }
             _elapsedSeconds += deltaSeconds;
             var overBrowser = _mouseX >= 0 && _mouseY >= 0
                               && _mouseX < _window.Size.X && _mouseY < _window.Size.Y;

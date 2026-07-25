@@ -1,0 +1,51 @@
+using System.Runtime.InteropServices;
+
+namespace CefUnity.Viewer
+{
+    /// <summary>
+    ///     CLI 起動 (バンドルなし) の SDL アプリは自動でアクティブにならず、
+    ///     macOS は非アクティブアプリへモメンタムスクロールイベントを配送しない
+    ///     (録画実測: phase 4/5/6 が皆無)。起動時に自己アクティベートして
+    ///     通常アプリと同じイベント配送にする。
+    /// </summary>
+    internal static class MacApplicationActivator
+    {
+        private const string LibraryObjC = "/usr/lib/libobjc.A.dylib";
+        private const string LibraryAppKit = "/System/Library/Frameworks/AppKit.framework/AppKit";
+
+        [DllImport(LibraryObjC, EntryPoint = "objc_getClass")]
+        private static extern IntPtr GetClass([MarshalAs(UnmanagedType.LPStr)] string name);
+
+        [DllImport(LibraryObjC, EntryPoint = "sel_registerName")]
+        private static extern IntPtr Selector([MarshalAs(UnmanagedType.LPStr)] string name);
+
+        [DllImport(LibraryObjC, EntryPoint = "objc_msgSend")]
+        private static extern IntPtr IntPtrMessage(IntPtr receiver, IntPtr selector);
+
+        [DllImport(LibraryObjC, EntryPoint = "objc_msgSend")]
+        private static extern void VoidMessage(IntPtr receiver, IntPtr selector);
+
+        [DllImport(LibraryObjC, EntryPoint = "objc_msgSend")]
+        private static extern void VoidBoolMessage(IntPtr receiver, IntPtr selector, [MarshalAs(UnmanagedType.I1)] bool argument);
+
+        [DllImport(LibraryAppKit)]
+        private static extern void NSBeep();
+
+        public static void ActivateCurrentApplication()
+        {
+            try
+            {
+                var application = IntPtrMessage(GetClass("NSApplication"), Selector("sharedApplication"));
+                if (application != IntPtr.Zero)
+                {
+                    VoidBoolMessage(application, Selector("activateIgnoringOtherApps:"), true);
+                    VoidMessage(application, Selector("arrangeInFront:"));
+                }
+            }
+            catch
+            {
+                // Silently fail if Obj-C interop doesn't work
+            }
+        }
+    }
+}
