@@ -225,14 +225,21 @@ namespace CefUnity.Viewer
         {
             var instance = _eventWatchInstance;
             if (instance == null) return 1;
-            switch ((EventType)sdlEvent->Type)
+            try
             {
-                case EventType.Textediting:
-                    instance._imeBridge?.OnTextEditing(ReadFixedUtf8(sdlEvent->Edit.Text, 32), sdlEvent->Edit.Start);
-                    break;
-                case EventType.Textinput:
-                    instance._imeBridge?.OnTextInput(ReadFixedUtf8(sdlEvent->Text.Text, 32));
-                    break;
+                switch ((EventType)sdlEvent->Type)
+                {
+                    case EventType.Textediting:
+                        instance._imeBridge?.OnTextEditing(ReadFixedUtf8(sdlEvent->Edit.Text, 32), sdlEvent->Edit.Start);
+                        break;
+                    case EventType.Textinput:
+                        instance._imeBridge?.OnTextInput(ReadFixedUtf8(sdlEvent->Text.Text, 32));
+                        break;
+                }
+            }
+            catch (Exception exception)
+            {
+                Console.Error.WriteLine($"[IME] {exception}");
             }
             return 1;
         }
