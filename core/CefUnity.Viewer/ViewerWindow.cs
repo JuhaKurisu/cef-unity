@@ -17,6 +17,7 @@ namespace CefUnity.Viewer
         private readonly ScrollInputMatrix _scrollMatrix;
         private readonly IWindow _window;
         private readonly IFrameRenderer _renderer;
+        private readonly Sdl _sdl;
         private bool _firstFrameShown;
         private bool _applicationActivated;
         private IInputContext? _input;
@@ -32,6 +33,10 @@ namespace CefUnity.Viewer
         private readonly StatisticsRecorder? _statistics;
         private long _statisticsFrameIndex;
         private readonly CefUnity.Runtime.ScrollReplaySource? _replaySource;
+        private ImeBridge? _imeBridge;
+        private static ViewerWindow? _eventWatchInstance; // SDL コールバックは static のため
+        private int _caretX = -1;
+        private int _caretY = -1;
 
         public ViewerWindow(ViewerOptions options, CefFrameSource frameSource, ScrollInputMatrix scrollMatrix, StatisticsRecorder? statistics, CefUnity.Runtime.ScrollReplaySource? replaySource = null)
         {
@@ -51,9 +56,9 @@ namespace CefUnity.Viewer
                 UpdatesPerSecond = 0,
                 VSync = false,
             });
-            var sdl = SdlWindowing.GetExistingApi(_window)
-                      ?? throw new InvalidOperationException("SDL backend not active");
-            _renderer = new MetalFrameRenderer(sdl);
+            _sdl = SdlWindowing.GetExistingApi(_window)
+                   ?? throw new InvalidOperationException("SDL backend not active");
+            _renderer = new MetalFrameRenderer(_sdl);
             _window.Load += OnLoad;
             _window.Render += OnRender;
             _window.Resize += OnWindowResize;
@@ -93,6 +98,9 @@ namespace CefUnity.Viewer
             }
             _scrollMatrix.SetMode(_options.Mode);
             _scrollMatrix.RecordingEnabled = _options.Record;
+            _imeBridge = new ImeBridge(new BrowserImeSink(_frameSource.Browser));
+            _eventWatchInstance = this;
+            unsafe { _sdl.StartTextInput(); _sdl.AddEventWatch(new PfnEventFilter(ImeEventWatch), null); }
         }
 
         private void OnRender(double deltaSeconds)
@@ -130,6 +138,14 @@ namespace CefUnity.Viewer
             }
             _statistics?.RecordFrame(_statisticsFrameIndex++, deltaSeconds * 1000.0,
                 _frameSource.Browser.PeekAcceleratedFrameId(), _lastSentDeltaX, _lastSentDeltaY, _scrollMatrix.Mode);
+            _frameSource.Browser.GetImeCaret(out var caretX, out var caretY, out var caretWidth, out var caretHeight);
+            if ((caretX != _caretX || caretY != _caretY) && caretWidth >= 0)
+            {
+                _caretX = caretX;
+                _caretY = caretY;
+                var caretRectangle = new Rectangle<int>(caretX, caretY, System.Math.Max(caretWidth, 1), System.Math.Max(caretHeight, 16));
+                unsafe { _sdl.SetTextInputRect(&caretRectangle); }
+            }
         }
 
         private void UpdateTitle()
@@ -140,6 +156,7 @@ namespace CefUnity.Viewer
 
         public void Dispose()
         {
+            _eventWatchInstance = null;
             _statistics?.Dispose();
             _input?.Dispose();
             _renderer.Dispose();
@@ -203,5 +220,45 @@ namespace CefUnity.Viewer
             if (!SilkKeyboardMapper.TryMap(key, out var code)) return;
             _frameSource.Browser.SendKeyEvent(KeyEventType.KeyUp, code, SilkKeyboardMapper.BuildModifiers(keyboard));
         }
+
+        private static unsafe int ImeEventWatch(void* userData, Event* sdlEvent)
+        {
+            var instance = _eventWatchInstance;
+            if (instance == null) return 1;
+            switch ((EventType)sdlEvent->Type)
+            {
+                case EventType.Textediting:
+                    instance._imeBridge?.OnTextEditing(ReadFixedUtf8(sdlEvent->Edit.Text, 32), sdlEvent->Edit.Start);
+                    break;
+                case EventType.Textinput:
+                    instance._imeBridge?.OnTextInput(ReadFixedUtf8(sdlEvent->Text.Text, 32));
+                    break;
+            }
+            return 1;
+        }
+
+        private static unsafe string ReadFixedUtf8(byte* bytes, int capacity)
+        {
+            var length = 0;
+            while (length < capacity && bytes[length] != 0) length++;
+            return System.Text.Encoding.UTF8.GetString(bytes, length);
+        }
+    }
+
+    /// <summary>IImeSink → Browser の橋 (実行時配線)。</summary>
+    internal sealed class BrowserImeSink : IImeSink
+    {
+        private readonly CefUnity.Interop.Browser _browser;
+
+        public BrowserImeSink(CefUnity.Interop.Browser browser)
+        {
+            _browser = browser;
+        }
+
+        public void SetComposition(string text, uint cursorPosition) => _browser.ImeSetComposition(text, cursorPosition, cursorPosition);
+        public void CommitText(string text) => _browser.ImeCommitText(text);
+        public void SendCharacter(char character) => _browser.SendCharEvent(character);
+        public void FinishComposition() => _browser.ImeFinishComposingText();
+        public void CancelComposition() => _browser.ImeCancelComposition();
     }
 }
