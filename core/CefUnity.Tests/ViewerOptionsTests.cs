@@ -29,6 +29,7 @@ namespace CefUnity.Tests
                 "--url", "https://ja.wikipedia.org", "--size", "1920x1080",
                 "--scroll-mode", "smoother", "--record",
                 "--replay", "/tmp/replay.csv", "--statistics", "/tmp/statistics.csv",
+                "--analyze", "/tmp/analyze.csv",
             });
             Assert.That(options, Is.Not.Null);
             Assert.That(options!.Url, Is.EqualTo("https://ja.wikipedia.org"));
@@ -38,6 +39,7 @@ namespace CefUnity.Tests
             Assert.That(options.Record, Is.True);
             Assert.That(options.ReplayPath, Is.EqualTo("/tmp/replay.csv"));
             Assert.That(options.StatisticsPath, Is.EqualTo("/tmp/statistics.csv"));
+            Assert.That(options.AnalyzePath, Is.EqualTo("/tmp/analyze.csv"));
         }
 
         [TestCase("raw", ScrollMode.Raw)]

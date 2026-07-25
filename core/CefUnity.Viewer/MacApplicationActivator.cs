@@ -11,7 +11,6 @@ namespace CefUnity.Viewer
     internal static class MacApplicationActivator
     {
         private const string LibraryObjC = "/usr/lib/libobjc.A.dylib";
-        private const string LibraryAppKit = "/System/Library/Frameworks/AppKit.framework/AppKit";
 
         [DllImport(LibraryObjC, EntryPoint = "objc_getClass")]
         private static extern IntPtr GetClass([MarshalAs(UnmanagedType.LPStr)] string name);
@@ -28,8 +27,8 @@ namespace CefUnity.Viewer
         [DllImport(LibraryObjC, EntryPoint = "objc_msgSend")]
         private static extern void VoidBoolMessage(IntPtr receiver, IntPtr selector, [MarshalAs(UnmanagedType.I1)] bool argument);
 
-        [DllImport(LibraryAppKit)]
-        private static extern void NSBeep();
+        [DllImport(LibraryObjC, EntryPoint = "objc_msgSend")]
+        private static extern void VoidMessageWithArg(IntPtr receiver, IntPtr selector, IntPtr argument);
 
         public static void ActivateCurrentApplication()
         {
@@ -39,7 +38,8 @@ namespace CefUnity.Viewer
                 if (application != IntPtr.Zero)
                 {
                     VoidBoolMessage(application, Selector("activateIgnoringOtherApps:"), true);
-                    VoidMessage(application, Selector("arrangeInFront:"));
+                    // arrangeInFront: は sender 引数を取る。nil (IntPtr.Zero) を明示的に渡す。
+                    VoidMessageWithArg(application, Selector("arrangeInFront:"), IntPtr.Zero);
                 }
             }
             catch

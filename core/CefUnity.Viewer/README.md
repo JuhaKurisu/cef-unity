@@ -31,4 +31,10 @@ dotnet run --project core/CefUnity.Viewer -- spike   # SDL/Metal/NSEvent/IME 疎
 - サーバープロセス残留 (次回起動が永久ハング): `pkill -f cef-unity-server`
 - 起動ハング (キャッシュ破損): `$TMPDIR` 配下の cef_unity_cache を削除
 - スクロール resampler モードが効かない: 起動ログの `native scroll source:` を確認
-- モメンタムスクロールが効かない: 初回起動時に `~/Library/Preferences/CefUnity.Viewer.plist` へ `AppleMomentumScrollSupported=YES` を永続書き込みする (SDL がモメンタムスクロール配送を止めるための対策。除去は `defaults delete CefUnity.Viewer AppleMomentumScrollSupported`)
+- モメンタムスクロールが効かない: 起動時に毎回 (冪等) `~/Library/Preferences/CefUnity.Viewer.plist` へ `AppleMomentumScrollSupported=YES` を書き込む (SDL がモメンタムスクロール配送を止めるための対策。除去は `defaults delete CefUnity.Viewer AppleMomentumScrollSupported`)
+
+## 録画・リプレイの注意事項
+
+- `--record` は既存の録画 CSV (`$TMPDIR/cef_scroll_events.csv`) を削除して新規開始する (旧セッションの追記混入防止)
+- `--replay` 可能な録画 (over=1) が残るのは Resampler モード時のみ (Raw/Smoother 中のイベントは over=0 で記録され再生対象外)
+- リプレイ中のモード切替 (F1/F2) は再生イベントが破棄されるため非推奨
