@@ -71,6 +71,7 @@ namespace CefUnity.Viewer
                 var drawable = MetalNative.IntPtrMessage(_layer, SelectorNextDrawable);
                 if (drawable == IntPtr.Zero) return;
                 var commandBuffer = MetalNative.IntPtrMessage(_commandQueue, SelectorCommandBuffer);
+                if (commandBuffer == IntPtr.Zero) return;
                 if (texturePointer != IntPtr.Zero)
                 {
                     var drawableTexture = MetalNative.IntPtrMessage(drawable, SelectorTexture);
