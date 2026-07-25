@@ -1,4 +1,5 @@
 using CefUnity.Interop;
+using CefUnity.Runtime;
 using Silk.NET.Input;
 using Silk.NET.Maths;
 using Silk.NET.SDL;
@@ -13,6 +14,7 @@ namespace CefUnity.Viewer
     {
         private readonly ViewerOptions _options;
         private readonly CefFrameSource _frameSource;
+        private readonly ScrollInputMatrix _scrollMatrix;
         private readonly IWindow _window;
         private readonly IFrameRenderer _renderer;
         private bool _firstFrameShown;
@@ -23,11 +25,13 @@ namespace CefUnity.Viewer
         private int _mouseX;
         private int _mouseY;
         private double _elapsedSeconds;
+        private int _lastSentDeltaY;
 
-        public ViewerWindow(ViewerOptions options, CefFrameSource frameSource)
+        public ViewerWindow(ViewerOptions options, CefFrameSource frameSource, ScrollInputMatrix scrollMatrix)
         {
             _options = options;
             _frameSource = frameSource;
+            _scrollMatrix = scrollMatrix;
             SdlWindowing.Use();
             _window = SilkWindow.Create(WindowOptions.Default with
             {
@@ -66,18 +70,35 @@ namespace CefUnity.Viewer
                 _keyboard.KeyDown += OnKeyDown;
                 _keyboard.KeyUp += OnKeyUp;
             }
+            if (_options.ReplayPath == null)
+            {
+                var startResult = _scrollMatrix.StartNativeSource(out var startError);
+                if (startResult != NativeScrollSourceStart.Started)
+                    Console.WriteLine($"native scroll source: {startResult} {startError?.Message} — フォールバック (窓 wheel イベント)");
+            }
+            _scrollMatrix.SetMode(_options.Mode);
+            _scrollMatrix.RecordingEnabled = _options.Record;
         }
 
         private void OnRender(double deltaSeconds)
         {
             _elapsedSeconds += deltaSeconds;
+            var overBrowser = _mouseX >= 0 && _mouseY >= 0
+                              && _mouseX < _window.Size.X && _mouseY < _window.Size.Y;
+            _scrollMatrix.TickFrame((float)deltaSeconds, overBrowser,
+                out var primaryDeltaX, out var primaryDeltaY, out var secondaryDeltaX, out var secondaryDeltaY);
+            if (primaryDeltaX != 0 || primaryDeltaY != 0)
+                _frameSource.Browser.SendMouseWheel(_mouseX, _mouseY, primaryDeltaX, primaryDeltaY);
+            if (secondaryDeltaX != 0 || secondaryDeltaY != 0)
+                _frameSource.Browser.SendMouseWheel(_mouseX, _mouseY, secondaryDeltaX, secondaryDeltaY);
+            _lastSentDeltaY = primaryDeltaY + secondaryDeltaY; // Task 8 の統計用
             if (_frameSource.TickFrame(out var texturePointer, out var textureWidth, out var textureHeight))
             {
                 _renderer.Present(texturePointer, textureWidth, textureHeight);
                 if (!_firstFrameShown)
                 {
                     _firstFrameShown = true;
-                    _window.Title = "CefUnity.Viewer";
+                    UpdateTitle();
                 }
             }
             else
@@ -85,6 +106,12 @@ namespace CefUnity.Viewer
                 // まだ 1 枚も来ていない: drawable だけ回す (黒画面)
                 _renderer.Present(IntPtr.Zero, _options.Width, _options.Height);
             }
+        }
+
+        private void UpdateTitle()
+        {
+            var recording = _scrollMatrix.RecordingEnabled ? " REC" : "";
+            _window.Title = $"CefUnity.Viewer [{_scrollMatrix.Mode}]{recording}";
         }
 
         public void Dispose()
@@ -121,14 +148,21 @@ namespace CefUnity.Viewer
 
         private void OnMouseScroll(IMouse mouse, ScrollWheel wheel)
         {
-            // Task 6 で ScrollInputMatrix に置き換える。まずは raw 直送 (Unity 旧経路相当)
-            _frameSource.Browser.SendMouseWheel(_mouseX, _mouseY,
-                (int)(wheel.X * CefUnity.Runtime.ScrollInputPipeline.WheelPixelsPerStep),
-                (int)(wheel.Y * CefUnity.Runtime.ScrollInputPipeline.WheelPixelsPerStep));
+            _scrollMatrix.AddWheelSteps(wheel.X, wheel.Y);
         }
 
         private void OnKeyDown(IKeyboard keyboard, Key key, int scanCode)
         {
+            switch (key)
+            {
+                case Key.F1: _scrollMatrix.SetMode(ScrollMode.Raw); UpdateTitle(); return;
+                case Key.F2: _scrollMatrix.SetMode(ScrollMode.Smoother); UpdateTitle(); return;
+                case Key.F3: _scrollMatrix.SetMode(ScrollMode.Resampler); UpdateTitle(); return;
+                case Key.F5:
+                    _scrollMatrix.RecordingEnabled = !_scrollMatrix.RecordingEnabled;
+                    UpdateTitle();
+                    return;
+            }
             if (!SilkKeyboardMapper.TryMap(key, out var code)) return;
             _frameSource.Browser.SendKeyEvent(KeyEventType.RawKeyDown, code, SilkKeyboardMapper.BuildModifiers(keyboard));
         }

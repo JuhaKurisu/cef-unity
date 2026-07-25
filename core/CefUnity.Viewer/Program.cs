@@ -14,7 +14,8 @@ CefRuntime.Initialize(useGpu: true);
 try
 {
     using var frameSource = new CefFrameSource(viewerOptions.Width, viewerOptions.Height, viewerOptions.Url);
-    using var viewerWindow = new ViewerWindow(viewerOptions, frameSource);
+    using var scrollMatrix = new ScrollInputMatrix();
+    using var viewerWindow = new ViewerWindow(viewerOptions, frameSource, scrollMatrix);
     viewerWindow.Run();
 }
 catch (Exception exception)
