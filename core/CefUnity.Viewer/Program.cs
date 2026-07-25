@@ -1,6 +1,8 @@
 using CefUnity.Interop;
 using CefUnity.Viewer;
 
+MacMomentumScrollSupport.Enable();
+
 if (args.Length > 0 && args[0] == "spike") return SpikeRunner.Run();
 
 var viewerOptions = ViewerOptions.Parse(args);
