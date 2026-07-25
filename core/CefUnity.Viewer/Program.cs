@@ -1,5 +1,7 @@
 using CefUnity.Viewer;
 
+if (args.Length > 0 && args[0] == "spike") return CefUnity.Viewer.SpikeRunner.Run();
+
 var viewerOptions = ViewerOptions.Parse(args);
 if (viewerOptions == null)
 {
