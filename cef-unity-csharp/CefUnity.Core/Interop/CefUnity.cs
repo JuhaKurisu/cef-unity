@@ -476,6 +476,24 @@ namespace CefUnity.Interop
         // ----- Windows D3D11 共有テクスチャ -----
 
         /// <summary>
+        ///     Windows: 外部ホストの ID3D11Device を native 側へ注入する (Unity 以外のホスト用)。
+        ///     Unity では UnityPluginLoad が device を解決するため呼ぶ必要はない。
+        ///
+        ///     <para>
+        ///     Browser 生成より前に呼ぶこと。browser 生成時に共有 fence を開く判定が走るため、
+        ///     後から注入すると GPU 同期が張られない。
+        ///     </para>
+        ///     <para>
+        ///     デバイスの所有権は呼び出し側にあり、native 側は AddRef せず借用するだけなので、
+        ///     CefRuntime.Shutdown まで生存させること。非 Windows では何もしない。
+        ///     </para>
+        /// </summary>
+        public static unsafe void SetExternalD3D11Device(IntPtr device)
+        {
+            NativeMethods.cef_unity_set_external_d3d11_device((void*)device);
+        }
+
+        /// <summary>
         ///     Unity の D3D11 device と接続済みかどうかを返す (Windows 用)。
         /// </summary>
         public static bool IsD3D11Connected()

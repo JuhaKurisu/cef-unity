@@ -137,6 +137,14 @@ pub fn clear_unity_interfaces() {
     *FENCE.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
 
+/// Unity 以外のホスト (CefUnity.Viewer 等) が自前の ID3D11Device を注入する。
+///
+/// デバイスの所有権は呼び出し側にあり、こちら側は AddRef せず借用するだけなので、
+/// CEF shutdown まで生存させること。
+pub fn set_external_device(device: *mut c_void) {
+    UNITY_DEVICE.store(device, Ordering::Release);
+}
+
 /// 保持している IUnityInterfaces* から ID3D11Device を遅延取得する。
 /// 取得に成功したら UNITY_DEVICE に格納する。既に取得済みの場合は何もしない。
 fn try_resolve_d3d11_device() -> *mut c_void {
