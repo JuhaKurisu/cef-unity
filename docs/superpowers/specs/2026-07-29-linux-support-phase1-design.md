@@ -17,7 +17,7 @@ WSL2 (Ubuntu 24.04) 上で実測した結果、Linux 対応に必要な作業は
 |---|---|
 | `cargo build` (workspace) | **1 箇所の修正で成功**。client / ipc / helper は無修正で通る |
 | `cargo test -p cef-unity-ipc` | **19/19 パス** (共有メモリ read/write ラウンドトリップを含む) |
-| CEF Linux 配布物 | `cef-dll-sys` が自動取得・展開する (`target/*/build/cef-dll-sys-*/out/cef_linux_x86_64/`)。<br>`libcef.so`, `*.pak`, `icudtl.dat`, `locales/`, SwiftShader 一式のフラット構成 |
+| CEF Linux 配布物 | `cef-dll-sys` が自動取得・展開する (`target/*/build/cef-dll-sys-*/out/cef_linux_<arch>/`。<br>x86_64 環境での実測値は `cef_linux_x86_64`)。<br>`libcef.so`, `*.pak`, `icudtl.dat`, `locales/`, SwiftShader 一式のフラット構成 |
 | `libcef.so` のリンク | 実行時に **解決できない** (RPATH/RUNPATH なし) |
 | `libcef.so` の実行時依存 | `libnss3` / `libnspr4` / `libasound2` が不足 (apt で解消) |
 | CEF ロード | 上記解消後、サーバーは正常起動し `--ipc-server argument required` で停止 = **CEF ロードは通る** |
@@ -41,6 +41,18 @@ WSL2 (Ubuntu 24.04) 上で実測した結果、Linux 対応に必要な作業は
 
 GPU ゼロコピー (dmabuf / EGL) は macOS の IOSurface、Windows の D3D11 共有テクスチャに相当する
 第 3 の経路になるが、フェーズ 1 では扱わない。software paint で正しく動く土台を先に確定させる。
+
+## CPU アーキテクチャの扱い
+
+既存コードにアーキテクチャ分岐 (`#[cfg(target_arch)]`) は存在しない。クライアントは
+プラグインディレクトリを `dylib_directory()` (`client/src/lib.rs:272`) — 自分自身が
+ロードされた場所 — として解決するため、ネイティブ側はアーキテクチャ非依存に作られている。
+アーキテクチャ名が現れるのは deploy スクリプトの配置先 (`osx-arm64` / `win-x64`) だけで、
+これは Unity のプラグインフォルダ規約に従ったものである。
+
+フェーズ 1 でもこの方針を踏襲し、アーキテクチャ分岐を導入しない。CEF 配布物の探索には
+既存の `cef_macos_*` と同じくワイルドカードを使い、x86_64 / aarch64 のどちらでも
+同じスクリプトが通るようにする。
 
 ## 変更点
 
@@ -91,9 +103,13 @@ Linux 側が出力先ディレクトリへ配置するもの:
 
 - `target/debug/cef-unity-server`
 - `target/debug/cef-unity-rust-helper`
-- `cef_linux_x86_64/` から `libcef.so`, `libEGL.so`, `libGLESv2.so`, `libvk_swiftshader.so`,
+- CEF 配布物ディレクトリから `libcef.so`, `libEGL.so`, `libGLESv2.so`, `libvk_swiftshader.so`,
   `libvulkan.so.1`, `vk_swiftshader_icd.json`
-- `cef_linux_x86_64/` から `*.pak`, `icudtl.dat`, `v8_context_snapshot.bin`, `locales/`
+- 同ディレクトリから `*.pak`, `icudtl.dat`, `v8_context_snapshot.bin`, `locales/`
+
+CEF 配布物ディレクトリの特定には、既存の macOS 分岐 (`build-server-sandbox.sh:16` の
+`cef_macos_*`) と同じくワイルドカード `cef_linux_*` を使う。x86_64 と aarch64 の
+どちらでも同じスクリプトが通り、アーキテクチャ名をハードコードしない。
 
 `chrome-sandbox` は `no_sandbox = 1` のため配置しない。
 
