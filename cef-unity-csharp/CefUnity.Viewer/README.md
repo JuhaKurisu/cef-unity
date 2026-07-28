@@ -42,6 +42,13 @@ Windows にはネイティブスクロールソース (macOS の NSEvent モニ�
 - 入力が一切効かない: 起動ログの `input devices: mice=N keyboards=N` が 0 件でないか確認
 - Windows で黒画面のまま: `%TEMP%\cef_unity_debug.log` の `external d3d11 device set` /
   `opened handle=` 行を確認する (デバイス注入と共有テクスチャの open が成功しているか)
+
+## 既知の制限
+
+- **Windows の高 DPI ディスプレイ**: Viewer は DPI 非対応プロセスとして動くため、表示スケールが
+  100% でない環境では OS がウィンドウを引き伸ばして表示する (150% なら 1000x700 の窓が物理
+  1500x1050 になり、その分ぼやける)。入力座標と CEF 側の座標は一致するので操作に支障はない。
+  等倍で見たい場合は実行ファイルのプロパティ → 互換性 → 高 DPI 設定で「アプリケーション」を選ぶ
 - モメンタムスクロールが効かない: 起動時に毎回 (冪等) `~/Library/Preferences/CefUnity.Viewer.plist` へ `AppleMomentumScrollSupported=YES` を書き込む (SDL がモメンタムスクロール配送を止めるための対策。除去は `defaults delete CefUnity.Viewer AppleMomentumScrollSupported`)
 
 ## 録画・リプレイの注意事項
