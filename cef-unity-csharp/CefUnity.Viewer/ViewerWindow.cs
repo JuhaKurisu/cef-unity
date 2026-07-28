@@ -40,7 +40,11 @@ namespace CefUnity.Viewer
         private int _caretY = -1;
         private bool _replayFinishedShown; // Item I: リプレイ完了表示フラグ
 
-        public ViewerWindow(ViewerOptions options, CefFrameSource frameSource, ScrollInputMatrix scrollMatrix, StatisticsRecorder? statistics, CefUnity.Runtime.ScrollReplaySource? replaySource = null)
+        /// <param name="rendererFactory">
+        ///     表示バックエンドの生成関数。MetalFrameRenderer は Sdl インスタンスを要求し、
+        ///     それはウィンドウ生成後にしか取れないため、インスタンスではなくファクトリを受け取る。
+        /// </param>
+        public ViewerWindow(ViewerOptions options, CefFrameSource frameSource, ScrollInputMatrix scrollMatrix, Func<Sdl, IFrameRenderer> rendererFactory, StatisticsRecorder? statistics, CefUnity.Runtime.ScrollReplaySource? replaySource = null)
         {
             _options = options;
             _frameSource = frameSource;
@@ -60,7 +64,7 @@ namespace CefUnity.Viewer
             });
             _sdl = SdlWindowing.GetExistingApi(_window)
                    ?? throw new InvalidOperationException("SDL backend not active");
-            _renderer = new MetalFrameRenderer(_sdl);
+            _renderer = rendererFactory(_sdl);
             _window.Load += OnLoad;
             _window.Render += OnRender;
             _window.Resize += OnWindowResize;
@@ -126,8 +130,10 @@ namespace CefUnity.Viewer
                 _frameSource.Browser.SendMouseWheel(_mouseX, _mouseY, secondaryDeltaX, secondaryDeltaY, currentModifiers);
             _lastSentDeltaX = primaryDeltaX + secondaryDeltaX;
             _lastSentDeltaY = primaryDeltaY + secondaryDeltaY; // Task 8 の統計用
-            if (_frameSource.TickFrame(out var texturePointer, out var textureWidth, out var textureHeight))
+            if (_frameSource.TickFrame(out var texturePointer, out var textureWidth, out var textureHeight, out var textureFormat))
             {
+                // D3D11 は BGRA/RGBA で スワップチェーンの format family が変わるため受信値を伝える
+                if (_renderer is D3D11FrameRenderer d3d11Renderer) d3d11Renderer.SetReceivedFormat(textureFormat);
                 _renderer.Present(texturePointer, textureWidth, textureHeight);
                 if (!_firstFrameShown)
                 {
