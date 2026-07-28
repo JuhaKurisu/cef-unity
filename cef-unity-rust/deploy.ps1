@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 $ErrorActionPreference = 'Stop'
 
 # Windows x64 用のビルド + Unity プラグインへのコピー。
@@ -23,7 +23,9 @@ if (-not (Test-Path $Dest)) {
     New-Item -ItemType Directory -Path $Dest -Force | Out-Null
 }
 
-# ---- Rust 成果物 ----
+# ---- Rust 成果物の存在検査 ----
+# 実コピーは copy-windows-runtime.ps1 (Viewer のビルドと共有) が行うが、
+# Unity への配置では成果物の欠落を検出したいのでここで厳格に検査する。
 $Release = Join-Path $ScriptDir 'target\release'
 
 $Artifacts = @(
@@ -34,93 +36,42 @@ $Artifacts = @(
 foreach ($a in $Artifacts) {
     $src = Join-Path $Release $a
     if (-not (Test-Path $src)) { throw "missing artifact: $src" }
-    Copy-Item -Path $src -Destination $Dest -Force
-    Write-Host "[deploy] copied $a"
 }
 
-# ---- CEF ランタイムを cef-dll-sys のビルド出力から拾う ----
-# cef-rs は target/release/build/cef-dll-sys-*/out/cef_windows_x86_64/ に
-# フラット展開する (Release/ や Resources/ サブフォルダなし)。
-$CefDir = $null
-$CefOutCandidates = Get-ChildItem -Path (Join-Path $Release 'build') -Directory -Filter 'cef-dll-sys-*' -ErrorAction SilentlyContinue
-foreach ($c in $CefOutCandidates) {
-    $maybe = Get-ChildItem -Path (Join-Path $c.FullName 'out') -Directory -Filter 'cef_windows*' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($maybe -and (Test-Path (Join-Path $maybe.FullName 'libcef.dll'))) {
-        $CefDir = $maybe.FullName
-        break
-    }
-}
-if (-not $CefDir) {
-    throw "CEF runtime not found at target/release/build/cef-dll-sys-*/out/cef_windows*/libcef.dll"
-}
-Write-Host "[deploy] CEF runtime: $CefDir"
-
-# ---- ランタイム必須 dll (Chromium / Skia / Angle / SwiftShader / Vulkan) ----
-$RuntimeDlls = @(
-    'libcef.dll',
-    'chrome_elf.dll',
-    'd3dcompiler_47.dll',
-    'dxcompiler.dll',
-    'dxil.dll',
-    'libEGL.dll',
-    'libGLESv2.dll',
-    'vk_swiftshader.dll',
-    'vulkan-1.dll'
-)
-foreach ($dll in $RuntimeDlls) {
-    $src = Join-Path $CefDir $dll
-    if (Test-Path $src) {
-        Copy-Item -Path $src -Destination $Dest -Force
-    } else {
-        Write-Warning "[deploy] missing runtime dll (skipped): $dll"
-    }
-}
-
-# ---- リソース (V8 snapshot / ICU / pak / SwiftShader manifest) ----
-$ResourceFiles = @(
-    'icudtl.dat',
-    'v8_context_snapshot.bin',
-    'snapshot_blob.bin',
-    'resources.pak',
-    'chrome_100_percent.pak',
-    'chrome_200_percent.pak',
-    'vk_swiftshader_icd.json'
-)
-foreach ($f in $ResourceFiles) {
-    $src = Join-Path $CefDir $f
-    if (Test-Path $src) {
-        Copy-Item -Path $src -Destination $Dest -Force
-    }
-}
-
-# ---- locales/ ----
-$LocalesSrc = Join-Path $CefDir 'locales'
-if (Test-Path $LocalesSrc) {
-    $LocalesDst = Join-Path $Dest 'locales'
-
-    # Unity が生成した .meta ファイルを退避
-    $MetaTmp = $null
-    if (Test-Path $LocalesDst) {
-        $metas = Get-ChildItem -Path $LocalesDst -Filter '*.meta' -ErrorAction SilentlyContinue
-        if ($metas) {
-            $MetaTmp = Join-Path ([System.IO.Path]::GetTempPath()) "cef-unity-meta-$([System.Guid]::NewGuid())"
-            New-Item -ItemType Directory -Path $MetaTmp -Force | Out-Null
-            foreach ($m in $metas) {
-                Copy-Item -Path $m.FullName -Destination $MetaTmp -Force
-            }
+# ---- locales/ の Unity .meta を退避 ----
+# 共有スクリプトは .meta を関知しないため、退避・復元は Unity 配置固有の処理として
+# ここで行う。旧ファイルの残留を避けるためディレクトリごと作り直す。
+$LocalesDst = Join-Path $Dest 'locales'
+$MetaTmp = $null
+if (Test-Path $LocalesDst) {
+    $metas = Get-ChildItem -Path $LocalesDst -Filter '*.meta' -ErrorAction SilentlyContinue
+    if ($metas) {
+        $MetaTmp = Join-Path ([System.IO.Path]::GetTempPath()) "cef-unity-meta-$([System.Guid]::NewGuid())"
+        New-Item -ItemType Directory -Path $MetaTmp -Force | Out-Null
+        foreach ($m in $metas) {
+            Copy-Item -Path $m.FullName -Destination $MetaTmp -Force
         }
-        Remove-Item -Path $LocalesDst -Recurse -Force
     }
+    Remove-Item -Path $LocalesDst -Recurse -Force
+}
 
-    Copy-Item -Path $LocalesSrc -Destination $LocalesDst -Recurse -Force
+# ---- Rust 成果物 + CEF ランタイムを配置 (Viewer のビルドと共有) ----
+& (Join-Path $ScriptDir 'copy-windows-runtime.ps1') -Destination $Dest
+if ($LASTEXITCODE -ne 0) { throw "copy-windows-runtime.ps1 failed" }
 
-    # 退避した .meta を復元
-    if ($MetaTmp -and (Test-Path $MetaTmp)) {
-        Get-ChildItem -Path $MetaTmp -Filter '*.meta' | ForEach-Object {
-            Copy-Item -Path $_.FullName -Destination $LocalesDst -Force
-        }
-        Remove-Item -Path $MetaTmp -Recurse -Force
+# 共有スクリプトは CEF ランタイム未検出でも警告のみで抜けるため、Unity 配置では結果を検査する。
+foreach ($required in @('cef_unity_rust.dll', 'cef-unity-server.exe', 'libcef.dll')) {
+    if (-not (Test-Path (Join-Path $Dest $required))) {
+        throw "deploy failed: $required was not copied to $Dest"
     }
+}
+
+# ---- 退避した .meta を復元 ----
+if ($MetaTmp -and (Test-Path $MetaTmp)) {
+    Get-ChildItem -Path $MetaTmp -Filter '*.meta' | ForEach-Object {
+        Copy-Item -Path $_.FullName -Destination $LocalesDst -Force
+    }
+    Remove-Item -Path $MetaTmp -Recurse -Force
 }
 
 Write-Host "[deploy] done -> $Dest"

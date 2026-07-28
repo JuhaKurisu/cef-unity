@@ -28,4 +28,14 @@
           Condition="$([MSBuild]::IsOSPlatform('OSX')) And !Exists('$(OutputPath)cef-unity-server.app') And Exists('$(RustTargetDir)/cef-unity-server')">
     <Exec Command="bash '$(RustProjectDir)/build-server-sandbox.sh' '$(OutputPath)'" />
   </Target>
+  <!-- Windows: cef-unity-server.exe は cef_unity_rust.dll と同じディレクトリ直下から
+       起動されるため、Rust 成果物と CEF ランタイムを出力先へフラット配置する
+       (deploy.ps1 と同じスクリプトを共有)。Rust 未ビルド環境ではスクリプト側が警告のみで抜ける。
+       注: 配置元は release ビルド。RustTargetDir (debug) ではない。 -->
+  <Target Name="CopyWindowsRuntime" AfterTargets="Build"
+          Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+    <!-- OutputPath は末尾が \ なので、引用符の直前に来ると PowerShell 側で
+         エスケープと解釈される。TrimEnd で落としてから渡す。 -->
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(RustProjectDir)\copy-windows-runtime.ps1&quot; -Destination &quot;$(OutputPath.TrimEnd('\'))&quot;" />
+  </Target>
 </Project>
