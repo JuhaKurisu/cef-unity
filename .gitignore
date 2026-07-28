@@ -5,3 +5,4 @@
 # Claude Code のセッション状態・個人設定 (skills は共有のためトラック)
 .claude/scheduled_tasks.lock
 .claude/settings.local.json
+.claude/worktrees/
