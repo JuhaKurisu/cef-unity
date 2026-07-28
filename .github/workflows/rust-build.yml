@@ -9,12 +9,12 @@ on:
     paths:
       - "cef-unity-rust/**"
       - ".github/workflows/rust-build.yml"
-      - "core/**"
+      - "cef-unity-csharp/**"
   pull_request:
     paths:
       - "cef-unity-rust/**"
       - ".github/workflows/rust-build.yml"
-      - "core/**"
+      - "cef-unity-csharp/**"
   workflow_dispatch:
 
 concurrency:
@@ -53,7 +53,7 @@ jobs:
         with:
           dotnet-version: '10.0.x'
       - name: Core unit tests (no Unity)
-        run: dotnet test core/CefUnity.Tests -c Release --logger "console;verbosity=minimal"
+        run: dotnet test cef-unity-csharp/CefUnity.Tests -c Release --logger "console;verbosity=minimal"
 
       - name: Zip artifact
         working-directory: cef-unity-unityproject/Assets/CefUnity/Plugins
@@ -170,7 +170,7 @@ jobs:
           dotnet-version: '10.0.x'
       - name: Build & stage CefUnity.Core.dll
         run: |
-          bash core/build-core.sh
+          bash cef-unity-csharp/build-csharp.sh
           git add cef-unity-unityproject/Assets/CefUnity/Plugins/CefUnity.Core.dll
 
       - name: Update Plugins (mac)

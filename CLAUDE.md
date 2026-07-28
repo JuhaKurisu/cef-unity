@@ -14,4 +14,4 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## サブディレクトリの指針
 
 - Rust 側のビルド・デプロイ手順: `cef-unity-rust/CLAUDE.md` を参照 (Rust 変更時は csbindgen 再生成 → `deploy.sh` / `deploy.ps1` 必須)
-- C# Interop の単一の真実源は `core/CefUnity.Core/Interop/` (`NativeMethods.g.cs` は `crates/client/build.rs` の csbindgen がここへ直接生成する)。Unity は `Assets/CefUnity/Plugins/CefUnity.Core.dll` を参照するため、core 変更時は `bash core/build-core.sh` で再ビルド・配置する
+- C# Interop の単一の真実源は `cef-unity-csharp/CefUnity.Core/Interop/` (`NativeMethods.g.cs` は `crates/client/build.rs` の csbindgen がここへ直接生成する)。Unity は `Assets/CefUnity/Plugins/CefUnity.Core.dll` を参照するため、C# 側変更時は `bash cef-unity-csharp/build-csharp.sh` で再ビルド・配置する

@@ -6,10 +6,10 @@ Unity 固有性切り分けが主目的 (spec: docs/superpowers/specs/2026-07-25
 ## 実行
 
 ```
-dotnet run --project core/CefUnity.Viewer -- [--url <url>] [--size 1280x720]
+dotnet run --project cef-unity-csharp/CefUnity.Viewer -- [--url <url>] [--size 1280x720]
     [--scroll-mode raw|smoother|resampler] [--record]
     [--replay <events-csv>] [--statistics <output-csv>] [--analyze <statistics-csv>]
-dotnet run --project core/CefUnity.Viewer -- spike   # SDL/Metal/NSEvent/IME 疎通確認
+dotnet run --project cef-unity-csharp/CefUnity.Viewer -- spike   # SDL/Metal/NSEvent/IME 疎通確認
 ```
 
 ## 実行時ショートカット

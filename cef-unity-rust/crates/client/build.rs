@@ -41,6 +41,6 @@ fn main() {
         .csharp_class_name("NativeMethods")
         .csharp_class_accessibility("public")
         .csharp_use_function_pointer(false)
-        .generate_csharp_file(workspace_root.join("../core/CefUnity.Core/Interop/NativeMethods.g.cs"))
+        .generate_csharp_file(workspace_root.join("../cef-unity-csharp/CefUnity.Core/Interop/NativeMethods.g.cs"))
         .unwrap();
 }

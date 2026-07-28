@@ -13,9 +13,9 @@ cargo test -p cef-unity-ipc
 
 ### 2. C# 側の同期更新
 
-FFI 関数の追加・変更時は **`core/CefUnity.Core/Interop/NativeMethods.g.cs` + `CefUnity.cs`** を更新する (namespace は `CefUnity` / `CefUnity.Interop`)。
+FFI 関数の追加・変更時は **`cef-unity-csharp/CefUnity.Core/Interop/NativeMethods.g.cs` + `CefUnity.cs`** を更新する (namespace は `CefUnity` / `CefUnity.Interop`)。
 
-Interop は逆転設計で **CefUnity.Core に一本化済み** — Unity・Harness・Tests はこの Core を単一の真実源として参照する (旧 `cef-unity-csharp/` と Unity 側 `Assets/CefUnity/Interop/` の二重管理は廃止)。
+Interop は逆転設計で **CefUnity.Core に一本化済み** — Unity・Harness・Tests はこの Core を単一の真実源として参照する (Unity 側 `Assets/CefUnity/Interop/` との二重管理は廃止)。
 
 ### 3. Unity プロジェクトへのデプロイ
 
