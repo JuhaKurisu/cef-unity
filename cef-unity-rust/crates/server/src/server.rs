@@ -1762,5 +1762,7 @@ fn helper_binary_path(executable_directory: &std::path::Path) -> std::path::Path
 
 #[cfg(target_os = "windows")]
 fn helper_binary_path(executable_directory: &std::path::Path) -> std::path::PathBuf {
-    executable_directory.join("cef-unity-rust-helper.executable")
+    // ".exe" は Windows の実行ファイル拡張子であり識別子ではない (命名規約の展開対象外)。
+    // ここが実ファイル名と食い違うと CEF のサブプロセス起動が error_code=63 で失敗する。
+    executable_directory.join("cef-unity-rust-helper.exe")
 }

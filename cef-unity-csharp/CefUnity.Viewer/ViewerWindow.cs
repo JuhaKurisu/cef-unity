@@ -83,6 +83,8 @@ namespace CefUnity.Viewer
                 _frameSource.Resize(_window.Size.X, _window.Size.Y);
             _renderer.Initialize(_window);
             _input = _window.CreateInput();
+            // デバイスが 0 件だと入力が一切効かない (原因が見えにくいので起動時に必ず出す)
+            Console.WriteLine($"input devices: mice={_input.Mice.Count} keyboards={_input.Keyboards.Count}");
             _mouse = _input.Mice.Count > 0 ? _input.Mice[0] : null;
             if (_mouse != null)
             {
@@ -97,13 +99,24 @@ namespace CefUnity.Viewer
                 _keyboard.KeyDown += OnKeyDown;
                 _keyboard.KeyUp += OnKeyUp;
             }
+            var effectiveMode = _options.Mode;
             if (_options.ReplayPath == null)
             {
                 var startResult = _scrollMatrix.StartNativeSource(out var startError);
                 if (startResult != NativeScrollSourceStart.Started)
+                {
                     Console.WriteLine($"native scroll source: {startResult} {startError?.Message} — フォールバック (窓 wheel イベント)");
+                    // Resampler モードは窓 wheel を無視する (native ソースとの二重計上防止) ため、
+                    // native ソースが無いままだとスクロールが一切効かない。Smoother に落とす。
+                    // Windows は native ソース未対応なので常にこの経路を通る。
+                    if (effectiveMode == ScrollMode.Resampler)
+                    {
+                        effectiveMode = ScrollMode.Smoother;
+                        Console.WriteLine("scroll mode: Resampler は native ソースを要するため Smoother で起動する (F1/F2/F3 で切替可)");
+                    }
+                }
             }
-            _scrollMatrix.SetMode(_options.Mode);
+            _scrollMatrix.SetMode(effectiveMode);
             _scrollMatrix.RecordingEnabled = _options.Record;
             _imeBridge = new ImeBridge(new BrowserImeSink(_frameSource.Browser));
             _eventWatchInstance = this;
