@@ -15,6 +15,9 @@
     <PackageReference Include="Silk.NET.Input" Version="2.22.0" />
     <PackageReference Include="Silk.NET.Input.Sdl" Version="2.22.0" />
     <PackageReference Include="Silk.NET.SDL" Version="2.22.0" />
+    <!-- Windows の表示経路 (D3D11FrameRenderer)。非 Windows でもビルドは通る (P/Invoke は実行時解決)。 -->
+    <PackageReference Include="Silk.NET.Direct3D11" Version="2.22.0" />
+    <PackageReference Include="Silk.NET.DXGI" Version="2.22.0" />
   </ItemGroup>
   <ItemGroup>
     <!-- debug 成果物はローカル開発専用。CI は release ビルドのみで target/debug が無いため Exists ガード必須
