@@ -1,7 +1,11 @@
 # CefUnity.Viewer
 
-Unity 外で CEF を表示+操作する mac 単体ブラウザ。スクロールカクツキの
-Unity 固有性切り分けが主目的 (spec: docs/superpowers/specs/2026-07-25-silknet-viewer-design.md)。
+Unity 外で CEF を表示+操作する macOS / Windows 単体ブラウザ。スクロールカクツキの
+Unity 固有性切り分けが主目的 (spec: docs/superpowers/specs/2026-07-25-silknet-viewer-design.md、
+Windows 対応: docs/superpowers/specs/2026-07-28-windows-viewer-d3d11-design.md)。
+
+表示はどちらも GPU ゼロコピー経路を使う (macOS: IOSurface → Metal blit / Windows: D3D11 共有
+テクスチャ → DXGI スワップチェーン)。
 
 ## 実行
 
@@ -19,6 +23,9 @@ dotnet run --project cef-unity-csharp/CefUnity.Viewer -- spike   # SDL/Metal/NSE
 | F1 / F2 / F3 | スクロールモード切替 raw / smoother / resampler (タイトルに表示) |
 | F5 | 生イベント録画トグル → $TMPDIR/cef_scroll_events.csv |
 
+Windows にはネイティブスクロールソース (macOS の NSEvent モニタ相当) が無く、Resampler モードは
+窓の wheel イベントを無視する仕様のため、起動時に自動的に Smoother へ落ちる (F1/F2/F3 で切替可)。
+
 ## 切り分けの実験プロトコル
 
 1. Unity (または Viewer) で `--record` 相当の録画を取る
@@ -28,9 +35,20 @@ dotnet run --project cef-unity-csharp/CefUnity.Viewer -- spike   # SDL/Metal/NSE
 
 ## トラブルシューティング
 
-- サーバープロセス残留 (次回起動が永久ハング): `pkill -f cef-unity-server`
-- 起動ハング (キャッシュ破損): `$TMPDIR` 配下の cef_unity_cache を削除
+- サーバープロセス残留 (次回起動が永久ハング): macOS は `pkill -f cef-unity-server`、
+  Windows は `taskkill /IM cef-unity-server.exe /F`
+- 起動ハング (キャッシュ破損): macOS は `$TMPDIR`、Windows は `%TEMP%` 配下の cef_unity_cache を削除
 - スクロール resampler モードが効かない: 起動ログの `native scroll source:` を確認
+- 入力が一切効かない: 起動ログの `input devices: mice=N keyboards=N` が 0 件でないか確認
+- Windows で黒画面のまま: `%TEMP%\cef_unity_debug.log` の `external d3d11 device set` /
+  `opened handle=` 行を確認する (デバイス注入と共有テクスチャの open が成功しているか)
+
+## 既知の制限
+
+- **Windows の高 DPI ディスプレイ**: Viewer は DPI 非対応プロセスとして動くため、表示スケールが
+  100% でない環境では OS がウィンドウを引き伸ばして表示する (150% なら 1000x700 の窓が物理
+  1500x1050 になり、その分ぼやける)。入力座標と CEF 側の座標は一致するので操作に支障はない。
+  等倍で見たい場合は実行ファイルのプロパティ → 互換性 → 高 DPI 設定で「アプリケーション」を選ぶ
 - モメンタムスクロールが効かない: 起動時に毎回 (冪等) `~/Library/Preferences/CefUnity.Viewer.plist` へ `AppleMomentumScrollSupported=YES` を書き込む (SDL がモメンタムスクロール配送を止めるための対策。除去は `defaults delete CefUnity.Viewer AppleMomentumScrollSupported`)
 
 ## 録画・リプレイの注意事項

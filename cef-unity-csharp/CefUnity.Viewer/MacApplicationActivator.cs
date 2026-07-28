@@ -8,7 +8,7 @@ namespace CefUnity.Viewer
     ///     (録画実測: phase 4/5/6 が皆無)。起動時に自己アクティベートして
     ///     通常アプリと同じイベント配送にする。
     /// </summary>
-    internal static class MacApplicationActivator
+    public static class MacApplicationActivator
     {
         private const string LibraryObjC = "/usr/lib/libobjc.A.dylib";
 
@@ -32,6 +32,7 @@ namespace CefUnity.Viewer
 
         public static void ActivateCurrentApplication()
         {
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.OSX)) return;
             try
             {
                 var application = IntPtrMessage(GetClass("NSApplication"), Selector("sharedApplication"));

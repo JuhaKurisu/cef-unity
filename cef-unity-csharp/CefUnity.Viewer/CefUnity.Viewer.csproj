@@ -15,6 +15,9 @@
     <PackageReference Include="Silk.NET.Input" Version="2.22.0" />
     <PackageReference Include="Silk.NET.Input.Sdl" Version="2.22.0" />
     <PackageReference Include="Silk.NET.SDL" Version="2.22.0" />
+    <!-- Windows の表示経路 (D3D11FrameRenderer)。非 Windows でもビルドは通る (P/Invoke は実行時解決)。 -->
+    <PackageReference Include="Silk.NET.Direct3D11" Version="2.22.0" />
+    <PackageReference Include="Silk.NET.DXGI" Version="2.22.0" />
   </ItemGroup>
   <ItemGroup>
     <!-- debug 成果物はローカル開発専用。CI は release ビルドのみで target/debug が無いため Exists ガード必須
@@ -27,5 +30,15 @@
   <Target Name="CopyServerApp" AfterTargets="Build"
           Condition="$([MSBuild]::IsOSPlatform('OSX')) And !Exists('$(OutputPath)cef-unity-server.app') And Exists('$(RustTargetDir)/cef-unity-server')">
     <Exec Command="bash '$(RustProjectDir)/build-server-sandbox.sh' '$(OutputPath)'" />
+  </Target>
+  <!-- Windows: cef-unity-server.exe は cef_unity_rust.dll と同じディレクトリ直下から
+       起動されるため、Rust 成果物と CEF ランタイムを出力先へフラット配置する
+       (deploy.ps1 と同じスクリプトを共有)。Rust 未ビルド環境ではスクリプト側が警告のみで抜ける。
+       注: 配置元は release ビルド。RustTargetDir (debug) ではない。 -->
+  <Target Name="CopyWindowsRuntime" AfterTargets="Build"
+          Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+    <!-- OutputPath は末尾が \ なので、引用符の直前に来ると PowerShell 側で
+         エスケープと解釈される。TrimEnd で落としてから渡す。 -->
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(RustProjectDir)\copy-windows-runtime.ps1&quot; -Destination &quot;$(OutputPath.TrimEnd('\'))&quot;" />
   </Target>
 </Project>

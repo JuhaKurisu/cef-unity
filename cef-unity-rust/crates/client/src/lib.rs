@@ -1876,6 +1876,28 @@ pub extern "C" fn UnityPluginUnload() {
     })
 }
 
+/// Windows: 外部ホストの ID3D11Device を注入する (Unity 以外のホスト用)。
+///
+/// **`cef_unity_create_browser` より前に呼ぶこと。** browser 生成時に共有 fence を開く判定
+/// (`is_d3d11_connected`) が走るため、後から注入すると GPU 同期が張られない。
+///
+/// デバイスの所有権は呼び出し側。こちら側は AddRef せず借用するだけなので、
+/// `cef_unity_shutdown` まで生存させること。非 Windows では何もしない。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_set_external_d3d11_device(device: *mut std::ffi::c_void) {
+    ffi_guard((), || {
+        #[cfg(target_os = "windows")]
+        {
+            d3d11::set_external_device(device);
+            log_to_file(&format!("external d3d11 device set: {:p}", device));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = device;
+        }
+    })
+}
+
 /// Windows: Unity の D3D11 device に接続済みなら 1 を返す。
 /// CPU モード (Init で use_gpu=0) のときは常に 0 を返す。
 #[unsafe(no_mangle)]
