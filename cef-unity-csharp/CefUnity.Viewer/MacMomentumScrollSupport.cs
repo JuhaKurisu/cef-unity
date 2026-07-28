@@ -8,7 +8,7 @@ namespace CefUnity.Viewer
     ///     app ドメインは登録ドメインより優先されるため、YES を明示設定して
     ///     通常アプリと同じモメンタム配送を復元する。SDL 初期化前に呼ぶこと。
     /// </summary>
-    internal static class MacMomentumScrollSupport
+    public static class MacMomentumScrollSupport
     {
         private const string LibraryObjC = "/usr/lib/libobjc.A.dylib";
 
@@ -33,6 +33,10 @@ namespace CefUnity.Viewer
 
         public static void Enable()
         {
+            // 非 macOS では objc ランタイムが無く NativeLibrary.Load が例外を投げるため、
+            // ここで抜ける (Windows で Program が起動できなくなるのを防ぐ)。
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.OSX)) return;
+
             NativeLibrary.Load("/System/Library/Frameworks/Foundation.framework/Foundation");
 
             var userDefaultsClass = GetClass("NSUserDefaults");

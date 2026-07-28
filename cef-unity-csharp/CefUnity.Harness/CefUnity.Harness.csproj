@@ -11,11 +11,15 @@
     <ProjectReference Include="..\CefUnity.Core\CefUnity.Core.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <!-- debug 成果物はローカル開発専用。非 macOS / Rust 未ビルド環境では存在しないため
+         Viewer と同じ OS + Exists ガードが必須 (無いと Windows で MSB3030) -->
     <None Include="$(RustTargetDir)/libcef_unity_rust.dylib"
-          CopyToOutputDirectory="PreserveNewest" Link="libcef_unity_rust.dylib" />
+          CopyToOutputDirectory="PreserveNewest" Link="libcef_unity_rust.dylib"
+          Condition="$([MSBuild]::IsOSPlatform('OSX')) And Exists('$(RustTargetDir)/libcef_unity_rust.dylib')" />
   </ItemGroup>
   <!-- cef-unity-server.app bundle を出力先に用意(旧 Sandbox と同じ) -->
-  <Target Name="CopyServerApp" AfterTargets="Build">
+  <Target Name="CopyServerApp" AfterTargets="Build"
+          Condition="$([MSBuild]::IsOSPlatform('OSX')) And Exists('$(RustTargetDir)/cef-unity-server')">
     <Exec Command="bash '$(RustProjectDir)/build-server-sandbox.sh' '$(OutputPath)'" />
   </Target>
 </Project>
