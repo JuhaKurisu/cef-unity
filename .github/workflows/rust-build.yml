@@ -187,13 +187,14 @@ jobs:
           cp "$SRC/cef_unity_rust.dll" "$SRC/cef-unity-server.exe" "$SRC/cef-unity-rust-helper.exe" "$WD/"
           rsync -a --exclude archive.json "$SRC/cef/" "$WD/"
 
-      - name: Warn missing .meta (新規ファイルは Unity での meta 生成が必要)
-        run: |
-          MISSING=0
-          while IFS= read -r f; do
-            if [ ! -f "$f.meta" ]; then echo "META なし: $f"; MISSING=1; fi
-          done < <(find cef-unity-unityproject/Assets/CefUnity/Plugins -type f ! -name '*.meta')
-          [ "$MISSING" = 0 ] && echo "全ファイルに .meta あり" || echo "(警告のみ — コミットは続行)"
+      # CEF 更新でファイルが増えると、Unity Editor を起動しないこの job では .meta が
+      # 無いままコミットされ、利用側の Unity が GUID をローカル生成して参照がぶれる。
+      # パス由来の決定論的 GUID を与えて防ぐ。
+      - name: Generate missing .meta
+        run: bash cef-unity-unityproject/generate-missing-meta.sh cef-unity-unityproject/Assets/CefUnity/Plugins
+
+      - name: Verify .meta coverage
+        run: bash cef-unity-unityproject/generate-missing-meta.sh --check cef-unity-unityproject/Assets/CefUnity/Plugins
 
       - name: Commit and push via LFS
         run: |
