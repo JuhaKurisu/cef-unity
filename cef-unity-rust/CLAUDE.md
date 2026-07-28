@@ -47,7 +47,16 @@ Visual Studio Build Tools 2022 がある場合は VS Developer PowerShell から
 成果物は `cef-unity-unityproject/Assets/CefUnity/Plugins/win-x64/` にフラット配置される
 (`cef_unity_rust.dll`, `cef-unity-server.exe`, `cef-unity-rust-helper.exe`, `libcef.dll`, 各種 `.pak` / `.dat` / `.bin`, `locales/`)。
 
-Windows ではゼロコピー GPU 経路 (IOSurface/Mach/Metal) は無効で、software paint (共有メモリ経由の BGRA 転送) で動作する。
-将来的な D3D11 共有テクスチャ対応はフェーズ 2 で実装予定。
+Windows のゼロコピー GPU 経路は **D3D11 共有テクスチャ + 共有 fence** で実装済み
+(macOS の IOSurface/Mach/Metal に相当)。server が `on_accelerated_paint` で共有 NT HANDLE を
+publish し、client が `OpenSharedResource1` で開いて `ID3D11DeviceContext4::Wait` で同期する。
+
+client が使う D3D11 device の取得元は 2 系統ある:
+
+- **Unity**: `UnityPluginLoad` が `IUnityGraphicsD3D11` から取得する (呼び出し不要)
+- **Unity 以外のホスト** (`CefUnity.Viewer` 等): `cef_unity_set_external_d3d11_device` で自前の
+  `ID3D11Device` を注入する。**`cef_unity_create_browser` より前に呼ぶこと** (browser 生成時に
+  共有 fence を開く判定が走るため)。device の所有権は呼び出し側にあり、client は AddRef せず
+  借用するだけなので `cef_unity_shutdown` まで生存させること
 
 **注意:** Rust 側の変更が完了したら、必ず `deploy.sh` (macOS) または `deploy.ps1` (Windows) を実行すること。これを忘れると Unity プロジェクトに古いバイナリが残る。

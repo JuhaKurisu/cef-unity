@@ -8,6 +8,7 @@
 ## スコープ
 
 - **対象 OS: macOS のみ** (Windows は保留。将来 D3D11 対応する際は `IFrameRenderer` 抽象に `D3D11FrameRenderer` を追加し、native 側にデバイス注入 FFI `cef_unity_set_external_d3d11_device` を 1 本追加する — 現 native は UnityPluginLoad 経由でしか D3D11 デバイスを取得できないため)
+  - **2026-07-28 追記**: ここに書いたとおりの形で Windows 対応済み。設計は `2026-07-28-windows-viewer-d3d11-design.md` を参照
 - 表示経路: **GPU ゼロコピー (accelerated paint / IOSurface / Metal)**。useGpu:true で初期化
 - 入力: マウス (移動/クリック/ホイール)、キーボード、**IME (日本語入力)**、ウィンドウリサイズ追従
 - スクロール検証: **フルマトリクス (3 モード実行時切替) + 録画/リプレイ内蔵**
