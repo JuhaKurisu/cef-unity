@@ -16,6 +16,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # macOS 側の処理 (以降) は変更しない。Linux はここで配置を終えて exit する。
 if [ "$(uname -s)" = "Linux" ]; then
     bash "$SCRIPT_DIR/copy-linux-runtime.sh" "$OUTPUT_DIR" debug
+
+    # 共有スクリプトはソース欠落を警告のみで通す (Rust 未ビルド環境で dotnet build を
+    # 壊さないための方針)。直接叩かれた場合に空の配置で成功と表示しないよう、
+    # ここで必須ファイルを検査する。
+    for required in cef-unity-server cef-unity-rust-helper libcef.so; do
+        if [ ! -f "$OUTPUT_DIR/$required" ]; then
+            echo "ERROR: $required が $OUTPUT_DIR にありません。'cargo build' を先に実行してください。" >&2
+            exit 1
+        fi
+    done
+
     echo "server staged (flat) at $OUTPUT_DIR"
     exit 0
 fi
