@@ -182,6 +182,14 @@ Linux で開発する際の前提を記録する:
 ## 開発環境
 
 WSL2 (Ubuntu 24.04 LTS) を使う。ディストロは `F:\WSL\Ubuntu-24.04` に配置済み。
-リポジトリは ext4 側 (`~/cef-unity`) にクローンして作業する — `/mnt/f` 直参照は
-ファイル I/O が遅く、`target/` を Windows ビルドと共有すると相互にフルリビルドを
-誘発するため。Windows 側の作業ツリーとは git 経由で往復する。
+
+作業ツリーは git worktree で隔離する: `F:\GitHub\cef-unity\.claude\worktrees\linux-phase1`
+(WSL からは `/mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1`)。並行して進む
+Windows arm64 対応 (`feat/windows-arm64-wt`) と作業ツリーを共有しないための措置。
+
+`target/` だけは ext4 側に逃がす (`CARGO_TARGET_DIR=$HOME/cef-target-mnt`)。ビルド生成物の
+I/O が支配的なので、これだけで `/mnt/f` 越しのビルドが実用速度になる (実測: 依存キャッシュ
+済みでフルビルド 144 秒)。ソースを ext4 に別クローンする必要はない。
+
+worktree の `.git` は Windows パスを指すファイルのため、**WSL から git は実行できない**。
+編集と git は Windows 側、ビルドとテストは WSL 側という分担になる。

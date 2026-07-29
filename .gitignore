@@ -6,3 +6,6 @@
 .claude/scheduled_tasks.lock
 .claude/settings.local.json
 .claude/worktrees/
+
+# subagent-driven-development の作業ディレクトリ (ledger / brief / レビュー材料)
+.superpowers/
