@@ -21,6 +21,11 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Dxgi_Common",
     # RegisterClassW / WNDCLASSW (Raw Input 用のメッセージ専用ウィンドウ) がここに gate されている
     "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    # IMMDevice::Activate はこの 2 つに gate されている
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_UI_Input",

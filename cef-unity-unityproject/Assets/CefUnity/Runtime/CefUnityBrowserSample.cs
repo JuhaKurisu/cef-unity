@@ -34,7 +34,8 @@ namespace CefUnity.Runtime
         [Tooltip("CEF の音声を Unity の AudioSource で再生する (CEF/ブラウザ側では鳴らさない)")]
         [SerializeField] private bool _enableAudio = true;
 
-        [Tooltip("音声レンダラ。UnityMixer=AudioSource 再生 (ミキサ統合, ~160ms) / Native=AudioUnit 直結 (macOS, ~30ms)")]
+        [Tooltip("音声レンダラ。UnityMixer=AudioSource 再生 (ミキサ統合, ~160ms) / " +
+                 "Native=OS の音声 API 直結 (macOS: AudioUnit / Windows: WASAPI, 低遅延)")]
         [SerializeField] private AudioRendererMode _audioRenderer = AudioRendererMode.UnityMixer;
 
         [Tooltip("音声出力の DSP バッファサイズ (フレーム/段)。小さいほど低遅延だが負荷増。" +
@@ -48,7 +49,11 @@ namespace CefUnity.Runtime
             /// <summary>Unity AudioSource (FMOD ミキサ) で再生。ミキサ統合 (エフェクト等) が効くが遅延大 (~160ms)。</summary>
             UnityMixer,
 
-            /// <summary>ネイティブ AudioUnit で再生 (macOS)。低遅延 (~30ms) だが Unity ミキサ機能は効かない。</summary>
+            /// <summary>
+            ///     OS のネイティブ音声 API で再生 (macOS: AudioUnit / Windows: WASAPI)。
+            ///     低遅延 (macOS 実測 ~30ms) だが Unity ミキサ機能は効かない。
+            ///     未対応 OS では開始に失敗し、UnityMixer 経路へフォールバックする。
+            /// </summary>
             Native,
         }
 

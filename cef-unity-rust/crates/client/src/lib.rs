@@ -10,12 +10,18 @@ mod d3d11;
 #[cfg(target_os = "windows")]
 mod d3d12;
 
-#[cfg(target_os = "macos")]
+// ネイティブ音声出力の共通部 (SHM ドレイン + steering リング)。
+// 出力デバイス層だけが macOS = AudioUnit / Windows = WASAPI で分かれる。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod audio_pull;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod audio_ring;
 #[cfg(target_os = "macos")]
 mod au_output;
 #[cfg(target_os = "macos")]
 mod native_voice;
+#[cfg(target_os = "windows")]
+mod wasapi_output;
 #[cfg(target_os = "macos")]
 mod scroll_monitor;
 #[cfg(target_os = "windows")]
@@ -138,12 +144,18 @@ struct ClientBrowserInstance {
     /// 音声リングバッファのリーダー。サーバーが flink を返さなかった場合や
     /// open に失敗した場合は None (音声無効)。
     audio_shared_memory: Option<AudioSharedMemoryReader>,
-    /// 音声リングの flink。NativeVoice が独立カーソルの自前リーダーを開くのに使う。
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// 音声リングの flink。ネイティブ音声出力が独立カーソルの自前リーダーを開くのに使う。
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "windows")),
+        allow(dead_code)
+    )]
     audio_flink: String,
     /// CRI 方式ネイティブ音声出力 (macOS)。Unity ミキサを迂回して AudioUnit で再生。
     #[cfg(target_os = "macos")]
     native_voice: Option<native_voice::NativeVoice>,
+    /// ネイティブ音声出力 (Windows)。Unity ミキサを迂回して WASAPI で再生。
+    #[cfg(target_os = "windows")]
+    native_voice: Option<wasapi_output::WasapiOutput>,
 }
 
 fn handle_to_reference<'a>(handle: *mut CefUnityBrowser) -> &'a mut ClientBrowserInstance {
@@ -154,11 +166,11 @@ fn handle_to_reference<'a>(handle: *mut CefUnityBrowser) -> &'a mut ClientBrowse
 /// NativeVoice は自前 reader/Shmem を持ち instance と参照関係がないため、
 /// stop (排水待ち) さえ済めば以降の解放順序で UAF は構造的に起きない。
 fn stop_native_voice(instance: &mut ClientBrowserInstance) {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         instance.native_voice.take();
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = instance;
     }
@@ -617,7 +629,7 @@ pub extern "C" fn cef_unity_create_browser(
                     shared_memory,
                     audio_shared_memory,
                     audio_flink: audio_shared_memory_flink.clone(),
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
                     native_voice: None,
                 });
                 Box::into_raw(instance) as *mut CefUnityBrowser
@@ -1092,7 +1104,7 @@ pub extern "C" fn cef_unity_audio_native_start(
         if handle.is_null() {
             return -1;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             let instance = handle_to_reference(handle);
             if instance.native_voice.is_some() {
@@ -1101,7 +1113,15 @@ pub extern "C" fn cef_unity_audio_native_start(
             if instance.audio_flink.is_empty() {
                 return -1;
             }
-            match native_voice::NativeVoice::start(&instance.audio_flink, target_milliseconds, io_frames) {
+            // 出力デバイス層だけがプラットフォーム依存 (macOS: AudioUnit /
+            // Windows: WASAPI)。start のシグネチャは揃えてある。
+            #[cfg(target_os = "macos")]
+            let started =
+                native_voice::NativeVoice::start(&instance.audio_flink, target_milliseconds, io_frames);
+            #[cfg(target_os = "windows")]
+            let started =
+                wasapi_output::WasapiOutput::start(&instance.audio_flink, target_milliseconds, io_frames);
+            match started {
                 Ok(voice) => {
                     instance.native_voice = Some(voice);
                     log_to_file(&format!(
@@ -1116,7 +1136,7 @@ pub extern "C" fn cef_unity_audio_native_start(
                 }
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let _ = (target_milliseconds, io_frames);
             -1
@@ -1131,7 +1151,7 @@ pub extern "C" fn cef_unity_audio_native_stop(handle: *mut CefUnityBrowser) {
         if handle.is_null() {
             return;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             let instance = handle_to_reference(handle);
             if instance.native_voice.take().is_some() {
@@ -1148,14 +1168,14 @@ pub extern "C" fn cef_unity_audio_native_set_volume(handle: *mut CefUnityBrowser
         if handle.is_null() {
             return;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             let instance = handle_to_reference(handle);
             if let Some(voice) = instance.native_voice.as_ref() {
                 voice.set_volume(volume);
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let _ = volume;
         }
@@ -1177,7 +1197,7 @@ pub extern "C" fn cef_unity_audio_native_statistics(
         if handle.is_null() {
             return -1;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             let instance = handle_to_reference(handle);
             let Some(voice) = instance.native_voice.as_ref() else {
@@ -1197,7 +1217,7 @@ pub extern "C" fn cef_unity_audio_native_statistics(
             }
             0
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let _ = (out_occupancy_milliseconds, out_underrun_frames, out_overflow_frames);
             -1
