@@ -226,6 +226,10 @@ namespace CefUnity.Runtime
                 // Init() がサーバーを起動し接続を行うため、その後にチェック。
                 _useAcceleratedPaint = Browser.IsAcceleratedConnected();
                 if (_enableLog) CefLog.Log($"[CefUnity] Initialized ({_currentWidth}x{_currentHeight}), acceleratedPaint={_useAcceleratedPaint}");
+                // キーリピートは OS 設定から取得する (取得失敗時は既定値に落ちる)。
+                // 既定値と一致しているかを実機で判別できるようログに出す。
+                if (_enableLog)
+                    CefLog.Log($"[CefUnity] key repeat: delay={CefKeyboardMapper.KeyRepeatDelay:F3}s rate={CefKeyboardMapper.KeyRepeatRate:F4}s");
                 SetupImeProxy();
                 // Native レンダラは FMOD ミキサを使わないので DSP バッファ変更は不要。
                 if (_audioRenderer == AudioRendererMode.UnityMixer) ApplyAudioDspBufferSize();

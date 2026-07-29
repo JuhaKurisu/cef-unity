@@ -3,6 +3,8 @@ using UnityEngine;
 #if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
 using System;
 using System.Runtime.InteropServices;
+#elif UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+using System.Runtime.InteropServices;
 #endif
 
 namespace CefUnity.Runtime
@@ -106,6 +108,52 @@ namespace CefUnity.Runtime
             {
                 return 0.035f;
             }
+        }
+#elif UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SystemParametersInfoW(
+            uint action, uint parameter, out uint value, uint update);
+
+        private const uint SpiGetKeyboardDelay = 0x0016;
+        private const uint SpiGetKeyboardSpeed = 0x000A;
+
+        /// <summary>
+        ///     SPI_GETKEYBOARDDELAY は 0〜3 の段階値で、(値 + 1) × 250ms を表す
+        ///     (0 = 250ms 〜 3 = 1000ms)。取得できなければ macOS 側と同じ既定値。
+        /// </summary>
+        private static float GetOSKeyRepeatDelay()
+        {
+            try
+            {
+                if (SystemParametersInfoW(SpiGetKeyboardDelay, 0, out var value, 0) && value <= 3)
+                    return (value + 1) * 0.25f;
+            }
+            catch (System.Exception)
+            {
+                // P/Invoke 不能環境では既定値へ落とす
+            }
+            return 0.5f;
+        }
+
+        /// <summary>
+        ///     SPI_GETKEYBOARDSPEED は 0〜31 の段階値で、約 2.5〜30 回/秒に線形対応する。
+        ///     間隔 (秒) はその逆数。取得できなければ macOS 側と同じ既定値。
+        /// </summary>
+        private static float GetOSKeyRepeatRate()
+        {
+            try
+            {
+                if (SystemParametersInfoW(SpiGetKeyboardSpeed, 0, out var value, 0) && value <= 31)
+                {
+                    var repeatsPerSecond = 2.5f + value * ((30f - 2.5f) / 31f);
+                    return 1f / repeatsPerSecond;
+                }
+            }
+            catch (System.Exception)
+            {
+            }
+            return 0.035f;
         }
 #else
         private static float GetOSKeyRepeatDelay()
