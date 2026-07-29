@@ -18,6 +18,8 @@ mod au_output;
 mod native_voice;
 #[cfg(target_os = "macos")]
 mod scroll_monitor;
+#[cfg(target_os = "windows")]
+mod scroll_monitor_windows;
 
 use std::ffi::{CStr, c_char};
 use std::path::PathBuf;
@@ -442,8 +444,9 @@ pub struct CefScrollEvent {
     pub precise: u8,
 }
 
-/// NSEvent スクロールモニタを開始する。1=成功 0=失敗 (ヘッドレス等)。
-/// macOS 以外は常に 0 (呼び出し側がフォールバックする)。
+/// 生スクロールモニタを開始する。1=成功 0=失敗 (ヘッドレス等)。
+/// macOS は NSEvent ローカルモニタ、Windows は Raw Input。
+/// 対応外プラットフォームは常に 0 (呼び出し側がフォールバックする)。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_scroll_monitor_start() -> i32 {
     ffi_guard(0, || {
@@ -451,7 +454,11 @@ pub extern "C" fn cef_scroll_monitor_start() -> i32 {
         {
             unsafe { scroll_monitor::cef_scroll_monitor_start_impl() }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            scroll_monitor_windows::start()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             0
         }
@@ -464,6 +471,10 @@ pub extern "C" fn cef_scroll_monitor_stop() {
         #[cfg(target_os = "macos")]
         unsafe {
             scroll_monitor::cef_scroll_monitor_stop_impl()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            scroll_monitor_windows::stop()
         }
     })
 }
@@ -484,7 +495,11 @@ pub extern "C" fn cef_scroll_monitor_poll(out: *mut CefScrollEvent, max: i32) ->
                 )
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            unsafe { scroll_monitor_windows::poll(out, max) }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let _ = (out, max);
             0
@@ -500,7 +515,11 @@ pub extern "C" fn cef_scroll_monitor_now() -> f64 {
         {
             unsafe { scroll_monitor::cef_scroll_monitor_now_impl() }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            scroll_monitor_windows::now()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             0.0
         }
