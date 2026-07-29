@@ -127,8 +127,14 @@ CEF 配布物ディレクトリの特定には、既存の macOS 分岐 (`build-
 
 **(b) パス区切り文字 (7-8 行目)** — `RustProjectDir` / `RustTargetDir` が
 `'$(MSBuildThisFileDirectory)..\..\cef-unity-rust\target\debug'` とバックスラッシュ区切りで
-書かれている。Linux の MSBuild はバックスラッシュをディレクトリ区切りとして扱わないため、
-`Path.GetFullPath` が誤ったパスを返す。スラッシュ区切りに直す (Windows / macOS でも正しく動く)。
+書かれている。一貫性のためスラッシュ区切りに直す。
+
+> **訂正 (2026-07-29、実装後の実測による):** 当初この設計書は「Linux の MSBuild は
+> バックスラッシュを区切りとして扱わないため `Path.GetFullPath` が誤ったパスを返す」と
+> 記述していたが、**これは誤りだった**。Unix の MSBuild は `Path.GetFullPath` に渡された
+> 文字列内のバックスラッシュを正規化するため、両表記は同一のパスに解決される
+> (Linux 上で `dotnet msbuild -t:Show` により実測)。したがってこの変更は
+> 全プラットフォームで挙動を変えない純粋な一貫性の改善であり、不具合修正ではない。
 
 `CopyServerApp` ターゲット (18-20 行) は `build-server-sandbox.sh` 呼び出しのままでよい
 (スクリプト側で OS 分岐するため)。
@@ -179,9 +185,51 @@ Linux で開発する際の前提を記録する:
 - ネイティブ音声出力 (macOS の AudioUnit 経路に相当するもの)。Linux は Unity ミキサ経路のみ
 - GitHub Actions の ubuntu ジョブ追加
 
+## 実装結果 (2026-07-29)
+
+**フェーズ 1 は完了した。** 合否判定 (検証手順 5) は PASS —
+`SMOKE_OK frames=3` を得て、`dump` が出力した PNG に example.com が正しく描画されていることを
+目視確認した (リンクが青く出ており BGRA→RGB の並べ替えも正しい)。
+
+**「未知のリスク」は 3 つとも顕在化しなかった。** ozone/X11、zygote、external BeginFrame の
+いずれについても command line switch の追加は不要で、`server.rs` は Task 1 の型分岐以外
+一切変更していない。既存コードの `#[cfg(not(target_os = "macos"))]` 経路がそのまま
+Linux で機能した。
+
+実装中に判明した、設計時に見えていなかったもの:
+
+- `CefUnity.Harness/Directory.Build.targets` と `CefUnity.Viewer/Directory.Build.targets` の
+  `CopyCefFramework` が `OSX Or Linux` 条件で macOS 専用の `cef_macos_aarch64` を参照しており、
+  Linux で `rsync` が失敗していた。両方とも `OSX` 限定に修正した (設計書の変更点には無かった)
+
+## フェーズ 2 への申し送り
+
+- **フレーム供給レート**: 600 反復 (約 10 秒) で `frames=3` と少ない。`get_active_buffer_pointer`
+  が `frame_id` の変化で edge-trigger され、CEF は damage が無ければ再描画しないため静的ページ
+  では妥当な形だが、スクロール等の動的な負荷での供給レートは未確認
+- **真のヘッドレス環境**: 検証は WSLg (X11 が見える状態) で行った。X11 が無い環境では
+  `--ozone-platform=headless` が必要になる可能性がある (`cef-unity-rust/CLAUDE.md` に記載済み)
+- **PNG ライターのテストの穴**: CRC 計算自体のテストが無く (IEND の既知 CRC `0xAE426082` との
+  照合で塞げる)、多画素ケースが IDAT を展開検証していないため行ストライド計算が間接検証のみ
+- **`CefUnity.Harness/Directory.Build.targets`** には Viewer 側にある
+  `Exists('$(_CefRustTargetDir)/build')` ガードが無い (既存の非対称、本フェーズ以前からのもの)
+- **`build-server-sandbox.sh` の CEF 配布物探索**が `ls -d ... | head -1` で辞書順選択になっている
+  (`ls -dt` なら新しい順)。macOS 分岐も同じで、直すなら両方
+- **GPU ゼロコピー (dmabuf / EGL)**: macOS の IOSurface、Windows の D3D11 共有テクスチャに
+  相当する第 3 の経路。フェーズ 1 では扱わなかった
+- **Unity 対応**: `Assets/CefUnity/Plugins/linux-x64/` への deploy スクリプトが未整備
+
 ## 開発環境
 
 WSL2 (Ubuntu 24.04 LTS) を使う。ディストロは `F:\WSL\Ubuntu-24.04` に配置済み。
-リポジトリは ext4 側 (`~/cef-unity`) にクローンして作業する — `/mnt/f` 直参照は
-ファイル I/O が遅く、`target/` を Windows ビルドと共有すると相互にフルリビルドを
-誘発するため。Windows 側の作業ツリーとは git 経由で往復する。
+
+作業ツリーは git worktree で隔離する: `F:\GitHub\cef-unity\.claude\worktrees\linux-phase1`
+(WSL からは `/mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1`)。並行して進む
+Windows arm64 対応 (`feat/windows-arm64-wt`) と作業ツリーを共有しないための措置。
+
+`target/` だけは ext4 側に逃がす (`CARGO_TARGET_DIR=$HOME/cef-target-mnt`)。ビルド生成物の
+I/O が支配的なので、これだけで `/mnt/f` 越しのビルドが実用速度になる (実測: 依存キャッシュ
+済みでフルビルド 144 秒)。ソースを ext4 に別クローンする必要はない。
+
+worktree の `.git` は Windows パスを指すファイルのため、**WSL から git は実行できない**。
+編集と git は Windows 側、ビルドとテストは WSL 側という分担になる。

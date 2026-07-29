@@ -13,11 +13,27 @@
 ## Global Constraints
 
 - **命名規約**: 識別子は省略形を使わずフルネーム (`buffer`, `index`, `width`, `height` 等)。ルート `CLAUDE.md` の規約に従う。シェル変数も同様
-- **アーキテクチャ分岐を導入しない**: `#[cfg(target_arch)]` を追加しない。CEF 配布物の探索はワイルドカード `cef_linux_*` を使う (既存 `cef_macos_*` と同じ方式)
+- **このフェーズの変更範囲ではアーキテクチャ分岐を導入しない**: `#[cfg(target_arch)]` を追加しない。CEF 配布物の探索はワイルドカード `cef_linux_*` を使う (既存 `cef_macos_*` と同じ方式)。
+  なお別途 `feat/windows-arm64-wt` で `deploy.ps1` への `-Arch x64/arm64` 追加が進行中だが、
+  本フェーズの Task は `deploy.ps1` に触れないため衝突しない
 - **Intel Mac (x86_64 macOS) はサポートしない** (2026-07-29 決定)。`deploy.sh` の `osx-arm64` ハードコードは意図的なもので修正しない
 - **既存の macOS / Windows 経路の挙動を変えない**: 追加する分岐はすべて `#[cfg(target_os = "linux")]` または MSBuild の `IsOSPlatform('Linux')` の内側に閉じる
 - **文字列リテラルは挙動契約**: dev トグル、プロトコル文字列、CLI 引数、環境変数名を変更しない
-- **作業場所**: WSL2 Ubuntu 24.04 の `~/cef-unity` (ext4 側)。`/mnt/f` 直参照は使わない
+- **作業場所**: git worktree `F:\GitHub\cef-unity\.claude\worktrees\linux-phase1`
+  (WSL からは `/mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1`)。ブランチは
+  `worktree-linux-phase1`。**main や他の worktree には一切触れない**
+- **役割分担 (重要)**:
+  - **ファイル編集**は Windows 側のツール (Edit / Write) で行う
+  - **ビルドとテスト**は WSL で実行する。`cargo` / `dotnet` を Windows で直接叩かないこと
+  - **git 操作は Windows 側から行う。** worktree の `.git` は Windows パス (`F:/...`) を指す
+    ファイルなので、WSL から git を実行すると `fatal: not a git repository` になる
+- **WSL コマンドの実行方法**: 引用符の入れ子が壊れやすいため、複数行のコマンドは
+  スクラッチパッドに `.sh` を書いてから渡す:
+  `MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu-24.04 -- bash <スクリプトの /mnt/c/... パス>`
+  (`MSYS_NO_PATHCONV=1` が無いと Git Bash が `/mnt/...` を Windows パスに変換して失敗する)
+- **ビルド時の環境変数**: `CARGO_TARGET_DIR="$HOME/cef-target-mnt"` を必ず設定する
+  (ext4 側に置くことでビルドを高速化し、Windows 側の `target/` と混ざるのを防ぐ)。
+  `. "$HOME/.cargo/env"` と `export PATH="$HOME/.dotnet:$PATH"` も同様に必要
 - **フェーズ 1 のスコープ外**: Unity 向け deploy (`Plugins/linux-x64/`)、GPU ゼロコピー (dmabuf/EGL)、ネイティブ音声出力、GitHub Actions の ubuntu ジョブ
 
 ## File Structure
@@ -41,7 +57,7 @@
 
 - `build-essential pkg-config curl git cmake python3`
 - Rust stable ツールチェーン
-- リポジトリのクローンが `~/cef-unity` にある
+- worktree が `/mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1` から見える (WSL 側)
 
 ---
 
@@ -56,7 +72,7 @@
 - [ ] **Step 1: 必要なコマンドが揃っているか確認**
 
 ```bash
-cd ~/cef-unity/cef-unity-rust
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1/cef-unity-rust
 . "$HOME/.cargo/env"
 cargo --version && gcc --version | head -1 && readelf --version | head -1
 ```
@@ -76,7 +92,7 @@ sudo apt-get install -y \
 - [ ] **Step 3: ベースラインのテストが通ることを確認**
 
 ```bash
-cd ~/cef-unity/cef-unity-rust && . "$HOME/.cargo/env" && cargo test -p cef-unity-ipc
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1/cef-unity-rust && . "$HOME/.cargo/env" && export CARGO_TARGET_DIR="$HOME/cef-target-mnt" && cargo test -p cef-unity-ipc
 ```
 
 Expected: `test result: ok. 19 passed; 0 failed`
@@ -102,7 +118,7 @@ macOS = `*mut c_void`、Linux = `c_ulong` (X11 Window / XID)、Windows = `HWND` 
 - [ ] **Step 1: ビルドが失敗することを確認する (失敗するテスト)**
 
 ```bash
-cd ~/cef-unity/cef-unity-rust && . "$HOME/.cargo/env" && cargo build 2>&1 | tail -20
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1/cef-unity-rust && . "$HOME/.cargo/env" && export CARGO_TARGET_DIR="$HOME/cef-target-mnt" && cargo build 2>&1 | tail -20
 ```
 
 Expected: FAIL。以下のエラーが出る。
@@ -149,7 +165,7 @@ error[E0308]: mismatched types
 - [ ] **Step 3: ビルドが通ることを確認**
 
 ```bash
-cd ~/cef-unity/cef-unity-rust && . "$HOME/.cargo/env" && cargo build 2>&1 | tail -5
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1/cef-unity-rust && . "$HOME/.cargo/env" && export CARGO_TARGET_DIR="$HOME/cef-target-mnt" && cargo build 2>&1 | tail -5
 ```
 
 Expected: PASS。`Finished \`dev\` profile` が出る。エラーなし (warning は既存のものが残る)。
@@ -157,7 +173,7 @@ Expected: PASS。`Finished \`dev\` profile` が出る。エラーなし (warning
 - [ ] **Step 4: 既存テストが壊れていないことを確認**
 
 ```bash
-cd ~/cef-unity/cef-unity-rust && . "$HOME/.cargo/env" && cargo test -p cef-unity-ipc 2>&1 | tail -5
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1/cef-unity-rust && . "$HOME/.cargo/env" && export CARGO_TARGET_DIR="$HOME/cef-target-mnt" && cargo test -p cef-unity-ipc 2>&1 | tail -5
 ```
 
 Expected: `test result: ok. 19 passed; 0 failed`
@@ -165,7 +181,7 @@ Expected: `test result: ok. 19 passed; 0 failed`
 - [ ] **Step 5: コミット**
 
 ```bash
-cd ~/cef-unity
+# git は Windows 側 (worktree ディレクトリ) から実行する
 git add cef-unity-rust/crates/server/src/server.rs
 git commit -m "fix(server): Linux の cef_window_handle_t は c_ulong なので分岐を 3 系統に割る"
 ```
@@ -190,7 +206,7 @@ git commit -m "fix(server): Linux の cef_window_handle_t は c_ulong なので�
 - [ ] **Step 1: RUNPATH が無いことを確認する (失敗するテスト)**
 
 ```bash
-cd ~/cef-unity/cef-unity-rust
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1/cef-unity-rust
 readelf -d target/debug/cef-unity-server | grep -E 'RPATH|RUNPATH' || echo "NO_RUNPATH"
 readelf -d target/debug/cef-unity-rust-helper | grep -E 'RPATH|RUNPATH' || echo "NO_RUNPATH"
 ```
@@ -224,7 +240,7 @@ fn main() {
 - [ ] **Step 4: 再ビルドして RUNPATH が入ったことを確認**
 
 ```bash
-cd ~/cef-unity/cef-unity-rust && . "$HOME/.cargo/env" && cargo build 2>&1 | tail -3
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1/cef-unity-rust && . "$HOME/.cargo/env" && export CARGO_TARGET_DIR="$HOME/cef-target-mnt" && cargo build 2>&1 | tail -3
 readelf -d target/debug/cef-unity-server | grep -E 'RPATH|RUNPATH'
 readelf -d target/debug/cef-unity-rust-helper | grep -E 'RPATH|RUNPATH'
 ```
@@ -234,7 +250,7 @@ Expected: PASS。両方に `Library runpath: [$ORIGIN]` が出る。
 - [ ] **Step 5: コミット**
 
 ```bash
-cd ~/cef-unity
+# git は Windows 側 (worktree ディレクトリ) から実行する
 git add cef-unity-rust/crates/server/build.rs cef-unity-rust/crates/helper/build.rs
 git commit -m "build(linux): server/helper に RPATH=\$ORIGIN を付与し libcef.so を隣から解決する"
 ```
@@ -269,7 +285,7 @@ Windows にある `snapshot_blob.bin` は Linux 配布物に存在しない。
 - [ ] **Step 1: Linux で現状のスクリプトが失敗することを確認する (失敗するテスト)**
 
 ```bash
-cd ~/cef-unity/cef-unity-rust
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1/cef-unity-rust
 rm -rf /tmp/stage-test && mkdir -p /tmp/stage-test
 bash build-server-sandbox.sh /tmp/stage-test; echo "exit=$?"
 ```
@@ -328,7 +344,7 @@ fi
 - [ ] **Step 3: 配置が成功し、共有ライブラリがすべて解決することを確認**
 
 ```bash
-cd ~/cef-unity/cef-unity-rust
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1/cef-unity-rust
 rm -rf /tmp/stage-test && mkdir -p /tmp/stage-test
 bash build-server-sandbox.sh /tmp/stage-test && echo "--- ldd ---" && \
   ldd /tmp/stage-test/cef-unity-server | grep "not found" || echo "ALL_RESOLVED"
@@ -362,7 +378,7 @@ Expected: PASS。`--ipc-server argument required` で panic する。
 - [ ] **Step 6: コミット**
 
 ```bash
-cd ~/cef-unity
+# git は Windows 側 (worktree ディレクトリ) から実行する
 git add cef-unity-rust/build-server-sandbox.sh
 git commit -m "build(linux): build-server-sandbox.sh に Linux のフラット配置分岐を追加"
 ```
@@ -374,9 +390,15 @@ git commit -m "build(linux): build-server-sandbox.sh に Linux のフラット�
 2 つの問題がある。
 
 **(a) パス区切り (7-8 行目)** — `'$(MSBuildThisFileDirectory)..\..\cef-unity-rust'` と
-バックスラッシュ区切りで書かれている。Linux の MSBuild はバックスラッシュをディレクトリ
-区切りとして扱わないため `Path.GetFullPath` が誤った値を返す。スラッシュ区切りに直す
-(Windows / macOS でも正しく動く)。
+バックスラッシュ区切りで書かれている。一貫性のためスラッシュ区切りに直す。
+
+> **訂正 (2026-07-29、実装後の実測による):** 当初この計画は「Linux の MSBuild は
+> バックスラッシュをディレクトリ区切りとして扱わないため `Path.GetFullPath` が誤った値を
+> 返す」と記述していたが、**これは誤りだった**。Unix の MSBuild は `Path.GetFullPath` に
+> 渡された文字列内のバックスラッシュを正規化するため、両表記は同一のパスに解決される
+> (Linux 上で `dotnet msbuild -t:Show` により実測)。したがってこの変更は全プラットフォームで
+> 挙動を変えない純粋な一貫性の改善であり、不具合修正ではない。以下の Step 3 の置換手順自体は
+> 実施した作業の記録として変更しない。
 
 **(b) 共有ライブラリ名とステージング条件 (16-24 行目)** — `.dylib` 決め打ちで、
 条件が `IsOSPlatform('OSX')` に限定されている。
@@ -405,7 +427,7 @@ Expected: `10.` で始まるバージョンが表示される。
 - [ ] **Step 2: 現状ビルドすると成果物が配置されないことを確認する (失敗するテスト)**
 
 ```bash
-cd ~/cef-unity && export PATH="$HOME/.dotnet:$PATH"
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1 && export PATH="$HOME/.dotnet:$PATH"
 rm -rf cef-unity-csharp/CefUnity.Harness/bin
 dotnet build cef-unity-csharp/CefUnity.Harness -c Debug 2>&1 | tail -3
 ls cef-unity-csharp/CefUnity.Harness/bin/Debug/net10.0/libcef_unity_rust.so 2>/dev/null \
@@ -476,7 +498,7 @@ Expected: FAIL。ビルド自体は成功するが `MISSING libcef_unity_rust.so
 - [ ] **Step 4: ビルドして成果物が揃うことを確認**
 
 ```bash
-cd ~/cef-unity && export PATH="$HOME/.dotnet:$PATH"
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1 && export PATH="$HOME/.dotnet:$PATH"
 rm -rf cef-unity-csharp/CefUnity.Harness/bin
 dotnet build cef-unity-csharp/CefUnity.Harness -c Debug 2>&1 | tail -3
 cd cef-unity-csharp/CefUnity.Harness/bin/Debug/net10.0
@@ -495,7 +517,7 @@ Expected: PASS。ビルド成功かつすべて `ok`。
 diff で目視確認する。
 
 ```bash
-cd ~/cef-unity && git diff cef-unity-csharp/CefUnity.Harness/CefUnity.Harness.csproj
+git diff cef-unity-csharp/CefUnity.Harness/CefUnity.Harness.csproj
 ```
 
 Expected: `.dylib` 行が削除されていない。`IsOSPlatform('Windows')` の条件を新設していない。
@@ -503,7 +525,7 @@ Expected: `.dylib` 行が削除されていない。`IsOSPlatform('Windows')` �
 - [ ] **Step 6: コミット**
 
 ```bash
-cd ~/cef-unity
+# git は Windows 側 (worktree ディレクトリ) から実行する
 git add cef-unity-csharp/CefUnity.Harness/CefUnity.Harness.csproj
 git commit -m "build(linux): Harness csproj のパス区切りをスラッシュ化し .so 配置と Linux ステージングを追加"
 ```
@@ -669,7 +691,7 @@ namespace CefUnity.Tests
 - [ ] **Step 3: テストが失敗することを確認**
 
 ```bash
-cd ~/cef-unity && export PATH="$HOME/.dotnet:$PATH"
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1 && export PATH="$HOME/.dotnet:$PATH"
 dotnet test cef-unity-csharp/CefUnity.Tests --filter PortableNetworkGraphicsWriterTests 2>&1 | tail -20
 ```
 
@@ -795,7 +817,7 @@ public static class PortableNetworkGraphicsWriter
 - [ ] **Step 5: テストが通ることを確認**
 
 ```bash
-cd ~/cef-unity && export PATH="$HOME/.dotnet:$PATH"
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1 && export PATH="$HOME/.dotnet:$PATH"
 dotnet test cef-unity-csharp/CefUnity.Tests --filter PortableNetworkGraphicsWriterTests 2>&1 | tail -10
 ```
 
@@ -804,7 +826,7 @@ Expected: PASS。4 件すべて成功する。
 - [ ] **Step 6: 既存テストを壊していないことを確認**
 
 ```bash
-cd ~/cef-unity && export PATH="$HOME/.dotnet:$PATH"
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1 && export PATH="$HOME/.dotnet:$PATH"
 dotnet test cef-unity-csharp/CefUnity.Tests 2>&1 | tail -10
 ```
 
@@ -863,7 +885,7 @@ if (command == "dump")
 - [ ] **Step 8: Harness がビルドできることを確認**
 
 ```bash
-cd ~/cef-unity && export PATH="$HOME/.dotnet:$PATH"
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1 && export PATH="$HOME/.dotnet:$PATH"
 dotnet build cef-unity-csharp/CefUnity.Harness -c Debug 2>&1 | tail -5
 ```
 
@@ -872,7 +894,7 @@ Expected: PASS。`Build succeeded`。
 - [ ] **Step 9: コミット**
 
 ```bash
-cd ~/cef-unity
+# git は Windows 側 (worktree ディレクトリ) から実行する
 git add cef-unity-csharp/CefUnity.Harness/PortableNetworkGraphicsWriter.cs \
         cef-unity-csharp/CefUnity.Harness/Program.cs \
         cef-unity-csharp/CefUnity.Tests/PortableNetworkGraphicsWriterTests.cs \
@@ -899,7 +921,7 @@ git commit -m "feat(harness): BGRA を PNG に書き出す dump サブコマン�
 - [ ] **Step 1: スモークを実行する**
 
 ```bash
-cd ~/cef-unity/cef-unity-csharp/CefUnity.Harness/bin/Debug/net10.0
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1/cef-unity-csharp/CefUnity.Harness/bin/Debug/net10.0
 ./CefUnity.Harness smoke 2>&1 | tail -20; echo "exit=$?"
 ```
 
@@ -975,7 +997,7 @@ echo "DISPLAY=$DISPLAY"; ls -la /tmp/.X11-unix/ 2>/dev/null
 - [ ] **Step 3: PNG ダンプを実行して目視確認する**
 
 ```bash
-cd ~/cef-unity/cef-unity-csharp/CefUnity.Harness/bin/Debug/net10.0
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1/cef-unity-csharp/CefUnity.Harness/bin/Debug/net10.0
 ./CefUnity.Harness dump /tmp/linux-frame.png 2>&1 | tail -5
 file /tmp/linux-frame.png
 ```
@@ -1006,7 +1028,7 @@ rm -f /mnt/f/GitHub/cef-unity/linux-frame.png
 Step 2 で `server.rs` にスイッチを追加した場合のみコミットする。変更が無ければ飛ばす。
 
 ```bash
-cd ~/cef-unity
+# git は Windows 側 (worktree ディレクトリ) から実行する
 git add cef-unity-rust/crates/server/src/server.rs
 git commit -m "fix(linux): CEF 初期化に必要な command line switch を追加"
 ```
@@ -1088,7 +1110,7 @@ cd cef-unity-csharp/CefUnity.Harness/bin/Debug/net10.0
 追記したコマンドをそのままコピーして実行し、記載に誤りが無いことを確認する。
 
 ```bash
-cd ~/cef-unity && export PATH="$HOME/.dotnet:$PATH"
+cd /mnt/f/GitHub/cef-unity/.claude/worktrees/linux-phase1 && export PATH="$HOME/.dotnet:$PATH"
 dotnet build cef-unity-csharp/CefUnity.Harness -c Debug 2>&1 | tail -3
 cd cef-unity-csharp/CefUnity.Harness/bin/Debug/net10.0 && ./CefUnity.Harness smoke 2>&1 | tail -3
 ```
@@ -1098,7 +1120,7 @@ Expected: `SMOKE_OK frames=N`
 - [ ] **Step 4: コミット**
 
 ```bash
-cd ~/cef-unity
+# git は Windows 側 (worktree ディレクトリ) から実行する
 git add cef-unity-rust/CLAUDE.md
 git commit -m "docs: CLAUDE.md に Linux セクションとサポート対象プラットフォームを追記"
 ```

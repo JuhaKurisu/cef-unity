@@ -1,12 +1,12 @@
 <Project>
   <PropertyGroup>
-    <_CefRustTargetDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\cef-unity-rust\target\debug'))</_CefRustTargetDir>
+    <_CefRustTargetDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../cef-unity-rust/target/debug'))</_CefRustTargetDir>
     <_CefFrameworkDest>$(OutputPath)Chromium Embedded Framework.framework</_CefFrameworkDest>
   </PropertyGroup>
   <!-- debug 成果物はローカル開発専用。CI は release ビルドのみで target/debug が無いため Exists ガード必須 -->
   <Target Name="CopyCefFramework" AfterTargets="Build"
           Condition="!Exists('$(_CefFrameworkDest)') And Exists('$(_CefRustTargetDir)/build')">
-    <Exec Condition="$([MSBuild]::IsOSPlatform('OSX')) Or $([MSBuild]::IsOSPlatform('Linux'))"
+    <Exec Condition="$([MSBuild]::IsOSPlatform('OSX'))"
           Command="rsync -a `ls -dt &quot;$(_CefRustTargetDir)&quot;/build/cef-dll-sys-*/out/cef_macos_aarch64 | head -1`/&quot;Chromium Embedded Framework.framework/&quot; &quot;$(_CefFrameworkDest)/&quot;" />
   </Target>
 </Project>

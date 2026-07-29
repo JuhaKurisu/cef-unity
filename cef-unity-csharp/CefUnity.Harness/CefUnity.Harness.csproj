@@ -4,22 +4,26 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <RustProjectDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\cef-unity-rust'))</RustProjectDir>
-    <RustTargetDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\cef-unity-rust\target\debug'))</RustTargetDir>
+    <RustProjectDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../cef-unity-rust'))</RustProjectDir>
+    <RustTargetDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../cef-unity-rust/target/debug'))</RustTargetDir>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\CefUnity.Core\CefUnity.Core.csproj" />
   </ItemGroup>
   <ItemGroup>
-    <!-- debug 成果物はローカル開発専用。非 macOS / Rust 未ビルド環境では存在しないため
+    <!-- debug 成果物はローカル開発専用。Rust 未ビルド環境では存在しないため
          Viewer と同じ OS + Exists ガードが必須 (無いと Windows で MSB3030) -->
     <None Include="$(RustTargetDir)/libcef_unity_rust.dylib"
           CopyToOutputDirectory="PreserveNewest" Link="libcef_unity_rust.dylib"
           Condition="$([MSBuild]::IsOSPlatform('OSX')) And Exists('$(RustTargetDir)/libcef_unity_rust.dylib')" />
+    <None Include="$(RustTargetDir)/libcef_unity_rust.so"
+          CopyToOutputDirectory="PreserveNewest" Link="libcef_unity_rust.so"
+          Condition="$([MSBuild]::IsOSPlatform('Linux')) And Exists('$(RustTargetDir)/libcef_unity_rust.so')" />
   </ItemGroup>
-  <!-- cef-unity-server.app bundle を出力先に用意(旧 Sandbox と同じ) -->
+  <!-- サーバーと CEF ランタイムを出力先に用意する。
+       macOS は cef-unity-server.app バンドル、Linux はフラット配置 (スクリプト側で分岐)。 -->
   <Target Name="CopyServerApp" AfterTargets="Build"
-          Condition="$([MSBuild]::IsOSPlatform('OSX')) And Exists('$(RustTargetDir)/cef-unity-server')">
+          Condition="($([MSBuild]::IsOSPlatform('OSX')) Or $([MSBuild]::IsOSPlatform('Linux'))) And Exists('$(RustTargetDir)/cef-unity-server')">
     <Exec Command="bash '$(RustProjectDir)/build-server-sandbox.sh' '$(OutputPath)'" />
   </Target>
 </Project>
