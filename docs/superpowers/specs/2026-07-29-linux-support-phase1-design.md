@@ -54,6 +54,11 @@ GPU ゼロコピー (dmabuf / EGL) は macOS の IOSurface、Windows の D3D11 �
 既存の `cef_macos_*` と同じくワイルドカードを使い、x86_64 / aarch64 のどちらでも
 同じスクリプトが通るようにする。
 
+**サポート対象アーキテクチャの方針 (2026-07-29 決定):** Intel Mac (x86_64 macOS) は
+サポートしない。`deploy.sh` の配置先が `osx-arm64` にハードコードされているのは
+この方針に沿った意図的なものであり、修正対象ではない。この方針は
+`cef-unity-rust/CLAUDE.md` にも記載する (変更点 5 に含める)。
+
 ## 変更点
 
 ### 1. `crates/server/src/server.rs:1174-1180` — `cef_window_handle_t` の Linux 分岐
