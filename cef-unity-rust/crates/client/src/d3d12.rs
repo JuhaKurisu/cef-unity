@@ -20,7 +20,6 @@
 #![cfg(target_os = "windows")]
 
 use std::ffi::c_void;
-use std::io::Write;
 use std::sync::{Mutex, PoisonError};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
@@ -35,14 +34,7 @@ use windows::Win32::Graphics::Direct3D12::{
 use windows::core::Interface;
 
 fn log_debug(message: &str) {
-    let path = std::env::temp_dir().join("cef_unity_debug.log");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(file, "[d3d12] {}", message);
-    }
+    crate::logging::write("d3d12", message);
 }
 
 // ---- Unity Native Plugin Interface (subset) ----

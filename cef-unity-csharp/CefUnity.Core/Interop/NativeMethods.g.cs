@@ -54,8 +54,9 @@ namespace CefUnity
         public static extern void cef_unity_shutdown();
 
         /// <summary>
-        ///  NSEvent スクロールモニタを開始する。1=成功 0=失敗 (ヘッドレス等)。
-        ///  macOS 以外は常に 0 (呼び出し側がフォールバックする)。
+        ///  生スクロールモニタを開始する。1=成功 0=失敗 (ヘッドレス等)。
+        ///  macOS は NSEvent ローカルモニタ、Windows は Raw Input。
+        ///  対応外プラットフォームは常に 0 (呼び出し側がフォールバックする)。
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_scroll_monitor_start", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern int cef_scroll_monitor_start();

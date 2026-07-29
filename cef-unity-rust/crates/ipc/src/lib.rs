@@ -698,29 +698,47 @@ impl SharedMemoryReader {
     /// Returns None if no new frame since last call.
     pub fn read_frame(&mut self, destination: &mut Vec<u8>) -> Option<(u32, u32)> {
         let header = unsafe { &*(self.shared_memory.as_ptr() as *const SharedMemoryHeader) };
-        let frame_id = header.frame_id.load(Ordering::Acquire);
-        if frame_id == self.last_frame_id {
+        if header.frame_id.load(Ordering::Acquire) == self.last_frame_id {
             return None;
         }
-        self.last_frame_id = frame_id;
 
-        let active = header.active_buffer.load(Ordering::Acquire);
-        let width = header.width.load(Ordering::Acquire);
-        let height = header.height.load(Ordering::Acquire);
-        // u32 のまま乗算すると wrap して境界チェックをすり抜けるため、次元を先に検証する
-        // (MAX_WIDTH×MAX_HEIGHT×4 == BUFFER_SIZE なので次元が正なら size は常に収まる)
-        if width == 0 || height == 0 || width > MAX_WIDTH || height > MAX_HEIGHT {
-            return None;
-        }
-        let size = (width as usize) * (height as usize) * 4;
+        // seqlock: コピー中に writer が 2 フレーム進むと、リーダーが読んでいる
+        // バッファへ writer が書き戻して新旧フレームが混在する。コピー前後で
+        // (frame_id, active_buffer) を照合し、変化していたら 1 回だけ読み直す。
+        //
+        // リトライを 1 回に固定するのは、高負荷時に reader がスピンして
+        // フレームレートを壊すのを避けるため。2 回目も競合した場合はその結果を
+        // 返す (60fps を守ることを優先する)。
+        const MAX_ATTEMPTS: usize = 2;
+        for attempt in 0..MAX_ATTEMPTS {
+            let observed_frame_id = header.frame_id.load(Ordering::Acquire);
+            let active = header.active_buffer.load(Ordering::Acquire);
+            let width = header.width.load(Ordering::Acquire);
+            let height = header.height.load(Ordering::Acquire);
+            // u32 のまま乗算すると wrap して境界チェックをすり抜けるため、次元を先に検証する
+            // (MAX_WIDTH×MAX_HEIGHT×4 == BUFFER_SIZE なので次元が正なら size は常に収まる)
+            if width == 0 || height == 0 || width > MAX_WIDTH || height > MAX_HEIGHT {
+                return None;
+            }
+            let size = (width as usize) * (height as usize) * 4;
 
-        let offset = SHARED_MEMORY_HEADER_SIZE + active as usize * BUFFER_SIZE;
-        destination.resize(size, 0);
-        unsafe {
-            let source = self.shared_memory.as_ptr().add(offset);
-            std::ptr::copy_nonoverlapping(source, destination.as_mut_ptr(), size);
+            let offset = SHARED_MEMORY_HEADER_SIZE + active as usize * BUFFER_SIZE;
+            destination.resize(size, 0);
+            unsafe {
+                let source = self.shared_memory.as_ptr().add(offset);
+                std::ptr::copy_nonoverlapping(source, destination.as_mut_ptr(), size);
+            }
+
+            let unchanged = header.frame_id.load(Ordering::Acquire) == observed_frame_id
+                && header.active_buffer.load(Ordering::Acquire) == active;
+            if unchanged || attempt == MAX_ATTEMPTS - 1 {
+                // コピーが確定してから消費済み frame_id を進める。
+                // 先に進めると、リトライ時に「新フレーム無し」と誤判定する。
+                self.last_frame_id = observed_frame_id;
+                return Some((width, height));
+            }
         }
-        Some((width, height))
+        None
     }
 }
 
@@ -1454,6 +1472,61 @@ mod tests {
             2,
             "publish のたびに単調増加すること"
         );
+    }
+
+    /// writer がコピー中に 2 フレーム進んでも、read_frame の結果に新旧フレームが
+    /// 混在しないこと (seqlock)。
+    ///
+    /// 各フレームは全画素を同じ値で塗るので、返ったバッファに 2 種類の値が混ざって
+    /// いれば「コピー中に writer が同じバッファへ書き戻した」= ティアリングと分かる。
+    /// 競合を起こすため、リーダーのコピーが長くなる大きめのフレームを使う。
+    #[test]
+    fn read_frame_does_not_mix_frames_while_writer_advances() {
+        let flink = std::env::temp_dir()
+            .join("cef-unity-test-shm-seqlock")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let writer = SharedMemoryWriter::new(&flink).expect("SharedMemoryWriter::new");
+        let mut reader = SharedMemoryReader::open(&flink).expect("SharedMemoryReader::open");
+
+        const WIDTH: u32 = 512;
+        const HEIGHT: u32 = 512;
+        let size = (WIDTH as usize) * (HEIGHT as usize) * 4;
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_stop = stop.clone();
+        let writer_thread = std::thread::spawn(move || {
+            let mut value: u8 = 1;
+            while !writer_stop.load(Ordering::Relaxed) {
+                // 0 は「未書き込み」と区別できないよう避ける
+                if value == 0 {
+                    value = 1;
+                }
+                let pixels = vec![value; size];
+                writer.write_frame(&pixels, WIDTH, HEIGHT);
+                value = value.wrapping_add(1);
+            }
+        });
+
+        let mut buffer = Vec::new();
+        let mut checked = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while checked < 200 && std::time::Instant::now() < deadline {
+            if reader.read_frame(&mut buffer).is_some() {
+                let first = buffer[0];
+                assert!(
+                    buffer.iter().all(|&byte| byte == first),
+                    "1 回の read_frame に複数フレームの画素が混在した (seqlock 不在)"
+                );
+                checked += 1;
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        writer_thread.join().expect("writer thread join");
+        assert!(checked > 0, "検証できたフレームが 1 つも無い");
     }
 
     /// `accelerated_frame_id` の増分を観測した時点で `d3d11_frame_id` 側の

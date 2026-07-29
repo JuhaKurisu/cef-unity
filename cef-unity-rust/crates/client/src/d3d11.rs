@@ -16,7 +16,6 @@ use std::ffi::c_void;
 use std::sync::{Mutex, PoisonError};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use std::io::Write;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D11::{
@@ -26,14 +25,7 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::core::Interface;
 
 fn log_debug(message: &str) {
-    let path = std::env::temp_dir().join("cef_unity_debug.log");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(file, "[d3d11] {}", message);
-    }
+    crate::logging::write("d3d11", message);
 }
 
 // ---- Unity Native Plugin Interface (subset) ----
@@ -232,13 +224,40 @@ pub fn open_fence(handle_value: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// `wait_fence` / `open_or_cached` を最初に呼んだ OS スレッド ID。
+///
+/// `ID3D11DeviceContext` は非スレッドセーフな COM で、Unity は自身の render thread から
+/// これを使う。我々が別スレッド (C# のメインスレッド) から `Wait` を発行すると競合し得るため、
+/// 実際に単一スレッドから呼ばれているかを実測できるようにする。
+static CONTEXT_CALLER_THREAD_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// immediate context を触る関数の入口で呼び、呼び出しスレッドが変わったら警告を残す。
+fn record_context_caller_thread(function_name: &str) {
+    let current = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+    let previous = CONTEXT_CALLER_THREAD_ID.swap(current, Ordering::Relaxed);
+    if previous != 0 && previous != current {
+        log_debug(&format!(
+            "WARNING: {} が別スレッドから呼ばれた ({} -> {})。\
+             ID3D11DeviceContext は非スレッドセーフのため Unity の render thread と競合し得る",
+            function_name, previous, current
+        ));
+    }
+}
+
 /// Unity の immediate context に "fence が `target_value` に到達するまで以降の
 /// GPU ワークを保留" を指示する (GPU-side wait)。CPU はブロックしない。
 /// fence 未対応 (open_fence 未呼び出し) の場合は no-op。
+///
+/// **呼び出しスレッド規約: Unity のメインスレッドからのみ呼ぶこと。**
+/// immediate context は非スレッドセーフなので、複数スレッドから触ると
+/// DEVICE_REMOVED 系の障害になり得る (D3D12 の `ID3D12CommandQueue::Wait` は
+/// スレッドセーフなので d3d12.rs 側にこの制約は無い)。
 pub fn wait_fence(target_value: u64) -> Result<(), String> {
     if target_value == 0 {
         return Ok(());
     }
+    record_context_caller_thread("wait_fence");
     let mut guard = FENCE.lock().unwrap_or_else(PoisonError::into_inner);
     let Some(state) = guard.as_mut() else {
         return Ok(()); // fence 未対応経路
@@ -264,6 +283,8 @@ pub fn wait_fence(target_value: u64) -> Result<(), String> {
 /// 同期は呼び出し側で `wait_fence(fence_value)` を呼ぶことで GPU-side に提供される。
 /// 返したポインタは次に open_or_cached が呼ばれて HANDLE が変わるか、
 /// clear_unity_interfaces が呼ばれるまで有効。
+///
+/// **呼び出しスレッド規約: `wait_fence` と同じく Unity のメインスレッドからのみ呼ぶこと。**
 pub fn open_or_cached(
     handle_value: u64,
     width: u32,

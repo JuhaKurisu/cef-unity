@@ -11,6 +11,12 @@ cargo build
 cargo test -p cef-unity-ipc
 ```
 
+Windows では MSVC 環境が要る (下記「落とし穴」参照):
+
+```powershell
+cmd /c '"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul && cargo test'
+```
+
 ### 2. C# 側の同期更新
 
 FFI 関数の追加・変更時は **`cef-unity-csharp/CefUnity.Core/Interop/NativeMethods.g.cs` + `CefUnity.cs`** を更新する (namespace は `CefUnity` / `CefUnity.Interop`)。
@@ -47,9 +53,34 @@ Visual Studio Build Tools 2022 がある場合は VS Developer PowerShell から
 成果物は `cef-unity-unityproject/Assets/CefUnity/Plugins/win-x64/` にフラット配置される
 (`cef_unity_rust.dll`, `cef-unity-server.exe`, `cef-unity-rust-helper.exe`, `libcef.dll`, 各種 `.pak` / `.dat` / `.bin`, `locales/`)。
 
-Windows のゼロコピー GPU 経路は **D3D11 共有テクスチャ + 共有 fence** で実装済み
-(macOS の IOSurface/Mach/Metal に相当)。server が `on_accelerated_paint` で共有 NT HANDLE を
-publish し、client が `OpenSharedResource1` で開いて `ID3D11DeviceContext4::Wait` で同期する。
+**落とし穴:** Git Bash から `cargo` を直接叩くと、`/usr/bin/link` が MSVC の `link.exe` を
+隠してリンクエラーになる (`extra operand ... .rcgu.o`)。Windows では PowerShell から
+`vcvars64.bat` 経由で実行すること。
+
+##### GPU ゼロコピー経路 (D3D11 / D3D12)
+
+server は `on_accelerated_paint` で CEF の共有テクスチャを自前の出力テクスチャへ
+`CopyResource` し、その NT 共有 HANDLE と **共有 fence** の値を shm に publish する
+(`d3d11_pool.rs`)。KeyedMutex は使わない (D3D12 リソースからは `IDXGIKeyedMutex` を
+取得できず、helper device 経由だと implicit fence が cross-device に効かないため撤去済み)。
+
+client は Unity の graphics backend に応じて 2 経路を使い分ける。`UnityPluginLoad` が
+D3D11/D3D12 の両方を試し、生きている方が使われる:
+
+| backend | テクスチャを開く | 同期 |
+|---|---|---|
+| D3D11 (`d3d11.rs`) | `OpenSharedResource1` | `ID3D11DeviceContext4::Wait` |
+| D3D12 (`d3d12.rs`) | `ID3D12Device::OpenSharedHandle` | `ID3D12CommandQueue::Wait` |
+
+**Unity は既定で D3D12 を選ぶ** (`ProjectSettings` の `m_APIs` が D3D12 優先) ため、
+実際の主経路は D3D12 側になることが多い。D3D11 を強制して検証したい場合は
+`m_APIs: 0200000012000000` / `m_Automatic: 0` に変更して Editor を再起動する。
+
+**D3D11 経路の呼び出しスレッド規約:** `d3d11.rs` の `wait_fence` / `open_or_cached` は
+Unity のメインスレッドからのみ呼ぶこと。`ID3D11DeviceContext` は非スレッドセーフで、
+Unity の render thread と競合し得る (D3D12 の `ID3D12CommandQueue::Wait` はスレッドセーフ
+なのでこの制約は無い)。違反を検出できるよう呼び出しスレッド ID を記録しており、
+変化すると `%TEMP%\cef_unity_debug.log` に WARNING が出る。
 
 client が使う D3D11 device の取得元は 2 系統ある:
 
@@ -58,6 +89,19 @@ client が使う D3D11 device の取得元は 2 系統ある:
   `ID3D11Device` を注入する。**`cef_unity_create_browser` より前に呼ぶこと** (browser 生成時に
   共有 fence を開く判定が走るため)。device の所有権は呼び出し側にあり、client は AddRef せず
   借用するだけなので `cef_unity_shutdown` まで生存させること
+
+##### プレイヤービルド
+
+`CefBuildPostProcessor.PostProcessWindows` が `win-x64/` の中身を
+`<App>_Data/Plugins/x86_64/` へ再帰コピーする (`cef_unity_rust.dll` は Unity が自動配置
+するので除外、`.meta` はスキップ)。`CefUnity/Build Windows Player (measure)` メニュー
+または `-executeMethod CefUnity.Editor.CefQuickBuild.BuildWindows` でビルドできる。
+
+既知の制限:
+
+- **ARM64 プレイヤービルドは未対応**。`PostProcessWindows` はコピー元 `win-x64`・
+  コピー先 `Plugins/x86_64` が決め打ちで、`win-arm64` を見ない
+- `win-arm64` はクロスビルドのみで実行検証をしていない (CI も x64 ランナー上でビルドするだけ)
 
 #### Linux (x86_64)
 
@@ -103,9 +147,27 @@ apphost がランタイムを見つけられない場合は `export DOTNET_ROOT=
 | プラットフォーム | 状態 |
 |---|---|
 | macOS arm64 | GPU ゼロコピー (IOSurface/Mach/Metal) |
-| Windows x64 | GPU ゼロコピー (D3D11 共有テクスチャ + 共有 fence) |
+| Windows x64 | GPU ゼロコピー (D3D11/D3D12 共有テクスチャ + 共有 fence)。Editor / プレイヤーとも動作確認済み |
+| Windows arm64 | クロスビルドのみ。**実行未検証**、プレイヤービルド未対応 |
 | Linux x86_64 | software paint のみ。Rust + Harness まで (Unity 未対応) |
 | macOS x86_64 (Intel Mac) | **サポートしない** |
+
+### プラットフォーム別の機能対応
+
+| 機能 | macOS | Windows | Linux |
+|---|---|---|---|
+| GPU ゼロコピー | IOSurface/Metal | D3D11 / D3D12 | 未実装 (software) |
+| ネイティブ音声出力 | AudioUnit | WASAPI | 無し (Unity ミキサのみ) |
+| 生スクロール入力 | NSEvent モニタ | Raw Input | 無し (frame-polled) |
+| キーリピート設定 | NSEvent の OS 値 | `SystemParametersInfo` の OS 値 | 既定値固定 |
+
+ネイティブ音声出力と生スクロール入力は、出力/入力デバイス層だけがプラットフォーム依存で、
+共通ロジックは 1 箇所に集約してある:
+
+- 音声: SHM ドレイン + steering リングは `audio_pull.rs`。macOS は `native_voice.rs`
+  (AudioUnit)、Windows は `wasapi_output.rs` (WASAPI) が出力層
+- スクロール: 分岐は `ScrollInputPipeline.StartNativeSource` の 1 箇所のみ。
+  呼び出し側に `#if` を増やさないこと
 
 `deploy.sh` の配置先が `osx-arm64` にハードコードされているのは Intel Mac 非サポートの
 方針によるもので、意図的なもの。

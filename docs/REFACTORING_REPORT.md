@@ -233,12 +233,22 @@
 - **問題**: immediate context は非スレッドセーフ COM。C# が main thread から呼ぶと Unity render thread と競合 → まれな DEVICE_REMOVED 系。Windows 経路固有 (D3D12 の CommandQueue::Wait はスレッドセーフ)
 - **修正案**: 段階 1 = 呼び出しスレッド規約の doc 明記 + debug ビルドでスレッド ID 記録アサート。段階 2 = `cef_unity_get_render_event_func()` エクスポートで render thread コールバックに閉じ込め (Unity ネイティブプラグイン標準パターン)
 - **リスク**: 段階 2 は C# フロー変更 + fence 実証の再検証が必要。まず段階 1 で実測してから
+- **状況 (2026-07-29)**: **段階 1 を実施済み**。`wait_fence` / `open_or_cached` に呼び出しスレッド規約を doc 明記し、
+  OS スレッド ID を記録して変化時に WARNING を残す `record_context_caller_thread` を追加した。
+  Unity 6000.3.8f1 / Windows x64 を D3D11 強制 (`m_APIs: 0200000012000000`) にして実測した結果、
+  **accelerated frame 1866 回 (afi=1866) で WARNING は 0 件** — `wait_fence` は一貫して単一スレッドから
+  呼ばれている。したがって段階 2 (render thread への移設) は着手しない: C# フロー変更と fence 同期の
+  再検証というリスクに見合う実害が観測されていない。将来 C# 側の呼び出し位置を変更した場合は、
+  この WARNING が出ないことを再確認すること。
 
 ### CLI-13. `LOG_ENABLED` が d3d11/d3d12 に効かない 【優先度: 低 / 工数: 小】
 - **場所**: `d3d11.rs:28-37`、`d3d12.rs:37-46` (マスターフラグ無視で常にファイル open + 書き込み)
 - **問題**: fence 失敗継続の異常系で毎フレームのファイル open = フレームスパイク源 (macOS 側で実測排除した問題と同型)
 - **修正案**: CLI-4 の `logging.rs` に 1 本化、ファイルハンドル保持
 - **リスク**: なし
+- **状況 (2026-07-29)**: **対応済み**。`logging.rs` を新設して `lib.rs` の `log_to_file` と
+  `d3d11.rs` / `d3d12.rs` の `log_debug` を一本化した。無効時は即 return、有効時はファイル
+  ハンドルを保持する (無効時にハンドルを開かないことを単体テストで固定)。
 
 ### CLI-14. shutdown の固定 500ms sleep 【優先度: 低 / 工数: 小】
 - **場所**: `lib.rs:336`
@@ -297,6 +307,11 @@
 - **問題**: reader のコピー中に writer が 2 フレーム進むと新旧混在ピクセル。software 経路は Windows の現行本番経路なので実害があり得る
 - **修正案**: read_frame に seqlock — コピー前後で `(frame_id, active_buffer)` を照合、変化していたら **1 回だけ**リトライ。ヘッダ変更・writer 変更不要。get_active_buffer_ptr は doc に「writer 2 フレームで invalid」を明記
 - **リスク**: リトライは有限 (1 回) 固定。無限リトライは高負荷時に reader スピン → 60fps 破壊
+- **状況 (2026-07-29)**: **対応済み** (`read_frame` のみ)。修正案どおり 1 回リトライの seqlock を入れた。
+  追加した並行テスト (writer スレッドが全画素同値のフレームを流し続け、reader の 1 回の
+  read_frame に 2 種類の値が混ざらないことを検証) は**修正前に確実に失敗する**ため、
+  この問題が理論上のものではなく実在したことが確認できている。
+  `get_active_buffer_pointer` 側の doc 追記は未実施。
 
 ### IPC-8. ipc/lib.rs の 3 責務同居 (実装 707 行 + テスト 700 行) 【優先度: 低 (単独では) / 工数: 小】
 - **場所**: `ipc/src/lib.rs` — プロトコル (1-148)、映像 shm (150-206, 448-706)、音声 shm (208-446)、テスト (708-1407)
@@ -373,6 +388,10 @@
 - **場所**: `CefUnityBrowserSample.cs:258-262` — `var useGpu = !(D3D12 || D3D11);` を計算直後、Init に渡していない (既定 useGpu=true)
 - **問題**: 「Windows で software に落とす意図」か「消し忘れ」か判別不能。現挙動は常に GPU 経路要求
 - **修正案**: 意図が「常に GPU」なら変数削除。プラットフォーム別に落とす必要が残るなら Init に渡して SerializeField でオーバーライド可能に
+- **状況 (2026-07-29)**: **解決済み (本レポートの記述が古い)**。現行の
+  `CefUnityBrowserSample.cs` は `CefRuntime.Initialize(useGpu: true, ...)` を直接呼んでおり、
+  未使用の `useGpu` 変数は既に存在しない。「常に GPU 経路を要求し、server 側がプール構築に
+  失敗したら software へ自動フォールバックする」という意図もコメントで明示されている。
 
 ---
 
