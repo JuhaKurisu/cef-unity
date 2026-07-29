@@ -58,12 +58,86 @@ compute_guid() {
     fi
 }
 
-# ファイルは最小形式 (fileFormatVersion + guid) に留め、インポーター種別の判定は
-# Unity に任せる。既存の libcef.dll.meta などもこの形式。
+# win-x64 と win-arm64 には同名の dll (libcef.dll 等) が並ぶ。インポーター設定が
+# 無いと Unity が両方を同じプラットフォーム向けと見なして "同名プラグインが複数ある"
+# と衝突扱いにするため、ネイティブ dll には CPU を明示した PluginImporter を書く。
+#
+# Editor は x64 のみ有効にする (x64 Editor が ARM64 の dll を掴まないようにするため。
+# ARM64 の Unity Editor で開発する場合はここを見直す必要がある)。
+plugin_cpu_for() {
+    local relative_path="$1"
+    case "$relative_path" in
+        */Plugins/win-x64/*.dll) echo "x86_64" ;;
+        */Plugins/win-arm64/*.dll) echo "ARM64" ;;
+        *) echo "" ;;
+    esac
+}
+
+write_plugin_importer() {
+    local cpu="$1"
+    local editor_enabled=0
+    local editor_cpu="None"
+    if [ "$cpu" = "x86_64" ]; then
+        editor_enabled=1
+        editor_cpu="x86_64"
+    fi
+    cat <<EOF
+PluginImporter:
+  externalObjects: {}
+  serializedVersion: 3
+  iconMap: {}
+  executionOrder: {}
+  defineConstraints: []
+  isPreloaded: 0
+  isOverridable: 0
+  isExplicitlyReferenced: 0
+  validateReferences: 1
+  platformData:
+    Any:
+      enabled: 0
+      settings:
+        Exclude Editor: $((1 - editor_enabled))
+        Exclude Linux64: 1
+        Exclude OSXUniversal: 1
+        Exclude Win: 1
+        Exclude Win64: 0
+    Editor:
+      enabled: $editor_enabled
+      settings:
+        CPU: $editor_cpu
+        DefaultValueInitialized: true
+        OS: Windows
+    Linux64:
+      enabled: 0
+      settings:
+        CPU: None
+    OSXUniversal:
+      enabled: 0
+      settings:
+        CPU: None
+    Win:
+      enabled: 0
+      settings:
+        CPU: None
+    Win64:
+      enabled: 1
+      settings:
+        CPU: $cpu
+  userData:
+  assetBundleName:
+  assetBundleVariant:
+EOF
+}
+
+# ネイティブ dll 以外は最小形式 (fileFormatVersion + guid) に留め、インポーター種別の
+# 判定は Unity に任せる。
 write_meta() {
     local asset_path="$1"
-    local guid
-    guid="$(compute_guid "${asset_path#"$unity_project_root/"}")"
+    local existing_guid="${2:-}"
+    local relative_path="${asset_path#"$unity_project_root/"}"
+    local guid="${existing_guid:-$(compute_guid "$relative_path")}"
+    local cpu
+    cpu="$(plugin_cpu_for "$relative_path")"
 
     {
         echo "fileFormatVersion: 2"
@@ -75,23 +149,49 @@ write_meta() {
             echo "  userData: "
             echo "  assetBundleName: "
             echo "  assetBundleVariant: "
+        elif [ -n "$cpu" ]; then
+            write_plugin_importer "$cpu"
         fi
     } >"$asset_path.meta"
 }
 
+# 既存 meta が CPU 設定を持たないネイティブ dll か (GUID は保持して書き直す)。
+needs_plugin_importer() {
+    local asset_path="$1"
+    local relative_path="${asset_path#"$unity_project_root/"}"
+    [ -n "$(plugin_cpu_for "$relative_path")" ] || return 1
+    ! grep -q "PluginImporter:" "$asset_path.meta"
+}
+
+read_guid() {
+    sed -n 's/^guid: \([0-9a-f]*\).*/\1/p' "$1" | head -1
+}
+
 missing_count=0
+upgrade_count=0
 
 # 除外するもの:
 #  - ドットで始まる名前: Unity がインポート対象外とするため meta を持たない
 #  - *.framework / *.bundle の中身: Unity は束ね全体を 1 アセットとして扱う。
 #    束ね自体には meta が要るので -prune -print0 で自身は出力する
 while IFS= read -r -d '' asset_path; do
+    relative_path="${asset_path#"$unity_project_root/"}"
+
     if [ -e "$asset_path.meta" ]; then
+        # 既存 meta でも、CPU 設定を持たないネイティブ dll は衝突の原因になるので直す
+        if needs_plugin_importer "$asset_path"; then
+            upgrade_count=$((upgrade_count + 1))
+            if [ "$check_only" = true ]; then
+                echo "CPU 設定なし: $relative_path"
+            else
+                write_meta "$asset_path" "$(read_guid "$asset_path.meta")"
+                echo "CPU 設定を追加: $relative_path"
+            fi
+        fi
         continue
     fi
 
     missing_count=$((missing_count + 1))
-    relative_path="${asset_path#"$unity_project_root/"}"
 
     if [ "$check_only" = true ]; then
         echo "meta なし: $relative_path"
@@ -106,11 +206,11 @@ done < <(find "$target_directory" -mindepth 1 \
     -print0)
 
 if [ "$check_only" = true ]; then
-    if [ "$missing_count" -gt 0 ]; then
-        echo "meta が $missing_count 件不足しています: $target_directory" >&2
+    if [ "$missing_count" -gt 0 ] || [ "$upgrade_count" -gt 0 ]; then
+        echo "meta が $missing_count 件不足、CPU 設定が $upgrade_count 件不足しています: $target_directory" >&2
         exit 1
     fi
-    echo "全アセットに meta あり: $target_directory"
+    echo "全アセットに meta あり (CPU 設定も充足): $target_directory"
 else
-    echo "meta を $missing_count 件生成しました: $target_directory"
+    echo "meta を $missing_count 件生成、CPU 設定を $upgrade_count 件追加しました: $target_directory"
 fi

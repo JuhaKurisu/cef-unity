@@ -8,12 +8,19 @@
 # ソースが無い場合はエラーにせず警告のみ (Rust 未ビルド環境で dotnet build を壊さないため)。
 # 成果物の欠落を検出したい呼び出し元 (deploy.ps1) は、呼ぶ前に自前で検査すること。
 param(
-    [Parameter(Mandatory = $true)][string]$Destination
+    [Parameter(Mandatory = $true)][string]$Destination,
+    # クロスビルド時のターゲットトリプル (例: aarch64-pc-windows-msvc)。
+    # 指定すると成果物を target\<triple>\release から拾う。未指定ならホストビルドの target\release。
+    [string]$Target = ''
 )
 $ErrorActionPreference = 'Stop'
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Release = Join-Path $ScriptDir 'target\release'
+if ($Target) {
+    $Release = Join-Path $ScriptDir "target\$Target\release"
+} else {
+    $Release = Join-Path $ScriptDir 'target\release'
+}
 $Destination = [System.IO.Path]::GetFullPath($Destination)
 
 if (-not (Test-Path $Release)) {
