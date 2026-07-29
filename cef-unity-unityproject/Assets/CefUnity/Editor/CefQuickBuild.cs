@@ -34,6 +34,34 @@ namespace CefUnity.Editor
             Debug.Log($"[CefQuickBuild] result={summary.result} sizeBytes={summary.totalSize} " +
                       $"errors={summary.totalErrors} out={OutputPath}");
         }
+
+        /// <summary>
+        ///     Windows プレイヤーの出力先。BuildMac と違い絶対パスを埋め込まず、
+        ///     プロジェクト直下の Build/Windows/ を使う (worktree でもそのまま動くように)。
+        /// </summary>
+        private static string WindowsOutputPath =>
+            System.IO.Path.Combine(
+                System.IO.Path.GetDirectoryName(Application.dataPath) ?? string.Empty,
+                "Build", "Windows", "CefUnity.exe");
+
+        [MenuItem("CefUnity/Build Windows Player (measure)")]
+        public static void BuildWindows()
+        {
+            var outputPath = WindowsOutputPath;
+            var buildPlayerOptions = new BuildPlayerOptions
+            {
+                scenes = new[] { "Assets/Scenes/SampleScene.unity" },
+                locationPathName = outputPath,
+                target = BuildTarget.StandaloneWindows64,
+                // BuildMac と同じ理由で Development ビルド (開発トグル群を有効にする)。
+                options = BuildOptions.Development,
+            };
+
+            var report = BuildPipeline.BuildPlayer(buildPlayerOptions);
+            var summary = report.summary;
+            Debug.Log($"[CefQuickBuild] result={summary.result} sizeBytes={summary.totalSize} " +
+                      $"errors={summary.totalErrors} out={outputPath}");
+        }
     }
 }
 #endif
