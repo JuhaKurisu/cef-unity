@@ -185,6 +185,40 @@ Linux で開発する際の前提を記録する:
 - ネイティブ音声出力 (macOS の AudioUnit 経路に相当するもの)。Linux は Unity ミキサ経路のみ
 - GitHub Actions の ubuntu ジョブ追加
 
+## 実装結果 (2026-07-29)
+
+**フェーズ 1 は完了した。** 合否判定 (検証手順 5) は PASS —
+`SMOKE_OK frames=3` を得て、`dump` が出力した PNG に example.com が正しく描画されていることを
+目視確認した (リンクが青く出ており BGRA→RGB の並べ替えも正しい)。
+
+**「未知のリスク」は 3 つとも顕在化しなかった。** ozone/X11、zygote、external BeginFrame の
+いずれについても command line switch の追加は不要で、`server.rs` は Task 1 の型分岐以外
+一切変更していない。既存コードの `#[cfg(not(target_os = "macos"))]` 経路がそのまま
+Linux で機能した。
+
+実装中に判明した、設計時に見えていなかったもの:
+
+- `CefUnity.Harness/Directory.Build.targets` と `CefUnity.Viewer/Directory.Build.targets` の
+  `CopyCefFramework` が `OSX Or Linux` 条件で macOS 専用の `cef_macos_aarch64` を参照しており、
+  Linux で `rsync` が失敗していた。両方とも `OSX` 限定に修正した (設計書の変更点には無かった)
+
+## フェーズ 2 への申し送り
+
+- **フレーム供給レート**: 600 反復 (約 10 秒) で `frames=3` と少ない。`get_active_buffer_pointer`
+  が `frame_id` の変化で edge-trigger され、CEF は damage が無ければ再描画しないため静的ページ
+  では妥当な形だが、スクロール等の動的な負荷での供給レートは未確認
+- **真のヘッドレス環境**: 検証は WSLg (X11 が見える状態) で行った。X11 が無い環境では
+  `--ozone-platform=headless` が必要になる可能性がある (`cef-unity-rust/CLAUDE.md` に記載済み)
+- **PNG ライターのテストの穴**: CRC 計算自体のテストが無く (IEND の既知 CRC `0xAE426082` との
+  照合で塞げる)、多画素ケースが IDAT を展開検証していないため行ストライド計算が間接検証のみ
+- **`CefUnity.Harness/Directory.Build.targets`** には Viewer 側にある
+  `Exists('$(_CefRustTargetDir)/build')` ガードが無い (既存の非対称、本フェーズ以前からのもの)
+- **`build-server-sandbox.sh` の CEF 配布物探索**が `ls -d ... | head -1` で辞書順選択になっている
+  (`ls -dt` なら新しい順)。macOS 分岐も同じで、直すなら両方
+- **GPU ゼロコピー (dmabuf / EGL)**: macOS の IOSurface、Windows の D3D11 共有テクスチャに
+  相当する第 3 の経路。フェーズ 1 では扱わなかった
+- **Unity 対応**: `Assets/CefUnity/Plugins/linux-x64/` への deploy スクリプトが未整備
+
 ## 開発環境
 
 WSL2 (Ubuntu 24.04 LTS) を使う。ディストロは `F:\WSL\Ubuntu-24.04` に配置済み。
