@@ -1,6 +1,6 @@
 using CefUnity.Interop;
 
-// サブコマンド: (なし)=スモーク, replay=Phase 4 で追加
+// サブコマンド: (なし)=スモーク, dump=1 フレームを PNG 保存, replay=Phase 4 で追加
 var command = args.Length > 0 ? args[0] : "smoke";
 if (command == "smoke")
 {
@@ -24,6 +24,32 @@ if (command == "smoke")
     }
     CefRuntime.Shutdown();
     return frames > 0 ? 0 : 1;
+}
+if (command == "dump")
+{
+    var outputPath = args.Length > 1 ? args[1] : "frame.png";
+    CefRuntime.Initialize(useGpu: false);
+    var written = false;
+    using (var browser = new Browser(1280, 720, "https://example.com"))
+    {
+        for (var frameIndex = 0; frameIndex < 600 && !written; frameIndex++)
+        {
+            browser.SendExternalBeginFrame((ulong)frameIndex);
+            CefRuntime.Pump();
+            Thread.Sleep(16);
+            // 最初の 120 フレームはページのロード待ちに使い、白紙を掴まないようにする
+            if (frameIndex < 120) continue;
+            if (browser.TryGetBuffer(out var bgra, out var width, out var height))
+            {
+                CefUnity.Harness.PortableNetworkGraphicsWriter.WriteBgra(outputPath, bgra.ToArray(), width, height);
+                Console.WriteLine($"DUMP_OK {outputPath} {width}x{height}");
+                written = true;
+            }
+        }
+    }
+    CefRuntime.Shutdown();
+    if (!written) Console.Error.WriteLine("DUMP FAIL: no frame captured");
+    return written ? 0 : 1;
 }
 if (command == "replay")
 {

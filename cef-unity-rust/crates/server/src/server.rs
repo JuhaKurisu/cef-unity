@@ -1172,12 +1172,15 @@ impl CefServer {
         );
 
         // cef_window_handle_t はプラットフォーム依存:
-        //   macOS / Linux: *mut c_void
+        //   macOS: *mut c_void
+        //   Linux: c_ulong (X11 Window / XID)
         //   Windows: HWND (newtype wrapping *mut c_void)
         #[cfg(target_os = "windows")]
         let parent_handle = cef::sys::HWND(std::ptr::null_mut());
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
         let parent_handle = std::ptr::null_mut();
+        #[cfg(target_os = "linux")]
+        let parent_handle: cef::sys::cef_window_handle_t = 0;
         let mut window_info = WindowInfo::default().set_as_windowless(parent_handle);
         // macOS: IOSurface Mach port 転送を使用 (use_gpu=true のときのみ)。
         // Windows: D3D11 共有テクスチャプールが構築できた場合のみ accelerated paint を有効化。
