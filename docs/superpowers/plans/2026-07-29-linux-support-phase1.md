@@ -390,9 +390,15 @@ git commit -m "build(linux): build-server-sandbox.sh に Linux のフラット�
 2 つの問題がある。
 
 **(a) パス区切り (7-8 行目)** — `'$(MSBuildThisFileDirectory)..\..\cef-unity-rust'` と
-バックスラッシュ区切りで書かれている。Linux の MSBuild はバックスラッシュをディレクトリ
-区切りとして扱わないため `Path.GetFullPath` が誤った値を返す。スラッシュ区切りに直す
-(Windows / macOS でも正しく動く)。
+バックスラッシュ区切りで書かれている。一貫性のためスラッシュ区切りに直す。
+
+> **訂正 (2026-07-29、実装後の実測による):** 当初この計画は「Linux の MSBuild は
+> バックスラッシュをディレクトリ区切りとして扱わないため `Path.GetFullPath` が誤った値を
+> 返す」と記述していたが、**これは誤りだった**。Unix の MSBuild は `Path.GetFullPath` に
+> 渡された文字列内のバックスラッシュを正規化するため、両表記は同一のパスに解決される
+> (Linux 上で `dotnet msbuild -t:Show` により実測)。したがってこの変更は全プラットフォームで
+> 挙動を変えない純粋な一貫性の改善であり、不具合修正ではない。以下の Step 3 の置換手順自体は
+> 実施した作業の記録として変更しない。
 
 **(b) 共有ライブラリ名とステージング条件 (16-24 行目)** — `.dylib` 決め打ちで、
 条件が `IsOSPlatform('OSX')` に限定されている。

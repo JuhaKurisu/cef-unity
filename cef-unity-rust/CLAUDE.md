@@ -94,7 +94,7 @@ apphost がランタイムを見つけられない場合は `export DOTNET_ROOT=
 - **software paint 経路のみ**。GPU ゼロコピー (dmabuf/EGL) は未実装
 - ネイティブ音声出力 (macOS の AudioUnit 経路に相当) は無い。Unity ミキサ経路のみ
 - Unity Editor / Player 対応は未着手
-- Task 6 の実測では command line switch の追加は不要だった (`SMOKE_OK` を確認済み)。
+- フェーズ 1 の実測では command line switch の追加は不要だった (`SMOKE_OK` を確認済み)。
   ただし検証環境は WSLg (X11 が見える状態) であり、**X11 が無い真のヘッドレス環境は未検証**。
   その場合は `--ozone-platform=headless` の追加が必要になる可能性がある
 

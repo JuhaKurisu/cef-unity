@@ -127,8 +127,14 @@ CEF 配布物ディレクトリの特定には、既存の macOS 分岐 (`build-
 
 **(b) パス区切り文字 (7-8 行目)** — `RustProjectDir` / `RustTargetDir` が
 `'$(MSBuildThisFileDirectory)..\..\cef-unity-rust\target\debug'` とバックスラッシュ区切りで
-書かれている。Linux の MSBuild はバックスラッシュをディレクトリ区切りとして扱わないため、
-`Path.GetFullPath` が誤ったパスを返す。スラッシュ区切りに直す (Windows / macOS でも正しく動く)。
+書かれている。一貫性のためスラッシュ区切りに直す。
+
+> **訂正 (2026-07-29、実装後の実測による):** 当初この設計書は「Linux の MSBuild は
+> バックスラッシュを区切りとして扱わないため `Path.GetFullPath` が誤ったパスを返す」と
+> 記述していたが、**これは誤りだった**。Unix の MSBuild は `Path.GetFullPath` に渡された
+> 文字列内のバックスラッシュを正規化するため、両表記は同一のパスに解決される
+> (Linux 上で `dotnet msbuild -t:Show` により実測)。したがってこの変更は
+> 全プラットフォームで挙動を変えない純粋な一貫性の改善であり、不具合修正ではない。
 
 `CopyServerApp` ターゲット (18-20 行) は `build-server-sandbox.sh` 呼び出しのままでよい
 (スクリプト側で OS 分岐するため)。
