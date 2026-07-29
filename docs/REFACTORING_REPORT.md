@@ -233,6 +233,13 @@
 - **問題**: immediate context は非スレッドセーフ COM。C# が main thread から呼ぶと Unity render thread と競合 → まれな DEVICE_REMOVED 系。Windows 経路固有 (D3D12 の CommandQueue::Wait はスレッドセーフ)
 - **修正案**: 段階 1 = 呼び出しスレッド規約の doc 明記 + debug ビルドでスレッド ID 記録アサート。段階 2 = `cef_unity_get_render_event_func()` エクスポートで render thread コールバックに閉じ込め (Unity ネイティブプラグイン標準パターン)
 - **リスク**: 段階 2 は C# フロー変更 + fence 実証の再検証が必要。まず段階 1 で実測してから
+- **状況 (2026-07-29)**: **段階 1 を実施済み**。`wait_fence` / `open_or_cached` に呼び出しスレッド規約を doc 明記し、
+  OS スレッド ID を記録して変化時に WARNING を残す `record_context_caller_thread` を追加した。
+  Unity 6000.3.8f1 / Windows x64 を D3D11 強制 (`m_APIs: 0200000012000000`) にして実測した結果、
+  **accelerated frame 1866 回 (afi=1866) で WARNING は 0 件** — `wait_fence` は一貫して単一スレッドから
+  呼ばれている。したがって段階 2 (render thread への移設) は着手しない: C# フロー変更と fence 同期の
+  再検証というリスクに見合う実害が観測されていない。将来 C# 側の呼び出し位置を変更した場合は、
+  この WARNING が出ないことを再確認すること。
 
 ### CLI-13. `LOG_ENABLED` が d3d11/d3d12 に効かない 【優先度: 低 / 工数: 小】
 - **場所**: `d3d11.rs:28-37`、`d3d12.rs:37-46` (マスターフラグ無視で常にファイル open + 書き込み)
