@@ -76,6 +76,18 @@ Linux 版。
 - `locales/` の Unity `.meta` を退避・復元する (`deploy.ps1` と同じ処理)
 - 配置後、必須ファイル (`libcef_unity_rust.so`, `cef-unity-server`, `libcef.so`) の存在を検査する
 
+### 2-b. `Assets/CefUnity/Plugins/.gitattributes` (変更)
+
+`Plugins/.gitattributes` はプラットフォームごとに LFS フィルタを指定している
+(`osx-arm64/**`, `win-x64/**`, `win-arm64/**`)。`linux-x64/**` の行を追加する。
+これが無いと約 1 GB のバイナリが LFS を経由せず通常の blob として commit される。
+
+`**/*.meta -filter -diff -merge text` の行は変更しない (`.meta` は平文で管理する)。
+
+**バイナリのコミット主体:** `Plugins/linux-x64/` のバイナリと `.meta` は、Windows と同じく
+CI の `publish` ジョブがタグ時にコミットする。ローカルの `deploy-linux.sh` の実行結果は
+コミットしない (実装ブランチを約 1 GB 太らせないため)。
+
 ### 3. `cef-unity-rust/build-server-sandbox.sh` (変更)
 
 Linux 分岐のコピー処理を `copy-linux-runtime.sh` の呼び出しに置き換える。macOS 分岐には
