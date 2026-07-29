@@ -1,21 +1,44 @@
 ﻿#Requires -Version 5.1
+param(
+    # 配置する CPU アーキテクチャ。arm64 はクロスビルド
+    # (MSVC の "ARM64 build tools" コンポーネントが必要)。
+    [ValidateSet('x64', 'arm64')][string]$Arch = 'x64'
+)
 $ErrorActionPreference = 'Stop'
 
-# Windows x64 用のビルド + Unity プラグインへのコピー。
+# Windows 用のビルド + Unity プラグインへのコピー。
 # cef-unity-rust.dll (cdylib), cef-unity-server.exe, cef-unity-rust-helper.exe,
 # および CEF ランタイム (libcef.dll, *.pak, *.dat, locales/ 等) を一括配置する。
 #
 # 前提: 呼び出し元は MSVC link.exe / cl.exe にパスが通っていること。
 #       Visual Studio Build Tools 2022 がある場合は vcvars64.bat を先に実行する。
+#       -Arch arm64 では vcvarsamd64_arm64.bat (ARM64 クロスツール) が必要。
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ScriptDir
 
-$Dest = Join-Path $ScriptDir '..\cef-unity-unityproject\Assets\CefUnity\Plugins\win-x64'
+# arm64 は --target 指定のクロスビルドになるので、成果物が target\<triple>\release に出る。
+# x64 はホストビルドのまま (target\release) にして既存のローカル開発フローを変えない。
+if ($Arch -eq 'arm64') {
+    $TargetTriple = 'aarch64-pc-windows-msvc'
+    $PluginFolder = 'win-arm64'
+    $Release = Join-Path $ScriptDir "target\$TargetTriple\release"
+} else {
+    $TargetTriple = ''
+    $PluginFolder = 'win-x64'
+    $Release = Join-Path $ScriptDir 'target\release'
+}
+
+$Dest = Join-Path $ScriptDir "..\cef-unity-unityproject\Assets\CefUnity\Plugins\$PluginFolder"
 $Dest = [System.IO.Path]::GetFullPath($Dest)
 
-Write-Host "[deploy] cargo build --release"
-cargo build --release
+if ($TargetTriple) {
+    Write-Host "[deploy] cargo build --release --target $TargetTriple"
+    cargo build --release --target $TargetTriple
+} else {
+    Write-Host "[deploy] cargo build --release"
+    cargo build --release
+}
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 
 # ---- 配置先ディレクトリを準備 ----
@@ -26,8 +49,6 @@ if (-not (Test-Path $Dest)) {
 # ---- Rust 成果物の存在検査 ----
 # 実コピーは copy-windows-runtime.ps1 (Viewer のビルドと共有) が行うが、
 # Unity への配置では成果物の欠落を検出したいのでここで厳格に検査する。
-$Release = Join-Path $ScriptDir 'target\release'
-
 $Artifacts = @(
     'cef_unity_rust.dll',
     'cef-unity-server.exe',
@@ -56,7 +77,7 @@ if (Test-Path $LocalesDst) {
 }
 
 # ---- Rust 成果物 + CEF ランタイムを配置 (Viewer のビルドと共有) ----
-& (Join-Path $ScriptDir 'copy-windows-runtime.ps1') -Destination $Dest
+& (Join-Path $ScriptDir 'copy-windows-runtime.ps1') -Destination $Dest -Target $TargetTriple
 if ($LASTEXITCODE -ne 0) { throw "copy-windows-runtime.ps1 failed" }
 
 # 共有スクリプトは CEF ランタイム未検出でも警告のみで抜けるため、Unity 配置では結果を検査する。

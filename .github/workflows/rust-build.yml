@@ -1,5 +1,6 @@
 # Rust クライアント/サーバーの CI ビルド (設計: docs/superpowers/specs/2026-07-22-rust-ci-design.md)
-# mac は deploy.sh 再利用でバンドルまで、win はビルド+診断+ベストエフォート収集。
+# mac は deploy.sh 再利用でバンドルまで、win は x64/arm64 のマトリクスでビルド+診断+収集。
+# win-arm64 は x64 ランナー上のクロスビルドのみ (実行検証はしていない)。
 name: rust-build
 
 on:
@@ -66,10 +67,22 @@ jobs:
 
   build-win:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x64 はホストと同じなので実行を伴うテストもここで回す。
+          # arm64 はクロスビルドのみ (x64 ランナー上では実行できない)。
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -77,9 +90,11 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-win-${{ hashFiles('cef-unity-rust/Cargo.lock') }}
+          key: cargo-win-${{ matrix.arch }}-${{ hashFiles('cef-unity-rust/Cargo.lock') }}
 
+      # クロスビルドは実行できないので x64 のみ。
       - name: Unit tests
+        if: matrix.arch == 'x64'
         working-directory: cef-unity-rust
         shell: bash
         run: cargo test --workspace --lib --release || cargo test --workspace --lib --release
@@ -87,26 +102,29 @@ jobs:
       - name: Build
         working-directory: cef-unity-rust
         shell: bash
-        run: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Setup .NET
+        if: matrix.arch == 'x64'
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
       - name: Core unit tests (no Unity)
+        if: matrix.arch == 'x64'
         run: dotnet test cef-unity-csharp/CefUnity.Tests -c Release --logger "console;verbosity=minimal"
 
-      # Windows のバンドル構成は 2026-05 以来未検証。初回実行はこの診断ログで
-      # 収集対象を確定する (設計書に明記済み)。
+      # --target 指定なので成果物は target/<triple>/release に出る。
       - name: Diagnostics
         working-directory: cef-unity-rust
         shell: bash
+        env:
+          RELEASE_DIR: target/${{ matrix.target }}/release
         run: |
-          echo "=== target/release の exe/dll ==="
-          ls -la target/release | grep -Ei '\.(exe|dll)$' || echo "(なし)"
+          echo "=== $RELEASE_DIR の exe/dll ==="
+          ls -la "$RELEASE_DIR" | grep -Ei '\.(exe|dll)$' || echo "(なし)"
           echo "=== cef-dll-sys out ==="
-          ls -d target/release/build/cef-dll-sys-*/out/* 2>/dev/null || echo "(なし)"
-          for d in target/release/build/cef-dll-sys-*/out/cef_windows_*; do
+          ls -d "$RELEASE_DIR"/build/cef-dll-sys-*/out/* 2>/dev/null || echo "(なし)"
+          for d in "$RELEASE_DIR"/build/cef-dll-sys-*/out/cef_windows_*; do
             [ -d "$d" ] || continue
             echo "--- $d ---"
             # head の SIGPIPE (exit 141) を pipefail に拾わせない
@@ -116,18 +134,20 @@ jobs:
       - name: Collect bundle
         working-directory: cef-unity-rust
         shell: bash
+        env:
+          RELEASE_DIR: target/${{ matrix.target }}/release
         run: |
           mkdir -p bundle-win
-          for f in target/release/cef_unity_rust.dll \
-                   target/release/cef-unity-server.exe \
-                   target/release/cef-unity-rust-helper.exe; do
+          for f in "$RELEASE_DIR"/cef_unity_rust.dll \
+                   "$RELEASE_DIR"/cef-unity-server.exe \
+                   "$RELEASE_DIR"/cef-unity-rust-helper.exe; do
             if [ -f "$f" ]; then
               cp "$f" bundle-win/
             else
               echo "SKIP (not found): $f"
             fi
           done
-          CEF_DIR=$(ls -d target/release/build/cef-dll-sys-*/out/cef_windows_* 2>/dev/null | head -1)
+          CEF_DIR=$(ls -d "$RELEASE_DIR"/build/cef-dll-sys-*/out/cef_windows_* 2>/dev/null | head -1)
           if [ -n "$CEF_DIR" ]; then
             # ランタイムに必要なもののみ (include/cmake/libcef_dll/*.lib 等の SDK は除外)。
             # 初回実行の診断でレイアウトはフラット (libcef.dll / *.pak / icudtl.dat /
@@ -149,7 +169,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: cef-unity-windows-x64
+          name: cef-unity-windows-${{ matrix.arch }}
           path: cef-unity-rust/bundle-win
 
   # 第3弾: タグ push (v*) または手動実行時、ビルド成果物を Plugins/ へコミット (LFS 経由)
@@ -189,10 +209,17 @@ jobs:
 
       - name: Update Plugins (win, フラット展開)
         run: |
-          WD=cef-unity-unityproject/Assets/CefUnity/Plugins/win-x64
-          SRC=artifacts/cef-unity-windows-x64
-          cp "$SRC/cef_unity_rust.dll" "$SRC/cef-unity-server.exe" "$SRC/cef-unity-rust-helper.exe" "$WD/"
-          rsync -a --exclude archive.json "$SRC/cef/" "$WD/"
+          for ARCH in x64 arm64; do
+            WD=cef-unity-unityproject/Assets/CefUnity/Plugins/win-$ARCH
+            SRC=artifacts/cef-unity-windows-$ARCH
+            if [ ! -d "$SRC" ]; then
+              echo "SKIP (artifact not found): $SRC"
+              continue
+            fi
+            mkdir -p "$WD"
+            cp "$SRC/cef_unity_rust.dll" "$SRC/cef-unity-server.exe" "$SRC/cef-unity-rust-helper.exe" "$WD/"
+            rsync -a --exclude archive.json "$SRC/cef/" "$WD/"
+          done
 
       # CEF 更新でファイルが増えると、Unity Editor を起動しないこの job では .meta が
       # 無いままコミットされ、利用側の Unity が GUID をローカル生成して参照がぶれる。
@@ -221,8 +248,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          (cd artifacts/cef-unity-windows-x64 && zip -qry ../../cef-unity-windows-x64.zip .)
+          ASSETS=(cef-unity-macos-arm64.zip)
           cp artifacts/cef-unity-macos-arm64/cef-unity-macos-arm64.zip .
-          gh release create "$GITHUB_REF_NAME" \
-            cef-unity-macos-arm64.zip cef-unity-windows-x64.zip \
-            --generate-notes
+          for ARCH in x64 arm64; do
+            if [ -d "artifacts/cef-unity-windows-$ARCH" ]; then
+              (cd "artifacts/cef-unity-windows-$ARCH" && zip -qry "../../cef-unity-windows-$ARCH.zip" .)
+              ASSETS+=("cef-unity-windows-$ARCH.zip")
+            fi
+          done
+          gh release create "$GITHUB_REF_NAME" "${ASSETS[@]}" --generate-notes
