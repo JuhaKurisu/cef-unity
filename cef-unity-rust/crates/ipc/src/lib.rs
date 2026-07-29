@@ -532,6 +532,13 @@ impl SharedMemoryWriter {
         header.d3d11_fence_value.store(fence_value, Ordering::Release);
         // d3d11_frame_id は最後に更新する: クライアントは frame_id の変化を検出して読む
         header.d3d11_frame_id.fetch_add(1, Ordering::Release);
+        // accelerated_frame_id は macOS の IOSurface 経路と共通の「新しい accelerated paint が
+        // 届いた」合図で、クライアントの 0F 待ち (CefZeroFramePacer) はこの増分だけを見ている。
+        // Windows でも進めないと待ちがフレーム到着で抜けられず、常に NoDamageGiveUp の
+        // タイムアウト側で終わる。d3d11_frame_id より**後**に進めること —
+        // 待機側はこの増分で起きた直後に d3d11_frame_id を見て受信するため、
+        // 先に進めると起床時点でまだフレームが読めず空振りする。
+        header.accelerated_frame_id.fetch_add(1, Ordering::Release);
     }
 
     /// Write a frame. The buffer must be width*height*4 BGRA bytes.
@@ -1415,5 +1422,62 @@ mod tests {
         response_sender.send(Response::Ok).unwrap();
         let response = bootstrap.response_receiver.recv().unwrap();
         assert!(matches!(response, Response::Ok));
+    }
+
+    /// Windows の accelerated paint でも `accelerated_frame_id` が進むこと。
+    /// クライアントの 0F 待ち (CefZeroFramePacer) はこのカウンタの増分だけを
+    /// フレーム到着の合図に使うため、macOS の IOSurface 経路と同じように
+    /// D3D11/D3D12 経路でも進まないと待ちが常にタイムアウト側で終わる。
+    #[test]
+    fn write_d3d11_handle_advances_accelerated_frame_id() {
+        let flink = std::env::temp_dir()
+            .join("cef-unity-test-shm-d3d11-afi")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let writer = SharedMemoryWriter::new(&flink).expect("SharedMemoryWriter::new");
+        let reader = SharedMemoryReader::open(&flink).expect("SharedMemoryReader::open");
+
+        assert_eq!(reader.peek_accelerated_frame_id(), 0, "初期値は 0");
+
+        writer.write_d3d11_handle(0x1234, 1920, 1080, 0, 1);
+        assert_eq!(
+            reader.peek_accelerated_frame_id(),
+            1,
+            "D3D11 handle を publish したら accelerated_frame_id が進むこと"
+        );
+
+        writer.write_d3d11_handle(0x1234, 1920, 1080, 0, 2);
+        assert_eq!(
+            reader.peek_accelerated_frame_id(),
+            2,
+            "publish のたびに単調増加すること"
+        );
+    }
+
+    /// `accelerated_frame_id` の増分を観測した時点で `d3d11_frame_id` 側の
+    /// データが既に読めること (待機側が起こされた直後に取りこぼさない順序保証)。
+    #[test]
+    fn accelerated_frame_id_is_published_after_d3d11_frame_data() {
+        let flink = std::env::temp_dir()
+            .join("cef-unity-test-shm-d3d11-order")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let writer = SharedMemoryWriter::new(&flink).expect("SharedMemoryWriter::new");
+        let mut reader = SharedMemoryReader::open(&flink).expect("SharedMemoryReader::open");
+
+        writer.write_d3d11_handle(0xabcd, 800, 600, 0, 7);
+
+        // 待機側は accelerated_frame_id の増分で起きる。その時点で get_d3d11_handle が
+        // 新フレームを返せなければ、起こされた直後の受信が空振りする。
+        assert_ne!(reader.peek_accelerated_frame_id(), 0);
+        assert_eq!(
+            reader.get_d3d11_handle(),
+            Some((0xabcd, 800, 600, 0, 7)),
+            "afi 増分を観測した時点で d3d11 フレームが取得できること"
+        );
     }
 }
