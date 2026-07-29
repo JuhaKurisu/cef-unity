@@ -14,6 +14,12 @@
     <ProjectReference Include="..\CefUnity.Core\CefUnity.Core.csproj" />
     <ProjectReference Include="..\CefUnity.Viewer\CefUnity.Viewer.csproj" />
   </ItemGroup>
+  <!-- Harness の診断用 PNG ライターを単体テストする。ProjectReference にすると
+       Harness の CopyServerApp ターゲットが dotnet test のたびに走るためリンク参照にする。 -->
+  <ItemGroup>
+    <Compile Include="..\CefUnity.Harness\PortableNetworkGraphicsWriter.cs"
+             Link="PortableNetworkGraphicsWriter.cs" />
+  </ItemGroup>
   <ItemGroup>
     <None Include="fixtures/**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
