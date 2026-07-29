@@ -3,6 +3,8 @@
 // This is a pure IPC client — no CEF dependency.
 // Communicates with cef-unity-server via ipc-channel + shared memory.
 
+mod logging;
+
 #[cfg(target_os = "windows")]
 mod d3d11;
 #[cfg(target_os = "windows")]
@@ -18,7 +20,6 @@ mod native_voice;
 mod scroll_monitor;
 
 use std::ffi::{CStr, c_char};
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -166,9 +167,6 @@ fn stop_native_voice(instance: &mut ClientBrowserInstance) {
 // ---------------------------------------------------------------------------
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
-/// ログ出力の有効/無効。Init で Unity 側のマスターフラグに従って設定される。
-/// false の場合 log_to_file は何もしない (ファイルログ抑制)。
-static LOG_ENABLED: AtomicBool = AtomicBool::new(false);
 static IOSURFACE_CONNECTED: AtomicBool = AtomicBool::new(false);
 /// GPU (accelerated paint) を使うか。Init 時にセットされ、以降は不変。
 /// false の場合は server が software paint で動作し、client 側でも
@@ -187,18 +185,10 @@ struct ServerConnection {
 
 static CONNECTION: Mutex<Option<ServerConnection>> = Mutex::new(None);
 
+/// ログ出力の有効/無効は `logging` モジュールが一元管理する
+/// (d3d11/d3d12 の経路も同じフラグとファイルハンドルを共有する)。
 fn log_to_file(message: &str) {
-    if !LOG_ENABLED.load(Ordering::Relaxed) {
-        return;
-    }
-    let path = std::env::temp_dir().join("cef_unity_debug.log");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(file, "[{:?}] {}", std::time::SystemTime::now(), message);
-    }
+    logging::write("", message);
 }
 
 /// FFI 境界のパニックガード。extern "C" 越しの unwind は edition 2024 で即 abort
@@ -255,7 +245,7 @@ fn send_command_no_wait(connection: &ServerConnection, command: Command) {
 pub extern "C" fn cef_unity_initialize(use_gpu: i32, enable_log: i32) -> i32 {
     ffi_guard(-1, || {
         // ログ有効/無効を最初に確定させる (以降の log_to_file がこれに従う)。
-        LOG_ENABLED.store(enable_log != 0, Ordering::SeqCst);
+        logging::set_enabled(enable_log != 0);
 
         if INITIALIZED.load(Ordering::SeqCst) {
             return 0;

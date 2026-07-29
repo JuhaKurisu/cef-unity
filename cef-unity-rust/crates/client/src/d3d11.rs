@@ -16,7 +16,6 @@ use std::ffi::c_void;
 use std::sync::{Mutex, PoisonError};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use std::io::Write;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D11::{
@@ -26,14 +25,7 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::core::Interface;
 
 fn log_debug(message: &str) {
-    let path = std::env::temp_dir().join("cef_unity_debug.log");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(file, "[d3d11] {}", message);
-    }
+    crate::logging::write("d3d11", message);
 }
 
 // ---- Unity Native Plugin Interface (subset) ----
