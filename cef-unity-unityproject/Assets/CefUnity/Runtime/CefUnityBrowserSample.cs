@@ -259,7 +259,10 @@ namespace CefUnity.Runtime
             switch (_scrollInput.StartNativeSource(out var error))
             {
                 case NativeScrollSourceStart.Started:
-                    CefLog.Log("[CefUnity] scroll: native NSEvent source active");
+                    // macOS = NSEvent ローカルモニタ / Windows = Raw Input。
+                    // 経路名を出さないのは、プラットフォームが増えるたびに文言が
+                    // 実装とずれるのを避けるため。
+                    CefLog.Log("[CefUnity] scroll: native source active");
                     break;
                 case NativeScrollSourceStart.Failed:
                     CefLog.Log($"[CefUnity] scroll: native source init threw ({error.GetType().Name}) — fallback");

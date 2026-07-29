@@ -72,28 +72,38 @@ namespace CefUnity.Runtime
         public NativeScrollSourceStart StartNativeSource(out Exception error)
         {
             error = null;
-            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.OSX))
-            {
-                var source = new MacNativeScrollSource();
-                try
-                {
-                    if (source.Start())
-                    {
-                        _source = source;
-                        return NativeScrollSourceStart.Started;
-                    }
-                }
-                catch (Exception exception)
-                {
-                    // dylib 不在等の P/Invoke 例外は回復可能 — フォールバックに落とす。
-                    error = exception;
-                    source.Dispose();
-                    return NativeScrollSourceStart.Failed;
-                }
-                source.Dispose();
-                return NativeScrollSourceStart.Unavailable;
-            }
+            var platforms = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform;
+            if (platforms(System.Runtime.InteropServices.OSPlatform.OSX))
+                return TryStartSource(new MacNativeScrollSource(), out error);
+            if (platforms(System.Runtime.InteropServices.OSPlatform.Windows))
+                return TryStartSource(new WindowsNativeScrollSource(), out error);
             return NativeScrollSourceStart.NotSupported;
+        }
+
+        /// <summary>
+        ///     生成済みソースの開始を試み、結果を分類する。プラットフォームが増えても
+        ///     この開始・失敗処理を複製しないためのヘルパー。
+        /// </summary>
+        private NativeScrollSourceStart TryStartSource(IScrollEventSource source, out Exception error)
+        {
+            error = null;
+            try
+            {
+                if (source.Start())
+                {
+                    _source = source;
+                    return NativeScrollSourceStart.Started;
+                }
+            }
+            catch (Exception exception)
+            {
+                // dylib/dll 不在等の P/Invoke 例外は回復可能 — フォールバックに落とす。
+                error = exception;
+                source.Dispose();
+                return NativeScrollSourceStart.Failed;
+            }
+            source.Dispose();
+            return NativeScrollSourceStart.Unavailable;
         }
 
         /// <summary>
