@@ -277,8 +277,9 @@ moorestech `MainGameUI.prefab` に `_zeroFrameWaitMs: 10` が保存済み
 **server-side flush の位置づけメモ**: 既定 OFF ではクライアントが flush 結果の到着を待たなく
 なるため、server-side flush（server.rs の BF#1 +3/+6ms 内部 flush）由来の paint は同フレームの
 present には乗らず、次フレームの受信で拾われる。つまり「0F 化」自体の効果は既定では消え、
-残るのは「次フレームの内容が数 ms 新しい」という効果だけになる（実測では received/s・paints/s
-とも ON/OFF で不変であり、コストが増えた証拠もない）。残作業 7 番の「次の一手 = サーバーからの
+残るのは「次フレームの内容が数 ms 新しい」という効果だけになる（実測では `received/s` が
+ON/OFF で不変であり、コストが増えた証拠もない。`paints/s` は `paint-statistics` の単独実行でしか
+計測しておらず、0F 待ちの ON/OFF を振った比較はまだ取っていない）。残作業 7 番の「次の一手 = サーバーからの
 damage なし通知」と併せて、server-side flush の存在意義そのものも opt-in 化後の構成でどこまで
 必要かを再評価する必要がある。
 

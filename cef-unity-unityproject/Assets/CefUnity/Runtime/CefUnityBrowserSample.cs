@@ -392,10 +392,13 @@ namespace CefUnity.Runtime
                         _recentSamples.Clear();
                     }
 
-                    // 0F 待ち専用メトリクス (ログ出力は待ちを有効にしたときだけだが、Reset() は
-                    // 既定 OFF でも毎窓必ず呼ぶ。if の内側に置くと待ち無効時は RecordNoWaitReceive
-                    // が窓をまたいで加算され続け、途中で有効化した瞬間の 1 行目で
-                    // 「2 軸の合計 = 窓のフレーム数」という不変条件が崩れる)。
+                    // 0F 待ち専用メトリクス (このブロックは外側の if (_enableLog) の内側でのみ
+                    // 実行される)。ログ出力は待ちを有効にしたときだけだが、Reset() はログを
+                    // 有効にしている間は待ちが無効でも毎窓リセットする。if の内側に置くと
+                    // ログ有効・待ち無効の構成で RecordNoWaitReceive が窓をまたいで加算され続け、
+                    // 途中で待ちを有効化した瞬間の 1 行目で「2 軸の合計 = 窓のフレーム数」という
+                    // 不変条件が崩れる (ログ無効の構成では本ブロック自体が呼ばれずカウンタも
+                    // 参照されないため実害はない)。
                     if (_zeroFrameWaitMilliseconds > 0f && _useAcceleratedPaint)
                     {
                         CefLog.Log($"[CefUnity] 0F-wait: {_zeroFrameWaitStatistics.FormatLine()}");
