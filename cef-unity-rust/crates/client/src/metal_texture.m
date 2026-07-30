@@ -43,6 +43,9 @@ typedef struct {
 
 static mach_port_t g_receive_port = MACH_PORT_NULL;
 
+// 直近に受信した IOSurface (キャッシュが retain 済み)。診断用の画素サンプルに使う。
+static IOSurfaceRef _lastReceivedSurface = NULL;
+
 /// Connect to the server's Mach IOSurface service and send subscription.
 /// Returns 0 on success, negative on error.
 int mach_iosurface_client_connect(const char* service_name) {
@@ -167,6 +170,7 @@ void* mach_iosurface_receive_texture(int32_t* out_width, int32_t* out_height, ui
         if (_surfaceCache[cache_index].surfaceID == latestID && _surfaceCache[cache_index].srgbView) {
             CFRelease(latest_surface);
             srgbView = _surfaceCache[cache_index].srgbView;
+            _lastReceivedSurface = _surfaceCache[cache_index].surface;
             break;
         }
     }
@@ -215,6 +219,7 @@ void* mach_iosurface_receive_texture(int32_t* out_width, int32_t* out_height, ui
             _surfaceCache[slot].surfaceID = latestID;
             _surfaceCache[slot].surface = latest_surface;
             _surfaceCache[slot].srgbView = srgbView;
+            _lastReceivedSurface = latest_surface;
         }
     }
 
@@ -222,6 +227,36 @@ void* mach_iosurface_receive_texture(int32_t* out_width, int32_t* out_height, ui
     *out_height = (int32_t)latest_height;
     *out_format = latest_format;
     return (__bridge_retained void*)srgbView;
+}
+
+/// 直近に受信した IOSurface から、縦方向に等間隔な行の中央画素を count 個サンプルする
+/// (診断専用)。全画面が単色のページでは全て同じ値になるはずで、値が割れていれば
+/// ティアリング = 転送先が blit 未完了 or src が上書きされた証拠になる。
+/// 戻り値: 書き込んだ画素数。0 は未受信 or lock 失敗。
+int cef_unity_sample_iosurface_pixels_objc(uint32_t* out_pixels, int32_t count) {
+    if (out_pixels == NULL || count <= 0 || _lastReceivedSurface == NULL) return 0;
+
+    IOSurfaceRef surface = _lastReceivedSurface;
+    if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return 0;
+
+    uint8_t* base = (uint8_t*)IOSurfaceGetBaseAddress(surface);
+    size_t bytes_per_row = IOSurfaceGetBytesPerRow(surface);
+    size_t width = IOSurfaceGetWidth(surface);
+    size_t height = IOSurfaceGetHeight(surface);
+    if (base == NULL || width == 0 || height == 0) {
+        IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+        return 0;
+    }
+
+    for (int32_t index = 0; index < count; index++) {
+        size_t row = (size_t)((double)index / (double)count * (double)height);
+        if (row >= height) row = height - 1;
+        uint32_t* pixels_in_row = (uint32_t*)(base + row * bytes_per_row);
+        out_pixels[index] = pixels_in_row[width / 2];
+    }
+
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    return count;
 }
 
 // ---------------------------------------------------------------------------

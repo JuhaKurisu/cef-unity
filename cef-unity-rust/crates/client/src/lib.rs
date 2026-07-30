@@ -1645,6 +1645,8 @@ unsafe extern "C" {
         out_format: *mut u32,
     ) -> *mut std::ffi::c_void;
 
+    fn cef_unity_sample_iosurface_pixels_objc(out_pixels: *mut u32, count: i32) -> i32;
+
 }
 
 /// Check if a new accelerated paint frame is available via IOSurface.
@@ -1711,6 +1713,28 @@ pub extern "C" fn cef_unity_create_metal_texture(
         {
             let _ = (surface_id, width, height, format);
             std::ptr::null_mut()
+        }
+    })
+}
+
+/// 診断専用: 直近に受信した IOSurface から縦方向に等間隔な行の中央画素を
+/// `count` 個サンプルして `out_pixels` に書く。書き込んだ画素数を返す (0 = 未受信)。
+///
+/// 全画面が単色のページで値が割れていれば、転送先が blit 未完了のまま読まれたか
+/// src が上書きされたことを意味する (ティアリング検出)。macOS 以外では常に 0。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_sample_iosurface_pixels(out_pixels: *mut u32, count: i32) -> i32 {
+    ffi_guard(0, || {
+        if out_pixels.is_null() || count <= 0 {
+            return 0;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            unsafe { cef_unity_sample_iosurface_pixels_objc(out_pixels, count) }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            0
         }
     })
 }

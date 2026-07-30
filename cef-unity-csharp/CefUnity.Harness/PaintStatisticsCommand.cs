@@ -120,7 +120,9 @@ internal static class PaintStatisticsCommand
                 $"received_min={(perSecondReceived.Count > 0 ? perSecondReceived.Min() : 0)} " +
                 $"received_median={Median(perSecondReceived)} " +
                 $"received_max={(perSecondReceived.Count > 0 ? perSecondReceived.Max() : 0)} " +
-                $"gap_max={(perSecondMaximumGap.Count > 0 ? perSecondMaximumGap.Max() : 0):F1}ms");
+                $"gap_max={(perSecondMaximumGap.Count > 0 ? perSecondMaximumGap.Max() : 0):F1}ms " +
+                $"verified_frames={s_verifiedFrameCount} torn_frames={s_tornFrameCount} " +
+                $"distinct_colors={s_observedColors.Count} max_colors_in_frame={s_maximumColorsInFrame}");
 
             Console.WriteLine();
             foreach (var line in CefRuntime.GetLogs().Where(line => line.Contains("STATISTICS")))
@@ -134,10 +136,35 @@ internal static class PaintStatisticsCommand
         }
     }
 
+    /// <summary>1 フレームあたりのティアリング検査でサンプルする行数。</summary>
+    private const int SampleRowCount = 16;
+    private static readonly uint[] s_samplePixels = new uint[SampleRowCount];
+
+    /// <summary>ティアリング (1 フレーム内に複数の色が混在) を検出したフレーム数。</summary>
+    private static int s_tornFrameCount;
+    /// <summary>サンプル取得に成功し検査できたフレーム数。</summary>
+    private static int s_verifiedFrameCount;
+    /// <summary>観測した先頭画素の異なる値の数 (検出器が生きているかの確認用)。</summary>
+    private static readonly HashSet<uint> s_observedColors = new();
+    /// <summary>1 フレーム内で観測した最大の色数 (2 以上ならティアリング)。</summary>
+    private static int s_maximumColorsInFrame = 1;
+
     /// <summary>Mach 経由で届いた最新 IOSurface を受け取り、即解放する。届いていれば true。</summary>
     private static bool DrainReceivedTexture()
     {
         if (!Browser.TryReceiveIOSurfaceTexture(out var texture, out _, out _, out _)) return false;
+
+        // 全画面単色ページなので 1 フレーム内の全サンプルは同じ値になるはず。
+        // 割れていれば blit 未完了の転送先を読んだ / src が上書きされた証拠 (ティアリング)。
+        if (Browser.SampleIOSurfacePixels(s_samplePixels) == SampleRowCount)
+        {
+            s_verifiedFrameCount++;
+            s_observedColors.Add(s_samplePixels[0]);
+            var colorsInFrame = s_samplePixels.Distinct().Count();
+            if (colorsInFrame > s_maximumColorsInFrame) s_maximumColorsInFrame = colorsInFrame;
+            if (colorsInFrame > 1) s_tornFrameCount++;
+        }
+
         Browser.ReleaseMetalTexture(texture);
         return true;
     }

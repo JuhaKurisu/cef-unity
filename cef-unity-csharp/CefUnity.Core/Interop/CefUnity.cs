@@ -466,6 +466,21 @@ namespace CefUnity.Interop
 
 
         /// <summary>
+        ///     診断専用: 直近に受信した IOSurface から縦方向に等間隔な行の中央画素をサンプルする。
+        ///     全画面が単色のページで値が割れていれば、転送先が blit 未完了のまま読まれたか
+        ///     src が上書きされたことを意味する (ティアリング検出)。
+        ///     戻り値は書き込んだ画素数 (0 = 未受信)。macOS 以外では常に 0。
+        /// </summary>
+        public static unsafe int SampleIOSurfacePixels(uint[] pixels)
+        {
+            if (pixels == null || pixels.Length == 0) return 0;
+            fixed (uint* pointer = pixels)
+            {
+                return NativeMethods.cef_unity_sample_iosurface_pixels(pointer, pixels.Length);
+            }
+        }
+
+        /// <summary>
         ///     Mach IOSurface port チャネルが接続済みかどうかを返す。
         /// </summary>
         public static bool IsIOSurfaceConnected()

@@ -33,6 +33,21 @@ unsafe extern "C" {
         height: u32,
         format: u32,
     ) -> *mut std::os::raw::c_void;
+    fn iosurface_pool_copy_no_wait_unsafe(
+        source: *mut std::os::raw::c_void,
+        width: u32,
+        height: u32,
+        format: u32,
+    ) -> *mut std::os::raw::c_void;
+    fn iosurface_pool_set_completion_callback(
+        callback: extern "C" fn(*mut std::os::raw::c_void, u32, u32, u32),
+    );
+    fn iosurface_pool_copy_async(
+        source: *mut std::os::raw::c_void,
+        width: u32,
+        height: u32,
+        format: u32,
+    ) -> i32;
 }
 
 use cef_unity_ipc::{self as ipc, AudioSharedMemoryWriter, Command, Response, SharedMemoryWriter};
@@ -173,6 +188,8 @@ static LATENCY_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 // `--logging` 有効時のみ計測する (無効時は Instant::now() も呼ばない)。
 
 static COPY_COUNT: AtomicU64 = AtomicU64::new(0);
+/// 非同期モードで in-flight 上限に達して捨てた paint 数。
+static COPY_DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
 static COPY_WAIT_TOTAL_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
 static COPY_WAIT_MAX_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
 static SEND_WAIT_TOTAL_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
@@ -181,6 +198,91 @@ static SEND_WAIT_MAX_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
 /// 統計を有効化するか (= ログ有効か) を返す。
 fn paint_statistics_enabled() -> bool {
     LOG_ENABLED.load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// 非同期 GPU コピー (issue #7 の修正候補) — CEF_UNITY_ASYNC_COPY=1 で有効
+// ---------------------------------------------------------------------------
+
+/// 非同期コピーを使うか。環境変数で切り替え、同一バイナリで A/B できるようにする。
+#[cfg(target_os = "macos")]
+pub fn use_async_copy() -> bool {
+    static USE_ASYNC_COPY: OnceLock<bool> = OnceLock::new();
+    *USE_ASYNC_COPY.get_or_init(|| {
+        std::env::var("CEF_UNITY_ASYNC_COPY").is_ok_and(|value| value == "1")
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn use_async_copy() -> bool {
+    false
+}
+
+/// 検証用の既知不良構成 (完了を待たずに送る) を使うか。ティアリング検出器の
+/// negative control 専用で、実運用では使わない。
+#[cfg(target_os = "macos")]
+pub fn use_unsafe_no_wait_copy() -> bool {
+    static USE_UNSAFE_NO_WAIT: OnceLock<bool> = OnceLock::new();
+    *USE_UNSAFE_NO_WAIT.get_or_init(|| {
+        std::env::var("CEF_UNITY_UNSAFE_NO_WAIT").is_ok_and(|value| value == "1")
+    })
+}
+
+/// 完了ハンドラ (Metal の直列送信キュー) から shm へ書くためのラッパ。
+///
+/// `SharedMemoryWriter` は `Send` だが `Sync` ではないため static に直接置けない。
+/// ここで触るのは `write_paint_unity_frame` / `write_iosurface_info` の 2 つだけで、
+/// いずれも header の atomic フィールドしか書かない。書き込み元は直列キューの 1 本に
+/// 限られる (`iosurface_pool.m` の g_send_queue) ため、共有しても競合しない。
+#[cfg(target_os = "macos")]
+struct AsyncCopyTarget(Arc<SharedMemoryWriter>);
+
+#[cfg(target_os = "macos")]
+unsafe impl Send for AsyncCopyTarget {}
+#[cfg(target_os = "macos")]
+unsafe impl Sync for AsyncCopyTarget {}
+
+/// 完了ハンドラから shm へ書くために、現在の browser の SharedMemoryWriter を保持する。
+/// プール・Mach チャネルと同様にプロセス内で 1 つの accelerated paint 経路を前提とする。
+#[cfg(target_os = "macos")]
+static ASYNC_COPY_SHARED_MEMORY: Mutex<Option<AsyncCopyTarget>> = Mutex::new(None);
+
+/// blit 完了後に Metal 側の直列キューから呼ばれる。この時点で surface は転送して安全。
+#[cfg(target_os = "macos")]
+extern "C" fn on_async_copy_completed(
+    surface: *mut std::os::raw::c_void,
+    width: u32,
+    height: u32,
+    format: u32,
+) {
+    if surface.is_null() {
+        return;
+    }
+    // 保留中の client 購読を受け付ける (ノンブロッキング)。
+    unsafe { mach_iosurface_server_accept() };
+
+    let send_started_at = paint_statistics_enabled().then(Instant::now);
+    let _send_result = unsafe { mach_iosurface_server_send(surface, width, height, format) };
+    if let Some(started_at) = send_started_at {
+        record_wait(
+            &SEND_WAIT_TOTAL_MICROSECONDS,
+            &SEND_WAIT_MAX_MICROSECONDS,
+            started_at.elapsed().as_micros() as u64,
+        );
+    }
+
+    let shared_memory = {
+        let guard = ASYNC_COPY_SHARED_MEMORY
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        guard.as_ref().map(|target| Arc::clone(&target.0))
+    };
+    if let Some(shared_memory) = shared_memory {
+        let surface_id = unsafe { IOSurfaceGetID(surface) };
+        shared_memory
+            .write_paint_unity_frame(LAST_BEGIN_FRAME_UNITY_FRAME.load(Ordering::Relaxed));
+        shared_memory.write_iosurface_info(surface_id, width, height, format);
+    }
 }
 
 /// on_accelerated_paint と event loop tick が同一スレッドかを 1 度だけ記録する
@@ -235,6 +337,7 @@ pub fn report_paint_statistics(pump_count: u64) {
     let pump_ticks = pump_count.saturating_sub(window.pump_count_at_start);
     let paints = paint_count.saturating_sub(window.paint_count_at_start);
     let copies = COPY_COUNT.swap(0, Ordering::Relaxed);
+    let copies_dropped = COPY_DROPPED_COUNT.swap(0, Ordering::Relaxed);
     let copy_wait_total = COPY_WAIT_TOTAL_MICROSECONDS.swap(0, Ordering::Relaxed);
     let copy_wait_max = COPY_WAIT_MAX_MICROSECONDS.swap(0, Ordering::Relaxed);
     let send_wait_total = SEND_WAIT_TOTAL_MICROSECONDS.swap(0, Ordering::Relaxed);
@@ -247,14 +350,22 @@ pub fn report_paint_statistics(pump_count: u64) {
     drop(guard);
 
     log(&format!(
-        "STATISTICS tick_thread={:?} window={}ms pump_ticks={} paints={} copies={} \
+        "STATISTICS tick_thread={:?} mode={} window={}ms pump_ticks={} paints={} copies={} dropped={} \
          copy_wait_total={}.{:03}ms copy_wait_max={}.{:03}ms \
          send_wait_total={}.{:03}ms send_wait_max={}.{:03}ms",
         std::thread::current().id(),
+        if use_async_copy() {
+            "async"
+        } else if use_unsafe_no_wait_copy() {
+            "unsafe-no-wait"
+        } else {
+            "sync"
+        },
         elapsed.as_millis(),
         pump_ticks,
         paints,
         copies,
+        copies_dropped,
         copy_wait_total / 1000, copy_wait_total % 1000,
         copy_wait_max / 1000, copy_wait_max % 1000,
         send_wait_total / 1000, send_wait_total % 1000,
@@ -413,8 +524,43 @@ wrap_render_handler! {
                 if copy_started_at.is_some() {
                     log_paint_thread_once();
                 }
-                let pool_surface = unsafe {
-                    iosurface_pool_copy_and_get(io_surface, width, height, format)
+
+                // 非同期モード: blit を投げるだけで返り、送信と shm 書き込みは完了ハンドラで行う。
+                if use_async_copy() {
+                    {
+                        let mut guard = ASYNC_COPY_SHARED_MEMORY
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        if guard.is_none() {
+                            unsafe {
+                                iosurface_pool_set_completion_callback(on_async_copy_completed)
+                            };
+                            *guard = Some(AsyncCopyTarget(Arc::clone(&self.shared_memory)));
+                        }
+                    }
+                    let submit_result =
+                        unsafe { iosurface_pool_copy_async(io_surface, width, height, format) };
+                    if let Some(started_at) = copy_started_at {
+                        COPY_COUNT.fetch_add(1, Ordering::Relaxed);
+                        record_wait(
+                            &COPY_WAIT_TOTAL_MICROSECONDS,
+                            &COPY_WAIT_MAX_MICROSECONDS,
+                            started_at.elapsed().as_micros() as u64,
+                        );
+                        if submit_result == 0 {
+                            COPY_DROPPED_COUNT.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    if submit_result < 0 && count <= 5 {
+                        log("on_accelerated_paint: async pool copy failed");
+                    }
+                    return;
+                }
+
+                let pool_surface = if use_unsafe_no_wait_copy() {
+                    unsafe { iosurface_pool_copy_no_wait_unsafe(io_surface, width, height, format) }
+                } else {
+                    unsafe { iosurface_pool_copy_and_get(io_surface, width, height, format) }
                 };
                 if let Some(started_at) = copy_started_at {
                     COPY_COUNT.fetch_add(1, Ordering::Relaxed);

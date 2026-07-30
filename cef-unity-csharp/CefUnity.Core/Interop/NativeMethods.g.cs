@@ -324,6 +324,16 @@ namespace CefUnity
         public static extern void* cef_unity_create_metal_texture(uint surface_id, int width, int height, uint format);
 
         /// <summary>
+        ///  診断専用: 直近に受信した IOSurface から縦方向に等間隔な行の中央画素を
+        ///  `count` 個サンプルして `out_pixels` に書く。書き込んだ画素数を返す (0 = 未受信)。
+        ///
+        ///  全画面が単色のページで値が割れていれば、転送先が blit 未完了のまま読まれたか
+        ///  src が上書きされたことを意味する (ティアリング検出)。macOS 以外では常に 0。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_sample_iosurface_pixels", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_sample_iosurface_pixels(uint* out_pixels, int count);
+
+        /// <summary>
         ///  Receive the latest IOSurface from the server via Mach port and create a Metal texture.
         ///  Returns an opaque MTLTexture pointer, or null if no new frame.
         ///  The caller must release the returned texture with cef_unity_release_metal_texture.
