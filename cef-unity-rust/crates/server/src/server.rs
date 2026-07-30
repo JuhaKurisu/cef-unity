@@ -163,6 +163,105 @@ static LAST_BEGIN_FRAME_UNITY_FRAME: AtomicU64 = AtomicU64::new(0);
 const LATENCY_WINDOW: usize = 60;
 static LATENCY_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
+// ---------------------------------------------------------------------------
+// paint 統計 (GPU コピー完了待ち・Mach 送信待ちと pump 停止の相関を見る計装)
+// ---------------------------------------------------------------------------
+//
+// on_accelerated_paint はメッセージ pump スレッド (CFRunLoop) 上で実行されるため、
+// GPU コピー完了待ちが伸びると pump 自体が止まる。1 秒窓で「pump tick 数」と
+// 「コピー待ち時間」を並べて出すことで、その因果を時系列で確認できるようにする。
+// `--logging` 有効時のみ計測する (無効時は Instant::now() も呼ばない)。
+
+static COPY_COUNT: AtomicU64 = AtomicU64::new(0);
+static COPY_WAIT_TOTAL_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
+static COPY_WAIT_MAX_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
+static SEND_WAIT_TOTAL_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
+static SEND_WAIT_MAX_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
+
+/// 統計を有効化するか (= ログ有効か) を返す。
+fn paint_statistics_enabled() -> bool {
+    LOG_ENABLED.load(Ordering::Relaxed)
+}
+
+/// on_accelerated_paint と event loop tick が同一スレッドかを 1 度だけ記録する
+/// (同一なら、コピー完了待ちはそのまま pump の停止時間になる)。
+static PAINT_THREAD_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn log_paint_thread_once() {
+    if PAINT_THREAD_LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    log(&format!(
+        "on_accelerated_paint thread = {:?}",
+        std::thread::current().id()
+    ));
+}
+
+fn record_wait(total: &AtomicU64, maximum: &AtomicU64, elapsed_microseconds: u64) {
+    total.fetch_add(elapsed_microseconds, Ordering::Relaxed);
+    maximum.fetch_max(elapsed_microseconds, Ordering::Relaxed);
+}
+
+/// 統計窓の起点。emit は event loop の tick から行うため、pump が凍結している間は
+/// 窓が 1 秒を超えて伸びる (窓長そのものが停止時間の証拠になる)。
+struct PaintStatisticsWindow {
+    started_at: Instant,
+    pump_count_at_start: u64,
+    paint_count_at_start: u64,
+}
+
+static PAINT_STATISTICS_WINDOW: Mutex<Option<PaintStatisticsWindow>> = Mutex::new(None);
+
+/// event loop の tick 毎に呼び、1 秒以上経過していれば STATISTICS 行を出す。
+pub fn report_paint_statistics(pump_count: u64) {
+    if !paint_statistics_enabled() {
+        return;
+    }
+    let mut guard = PAINT_STATISTICS_WINDOW
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let window = guard.get_or_insert_with(|| PaintStatisticsWindow {
+        started_at: Instant::now(),
+        pump_count_at_start: pump_count,
+        paint_count_at_start: PAINT_COUNT.load(Ordering::Relaxed),
+    });
+    let elapsed = window.started_at.elapsed();
+    if elapsed.as_millis() < 1000 {
+        return;
+    }
+
+    let paint_count = PAINT_COUNT.load(Ordering::Relaxed);
+    let pump_ticks = pump_count.saturating_sub(window.pump_count_at_start);
+    let paints = paint_count.saturating_sub(window.paint_count_at_start);
+    let copies = COPY_COUNT.swap(0, Ordering::Relaxed);
+    let copy_wait_total = COPY_WAIT_TOTAL_MICROSECONDS.swap(0, Ordering::Relaxed);
+    let copy_wait_max = COPY_WAIT_MAX_MICROSECONDS.swap(0, Ordering::Relaxed);
+    let send_wait_total = SEND_WAIT_TOTAL_MICROSECONDS.swap(0, Ordering::Relaxed);
+    let send_wait_max = SEND_WAIT_MAX_MICROSECONDS.swap(0, Ordering::Relaxed);
+    *window = PaintStatisticsWindow {
+        started_at: Instant::now(),
+        pump_count_at_start: pump_count,
+        paint_count_at_start: paint_count,
+    };
+    drop(guard);
+
+    log(&format!(
+        "STATISTICS tick_thread={:?} window={}ms pump_ticks={} paints={} copies={} \
+         copy_wait_total={}.{:03}ms copy_wait_max={}.{:03}ms \
+         send_wait_total={}.{:03}ms send_wait_max={}.{:03}ms",
+        std::thread::current().id(),
+        elapsed.as_millis(),
+        pump_ticks,
+        paints,
+        copies,
+        copy_wait_total / 1000, copy_wait_total % 1000,
+        copy_wait_max / 1000, copy_wait_max % 1000,
+        send_wait_total / 1000, send_wait_total % 1000,
+        send_wait_max / 1000, send_wait_max % 1000,
+    ));
+}
+
 /// paint 到着時にレイテンシを記録し、N サンプル貯まったら統計をログに出す。
 fn record_paint_latency() {
     // on_accelerated_paint の hot path から毎フレーム呼ばれるため、
@@ -309,9 +408,22 @@ wrap_render_handler! {
                 let count = PAINT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
                 // GPU blit: CEF IOSurface → pool IOSurface (must complete before returning)
+                // 完了待ちは pump スレッドを塞ぐため、所要時間を統計に記録する。
+                let copy_started_at = paint_statistics_enabled().then(Instant::now);
+                if copy_started_at.is_some() {
+                    log_paint_thread_once();
+                }
                 let pool_surface = unsafe {
                     iosurface_pool_copy_and_get(io_surface, width, height, format)
                 };
+                if let Some(started_at) = copy_started_at {
+                    COPY_COUNT.fetch_add(1, Ordering::Relaxed);
+                    record_wait(
+                        &COPY_WAIT_TOTAL_MICROSECONDS,
+                        &COPY_WAIT_MAX_MICROSECONDS,
+                        started_at.elapsed().as_micros() as u64,
+                    );
+                }
                 if pool_surface.is_null() {
                     if count <= 5 {
                         log("on_accelerated_paint: pool copy failed");
@@ -323,9 +435,18 @@ wrap_render_handler! {
                 unsafe { mach_iosurface_server_accept(); }
 
                 // Send the copied pool IOSurface via Mach port to connected client
+                // mach_msg は 10ms timeout の blocking send なので、これも pump を止め得る。
+                let send_started_at = paint_statistics_enabled().then(Instant::now);
                 let send_result = unsafe {
                     mach_iosurface_server_send(pool_surface, width, height, format)
                 };
+                if let Some(started_at) = send_started_at {
+                    record_wait(
+                        &SEND_WAIT_TOTAL_MICROSECONDS,
+                        &SEND_WAIT_MAX_MICROSECONDS,
+                        started_at.elapsed().as_micros() as u64,
+                    );
+                }
 
                 // 生存確認用ログ: 最初の 5 件 + 600 件ごと (≒10秒 @ 60fps)
                 if count <= 5 || count.is_multiple_of(600) {

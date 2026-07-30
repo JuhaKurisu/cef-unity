@@ -63,6 +63,9 @@ fn tick(state: &mut ServerState) {
 
     cef::do_message_loop_work();
     state.pump_count += 1;
+
+    // 1 秒窓の paint 統計 (macos.rs と同じ)。
+    crate::server::report_paint_statistics(state.pump_count);
 }
 
 fn drain_commands(state: &mut ServerState) {

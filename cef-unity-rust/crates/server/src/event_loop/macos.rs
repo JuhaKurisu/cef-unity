@@ -157,6 +157,10 @@ fn timer_callback_inner() {
 
     cef::do_message_loop_work();
     state.pump_count += 1;
+
+    // 1 秒窓の paint 統計 (pump tick 数 / paint 数 / GPU コピー待ち) を出す。
+    // tick から呼ぶため、コピー待ちで pump が凍結した分は窓長の伸びとして現れる。
+    crate::server::report_paint_statistics(state.pump_count);
 }
 
 /// mpsc チャネルからコマンドを全て取り出して処理する。

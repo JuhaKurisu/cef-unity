@@ -51,6 +51,14 @@ if (command == "dump")
     if (!written) Console.Error.WriteLine("DUMP FAIL: no frame captured");
     return written ? 0 : 1;
 }
+if (command == "paint-statistics")
+{
+    // usage: paint-statistics [seconds] [width] [height]
+    var durationSeconds = args.Length > 1 && int.TryParse(args[1], out var parsedSeconds) ? parsedSeconds : 20;
+    var viewportWidth = args.Length > 2 && int.TryParse(args[2], out var parsedWidth) ? parsedWidth : 1280;
+    var viewportHeight = args.Length > 3 && int.TryParse(args[3], out var parsedHeight) ? parsedHeight : 720;
+    return CefUnity.Harness.PaintStatisticsCommand.Run(durationSeconds, viewportWidth, viewportHeight);
+}
 if (command == "replay")
 {
     if (args.Length < 2) { Console.Error.WriteLine("usage: replay <recording-csv>"); return 2; }
