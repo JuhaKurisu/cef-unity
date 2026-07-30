@@ -776,6 +776,15 @@ wrap_app! {
                 // 無効 (no_sandbox=1) なので、GPU サンドボックスも不要)
                 command_line.append_switch(Some(&CefString::from("disable-gpu-sandbox")));
 
+                // Linux: OSR にはウィンドウが無く画面を要求する理由がないため、
+                // headless バックエンドを指定する。X11 が無い環境 (CI ランナー、
+                // コンテナ、サーバー) で初期化が失敗するのを防ぐ。
+                #[cfg(target_os = "linux")]
+                command_line.append_switch_with_value(
+                    Some(&CefString::from("ozone-platform")),
+                    Some(&CefString::from("headless")),
+                );
+
                 if !self.use_gpu {
                     // CPU モード: Chromium に GPU を一切使わせない。
                     // これにより on_paint 用の GPU→CPU readback が発生しなくなり、
