@@ -28,8 +28,8 @@
 | 全 drain → CEF pump 1 回、無制限 mpsc | ✅ `server/src/main.rs:117` が `std::sync::mpsc::channel` (無制限)、`macos.rs:162-190` が `TryRecvError::Empty` まで drain、`:155-158` で `do_message_loop_work()` 1 回。main の追加は `IN_TICK` 再入ガードのみ |
 | 7 機構中 a08f585 のみが修正 | ✅ main に `suppression_cooldown` + `SUPPRESSION_RETRY_FRAMES = 60` (`server.rs:906,917,1653-1663`)。他 6 機構は無変更 |
 | `g_receive_port` リーク・disconnect 経路の不存在 | ✅ `client/src/metal_texture.m:44,59` で connect 毎に allocate、解放コードなし。main にも `disconnect` を含む関数は皆無。`docs/REFACTORING_REPORT.md:219` の CLI-10 として自己診断済み |
-| Play 停止毎のゾンビ化の機構 | ✅ `client/src/lib.rs:286-288` が `Ok(_child) => { // Server runs independently; we don't track its PID }` そのもの。waitpid も PID 保持もない |
-| shutdown は fire-and-forget + 500ms 固定 sleep・終了確認なし | ✅ `client/src/lib.rs:358-366`。doc コメントは "wait for server to exit" と実装に反する記述になっている |
+| Play 停止毎のゾンビ化の機構 | ⚠️ `64f9a5f:286-288` は主張どおり (`Ok(_child) => { // we don't track its PID }`)。ただし main は `06d8731` で Child 保持済み → §2.3 |
+| shutdown は fire-and-forget + 500ms 固定 sleep・終了確認なし | ✅ `client/src/lib.rs:358-366` (64f9a5f) / `:418-445` (HEAD)。doc コメントは "wait for server to exit" と実装に反する記述になっている |
 | dirty rect 未使用の全画面 Metal blit + `waitUntilCompleted` | ✅ `server.rs` の `on_accelerated_paint` は `_dirty_rects` を捨て、`iosurface_pool.m:160-176` が `sourceSize:{w,h,1}` 全面 blit + 同期待ち |
 | Mach send は 10ms timeout | ✅ `mach_iosurface.c:141-148` |
 | client は溜まった message を drain し最新以外を破棄 | ✅ `metal_texture.m:114-147` |
@@ -65,7 +65,16 @@ rAF が 24% の秒で 62 回/秒超・最大 80 回/秒 を「+3/+6ms flush が�
 
 ただし**結論の向きは救われる**。総 spin 時間 = `blockAvg × (fresh+fallback)` ≒ 356ms/2s ≒ 実時間の 18% は割り方に依らず成立し、実際にブロックしたのが一部フレームなら 1 フレーム当たりの spin は報告値より**大きい**。文言が不正確なだけで、主張自体は保守的である。
 
-### 2.3 初回 §5.1「クラフトバーには待機抑止の成功経路がない」— 機構の誤り
+### 2.3 続報 結論4「Child ハンドル即破棄」— ピン版のみ真、main では一部修正済み
+
+「Rust client が `spawn()` 直後に Child ハンドルを破棄し、PID 追跡・waitpid・生死確認が一切ない (`client/src/lib.rs:286-288`)」は **`64f9a5f` では正しい** (`Ok(_child) => { // Server runs independently; we don't track its PID }`)。ゾンビ +1/サイクルの実測もピン版のパッケージで行われているため有効である。
+
+ただし **main (`8fc504e`) では `06d8731` で `child: std::process::Child` の保持が導入済み**で、`cef_unity_shutdown()` は 500ms sleep 後に `try_wait()` で回収する。続報 §6-4(a) は「Child 保持 + shutdown 時の wait/kill」を新規の確定バグとして挙げているが、現行コードで残っている欠陥は次の 2 点に絞られる。
+
+- 500ms 以内に終了しなかった場合は回収も `kill()` もせず放置する
+- `ServerConnection` に `Drop` 実装がないため他経路でも回収されない
+
+### 2.4 初回 §5.1「クラフトバーには待機抑止の成功経路がない」— 機構の誤り
 
 抑止条件は `_streakScore >= 3 || _consecutiveInputFrames >= 3` (`:701`) で、`_streakScore` は fresh paint で +1 / paint 落ちで −2 の**入力非依存**カウンタである (`:761, 770`)。rAF アニメーションでも paint が続けば抑止に入る。
 
@@ -92,12 +101,23 @@ rAF が 24% の秒で 62 回/秒超・最大 80 回/秒 を「+3/+6ms flush が�
 
 `iosurface_pool.m` は `POOL_SIZE 5` のラウンドロビンで転送先を回す (`g_pool_idx = (g_pool_idx + 1) % POOL_SIZE`)。差分だけ blit すると転送先には 5 フレーム前の内容が残っているため、非 dirty 領域が壊れる。サーフェス毎の damage 累積か、プール構成の変更が前提になる。この制約はレポートに記載がない。
 
-### 4.3 有効な指摘 (そのまま着手可)
+### 4.3 起票済み issue
 
-- `g_receive_port` の解放 (CLI-10 の実装) — コード確定のリークで、main HEAD でも未修正
-- Child ハンドル保持 + shutdown 時の wait/kill — `lib.rs:286-288` の設計欠陥は明白
-- spawn 時の FD 継承遮断
-- `waitUntilCompleted` の非同期化 (§4.1)
+本検証にもとづき、修正すべき項目を cef-unity の issue として起票した (優先度は §4.1 の分析に従い、`waitUntilCompleted` を最優先に置いている)。
+
+| issue | 内容 |
+|---|---|
+| [#7](https://github.com/JuhaKurisu/cef-unity/issues/7) | [P0] `on_accelerated_paint` の同期 GPU コピー完了待ちが CEF pump を無制限に止める |
+| [#8](https://github.com/JuhaKurisu/cef-unity/issues/8) | [P0] shutdown が 500ms 以内に終了しない server を回収しない (§2.3 の残存欠陥) |
+| [#9](https://github.com/JuhaKurisu/cef-unity/issues/9) | [P1] server が Unity の FD (TCP ソケット) を継承する |
+| [#10](https://github.com/JuhaKurisu/cef-unity/issues/10) | [P1] Mach receive port と native キャッシュが Play/Stop で解放されない (CLI-10) |
+| [#11](https://github.com/JuhaKurisu/cef-unity/issues/11) | [P1] Unity メインスレッドの paint 待ち busy-wait を廃止する (§2.2 のカウンタ分離も含む) |
+| [#12](https://github.com/JuhaKurisu/cef-unity/issues/12) | [P1] 1000Hz 固定 message pump を CEF 要求駆動へ |
+| [#13](https://github.com/JuhaKurisu/cef-unity/issues/13) | [P2] BeginFrame IPC を最新 1 件へ coalesce し drain に budget を設ける |
+| [#14](https://github.com/JuhaKurisu/cef-unity/issues/14) | [P2] dirty rect 部分コピー (§4.2 のプール前提整理を含む) |
+| [#15](https://github.com/JuhaKurisu/cef-unity/issues/15) | [P3] CEF の VERBOSE ログが `--logging` に関係なく常時出力される |
+
+未起票 (moorestech 側の対応): レポート結論 3 件の訂正 (§2)、クラフト進行の rAF 非依存化、cefunity ピン更新、public リポジトリ掲載内容の確認。
 
 ## 5. 細部
 
