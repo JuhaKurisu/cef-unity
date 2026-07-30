@@ -334,6 +334,17 @@ namespace CefUnity
         public static extern int cef_unity_sample_iosurface_pixels(uint* out_pixels, int count);
 
         /// <summary>
+        ///  診断専用: 直近に受信した IOSurface を **GPU 経路で** 読み出して画素をサンプルする。
+        ///
+        ///  CPU 読み (`cef_unity_sample_iosurface_pixels`) は IOSurfaceLock が GPU 同期を行う
+        ///  ため転送先の未完了を観測できない。こちらは自前の command queue で 1 列を staging
+        ///  buffer へ blit するので、Unity のサンプルと同じ条件で内容の破れを検出できる。
+        ///  macOS 以外では常に 0。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_verify_iosurface_pixels_gpu", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_verify_iosurface_pixels_gpu(uint* out_pixels, int count);
+
+        /// <summary>
         ///  Receive the latest IOSurface from the server via Mach port and create a Metal texture.
         ///  Returns an opaque MTLTexture pointer, or null if no new frame.
         ///  The caller must release the returned texture with cef_unity_release_metal_texture.

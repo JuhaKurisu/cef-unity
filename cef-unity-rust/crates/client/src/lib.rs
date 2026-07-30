@@ -1647,6 +1647,8 @@ unsafe extern "C" {
 
     fn cef_unity_sample_iosurface_pixels_objc(out_pixels: *mut u32, count: i32) -> i32;
 
+    fn cef_unity_verify_last_iosurface_gpu_objc(out_pixels: *mut u32, count: i32) -> i32;
+
 }
 
 /// Check if a new accelerated paint frame is available via IOSurface.
@@ -1731,6 +1733,29 @@ pub extern "C" fn cef_unity_sample_iosurface_pixels(out_pixels: *mut u32, count:
         #[cfg(target_os = "macos")]
         {
             unsafe { cef_unity_sample_iosurface_pixels_objc(out_pixels, count) }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            0
+        }
+    })
+}
+
+/// 診断専用: 直近に受信した IOSurface を **GPU 経路で** 読み出して画素をサンプルする。
+///
+/// CPU 読み (`cef_unity_sample_iosurface_pixels`) は IOSurfaceLock が GPU 同期を行う
+/// ため転送先の未完了を観測できない。こちらは自前の command queue で 1 列を staging
+/// buffer へ blit するので、Unity のサンプルと同じ条件で内容の破れを検出できる。
+/// macOS 以外では常に 0。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_verify_iosurface_pixels_gpu(out_pixels: *mut u32, count: i32) -> i32 {
+    ffi_guard(0, || {
+        if out_pixels.is_null() || count <= 0 {
+            return 0;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            unsafe { cef_unity_verify_last_iosurface_gpu_objc(out_pixels, count) }
         }
         #[cfg(not(target_os = "macos"))]
         {

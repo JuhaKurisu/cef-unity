@@ -481,6 +481,21 @@ namespace CefUnity.Interop
         }
 
         /// <summary>
+        ///     診断専用: 直近に受信した IOSurface を GPU 経路で読み出して画素をサンプルする。
+        ///     CPU 読み (<see cref="SampleIOSurfacePixels" />) は IOSurfaceLock が GPU 同期を
+        ///     行うため転送先の未完了を観測できない。こちらは Unity のサンプルと同じ条件で
+        ///     内容の破れ (ティアリング / ロールバック) を検出できる。
+        /// </summary>
+        public static unsafe int VerifyIOSurfacePixelsGpu(uint[] pixels)
+        {
+            if (pixels == null || pixels.Length == 0) return 0;
+            fixed (uint* pointer = pixels)
+            {
+                return NativeMethods.cef_unity_verify_iosurface_pixels_gpu(pointer, pixels.Length);
+            }
+        }
+
+        /// <summary>
         ///     Mach IOSurface port チャネルが接続済みかどうかを返す。
         /// </summary>
         public static bool IsIOSurfaceConnected()

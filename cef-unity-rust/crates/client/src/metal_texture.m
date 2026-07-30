@@ -43,8 +43,9 @@ typedef struct {
 
 static mach_port_t g_receive_port = MACH_PORT_NULL;
 
-// 直近に受信した IOSurface (キャッシュが retain 済み)。診断用の画素サンプルに使う。
+// 直近に受信した IOSurface / そのテクスチャ (キャッシュが retain 済み)。診断用。
 static IOSurfaceRef _lastReceivedSurface = NULL;
+static id<MTLTexture> _lastReceivedTexture = nil;
 
 /// Connect to the server's Mach IOSurface service and send subscription.
 /// Returns 0 on success, negative on error.
@@ -171,6 +172,7 @@ void* mach_iosurface_receive_texture(int32_t* out_width, int32_t* out_height, ui
             CFRelease(latest_surface);
             srgbView = _surfaceCache[cache_index].srgbView;
             _lastReceivedSurface = _surfaceCache[cache_index].surface;
+            _lastReceivedTexture = _surfaceCache[cache_index].srgbView;
             break;
         }
     }
@@ -220,6 +222,7 @@ void* mach_iosurface_receive_texture(int32_t* out_width, int32_t* out_height, ui
             _surfaceCache[slot].surface = latest_surface;
             _surfaceCache[slot].srgbView = srgbView;
             _lastReceivedSurface = latest_surface;
+            _lastReceivedTexture = srgbView;
         }
     }
 
@@ -256,6 +259,70 @@ int cef_unity_sample_iosurface_pixels_objc(uint32_t* out_pixels, int32_t count) 
     }
 
     IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    return count;
+}
+
+// GPU 読みティアリング検出 (診断専用)
+//
+// CPU 読み (IOSurfaceLock) は lock 自体が GPU 同期を行うため、「読んだ瞬間の内容」
+// ではなく「完了後の内容」しか見えず、GPU 可視性の破れを観測できない (実測で
+// 既知不良構成でも検出ゼロだった)。Unity が実際に行うのは GPU からのサンプルなので、
+// ここでは自前の command queue で 1 列を staging buffer へ blit し、その結果を読む。
+// サーバー側の blit と我々の読みは別キュー = 順序保証が無いため、未完了の転送先を
+// 読めば「複数フレームの混在 (ティアリング)」か「古い内容 (ロールバック)」が現れる。
+
+#define VERIFY_BYTES_PER_ROW 256  // copyFromTexture:toBuffer: の行アライメント要件を満たす
+
+static id<MTLCommandQueue> _verifyQueue = nil;
+static id<MTLBuffer> _verifyBuffer = nil;
+static NSUInteger _verifyBufferHeight = 0;
+
+/// 直近に受信した IOSurface の 1 列 (中央 x) を GPU で読み出し、縦方向に等間隔な
+/// count 個の画素を out_pixels に書く。戻り値は書き込んだ画素数 (0 = 失敗/未受信)。
+int cef_unity_verify_last_iosurface_gpu_objc(uint32_t* out_pixels, int32_t count) {
+    if (out_pixels == NULL || count <= 0) return 0;
+    if (_lastReceivedTexture == nil || _sharedDevice == nil) return 0;
+
+    id<MTLTexture> texture = _lastReceivedTexture;
+    NSUInteger width = texture.width;
+    NSUInteger height = texture.height;
+    if (width == 0 || height == 0) return 0;
+
+    @autoreleasepool {
+        if (_verifyQueue == nil) {
+            _verifyQueue = [_sharedDevice newCommandQueue];
+            if (_verifyQueue == nil) return 0;
+        }
+        if (_verifyBuffer == nil || _verifyBufferHeight != height) {
+            _verifyBuffer = [_sharedDevice newBufferWithLength:height * VERIFY_BYTES_PER_ROW
+                                                      options:MTLResourceStorageModeShared];
+            if (_verifyBuffer == nil) return 0;
+            _verifyBufferHeight = height;
+        }
+
+        id<MTLCommandBuffer> commandBuffer = [_verifyQueue commandBuffer];
+        if (commandBuffer == nil) return 0;
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+        [blit copyFromTexture:texture
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:(MTLOrigin){width / 2, 0, 0}
+                   sourceSize:(MTLSize){1, height, 1}
+                     toBuffer:_verifyBuffer
+            destinationOffset:0
+       destinationBytesPerRow:VERIFY_BYTES_PER_ROW
+     destinationBytesPerImage:height * VERIFY_BYTES_PER_ROW];
+        [blit endEncoding];
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+
+        const uint8_t* base = (const uint8_t*)_verifyBuffer.contents;
+        for (int32_t index = 0; index < count; index++) {
+            NSUInteger row = (NSUInteger)((double)index / (double)count * (double)height);
+            if (row >= height) row = height - 1;
+            out_pixels[index] = *(const uint32_t*)(base + row * VERIFY_BYTES_PER_ROW);
+        }
+    }
     return count;
 }
 

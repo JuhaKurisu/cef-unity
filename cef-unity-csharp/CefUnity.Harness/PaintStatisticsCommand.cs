@@ -122,7 +122,9 @@ internal static class PaintStatisticsCommand
                 $"received_max={(perSecondReceived.Count > 0 ? perSecondReceived.Max() : 0)} " +
                 $"gap_max={(perSecondMaximumGap.Count > 0 ? perSecondMaximumGap.Max() : 0):F1}ms " +
                 $"verified_frames={s_verifiedFrameCount} torn_frames={s_tornFrameCount} " +
-                $"distinct_colors={s_observedColors.Count} max_colors_in_frame={s_maximumColorsInFrame}");
+                $"distinct_colors={s_observedColors.Count} max_colors_in_frame={s_maximumColorsInFrame} " +
+                $"| gpu_verified={s_gpuVerifiedFrameCount} gpu_torn={s_gpuTornFrameCount} " +
+                $"gpu_rollback={s_gpuRollbackFrameCount}");
 
             Console.WriteLine();
             foreach (var line in CefRuntime.GetLogs().Where(line => line.Contains("STATISTICS")))
@@ -140,8 +142,41 @@ internal static class PaintStatisticsCommand
     private const int SampleRowCount = 16;
     private static readonly uint[] s_samplePixels = new uint[SampleRowCount];
 
-    /// <summary>ティアリング (1 フレーム内に複数の色が混在) を検出したフレーム数。</summary>
+    /// <summary>ティアリング (1 フレーム内に複数の色が混在) を検出したフレーム数 (CPU 読み)。</summary>
     private static int s_tornFrameCount;
+    /// <summary>GPU 読みでティアリングを検出したフレーム数。</summary>
+    private static int s_gpuTornFrameCount;
+    /// <summary>GPU 読みでロールバック (色の step が逆行) を検出したフレーム数。</summary>
+    private static int s_gpuRollbackFrameCount;
+    /// <summary>GPU 読みで検査できたフレーム数。</summary>
+    private static int s_gpuVerifiedFrameCount;
+    /// <summary>GPU 読みで直前に観測した step (ページは step を 0..255 で循環させる)。</summary>
+    private static int s_lastGpuStep = -1;
+    private static readonly uint[] s_gpuSamplePixels = new uint[SampleRowCount];
+
+    /// <summary>BGRA8 の生ビットから赤成分 (= ページの step) を取り出す。</summary>
+    private static int StepOf(uint pixel) => (int)((pixel >> 16) & 0xFF);
+
+    /// <summary>
+    ///     GPU 経路で直近フレームを読み、ティアリングとロールバックを検査する。
+    ///     ページは step を 1 ずつ進めるので、step が逆行したら古い内容を読んだ証拠。
+    /// </summary>
+    private static void VerifyOnGpu()
+    {
+        if (Browser.VerifyIOSurfacePixelsGpu(s_gpuSamplePixels) != SampleRowCount) return;
+        s_gpuVerifiedFrameCount++;
+
+        if (s_gpuSamplePixels.Distinct().Count() > 1) s_gpuTornFrameCount++;
+
+        var step = StepOf(s_gpuSamplePixels[0]);
+        if (s_lastGpuStep >= 0 && step != s_lastGpuStep)
+        {
+            // 0..255 の循環なので、進んだ距離が半周を超えていたら逆行と判定する。
+            var forward = (step - s_lastGpuStep + 256) % 256;
+            if (forward > 128) s_gpuRollbackFrameCount++;
+        }
+        s_lastGpuStep = step;
+    }
     /// <summary>サンプル取得に成功し検査できたフレーム数。</summary>
     private static int s_verifiedFrameCount;
     /// <summary>観測した先頭画素の異なる値の数 (検出器が生きているかの確認用)。</summary>
@@ -164,6 +199,8 @@ internal static class PaintStatisticsCommand
             if (colorsInFrame > s_maximumColorsInFrame) s_maximumColorsInFrame = colorsInFrame;
             if (colorsInFrame > 1) s_tornFrameCount++;
         }
+
+        VerifyOnGpu();
 
         Browser.ReleaseMetalTexture(texture);
         return true;
