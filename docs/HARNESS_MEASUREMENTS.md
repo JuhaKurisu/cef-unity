@@ -228,6 +228,29 @@ moorestech レポートの「dirty rect 面積は 2〜4%」は再現し、実際
 
 `settings.log_file` / `log_severity = VERBOSE` が `LOG_ENABLED` と無関係に設定されていることを確認した。
 
+## 残作業（優先順、2026-07-30 時点）
+
+1. **#7 を終わらせる（残り 1 手）**: ティアリング検証だけがブロッカー。`CEF_UNITY_SLOW_COPY=n` 相当の
+   デバッグモードで blit を重ねて GPU 読み窓を広げ、「CEF がコールバック復帰後に src をプールへ戻し、
+   GPU がまだ読んでいる」リスクが実在するか判定する。白なら既定を async に切替 → `deploy.sh` →
+   main マージ。採用理由は fps ではなく「入力・JS タイマー・IPC が最大 356ms 凍結するのを止める」こと
+2. **#10**: `mach_iosurface_client_disconnect()` を作り `cef_unity_shutdown` から呼ぶ。描画に触らず
+   リスクほぼゼロ。検証は `lifecycle` で `mach_ports` が横ばいになるかを見るだけ
+3. **software 経路の seqlock 欠陥（未起票）**: `read_frame_does_not_mix_frames_while_writer_advances`
+   が 5 回中 3 回失敗する（失敗は 0.01 秒で即決、成功は 0.5 秒）。`8d629af` のリトライ 1 回固定では
+   性質を保証できていない。Linux の唯一の本番経路であり、かつ CLAUDE.md が必須手順にしている
+   `cargo test -p cef-unity-ipc` が常時赤で機能していない
+4. **#15**: `settings.log_file` / `log_severity` を logging フラグで分岐（実質 3 行）
+5. **#8**: 500ms 固定 sleep → 期限付き待ち + `kill` + `Drop`。検証は `lifecycle` で 5/5 サイクル 0
+6. **#12**: one-shot timer 化。回帰確認（paints 60/s・レイテンシ・0F 達成率が不変、CPU が下がる）は
+   harness で自動化済み
+7. **#11**: まずカウンタ分離 + 既定 `_zeroFrameWaitMilliseconds = 0`（opt-in 化）。手調整の塊なので
+   一気にやらない。0F を取り戻すなら後から「サーバー側の damage なし通知」を足す
+8. **#9**: 先に Unity 実機で `lsof -p <server_pid> | grep <ゲームサーバーのポート>` を 1 回。
+   **測る前に直さない**
+9. **#14**: 棚上げ（P3 相当）
+10. **#13**: 実測で前提が崩れたためクローズ済み（#7 の下流）
+
 ## この調査で削除したもの
 
 - **CPU 読みの画素サンプラ** (`cef_unity_sample_iosurface_pixels`): 既知不良構成でも検出ゼロで
