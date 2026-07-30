@@ -50,10 +50,7 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_
 #[cfg(target_os = "windows")]
 use windows::core::Interface;
 
-// 非 Windows: スタブ (Windows 用 DXGI_FORMAT 引数の代替も含む)。
-#[cfg(not(target_os = "windows"))]
-pub type DXGI_FORMAT = u32;
-
+// 非 Windows: スタブ。
 #[cfg(not(target_os = "windows"))]
 pub struct D3D11Pool;
 

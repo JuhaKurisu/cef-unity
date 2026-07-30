@@ -1628,13 +1628,6 @@ pub extern "C" fn cef_unity_ime_cancel_composition(handle: *mut CefUnityBrowser)
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
-    fn cef_unity_create_metal_texture_objc(
-        surface_id: u32,
-        width: i32,
-        height: i32,
-        format: u32,
-    ) -> *mut std::ffi::c_void;
-
     fn cef_unity_release_metal_texture_objc(texture_pointer: *mut std::ffi::c_void);
 
     fn mach_iosurface_client_connect(service_name: *const std::ffi::c_char) -> i32;
@@ -1644,6 +1637,14 @@ unsafe extern "C" {
         out_height: *mut i32,
         out_format: *mut u32,
     ) -> *mut std::ffi::c_void;
+
+    fn cef_unity_verify_last_iosurface_gpu_objc(out_pixels: *mut u32, count: i32) -> i32;
+
+    fn cef_unity_debug_mach_port_count_objc() -> i32;
+    fn cef_unity_debug_iosurface_state_objc(
+        out_receive_port: *mut u32,
+        out_cache_count: *mut i32,
+    ) -> i32;
 
 }
 
@@ -1692,25 +1693,61 @@ pub extern "C" fn cef_unity_get_iosurface_info(
     })
 }
 
-/// Create a Metal texture backed by an IOSurface.
-/// Uses the system default Metal device internally.
-/// Returns an opaque MTLTexture pointer, or null on failure.
+/// 診断専用: 直近に受信した IOSurface を **GPU 経路で** 読み出して画素をサンプルする。
+///
+/// 自前の command queue で 1 列を staging buffer へ blit するので、Unity のサンプルと
+/// 同じ条件で内容の破れ (ティアリング / ロールバック) を検出できる。CPU 読み
+/// (IOSurfaceLock) では lock 自体が GPU 同期を行うため破れを観測できない。
+/// macOS 以外では常に 0。
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_create_metal_texture(
-    surface_id: u32,
-    width: i32,
-    height: i32,
-    format: u32,
-) -> *mut std::ffi::c_void {
-    ffi_guard(std::ptr::null_mut(), || {
+pub extern "C" fn cef_unity_verify_iosurface_pixels_gpu(out_pixels: *mut u32, count: i32) -> i32 {
+    ffi_guard(0, || {
+        if out_pixels.is_null() || count <= 0 {
+            return 0;
+        }
         #[cfg(target_os = "macos")]
         {
-            unsafe { cef_unity_create_metal_texture_objc(surface_id, width, height, format) }
+            unsafe { cef_unity_verify_last_iosurface_gpu_objc(out_pixels, count) }
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (surface_id, width, height, format);
-            std::ptr::null_mut()
+            0
+        }
+    })
+}
+
+/// 診断専用 (issue #10): このプロセスが保持している Mach port 名の総数を返す。
+/// Initialize/Shutdown を繰り返したときの単調増加 (リーク) を観測するために使う。
+/// macOS 以外・取得失敗時は -1。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_debug_mach_port_count() -> i32 {
+    ffi_guard(-1, || {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe { cef_unity_debug_mach_port_count_objc() }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            -1
+        }
+    })
+}
+
+/// 診断専用 (issue #10): 現在の Mach 受信ポート番号と surface キャッシュ数を返す。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_debug_iosurface_state(
+    out_receive_port: *mut u32,
+    out_cache_count: *mut i32,
+) -> i32 {
+    ffi_guard(0, || {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe { cef_unity_debug_iosurface_state_objc(out_receive_port, out_cache_count) }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (out_receive_port, out_cache_count);
+            0
         }
     })
 }
@@ -1758,7 +1795,7 @@ pub extern "C" fn cef_unity_is_iosurface_connected() -> i32 {
     })
 }
 
-/// Release a Metal texture previously created by cef_unity_create_metal_texture.
+/// Release a Metal texture previously returned by cef_unity_receive_iosurface_texture.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_release_metal_texture(texture: *mut std::ffi::c_void) {
     ffi_guard((), || {

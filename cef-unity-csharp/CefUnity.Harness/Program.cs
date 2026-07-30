@@ -51,6 +51,33 @@ if (command == "dump")
     if (!written) Console.Error.WriteLine("DUMP FAIL: no frame captured");
     return written ? 0 : 1;
 }
+if (command == "paint-statistics")
+{
+    // usage: paint-statistics [seconds] [width] [height] [animation|small-damage]
+    var durationSeconds = args.Length > 1 && int.TryParse(args[1], out var parsedSeconds) ? parsedSeconds : 20;
+    var viewportWidth = args.Length > 2 && int.TryParse(args[2], out var parsedWidth) ? parsedWidth : 1280;
+    var viewportHeight = args.Length > 3 && int.TryParse(args[3], out var parsedHeight) ? parsedHeight : 720;
+    var paintPageMode = args.Length > 4 ? args[4] : "animation";
+    return CefUnity.Harness.PaintStatisticsCommand.Run(durationSeconds, viewportWidth, viewportHeight, paintPageMode);
+}
+if (command == "zero-frame-wait")
+{
+    // usage: zero-frame-wait [seconds] [zeroFrameWaitMilliseconds] [width] [height] [animation|intermittent]
+    var durationSeconds = args.Length > 1 && int.TryParse(args[1], out var waitSeconds) ? waitSeconds : 20;
+    var zeroFrameWaitMilliseconds = args.Length > 2 && float.TryParse(args[2], out var parsedWait) ? parsedWait : 10f;
+    var width = args.Length > 3 && int.TryParse(args[3], out var parsedW) ? parsedW : 1920;
+    var height = args.Length > 4 && int.TryParse(args[4], out var parsedH) ? parsedH : 1080;
+    var pageMode = args.Length > 5 ? args[5] : "animation";
+    return CefUnity.Harness.ZeroFrameWaitCommand.Run(durationSeconds, zeroFrameWaitMilliseconds, width, height, pageMode);
+}
+if (command == "lifecycle")
+{
+    // usage: lifecycle [cycles] [listenPort] [framesPerCycle]
+    var cycles = args.Length > 1 && int.TryParse(args[1], out var parsedCycles) ? parsedCycles : 5;
+    var listenPort = args.Length > 2 && int.TryParse(args[2], out var parsedPort) ? parsedPort : 11564;
+    var framesPerCycle = args.Length > 3 && int.TryParse(args[3], out var parsedFrames) ? parsedFrames : 60;
+    return CefUnity.Harness.LifecycleCommand.Run(cycles, listenPort, framesPerCycle);
+}
 if (command == "replay")
 {
     if (args.Length < 2) { Console.Error.WriteLine("usage: replay <recording-csv>"); return 2; }

@@ -33,6 +33,24 @@ unsafe extern "C" {
         height: u32,
         format: u32,
     ) -> *mut std::os::raw::c_void;
+    fn iosurface_pool_copy_no_wait_unsafe(
+        source: *mut std::os::raw::c_void,
+        width: u32,
+        height: u32,
+        format: u32,
+    ) -> *mut std::os::raw::c_void;
+    fn iosurface_pool_set_completion_callback(
+        callback: extern "C" fn(*mut std::os::raw::c_void, u32, u32, u32),
+    );
+    fn iosurface_pool_copy_async(
+        source: *mut std::os::raw::c_void,
+        width: u32,
+        height: u32,
+        format: u32,
+    ) -> i32;
+    fn iosurface_pool_in_flight_copies() -> i32;
+    fn iosurface_pool_poisoned_copies() -> u64;
+    fn iosurface_pool_poison_copies_reading(source: *mut std::os::raw::c_void) -> i32;
 }
 
 use cef_unity_ipc::{self as ipc, AudioSharedMemoryWriter, Command, Response, SharedMemoryWriter};
@@ -162,6 +180,324 @@ static LAST_BEGIN_FRAME_UNITY_FRAME: AtomicU64 = AtomicU64::new(0);
 /// 直近 N サンプルの BeginFrame → paint レイテンシ集計バッファ (μs 単位)。
 const LATENCY_WINDOW: usize = 60;
 static LATENCY_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+// ---------------------------------------------------------------------------
+// paint 統計 (GPU コピー完了待ち・Mach 送信待ちと pump 停止の相関を見る計装)
+// ---------------------------------------------------------------------------
+//
+// on_accelerated_paint はメッセージ pump スレッド (CFRunLoop) 上で実行されるため、
+// GPU コピー完了待ちが伸びると pump 自体が止まる。1 秒窓で「pump tick 数」と
+// 「コピー待ち時間」を並べて出すことで、その因果を時系列で確認できるようにする。
+// `--logging` 有効時のみ計測する (無効時は Instant::now() も呼ばない)。
+
+static COPY_COUNT: AtomicU64 = AtomicU64::new(0);
+/// 非同期モードで in-flight 追跡スロットが枯渇して捨てた paint 数。
+static COPY_DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
+/// GPU コピー未完了のため BeginFrame の発行を見送った回数 (issue #7 のゲート)。
+static BEGIN_FRAME_DEFERRED_COUNT: AtomicU64 = AtomicU64::new(0);
+static COPY_WAIT_TOTAL_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
+static COPY_WAIT_MAX_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
+static SEND_WAIT_TOTAL_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
+static SEND_WAIT_MAX_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
+
+// issue #14: dirty rect の面積が転送面積のどれだけかを測る (全面コピーの無駄の定量)。
+static DAMAGE_AREA_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SURFACE_AREA_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+// issue #13: 1 tick で drain したコマンド数と、そのうち BeginFrame の数のバースト最大。
+static DRAIN_MAX_BURST: AtomicU64 = AtomicU64::new(0);
+static DRAIN_MAX_BEGIN_FRAME_BURST: AtomicU64 = AtomicU64::new(0);
+static DRAIN_BEGIN_FRAME_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// event loop から 1 tick 分の drain 結果を記録する (issue #13 の計測)。
+pub fn record_drain_burst(command_count: u64, begin_frame_count: u64) {
+    if !paint_statistics_enabled() {
+        return;
+    }
+    DRAIN_MAX_BURST.fetch_max(command_count, Ordering::Relaxed);
+    DRAIN_MAX_BEGIN_FRAME_BURST.fetch_max(begin_frame_count, Ordering::Relaxed);
+    DRAIN_BEGIN_FRAME_TOTAL.fetch_add(begin_frame_count, Ordering::Relaxed);
+}
+
+/// プロセスの CPU 時間 (user + sys) をミリ秒で返す。issue #12 の 1000Hz pump の
+/// コストを測るために使う。
+fn process_cpu_milliseconds() -> u64 {
+    #[repr(C)]
+    struct TimeValue {
+        seconds: i64,
+        microseconds: i32,
+    }
+    #[repr(C)]
+    struct ResourceUsage {
+        user_time: TimeValue,
+        system_time: TimeValue,
+        rest: [u64; 30],
+    }
+    unsafe extern "C" {
+        fn getrusage(who: i32, usage: *mut ResourceUsage) -> i32;
+    }
+    let mut usage = ResourceUsage {
+        user_time: TimeValue { seconds: 0, microseconds: 0 },
+        system_time: TimeValue { seconds: 0, microseconds: 0 },
+        rest: [0; 30],
+    };
+    if unsafe { getrusage(0, &mut usage) } != 0 {
+        return 0;
+    }
+    let user = usage.user_time.seconds as u64 * 1000 + usage.user_time.microseconds as u64 / 1000;
+    let system = usage.system_time.seconds as u64 * 1000 + usage.system_time.microseconds as u64 / 1000;
+    user + system
+}
+
+/// 統計を有効化するか (= ログ有効か) を返す。
+fn paint_statistics_enabled() -> bool {
+    LOG_ENABLED.load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// 非同期 GPU コピー (issue #7 の修正) — 既定で有効
+// ---------------------------------------------------------------------------
+
+/// 非同期コピーを使うか (既定 true)。`CEF_UNITY_SYNC_COPY=1` で従来の同期版に戻せる。
+///
+/// 同期版は `waitUntilCompleted` を CEF の message pump スレッド上で行うため、外部の
+/// GPU/CPU 競合下で pump ごと数百 ms 止まる (実測 copy_wait_max 796ms、pump 1000→7
+/// ticks/s)。入力・JS タイマー・IPC がまとめて凍結するのが issue #7 の症状。
+#[cfg(target_os = "macos")]
+pub fn use_async_copy() -> bool {
+    static USE_ASYNC_COPY: OnceLock<bool> = OnceLock::new();
+    *USE_ASYNC_COPY.get_or_init(|| {
+        // 検証用の既知不良構成は同期経路側にあるので、指定されていたら非同期を降りる。
+        !use_unsafe_no_wait_copy()
+            && !std::env::var("CEF_UNITY_SYNC_COPY").is_ok_and(|value| value == "1")
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn use_async_copy() -> bool {
+    false
+}
+
+/// 新しい BeginFrame を発行してよいか。
+///
+/// CEF は BeginFrame を受けて初めて次のフレームを描き、描き先は転送元プールの
+/// IOSurface である。非同期コピー中はその IOSurface をまだ GPU が読んでいるため、
+/// 読み終わるまで BeginFrame を発行しない。ここで「待つ」のではなく「発行しない」
+/// ことが要点で、pump は回り続ける (= 入力・JS タイマー・IPC は止まらない)。
+/// 供給が追いつかない分はフレームレートの低下として現れる。
+///
+/// 1 枚先行させる余地は無い: CEF の転送元プールは枚数固定ではなく (競合下で十数枚に
+/// 増えるのを実測)、返却済みの surface を次フレームに再び選ぶ可能性を排除できない。
+/// 直列でもフレーム供給レートは同期版と同じ (同期版も 1 コピー完了ごとに 1 フレーム)。
+#[cfg(target_os = "macos")]
+fn begin_frame_gate_open() -> bool {
+    if !use_async_copy() || disable_begin_frame_gate() {
+        return true;
+    }
+    unsafe { iosurface_pool_in_flight_copies() == 0 }
+}
+
+/// 検証用: BeginFrame ゲートを外す。転送元の契約 (コールバックから返るとプールへ戻る)
+/// を破る既知不良構成で、poison 検出器が実際に反応することを確かめる positive control
+/// 専用。実運用では使わない。
+#[cfg(target_os = "macos")]
+fn disable_begin_frame_gate() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("CEF_UNITY_NO_BEGIN_FRAME_GATE").is_ok_and(|value| value == "1")
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn begin_frame_gate_open() -> bool {
+    true
+}
+
+/// 検証用の既知不良構成 (完了を待たずに送る) を使うか。ティアリング検出器の
+/// negative control 専用で、実運用では使わない。
+#[cfg(target_os = "macos")]
+pub fn use_unsafe_no_wait_copy() -> bool {
+    static USE_UNSAFE_NO_WAIT: OnceLock<bool> = OnceLock::new();
+    *USE_UNSAFE_NO_WAIT.get_or_init(|| {
+        std::env::var("CEF_UNITY_UNSAFE_NO_WAIT").is_ok_and(|value| value == "1")
+    })
+}
+
+/// 完了ハンドラ (Metal の直列送信キュー) から shm へ書くためのラッパ。
+///
+/// `SharedMemoryWriter` は `Send` だが `Sync` ではないため static に直接置けない。
+/// ここで触るのは `write_paint_unity_frame` / `write_iosurface_info` の 2 つだけで、
+/// いずれも header の atomic フィールドしか書かない。書き込み元は直列キューの 1 本に
+/// 限られる (`iosurface_pool.m` の g_send_queue) ため、共有しても競合しない。
+#[cfg(target_os = "macos")]
+struct AsyncCopyTarget(Arc<SharedMemoryWriter>);
+
+#[cfg(target_os = "macos")]
+unsafe impl Send for AsyncCopyTarget {}
+#[cfg(target_os = "macos")]
+unsafe impl Sync for AsyncCopyTarget {}
+
+/// 完了ハンドラから shm へ書くために、現在の browser の SharedMemoryWriter を保持する。
+/// プール・Mach チャネルと同様にプロセス内で 1 つの accelerated paint 経路を前提とする。
+#[cfg(target_os = "macos")]
+static ASYNC_COPY_SHARED_MEMORY: Mutex<Option<AsyncCopyTarget>> = Mutex::new(None);
+
+/// blit 完了後に Metal 側の直列キューから呼ばれる。この時点で surface は転送して安全。
+#[cfg(target_os = "macos")]
+extern "C" fn on_async_copy_completed(
+    surface: *mut std::os::raw::c_void,
+    width: u32,
+    height: u32,
+    format: u32,
+) {
+    if surface.is_null() {
+        return;
+    }
+    // 保留中の client 購読を受け付ける (ノンブロッキング)。
+    unsafe { mach_iosurface_server_accept() };
+
+    let send_started_at = paint_statistics_enabled().then(Instant::now);
+    let _send_result = unsafe { mach_iosurface_server_send(surface, width, height, format) };
+    if let Some(started_at) = send_started_at {
+        record_wait(
+            &SEND_WAIT_TOTAL_MICROSECONDS,
+            &SEND_WAIT_MAX_MICROSECONDS,
+            started_at.elapsed().as_micros() as u64,
+        );
+    }
+
+    let shared_memory = {
+        let guard = ASYNC_COPY_SHARED_MEMORY
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        guard.as_ref().map(|target| Arc::clone(&target.0))
+    };
+    if let Some(shared_memory) = shared_memory {
+        let surface_id = unsafe { IOSurfaceGetID(surface) };
+        shared_memory
+            .write_paint_unity_frame(LAST_BEGIN_FRAME_UNITY_FRAME.load(Ordering::Relaxed));
+        shared_memory.write_iosurface_info(surface_id, width, height, format);
+    }
+}
+
+/// on_accelerated_paint と event loop tick が同一スレッドかを 1 度だけ記録する
+/// (同一なら、コピー完了待ちはそのまま pump の停止時間になる)。
+static PAINT_THREAD_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn log_paint_thread_once() {
+    if PAINT_THREAD_LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    log(&format!(
+        "on_accelerated_paint thread = {:?}",
+        std::thread::current().id()
+    ));
+}
+
+fn record_wait(total: &AtomicU64, maximum: &AtomicU64, elapsed_microseconds: u64) {
+    total.fetch_add(elapsed_microseconds, Ordering::Relaxed);
+    maximum.fetch_max(elapsed_microseconds, Ordering::Relaxed);
+}
+
+/// 統計窓の起点。emit は event loop の tick から行うため、pump が凍結している間は
+/// 窓が 1 秒を超えて伸びる (窓長そのものが停止時間の証拠になる)。
+struct PaintStatisticsWindow {
+    started_at: Instant,
+    pump_count_at_start: u64,
+    paint_count_at_start: u64,
+    cpu_milliseconds_at_start: u64,
+}
+
+static PAINT_STATISTICS_WINDOW: Mutex<Option<PaintStatisticsWindow>> = Mutex::new(None);
+
+/// event loop の tick 毎に呼び、1 秒以上経過していれば STATISTICS 行を出す。
+pub fn report_paint_statistics(pump_count: u64) {
+    if !paint_statistics_enabled() {
+        return;
+    }
+    let mut guard = PAINT_STATISTICS_WINDOW
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let window = guard.get_or_insert_with(|| PaintStatisticsWindow {
+        started_at: Instant::now(),
+        pump_count_at_start: pump_count,
+        paint_count_at_start: PAINT_COUNT.load(Ordering::Relaxed),
+        cpu_milliseconds_at_start: process_cpu_milliseconds(),
+    });
+    let elapsed = window.started_at.elapsed();
+    if elapsed.as_millis() < 1000 {
+        return;
+    }
+
+    let paint_count = PAINT_COUNT.load(Ordering::Relaxed);
+    let pump_ticks = pump_count.saturating_sub(window.pump_count_at_start);
+    let paints = paint_count.saturating_sub(window.paint_count_at_start);
+    let copies = COPY_COUNT.swap(0, Ordering::Relaxed);
+    let copies_dropped = COPY_DROPPED_COUNT.swap(0, Ordering::Relaxed);
+    let copy_wait_total = COPY_WAIT_TOTAL_MICROSECONDS.swap(0, Ordering::Relaxed);
+    let copy_wait_max = COPY_WAIT_MAX_MICROSECONDS.swap(0, Ordering::Relaxed);
+    let send_wait_total = SEND_WAIT_TOTAL_MICROSECONDS.swap(0, Ordering::Relaxed);
+    let send_wait_max = SEND_WAIT_MAX_MICROSECONDS.swap(0, Ordering::Relaxed);
+    let cpu_milliseconds_now = process_cpu_milliseconds();
+    let cpu_milliseconds = cpu_milliseconds_now.saturating_sub(window.cpu_milliseconds_at_start);
+    let damage_area = DAMAGE_AREA_TOTAL.swap(0, Ordering::Relaxed);
+    let surface_area = SURFACE_AREA_TOTAL.swap(0, Ordering::Relaxed);
+    let damage_ratio = if surface_area > 0 {
+        damage_area as f64 / surface_area as f64 * 100.0
+    } else {
+        0.0
+    };
+    let drain_max_burst = DRAIN_MAX_BURST.swap(0, Ordering::Relaxed);
+    let drain_max_begin_frame_burst = DRAIN_MAX_BEGIN_FRAME_BURST.swap(0, Ordering::Relaxed);
+    let drain_begin_frames = DRAIN_BEGIN_FRAME_TOTAL.swap(0, Ordering::Relaxed);
+    let begin_frames_deferred = BEGIN_FRAME_DEFERRED_COUNT.swap(0, Ordering::Relaxed);
+    // 転送元の契約違反で捨てたフレームの累計 (ゲートが効いていれば 0 のまま)。
+    #[cfg(target_os = "macos")]
+    let poisoned_copies = unsafe { iosurface_pool_poisoned_copies() };
+    #[cfg(not(target_os = "macos"))]
+    let poisoned_copies = 0u64;
+    *window = PaintStatisticsWindow {
+        started_at: Instant::now(),
+        pump_count_at_start: pump_count,
+        paint_count_at_start: paint_count,
+        cpu_milliseconds_at_start: cpu_milliseconds_now,
+    };
+    drop(guard);
+
+    log(&format!(
+        "STATISTICS tick_thread={:?} mode={} window={}ms pump_ticks={} paints={} copies={} dropped={} \
+         copy_wait_total={}.{:03}ms copy_wait_max={}.{:03}ms \
+         send_wait_total={}.{:03}ms send_wait_max={}.{:03}ms \
+         cpu={}ms damage_ratio={:.1}% \
+         drain_max={} begin_frame_drained={} begin_frame_burst_max={} \
+         begin_frame_deferred={} poisoned_total={}",
+        std::thread::current().id(),
+        if use_async_copy() {
+            "async"
+        } else if use_unsafe_no_wait_copy() {
+            "unsafe-no-wait"
+        } else {
+            "sync"
+        },
+        elapsed.as_millis(),
+        pump_ticks,
+        paints,
+        copies,
+        copies_dropped,
+        copy_wait_total / 1000, copy_wait_total % 1000,
+        copy_wait_max / 1000, copy_wait_max % 1000,
+        send_wait_total / 1000, send_wait_total % 1000,
+        send_wait_max / 1000, send_wait_max % 1000,
+        cpu_milliseconds,
+        damage_ratio,
+        drain_max_burst,
+        drain_begin_frames,
+        drain_max_begin_frame_burst,
+        begin_frames_deferred,
+        poisoned_copies,
+    ));
+}
 
 /// paint 到着時にレイテンシを記録し、N サンプル貯まったら統計をログに出す。
 fn record_paint_latency() {
@@ -295,6 +631,21 @@ wrap_render_handler! {
                 if io_surface.is_null() {
                     return;
                 }
+                // issue #14: 実際に damage している面積を記録する (コピーは常に全面)。
+                if paint_statistics_enabled() {
+                    let damage: u64 = _dirty_rects
+                        .map(|rects| {
+                            rects
+                                .iter()
+                                .map(|rect| (rect.width as u64) * (rect.height as u64))
+                                .sum()
+                        })
+                        .unwrap_or(0);
+                    let surface = (info.extra.coded_size.width as u64)
+                        * (info.extra.coded_size.height as u64);
+                    DAMAGE_AREA_TOTAL.fetch_add(damage, Ordering::Relaxed);
+                    SURFACE_AREA_TOTAL.fetch_add(surface, Ordering::Relaxed);
+                }
                 let width = info.extra.coded_size.width as u32;
                 let height = info.extra.coded_size.height as u32;
                 let format = if info.format.get_raw() == ColorType::RGBA_8888.get_raw() {
@@ -309,9 +660,79 @@ wrap_render_handler! {
                 let count = PAINT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
 
                 // GPU blit: CEF IOSurface → pool IOSurface (must complete before returning)
-                let pool_surface = unsafe {
-                    iosurface_pool_copy_and_get(io_surface, width, height, format)
+                // 完了待ちは pump スレッドを塞ぐため、所要時間を統計に記録する。
+                let copy_started_at = paint_statistics_enabled().then(Instant::now);
+                if copy_started_at.is_some() {
+                    log_paint_thread_once();
+                }
+
+                // 非同期モード: blit を投げるだけで返り、送信と shm 書き込みは完了ハンドラで行う。
+                if use_async_copy() {
+                    // CEF はコールバックから返った時点で転送元をプールへ戻す (ヘッダの契約)。
+                    // つまり今回交付された転送元は、前回それを読んだ blit の途中で
+                    // 上書きされている可能性がある。まだ読んでいる blit があればその結果を
+                    // 捨てる。BeginFrame ゲートが効いていればここは常に 0 件になる。
+                    let poisoned =
+                        unsafe { iosurface_pool_poison_copies_reading(io_surface) };
+                    if poisoned > 0 {
+                        log(&format!(
+                            "on_accelerated_paint #{}: CEF が読み取り中の転送元を再交付した \
+                             (poisoned={}) — BeginFrame ゲートが機能していない",
+                            count, poisoned
+                        ));
+                    }
+                    {
+                        let mut guard = ASYNC_COPY_SHARED_MEMORY
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        // 同期版は self.shared_memory を直接使うので browser ごとに正しい。
+                        // 非同期版は完了ハンドラから触るため global に置くが、別 browser の
+                        // paint が来たら差し替える (置きっぱなしだと最初の browser の shm に
+                        // 書き続けてしまう)。
+                        let matches_current = guard
+                            .as_ref()
+                            .is_some_and(|target| Arc::ptr_eq(&target.0, &self.shared_memory));
+                        if !matches_current {
+                            if guard.is_none() {
+                                unsafe {
+                                    iosurface_pool_set_completion_callback(on_async_copy_completed)
+                                };
+                            }
+                            *guard = Some(AsyncCopyTarget(Arc::clone(&self.shared_memory)));
+                        }
+                    }
+                    let submit_result =
+                        unsafe { iosurface_pool_copy_async(io_surface, width, height, format) };
+                    if let Some(started_at) = copy_started_at {
+                        COPY_COUNT.fetch_add(1, Ordering::Relaxed);
+                        record_wait(
+                            &COPY_WAIT_TOTAL_MICROSECONDS,
+                            &COPY_WAIT_MAX_MICROSECONDS,
+                            started_at.elapsed().as_micros() as u64,
+                        );
+                        if submit_result == 0 {
+                            COPY_DROPPED_COUNT.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    if submit_result < 0 && count <= 5 {
+                        log("on_accelerated_paint: async pool copy failed");
+                    }
+                    return;
+                }
+
+                let pool_surface = if use_unsafe_no_wait_copy() {
+                    unsafe { iosurface_pool_copy_no_wait_unsafe(io_surface, width, height, format) }
+                } else {
+                    unsafe { iosurface_pool_copy_and_get(io_surface, width, height, format) }
                 };
+                if let Some(started_at) = copy_started_at {
+                    COPY_COUNT.fetch_add(1, Ordering::Relaxed);
+                    record_wait(
+                        &COPY_WAIT_TOTAL_MICROSECONDS,
+                        &COPY_WAIT_MAX_MICROSECONDS,
+                        started_at.elapsed().as_micros() as u64,
+                    );
+                }
                 if pool_surface.is_null() {
                     if count <= 5 {
                         log("on_accelerated_paint: pool copy failed");
@@ -323,9 +744,18 @@ wrap_render_handler! {
                 unsafe { mach_iosurface_server_accept(); }
 
                 // Send the copied pool IOSurface via Mach port to connected client
+                // mach_msg は 10ms timeout の blocking send なので、これも pump を止め得る。
+                let send_started_at = paint_statistics_enabled().then(Instant::now);
                 let send_result = unsafe {
                     mach_iosurface_server_send(pool_surface, width, height, format)
                 };
+                if let Some(started_at) = send_started_at {
+                    record_wait(
+                        &SEND_WAIT_TOTAL_MICROSECONDS,
+                        &SEND_WAIT_MAX_MICROSECONDS,
+                        started_at.elapsed().as_micros() as u64,
+                    );
+                }
 
                 // 生存確認用ログ: 最初の 5 件 + 600 件ごと (≒10秒 @ 60fps)
                 if count <= 5 || count.is_multiple_of(600) {
@@ -913,6 +1343,9 @@ pub struct CefServer {
     last_begin_frame_1_suppressed: bool,
     /// 抑止トライアル失敗後のクールダウン残フレーム数。0 なら抑止を試してよい。
     suppression_cooldown: u32,
+    /// GPU コピー未完了で発行を見送った BF#1。tick でゲートが開き次第発行する。
+    /// (browser_id, unity_frame)。新しい BF#1 が来たら上書きする — 溜めても意味がない。
+    deferred_begin_frame: Option<(u32, u64)>,
 }
 
 /// 抑止トライアル失敗 (抑止フレームで paint が来ない = BF#1-only パイプラインが
@@ -938,6 +1371,7 @@ impl CefServer {
             damage_streak: 0,
             last_begin_frame_1_suppressed: false,
             suppression_cooldown: 0,
+            deferred_begin_frame: None,
         }
     }
 
@@ -1643,6 +2077,16 @@ impl CefServer {
                 message: format!("browser {} not found", browser_id),
             };
         }
+        // 前フレームの GPU コピーが転送元をまだ読んでいる間は発行できない (issue #7)。
+        // 待たずに保留し、tick で再試行する。damage streak の判定はここでは進めない
+        // — 実際に発行するときに 1 回だけ行う。
+        if !begin_frame_gate_open() {
+            self.deferred_begin_frame = Some((browser_id, unity_frame));
+            BEGIN_FRAME_DEFERRED_COUNT.fetch_add(1, Ordering::Relaxed);
+            return Response::Ok;
+        }
+        self.deferred_begin_frame = None;
+
         // damage streak 判定: 前フレームに paint があったか (= ページが連続描画中か)。
         // スクロール/アニメーション中は毎フレーム damage が出るため streak が伸びる。
         // その間 flush (BF#2..) を撃つと draw/blit/送信が倍増して renderer/GPU が飽和し、
@@ -1698,6 +2142,15 @@ impl CefServer {
     /// ブロックしない。BF#1 由来の renderer submit を跨ぐタイミングで撃つことで、display が
     /// 最新内容を draw → on_accelerated_paint が fresh #B を Mach 送信する。
     pub fn process_pending_flushes(&mut self) {
+        // ゲート待ちで見送った BF#1 を、転送元の読み出しが終わり次第発行する。
+        // flush より先に処理する — 保留中の BF#1 が無いのに flush だけ撃っても意味がない。
+        if let Some((browser_id, unity_frame)) = self.deferred_begin_frame
+            && begin_frame_gate_open()
+        {
+            self.deferred_begin_frame = None;
+            self.send_external_begin_frame(browser_id, unity_frame);
+        }
+
         let action = {
             let Some(pending_flush) = self.pending_flush.as_mut() else {
                 return;
@@ -1728,7 +2181,11 @@ impl CefServer {
         };
         match action {
             Some((browser_id, unity_frame, done)) => {
-                self.issue_begin_frame(browser_id, unity_frame);
+                // flush は最新内容を取り直すための追加 BeginFrame。ゲートが閉じている
+                // ときは撃たない (BF#1 と違い保留はしない — 次フレームで撃ち直せばよい)。
+                if begin_frame_gate_open() {
+                    self.issue_begin_frame(browser_id, unity_frame);
+                }
                 if done as usize >= FLUSH_THRESHOLDS_MILLISECONDS.len() {
                     self.pending_flush = None;
                 }

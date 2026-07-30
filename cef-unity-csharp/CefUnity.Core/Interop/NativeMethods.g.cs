@@ -316,12 +316,29 @@ namespace CefUnity
         public static extern int cef_unity_get_iosurface_info(CefUnityBrowser* handle, uint* out_surface_id, int* out_width, int* out_height, uint* out_format);
 
         /// <summary>
-        ///  Create a Metal texture backed by an IOSurface.
-        ///  Uses the system default Metal device internally.
-        ///  Returns an opaque MTLTexture pointer, or null on failure.
+        ///  診断専用: 直近に受信した IOSurface を **GPU 経路で** 読み出して画素をサンプルする。
+        ///
+        ///  自前の command queue で 1 列を staging buffer へ blit するので、Unity のサンプルと
+        ///  同じ条件で内容の破れ (ティアリング / ロールバック) を検出できる。CPU 読み
+        ///  (IOSurfaceLock) では lock 自体が GPU 同期を行うため破れを観測できない。
+        ///  macOS 以外では常に 0。
         /// </summary>
-        [DllImport(__DllName, EntryPoint = "cef_unity_create_metal_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern void* cef_unity_create_metal_texture(uint surface_id, int width, int height, uint format);
+        [DllImport(__DllName, EntryPoint = "cef_unity_verify_iosurface_pixels_gpu", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_verify_iosurface_pixels_gpu(uint* out_pixels, int count);
+
+        /// <summary>
+        ///  診断専用 (issue #10): このプロセスが保持している Mach port 名の総数を返す。
+        ///  Initialize/Shutdown を繰り返したときの単調増加 (リーク) を観測するために使う。
+        ///  macOS 以外・取得失敗時は -1。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_debug_mach_port_count", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_debug_mach_port_count();
+
+        /// <summary>
+        ///  診断専用 (issue #10): 現在の Mach 受信ポート番号と surface キャッシュ数を返す。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_debug_iosurface_state", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern int cef_unity_debug_iosurface_state(uint* out_receive_port, int* out_cache_count);
 
         /// <summary>
         ///  Receive the latest IOSurface from the server via Mach port and create a Metal texture.
@@ -339,7 +356,7 @@ namespace CefUnity
         public static extern int cef_unity_is_iosurface_connected();
 
         /// <summary>
-        ///  Release a Metal texture previously created by cef_unity_create_metal_texture.
+        ///  Release a Metal texture previously returned by cef_unity_receive_iosurface_texture.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_release_metal_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern void cef_unity_release_metal_texture(void* texture);

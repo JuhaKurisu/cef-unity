@@ -1,0 +1,222 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using CefUnity.Interop;
+
+namespace CefUnity.Harness
+{
+
+/// <summary>
+///     Unity を使わずに GPU 経路 (macOS: IOSurface / Metal) の paint 供給レートを測る診断コマンド。
+///
+///     <para>
+///     目的は issue #7 の再現である。<c>on_accelerated_paint</c> 内の同期 GPU コピー完了待ちは
+///     サーバーのメッセージ pump スレッド上で実行されるため、外部 GPU 競合でコピーが伸びると
+///     pump ごと止まり、paint 供給が崩壊する。ここでは Unity の代わりに
+///     60Hz で SendExternalBeginFrame + Pump を回し、client 側に届くフレーム数と
+///     フレーム間の最大ギャップを秒毎に出す。サーバー側の STATISTICS 行
+///     (pump tick 数 / copy_wait) と突き合わせることで因果を確認できる。
+///     </para>
+/// </summary>
+internal static class PaintStatisticsCommand
+{
+    /// <summary>rAF で毎フレーム全画面の色を変えるページ。全面 damage を作り paint を毎フレーム発生させる。</summary>
+    private const string AnimationHtml = """
+        <!doctype html><meta charset="utf-8">
+        <body style="margin:0;overflow:hidden">
+        <div id="surface" style="width:100vw;height:100vh"></div>
+        <script>
+        let step = 0;
+        const surface = document.getElementById('surface');
+        function frame() {
+            step = (step + 1) % 256;
+            surface.style.background =
+                'rgb(' + step + ',' + ((step * 7) % 256) + ',' + ((step * 13) % 256) + ')';
+            requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+        </script>
+        </body>
+        """;
+
+    /// <summary>
+    ///     進捗バー相当の小さな領域だけを毎フレーム更新するページ (issue #14 用)。
+    ///     dirty rect 面積が転送面積のごく一部になる条件を作る。
+    /// </summary>
+    private const string SmallDamageHtml = """
+        <!doctype html><meta charset="utf-8">
+        <body style="margin:0;overflow:hidden;background:#111">
+        <div id="bar" style="position:absolute;left:0;top:0;height:8px;width:0;background:#4af"></div>
+        <script>
+        let step = 0;
+        const bar = document.getElementById('bar');
+        function frame() {
+            step = (step + 1) % 400;
+            bar.style.width = step + 'px';
+            requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+        </script>
+        </body>
+        """;
+
+    public static int Run(int durationSeconds, int viewportWidth = 1280, int viewportHeight = 720,
+                          string pageMode = "animation")
+    {
+        var smallDamage = pageMode == "small-damage";
+        var pagePath = Path.Combine(Path.GetTempPath(),
+            smallDamage ? "cef_unity_paint_small_damage.html" : "cef_unity_paint_statistics.html");
+        File.WriteAllText(pagePath, smallDamage ? SmallDamageHtml : AnimationHtml);
+        var url = new Uri(pagePath).AbsoluteUri;
+
+        CefRuntime.Initialize(useGpu: true, enableLog: true);
+        try
+        {
+            using var browser = new Browser(viewportWidth, viewportHeight, url);
+            Console.WriteLine($"viewport={viewportWidth}x{viewportHeight} page={pageMode}");
+
+            // ページのロードと GPU 経路の接続を待つ (2 秒相当)。
+            var beginFrameIndex = 0UL;
+            for (var warmupIndex = 0; warmupIndex < 120; warmupIndex++)
+            {
+                browser.SendExternalBeginFrame(beginFrameIndex++);
+                CefRuntime.Pump();
+                DrainReceivedTexture();
+                Thread.Sleep(16);
+            }
+            Console.WriteLine($"iosurface_connected={Browser.IsIOSurfaceConnected()}");
+
+            var frameInterval = TimeSpan.FromTicks(TimeSpan.TicksPerSecond / 60);
+            var clock = Stopwatch.StartNew();
+            var deadline = clock.Elapsed;
+            var windowStart = clock.Elapsed;
+            var lastReceivedAt = clock.Elapsed;
+            var receivedInWindow = 0;
+            var beginFramesInWindow = 0;
+            var maximumGapMilliseconds = 0.0;
+            var perSecondReceived = new List<int>();
+            var perSecondMaximumGap = new List<double>();
+
+            while (clock.Elapsed < TimeSpan.FromSeconds(durationSeconds))
+            {
+                deadline += frameInterval;
+
+                browser.SendExternalBeginFrame(beginFrameIndex++);
+                beginFramesInWindow++;
+                CefRuntime.Pump();
+
+                if (DrainReceivedTexture())
+                {
+                    var gap = (clock.Elapsed - lastReceivedAt).TotalMilliseconds;
+                    if (gap > maximumGapMilliseconds) maximumGapMilliseconds = gap;
+                    lastReceivedAt = clock.Elapsed;
+                    receivedInWindow++;
+                }
+
+                if (clock.Elapsed - windowStart >= TimeSpan.FromSeconds(1))
+                {
+                    // 受信が完全に途切れている間もギャップは伸びるので、窓を閉じる時点でも測る。
+                    var pendingGap = (clock.Elapsed - lastReceivedAt).TotalMilliseconds;
+                    if (pendingGap > maximumGapMilliseconds) maximumGapMilliseconds = pendingGap;
+
+                    Console.WriteLine(
+                        $"t={clock.Elapsed.TotalSeconds,5:F1}s begin_frames={beginFramesInWindow,3} " +
+                        $"received={receivedInWindow,3} max_gap={maximumGapMilliseconds,7:F1}ms");
+                    perSecondReceived.Add(receivedInWindow);
+                    perSecondMaximumGap.Add(maximumGapMilliseconds);
+                    receivedInWindow = 0;
+                    beginFramesInWindow = 0;
+                    maximumGapMilliseconds = 0;
+                    windowStart = clock.Elapsed;
+                }
+
+                var remaining = deadline - clock.Elapsed;
+                if (remaining > TimeSpan.Zero) Thread.Sleep(remaining);
+                else deadline = clock.Elapsed; // 遅れた分は取り戻さない (burst 注入を避ける)
+            }
+
+            Console.WriteLine();
+            Console.WriteLine(
+                $"CLIENT_SUMMARY seconds={perSecondReceived.Count} " +
+                $"received_min={(perSecondReceived.Count > 0 ? perSecondReceived.Min() : 0)} " +
+                $"received_median={Median(perSecondReceived)} " +
+                $"received_max={(perSecondReceived.Count > 0 ? perSecondReceived.Max() : 0)} " +
+                $"gap_max={(perSecondMaximumGap.Count > 0 ? perSecondMaximumGap.Max() : 0):F1}ms " +
+                $"gpu_verified={s_gpuVerifiedFrameCount} gpu_torn={s_gpuTornFrameCount} " +
+                $"gpu_rollback={s_gpuRollbackFrameCount} distinct_steps={s_observedSteps.Count}");
+
+            Console.WriteLine();
+            foreach (var line in CefRuntime.GetLogs().Where(line => line.Contains("STATISTICS")))
+                Console.WriteLine($"SERVER {line}");
+
+            return perSecondReceived.Count > 0 ? 0 : 1;
+        }
+        finally
+        {
+            CefRuntime.Shutdown();
+        }
+    }
+
+    /// <summary>1 フレームあたりのティアリング検査でサンプルする行数。</summary>
+    private const int SampleRowCount = 16;
+
+    /// <summary>GPU 読みでティアリングを検出したフレーム数。</summary>
+    private static int s_gpuTornFrameCount;
+    /// <summary>GPU 読みでロールバック (色の step が逆行) を検出したフレーム数。</summary>
+    private static int s_gpuRollbackFrameCount;
+    /// <summary>GPU 読みで検査できたフレーム数。</summary>
+    private static int s_gpuVerifiedFrameCount;
+    /// <summary>GPU 読みで直前に観測した step (ページは step を 0..255 で循環させる)。</summary>
+    private static int s_lastGpuStep = -1;
+    private static readonly uint[] s_gpuSamplePixels = new uint[SampleRowCount];
+
+    /// <summary>BGRA8 の生ビットから赤成分 (= ページの step) を取り出す。</summary>
+    private static int StepOf(uint pixel) => (int)((pixel >> 16) & 0xFF);
+
+    /// <summary>
+    ///     GPU 経路で直近フレームを読み、ティアリングとロールバックを検査する。
+    ///     ページは step を 1 ずつ進めるので、step が逆行したら古い内容を読んだ証拠。
+    /// </summary>
+    private static void VerifyOnGpu()
+    {
+        if (Browser.VerifyIOSurfacePixelsGpu(s_gpuSamplePixels) != SampleRowCount) return;
+        s_gpuVerifiedFrameCount++;
+        s_observedSteps.Add(StepOf(s_gpuSamplePixels[0]));
+
+        if (s_gpuSamplePixels.Distinct().Count() > 1) s_gpuTornFrameCount++;
+
+        var step = StepOf(s_gpuSamplePixels[0]);
+        if (s_lastGpuStep >= 0 && step != s_lastGpuStep)
+        {
+            // 0..255 の循環なので、進んだ距離が半周を超えていたら逆行と判定する。
+            var forward = (step - s_lastGpuStep + 256) % 256;
+            if (forward > 128) s_gpuRollbackFrameCount++;
+        }
+        s_lastGpuStep = step;
+    }
+    /// <summary>観測した step の異なる値の数 (検出器が生きているかの確認用)。</summary>
+    private static readonly HashSet<int> s_observedSteps = new();
+
+    /// <summary>Mach 経由で届いた最新 IOSurface を受け取り、即解放する。届いていれば true。</summary>
+    private static bool DrainReceivedTexture()
+    {
+        if (!Browser.TryReceiveIOSurfaceTexture(out var texture, out _, out _, out _)) return false;
+
+        VerifyOnGpu();
+
+        Browser.ReleaseMetalTexture(texture);
+        return true;
+    }
+
+    private static double Median(List<int> values)
+    {
+        if (values.Count == 0) return 0;
+        var sorted = values.OrderBy(value => value).ToList();
+        return sorted[sorted.Count / 2];
+    }
+}
+
+}

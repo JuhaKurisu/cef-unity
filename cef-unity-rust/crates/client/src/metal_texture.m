@@ -43,6 +43,10 @@ typedef struct {
 
 static mach_port_t g_receive_port = MACH_PORT_NULL;
 
+// 直近に受信した IOSurface / そのテクスチャ (キャッシュが retain 済み)。診断用。
+static IOSurfaceRef _lastReceivedSurface = NULL;
+static id<MTLTexture> _lastReceivedTexture = nil;
+
 /// Connect to the server's Mach IOSurface service and send subscription.
 /// Returns 0 on success, negative on error.
 int mach_iosurface_client_connect(const char* service_name) {
@@ -167,6 +171,8 @@ void* mach_iosurface_receive_texture(int32_t* out_width, int32_t* out_height, ui
         if (_surfaceCache[cache_index].surfaceID == latestID && _surfaceCache[cache_index].srgbView) {
             CFRelease(latest_surface);
             srgbView = _surfaceCache[cache_index].srgbView;
+            _lastReceivedSurface = _surfaceCache[cache_index].surface;
+            _lastReceivedTexture = _surfaceCache[cache_index].srgbView;
             break;
         }
     }
@@ -215,6 +221,8 @@ void* mach_iosurface_receive_texture(int32_t* out_width, int32_t* out_height, ui
             _surfaceCache[slot].surfaceID = latestID;
             _surfaceCache[slot].surface = latest_surface;
             _surfaceCache[slot].srgbView = srgbView;
+            _lastReceivedSurface = latest_surface;
+            _lastReceivedTexture = srgbView;
         }
     }
 
@@ -224,48 +232,95 @@ void* mach_iosurface_receive_texture(int32_t* out_width, int32_t* out_height, ui
     return (__bridge_retained void*)srgbView;
 }
 
-// ---------------------------------------------------------------------------
-// Legacy IOSurfaceLookup (kept for backward compat, broken on macOS 16)
-// ---------------------------------------------------------------------------
+// GPU 読みティアリング検出 (診断専用)
+//
+// CPU 読み (IOSurfaceLock) は lock 自体が GPU 同期を行うため、「読んだ瞬間の内容」
+// ではなく「完了後の内容」しか見えず、GPU 可視性の破れを観測できない (実測で
+// 既知不良構成でも検出ゼロだった)。Unity が実際に行うのは GPU からのサンプルなので、
+// ここでは自前の command queue で 1 列を staging buffer へ blit し、その結果を読む。
+// サーバー側の blit と我々の読みは別キュー = 順序保証が無いため、未完了の転送先を
+// 読めば「複数フレームの混在 (ティアリング)」か「古い内容 (ロールバック)」が現れる。
 
-void* cef_unity_create_metal_texture_objc(
-    uint32_t surface_id,
-    int32_t width,
-    int32_t height,
-    uint32_t format)
-{
-    // Rust スレッドから呼ばれる (pool なし) — autoreleased な descriptor を
-    // 蓄積させないため必ず pool で囲む。
+#define VERIFY_BYTES_PER_ROW 256  // copyFromTexture:toBuffer: の行アライメント要件を満たす
+
+static id<MTLCommandQueue> _verifyQueue = nil;
+static id<MTLBuffer> _verifyBuffer = nil;
+static NSUInteger _verifyBufferHeight = 0;
+
+/// 直近に受信した IOSurface の 1 列 (中央 x) を GPU で読み出し、縦方向に等間隔な
+/// count 個の画素を out_pixels に書く。戻り値は書き込んだ画素数 (0 = 失敗/未受信)。
+int cef_unity_verify_last_iosurface_gpu_objc(uint32_t* out_pixels, int32_t count) {
+    if (out_pixels == NULL || count <= 0) return 0;
+    if (_lastReceivedTexture == nil || _sharedDevice == nil) return 0;
+
+    id<MTLTexture> texture = _lastReceivedTexture;
+    NSUInteger width = texture.width;
+    NSUInteger height = texture.height;
+    if (width == 0 || height == 0) return 0;
+
     @autoreleasepool {
-        if (surface_id == 0 || width <= 0 || height <= 0) return NULL;
-
-        if (!_sharedDevice) {
-            _sharedDevice = MTLCreateSystemDefaultDevice();
-            if (!_sharedDevice) return NULL;
+        if (_verifyQueue == nil) {
+            _verifyQueue = [_sharedDevice newCommandQueue];
+            if (_verifyQueue == nil) return 0;
+        }
+        if (_verifyBuffer == nil || _verifyBufferHeight != height) {
+            _verifyBuffer = [_sharedDevice newBufferWithLength:height * VERIFY_BYTES_PER_ROW
+                                                      options:MTLResourceStorageModeShared];
+            if (_verifyBuffer == nil) return 0;
+            _verifyBufferHeight = height;
         }
 
-        IOSurfaceRef surface = IOSurfaceLookup(surface_id);
-        if (!surface) return NULL;
+        id<MTLCommandBuffer> commandBuffer = [_verifyQueue commandBuffer];
+        if (commandBuffer == nil) return 0;
+        id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+        [blit copyFromTexture:texture
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:(MTLOrigin){width / 2, 0, 0}
+                   sourceSize:(MTLSize){1, height, 1}
+                     toBuffer:_verifyBuffer
+            destinationOffset:0
+       destinationBytesPerRow:VERIFY_BYTES_PER_ROW
+     destinationBytesPerImage:height * VERIFY_BYTES_PER_ROW];
+        [blit endEncoding];
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
 
-        MTLPixelFormat pixelFormat = (format == 1)
-            ? MTLPixelFormatRGBA8Unorm
-            : MTLPixelFormatBGRA8Unorm;
-
-        MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
-                                                                                       width:(NSUInteger)width
-                                                                                      height:(NSUInteger)height
-                                                                                   mipmapped:NO];
-        descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-        descriptor.storageMode = MTLStorageModeShared;
-
-        id<MTLTexture> texture = [_sharedDevice newTextureWithDescriptor:descriptor
-                                                                iosurface:surface
-                                                                    plane:0];
-        CFRelease(surface);
-        if (!texture) return NULL;
-
-        return (__bridge_retained void*)texture;
+        const uint8_t* base = (const uint8_t*)_verifyBuffer.contents;
+        for (int32_t index = 0; index < count; index++) {
+            NSUInteger row = (NSUInteger)((double)index / (double)count * (double)height);
+            if (row >= height) row = height - 1;
+            out_pixels[index] = *(const uint32_t*)(base + row * VERIFY_BYTES_PER_ROW);
+        }
     }
+    return count;
+}
+
+/// 診断専用 (issue #10): このプロセスが保持している Mach port 名の総数を返す。
+/// connect 毎に receive port が増えていくリークを外部ツール無しで観測するため。
+int cef_unity_debug_mach_port_count_objc(void) {
+    mach_port_name_array_t names = NULL;
+    mach_msg_type_number_t name_count = 0;
+    mach_port_type_array_t types = NULL;
+    mach_msg_type_number_t type_count = 0;
+    if (mach_port_names(mach_task_self(), &names, &name_count, &types, &type_count)
+            != KERN_SUCCESS) {
+        return -1;
+    }
+    int result = (int)name_count;
+    if (names) vm_deallocate(mach_task_self(), (vm_address_t)names,
+                             name_count * sizeof(mach_port_name_t));
+    if (types) vm_deallocate(mach_task_self(), (vm_address_t)types,
+                             type_count * sizeof(mach_port_type_t));
+    return result;
+}
+
+/// 診断専用 (issue #10): 受信ポートと surface キャッシュの現在値を返す。
+/// receive_port が connect 毎に変わり、古いポートが解放されていないことを見るため。
+int cef_unity_debug_iosurface_state_objc(uint32_t* out_receive_port, int32_t* out_cache_count) {
+    if (out_receive_port) *out_receive_port = (uint32_t)g_receive_port;
+    if (out_cache_count) *out_cache_count = _surfaceCacheCount;
+    return 1;
 }
 
 void cef_unity_release_metal_texture_objc(void* texture_pointer)

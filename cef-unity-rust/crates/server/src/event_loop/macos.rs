@@ -157,13 +157,29 @@ fn timer_callback_inner() {
 
     cef::do_message_loop_work();
     state.pump_count += 1;
+
+    // 1 秒窓の paint 統計 (pump tick 数 / paint 数 / GPU コピー待ち) を出す。
+    // tick から呼ぶため、コピー待ちで pump が凍結した分は窓長の伸びとして現れる。
+    crate::server::report_paint_statistics(state.pump_count);
 }
 
 /// mpsc チャネルからコマンドを全て取り出して処理する。
+///
+/// issue #13: キューが空になるまで無制限に drain するため、pump が止まっていた間に
+/// 溜まった BeginFrame がまとめて CEF へ送られる。1 tick 分の drain 数を計測する。
 fn drain_commands(state: &mut ServerState) {
+    let mut command_count: u64 = 0;
+    let mut begin_frame_count: u64 = 0;
     loop {
         match state.command_receiver.try_recv() {
             Ok(envelope) => {
+                command_count += 1;
+                if matches!(
+                    envelope.command,
+                    cef_unity_ipc::Command::SendExternalBeginFrame { .. }
+                ) {
+                    begin_frame_count += 1;
+                }
                 let is_shutdown = matches!(envelope.command, cef_unity_ipc::Command::Shutdown);
                 if envelope.expects_response {
                     log(&format!("received command: {:?}", envelope.command));
@@ -188,6 +204,7 @@ fn drain_commands(state: &mut ServerState) {
             }
         }
     }
+    crate::server::record_drain_burst(command_count, begin_frame_count);
 }
 
 pub fn run_event_loop(state: ServerState) -> ServerState {
@@ -208,10 +225,21 @@ pub fn run_event_loop(state: ServerState) -> ServerState {
         // CEF also controls timing via schedule_pump() for immediate work.
         // 1ms (1000Hz) は External BeginFrame モードで Unity の同フレーム取得 (0 遅延) を狙う際に必要。
         // CFRunLoopTimer は 1ms の精度を持つので CPU 負荷上昇は限定的。
+        // issue #12 の A/B 用に fallback 間隔を環境変数で上書きできるようにする
+        // (既定は従来どおり 1ms)。CEF 要求駆動 (schedule_pump) は常に併存する。
+        let interval_milliseconds: f64 = std::env::var("CEF_UNITY_PUMP_INTERVAL_MILLISECONDS")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| *value > 0.0)
+            .unwrap_or(1.0);
+        log(&format!(
+            "pump fallback interval = {}ms",
+            interval_milliseconds
+        ));
         let timer = CFRunLoopTimerCreate(
             std::ptr::null(),
             CFAbsoluteTimeGetCurrent(),
-            0.001, // 1ms fallback interval (~1000Hz)
+            interval_milliseconds / 1000.0,
             0,
             0,
             timer_callback,

@@ -430,16 +430,7 @@ namespace CefUnity.Interop
         }
 
         /// <summary>
-        ///     IOSurface から Metal テクスチャを作成する。
-        ///     Metal デバイスは内部で自動取得される。成功時は MTLTexture ポインタを返す。
-        /// </summary>
-        public static unsafe IntPtr CreateMetalTexture(uint surfaceId, int width, int height, uint format)
-        {
-            return (IntPtr)NativeMethods.cef_unity_create_metal_texture(surfaceId, width, height, format);
-        }
-
-        /// <summary>
-        ///     CreateMetalTexture で作成した Metal テクスチャを解放する。
+        ///     TryReceiveIOSurfaceTexture が返した Metal テクスチャを解放する。
         /// </summary>
         public static unsafe void ReleaseMetalTexture(IntPtr texture)
         {
@@ -464,6 +455,41 @@ namespace CefUnity.Interop
             return pointer != null;
         }
 
+
+        /// <summary>
+        ///     診断専用: 直近に受信した IOSurface を GPU 経路で読み出して画素をサンプルする。
+        ///     Unity のサンプルと同じ条件で内容の破れ (ティアリング / ロールバック) を検出できる。
+        ///     CPU 読み (IOSurfaceLock) では lock 自体が GPU 同期を行うため破れを観測できない。
+        /// </summary>
+        public static unsafe int VerifyIOSurfacePixelsGpu(uint[] pixels)
+        {
+            if (pixels == null || pixels.Length == 0) return 0;
+            fixed (uint* pointer = pixels)
+            {
+                return NativeMethods.cef_unity_verify_iosurface_pixels_gpu(pointer, pixels.Length);
+            }
+        }
+
+        /// <summary>
+        ///     診断専用 (issue #10): このプロセスが保持している Mach port 名の総数。
+        ///     Initialize/Shutdown の繰り返しで単調増加すればリークの証拠になる。
+        /// </summary>
+        public static int DebugMachPortCount()
+        {
+            return NativeMethods.cef_unity_debug_mach_port_count();
+        }
+
+        /// <summary>
+        ///     診断専用 (issue #10): 現在の Mach 受信ポート番号と surface キャッシュ数。
+        /// </summary>
+        public static unsafe void DebugIOSurfaceState(out uint receivePort, out int cacheCount)
+        {
+            uint nativeReceivePort;
+            int nativeCacheCount;
+            NativeMethods.cef_unity_debug_iosurface_state(&nativeReceivePort, &nativeCacheCount);
+            receivePort = nativeReceivePort;
+            cacheCount = nativeCacheCount;
+        }
 
         /// <summary>
         ///     Mach IOSurface port チャネルが接続済みかどうかを返す。
