@@ -107,7 +107,7 @@ Unity 側のカウンタは MonoBehaviour のフィールドに直書きで、�
 出力されるので、以下は opt-in で 10ms を指定し競合が起きている 1 秒窓の例:
 
 ```
-[CefUnity] 0F-wait: fresh=48 fallback(1F)=12 idle=0 suppressed_skip=42 wait_entered=18 block_avg=7.10ms block_max=9.41ms
+[CefUnity] 0F-wait: fresh=48 fallback(1F)=12 no_wait=0 idle=0 suppressed_skip=42 wait_entered=18 block_avg=7.10ms block_max=9.41ms
 ```
 
 `suppressed_skip + wait_entered = 60` (idle と no_wait は 0) でフレーム数と一致する。
