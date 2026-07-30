@@ -41,7 +41,7 @@ server 側のトグル（すべて環境変数）:
 | #8 P0 shutdown が server を回収しない | ✅ | 競合下で **5 サイクル中 2 回**、Shutdown 復帰後も server が存命 |
 | #9 P1 server が親の FD を継承する | ✅ (条件付き) | CLOEXEC を外した LISTEN ソケットが同一 fd 番号で server に出現 |
 | #10 P1 Mach port / キャッシュのリーク | ✅ | Mach port が **+1〜2/サイクル**で単調増加、surface キャッシュは上限 4 まで蓄積 |
-| #11 P1 メインスレッドの busy-wait | ✅ | 間欠ページで spin が実時間の **42.5%**・CPU 約 25 倍、0F 達成 69% |
+| #11 P1 メインスレッドの busy-wait | ✅ **修正済** | 既定 OFF 化で spin 0%、opt-in 時のみ従来動作 (間欠ページで spin **42.4%**・CPU 約 25 倍) |
 | #12 P1 1000Hz 固定 pump | ✅ | 間隔 1→16ms で **paint 60/s・レイテンシ・0F 達成率は不変**、CPU 120→85ms/s |
 | #13 P2 BeginFrame の burst drain | △ 部分的 | 競合下でも burst 最大 **1〜4**。規模は pump 停止時間に比例するので #7 の下流 |
 | #14 P2 dirty rect 未使用 | ✅ | 小 damage ページで damage 面積は転送面積の **0.0〜3.3%** |
@@ -202,8 +202,11 @@ Unity 側 `ReceiveBeforeRender` を harness へ忠実移植（判定は同一の
 | rAF 毎フレーム・競合なし・ON | **0** | 0% | 33ms/s | 0% | 60.0 |
 | rAF・GPU+CPU 競合・ON | 1〜28 | 5〜22% | 20〜139ms/s | **0.9%** | 46〜50 |
 | rAF・競合・OFF | 0 | 0% | 15〜37ms/s | 0% | 46〜50 |
-| **5Hz 間欠・競合なし・ON** | **60（全フレーム）** | **42.5%** | **423ms/s** | **69%** | 5.2 |
+| **5Hz 間欠・競合なし・ON** | **60（全フレーム）** | **42.5%** | **423ms/s** | **69%※** | 5.2 |
 | 5Hz 間欠・競合なし・OFF | 0 | 0% | 9〜25ms/s | 0% | 5.2 |
+
+※単一サンプル（1 回のみの計測）。後述「修正後」節の A/B 検証で 20.9〜56.3%（平均 33.4〜42.9%）まで
+ばらつくことが判明しており、単一の 69% ではなくこの分布として扱うべきである。
 
 - 健常な連続アニメーション中は抑止パスが常に効き、**spin はゼロ**
 - 発動するのは paint を取り逃し始めた時だけで、**その状態では 0F 達成 0.9%**（効かない時に限って発動する）
@@ -215,6 +218,114 @@ Unity 側 `ReceiveBeforeRender` を harness へ忠実移植（判定は同一の
 **含意**: 42% の spin のほぼ全部は「damage が無かったことを 7ms かけて発見する」空回りである。
 サーバーが「このフレームは damage なし」を shm に 1 ビット書けば即座に抜けられるので、
 #11 は「廃止」ではなく「サーバーからの damage 通知 + opt-in」に落とせる。
+
+### 修正後 (2026-07-31)
+
+修正内容: Unity `_zeroFrameWaitMilliseconds` の既定を `10f`→`0f` にして opt-in 化、開発トグルを
+`cef_no_zero_wait`→`cef_zero_wait` に反転、計装カウンタを `CefZeroFrameWaitStatistics`
+(`CefUnity.Core/Scroll/`) として恒久化し `block_avg` の分母を「実際に待機へ入った回数
+(`wait_entered`)」に統一した。
+
+**既知の制限（serialized 値による既定値の無効化）**: この既定値の変更は新規に追加した
+コンポーネントにのみ効く。フィールドには `[FormerlySerializedAs("_zeroFrameWaitMs")]` が付いて
+おり、既存の scene/prefab に `_zeroFrameWaitMs`（または `_zeroFrameWaitMilliseconds`）が
+保存されている場合は serialized 値が優先されるため、初期化子の `0f` は上書きされる。
+アップグレード時は Inspector で明示的に 0 へ変更する必要がある。既知の該当例:
+moorestech `MainGameUI.prefab` に `_zeroFrameWaitMs: 10` が保存済み
+（`docs/MOORESTECH_PR1097_VERIFICATION.md:42`）。つまり主要な下流消費者ではこの opt-in 化の
+効果がそのままでは 0 になる。
+
+`CefUnity.Harness zero-frame-wait` で Unity と同じ `CefZeroFramePacer` /
+`CefZeroFrameWaitStatistics` を使い、既定 OFF と opt-in ON を再計測した
+(load average 2.1〜6.5、5Hz 間欠ページ、各 20 秒 = 有効窓 17 秒):
+
+| 条件 | wait_entered/s | spin_share | block_avg (wait_entered 分母) | 0F 達成率 | received/s |
+|---|---|---|---|---|---|
+| 既定 OFF (`zeroFrameWaitMilliseconds=0`) | **0.0** | **0.0%** | 0.00ms | 0.0% | 5.1 |
+| opt-in ON (`=10`、1 回目) | 60.6 | 42.4% | 6.99ms | 36.0% | 5.1 |
+| opt-in ON (`=10`、2 回目) | 60.6 | 42.4% | 7.00ms | 40.7% | 5.1 |
+| opt-in ON (`=10`、3 回目) | 60.8 | 42.5% | 7.00ms | 56.3% | 5.1 |
+| opt-in ON (`=10`、4 回目) | 60.7 | 42.5% | 6.99ms | 38.4% | 5.1 |
+
+- **既定 OFF**: `wait_entered_per_second=0.0` / `spin_share=0.0%`、各窓の `no_wait` がほぼ全数
+  (60〜61/61) になり、busy-wait が既定で消えたことを実行時証拠として確認した
+- **opt-in ON**: `wait_entered_per_second`（60.6〜60.8。ブリーフの期待レンジ 55〜60 をわずかに
+  超えるが誤差の範囲とみている）/ `spin_share`（42.4〜42.5%）/ `block_avg`（6.99〜7.00ms）は
+  4 回とも安定しており、旧実測 (wait_entered 60・spin 42.5%・cpu 423ms/s) ともほぼ一致する。
+  opt-in 経路そのものは壊れていない
+- **`zero_frame_share`（0F 達成率）は 4 回で 36.0% / 40.7% / 56.3% / 38.4%（平均 42.9%）と
+  試行ごとに大きくばらつき、旧基準の 69% には毎回届かなかった。**
+- **load average の但し書き**: 実装後 4 回目 (`zero_frame_share=38.4%`) は計測直前の `uptime` が
+  load average 5.62 で、計測手順の上限（5 未満）を超過していた。ただし `wait_entered`・
+  `spin_share`・`block_avg` は他 3 回と一致していたため、この試行を除外していない
+- **paint 供給の回帰確認**（`paint-statistics 20 1920 1080 animation`）: `received` 中央値
+  61/s（`received_min=58` を除き概ね 60〜61）、`gpu_verified=1306` に対し `gpu_torn=0` /
+  `gpu_rollback=0` で回帰なし。`BeginFrame→paint latency` はサーバーログ実測で
+  平均 4.36ms（n=21 窓の平均、期待 3〜4ms よりわずかに高いが #12 記載の 3.67ms と同水準）
+- **ライフサイクルの回帰確認**（`lifecycle 5`）: 5/5 サイクル完走、`mach_ports` は
+  70→72→73→74→75（+2, +1, +1, +1）で #10 の既知水準（+1〜2/サイクル）から悪化なし、
+  `server_processes_final=0`
+
+**戻し方と代償**: 0F 待ちが必要な場面では以下のいずれかで opt-in できる。
+①Inspector で `_zeroFrameWaitMilliseconds` に正の値（旧既定は `10`）を入れる。
+②開発ビルド限定 (`#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)` 配下、
+リリースビルドでは効かない) で `$TMPDIR/cef_zero_wait` にマーカーファイルを置く。
+③戻さない場合（既定 OFF のまま）の代償: 5Hz 級の間欠更新ページで最大 16.7ms（1 フレーム分）の
+追加遅延が生じる。ただし `received/s` とフレーム間ギャップは ON/OFF で不変なので、コマ落ちや
+供給量そのものの劣化は起きない。
+
+**server-side flush の位置づけメモ**: 既定 OFF ではクライアントが flush 結果の到着を待たなく
+なるため、server-side flush（server.rs の BF#1 +3/+6ms 内部 flush）由来の paint は同フレームの
+present には乗らず、次フレームの受信で拾われる。つまり「0F 化」自体の効果は既定では消え、
+残るのは「次フレームの内容が数 ms 新しい」という効果だけになる（実測では `received/s` が
+ON/OFF で不変であり、コストが増えた証拠もない。`paints/s` は `paint-statistics` の単独実行でしか
+計測しておらず、0F 待ちの ON/OFF を振った比較はまだ取っていない）。残作業 7 番の「次の一手 = サーバーからの
+damage なし通知」と併せて、server-side flush の存在意義そのものも opt-in 化後の構成でどこまで
+必要かを再評価する必要がある。
+
+#### A/B: 実装前 (commit `0ed5391`) の harness との比較（2026-07-31 追加検証）
+
+`zero_frame_share` の低下が「今回の Task 1〜3 のリファクタが待機ロジックを壊した」せいか、
+「測定対象が変わっただけ」なのかを切り分けるため、リファクタ前の
+`ZeroFrameWaitCommand.cs`（commit `0ed5391`、`CefZeroFramePacer` や `Receive()` の判定ロジックは
+現行と同一で、集計先が独自フィールドか `CefZeroFrameWaitStatistics` かだけが違う）を一時的に
+チェックアウトしてビルドし、同一条件・同一手順（`pkill` → `uptime` →
+`zero-frame-wait 20 10 1920 1080 intermittent`）で 4 回計測した:
+
+```bash
+git checkout 0ed5391 -- cef-unity-csharp/CefUnity.Harness/ZeroFrameWaitCommand.cs
+dotnet build cef-unity-csharp/CefUnity.Harness -c Debug
+# 計測後
+git checkout HEAD -- cef-unity-csharp/CefUnity.Harness/ZeroFrameWaitCommand.cs
+dotnet build cef-unity-csharp/CefUnity.Harness -c Debug
+```
+
+| 版 | 試行1 | 試行2 | 試行3 | 試行4 | 平均 | 範囲 |
+|---|---|---|---|---|---|---|
+| 実装前 (`0ed5391`) | 52.3% | 29.1% | 20.9% | 31.4% | **33.4%** | 20.9〜52.3% |
+| 実装後 (現行 HEAD) | 36.0% | 40.7% | 56.3% | 38.4% | **42.9%** | 36.0〜56.3% |
+
+**判定（暫定、n=4+4）: 今回の Task 1〜3 のリファクタが `zero_frame_share` を悪化させたという
+証拠は見られなかった。** 実装前の harness でも `zero_frame_share` は 20.9〜52.3%（平均 33.4%）
+まで大きくばらつき、69% には一度も届かなかった。実装後（平均 42.9%）より低い試行すらあり、
+両者の分布は明確に重なる（実装前 4 回中 3 回が実装後の最小値 36.0% を下回る）。ただし試行数は
+各 4 回、レンジは平均の半分近くに達しており、有意差検定は行っていない。#12 の 0F 達成率比較
+（n≈137、「差はノイズ」）と比べても本件ははるかに小標本であり、「無罪の確定」と言い切れる
+強さの根拠ではない点に注意。
+
+`wait_entered_per_second`（60.6〜60.8）・`spin_share`（42.4〜42.6%）は両版とも `CLIENT_SUMMARY`
+で安定していた。`block_avg` は実装後の `CLIENT_SUMMARY`（`block_avg_entered`）では 6.99〜7.00ms、
+実装前は `CLIENT_SUMMARY` に集計値が無いため 1 秒窓ごとの `block_avg_entered` を見ると
+6.96〜7.10ms で、いずれも同水準だった。一方 `zero_frame_share` だけが両版で試行間 20〜31
+ポイントも揺れている（実装前レンジ 31.4pt、実装後レンジ 20.3pt）。5Hz 間欠ページの
+`setInterval(200ms)` と 60Hz の `SendExternalBeginFrame` は独立クロックなので、**仮説として**
+この揺れはプロセス起動ごとの位相関係（スケジューリングジッタ）に由来する測定対象そのものの
+高分散ではないかと考えている（位相そのものを直接計測して裏付けたわけではない）。
+
+したがって、旧基準の 69% は #7 修正の影響というより、そもそも 1 回しか採取していない
+サンプルが高分散な分布のたまたま高い側に当たっていた可能性がある、というのが現時点での
+見立てである。#11 の opt-in を語る際は「単一の 69%」ではなく、今回得られた 20.9〜56.3%
+（8 試行全体、実装前後合算）を分布として扱うべきである。
 
 ## #12 — 1000Hz 固定 message pump
 
@@ -287,8 +398,10 @@ moorestech レポートの「dirty rect 面積は 2〜4%」は再現し、実際
 5. **#8**: 500ms 固定 sleep → 期限付き待ち + `kill` + `Drop`。検証は `lifecycle` で 5/5 サイクル 0
 6. **#12**: one-shot timer 化。回帰確認（paints 60/s・レイテンシ・0F 達成率が不変、CPU が下がる）は
    harness で自動化済み
-7. **#11**: まずカウンタ分離 + 既定 `_zeroFrameWaitMilliseconds = 0`（opt-in 化）。手調整の塊なので
-   一気にやらない。0F を取り戻すなら後から「サーバー側の damage なし通知」を足す
+7. ~~**#11**~~ **完了**（2026-07-31）: カウンタ分離 (`CefZeroFrameWaitStatistics`) + 既定
+   `_zeroFrameWaitMilliseconds = 0`（opt-in 化、開発トグル `cef_zero_wait`）で spin を既定 0 にした。
+   0F を取り戻すなら次の一手として「サーバー側の damage なし通知」（#11 セクション参照）が
+   残っている。未着手
 8. **#9**: 先に Unity 実機で `lsof -p <server_pid> | grep <ゲームサーバーのポート>` を 1 回。
    **測る前に直さない**
 9. **#14**: 棚上げ（P3 相当）

@@ -19,11 +19,9 @@ namespace CefUnity.Harness
 ///     ステートマシンの挙動は Unity と同じになる。
 ///     </para>
 ///     <para>
-///     issue #11 が求める「待機パス専用カウンタの分離」もここで行う。現行の Unity 計装は
-///     <c>block_avg</c> の分母に fresh+fallback を使うが、この 2 つは抑止スキップパス
-///     (ブロックしない) でも加算されるため、1 フレーム当たりの実 spin を過小評価する。
-///     本コマンドは spin に入った回数 (<c>wait_entered</c>) を独立に数え、両方の分母で
-///     平均を出して差を可視化する。
+///     issue #11 が求める「待機パス専用カウンタの分離」は <see cref="CefZeroFrameWaitStatistics" />
+///     として Core 側で恒久化した。本コマンドは Unity と同じそのクラスへ集計を委譲するので、
+///     カウンタの加算位置は Unity と常に一致する。
 ///     </para>
 ///     <para>
 ///     Unity との差: Unity では BF#1 (EarlyUpdate) と recv (PostLateUpdate) の間にゲーム処理と
@@ -54,13 +52,8 @@ internal static class ZeroFrameWaitCommand
 
     private sealed class WindowCounters
     {
-        public int FreshCount;          // Unity の _doublePumpFreshCount 相当
-        public int FallbackCount;       // Unity の _doublePumpFallbackCount 相当
-        public int IdleSkipCount;       // Unity の _doublePumpIdleCount 相当
-        public int SuppressedSkipCount; // Unity には対応カウンタが無い (抑止スキップ)
-        public int WaitEnteredCount;    // #11 が求める分離: 実際に spin へ入った回数
-        public double SpinTotalMilliseconds;
-        public double SpinMaxMilliseconds;
+        /// <summary>Unity と共有する集計 (受信の成否・パス内訳・spin)。</summary>
+        public readonly CefZeroFrameWaitStatistics Statistics = new CefZeroFrameWaitStatistics();
         public int ReceivedCount;
         public double MaximumGapMilliseconds;
         // 待機の目的側: 受け取った paint が何フレーム前の BeginFrame 由来か (0 = 同フレーム = 0F)。
@@ -155,41 +148,26 @@ internal static class ZeroFrameWaitCommand
                         (processorTime - processorTimeAtWindowStart).TotalMilliseconds;
                     processorTimeAtWindowStart = processorTime;
 
-                    var activeCount = counters.FreshCount + counters.FallbackCount;
-                    var blockAverageOld = activeCount > 0
-                        ? counters.SpinTotalMilliseconds / activeCount : 0.0;
-                    var blockAverageEntered = counters.WaitEnteredCount > 0
-                        ? counters.SpinTotalMilliseconds / counters.WaitEnteredCount : 0.0;
                     var windowMilliseconds = (clock.Elapsed - windowStart).TotalMilliseconds;
+                    var statistics = counters.Statistics;
 
                     var line =
                         $"t={clock.Elapsed.TotalSeconds,5:F1}s received={counters.ReceivedCount,3} " +
                         $"max_gap={counters.MaximumGapMilliseconds,6:F1}ms | " +
-                        $"fresh={counters.FreshCount,3} fallback={counters.FallbackCount,3} " +
-                        $"idle_skip={counters.IdleSkipCount,3} suppressed_skip={counters.SuppressedSkipCount,3} " +
-                        $"wait_entered={counters.WaitEnteredCount,3} | " +
-                        $"spin_total={counters.SpinTotalMilliseconds,6:F1}ms " +
-                        $"({counters.SpinTotalMilliseconds / windowMilliseconds * 100,4:F1}% of wall) " +
-                        $"spin_max={counters.SpinMaxMilliseconds,5:F2}ms " +
-                        $"block_avg_old={blockAverageOld,5:F2}ms block_avg_entered={blockAverageEntered,5:F2}ms | " +
+                        $"{statistics.FormatLine()} | " +
+                        $"spin_total={statistics.SpinTotalMilliseconds,6:F1}ms " +
+                        $"({statistics.SpinTotalMilliseconds / windowMilliseconds * 100,4:F1}% of wall) | " +
                         $"delay_0F={counters.ZeroFrameDelayCount,3} delay_1F={counters.OneFrameDelayCount,3} " +
                         $"delay_2F+={counters.LaterFrameDelayCount,3} | " +
                         $"process_cpu={processorMilliseconds,6:F0}ms";
                     Console.WriteLine(line);
                     summaries.Add(line);
 
+                    totals.Statistics.Add(statistics);
                     totals.ReceivedCount += counters.ReceivedCount;
-                    totals.FreshCount += counters.FreshCount;
-                    totals.FallbackCount += counters.FallbackCount;
-                    totals.IdleSkipCount += counters.IdleSkipCount;
-                    totals.SuppressedSkipCount += counters.SuppressedSkipCount;
-                    totals.WaitEnteredCount += counters.WaitEnteredCount;
-                    totals.SpinTotalMilliseconds += counters.SpinTotalMilliseconds;
                     totals.ZeroFrameDelayCount += counters.ZeroFrameDelayCount;
                     totals.OneFrameDelayCount += counters.OneFrameDelayCount;
                     totals.LaterFrameDelayCount += counters.LaterFrameDelayCount;
-                    totals.SpinMaxMilliseconds =
-                        Math.Max(totals.SpinMaxMilliseconds, counters.SpinMaxMilliseconds);
                     totals.MaximumGapMilliseconds =
                         Math.Max(totals.MaximumGapMilliseconds, counters.MaximumGapMilliseconds);
                     totalSeconds++;
@@ -208,9 +186,10 @@ internal static class ZeroFrameWaitCommand
                 $"CLIENT_SUMMARY zero_frame_wait={zeroFrameWaitMilliseconds:F1}ms seconds={totalSeconds} " +
                 $"received_per_second={(totalSeconds > 0 ? (double)totals.ReceivedCount / totalSeconds : 0):F1} " +
                 $"gap_max={totals.MaximumGapMilliseconds:F1}ms " +
-                $"wait_entered_per_second={(totalSeconds > 0 ? (double)totals.WaitEnteredCount / totalSeconds : 0):F1} " +
-                $"spin_share={(totalSeconds > 0 ? totals.SpinTotalMilliseconds / (totalSeconds * 1000.0) * 100 : 0):F1}% " +
-                $"spin_max={totals.SpinMaxMilliseconds:F2}ms " +
+                $"wait_entered_per_second={(totalSeconds > 0 ? (double)totals.Statistics.WaitEnteredCount / totalSeconds : 0):F1} " +
+                $"spin_share={(totalSeconds > 0 ? totals.Statistics.SpinTotalMilliseconds / (totalSeconds * 1000.0) * 100 : 0):F1}% " +
+                $"spin_max={totals.Statistics.SpinMaximumMilliseconds:F2}ms " +
+                $"block_avg_entered={totals.Statistics.BlockAverageMilliseconds:F2}ms " +
                 $"delay_0F={totals.ZeroFrameDelayCount} delay_1F={totals.OneFrameDelayCount} " +
                 $"delay_2F+={totals.LaterFrameDelayCount} " +
                 $"zero_frame_share={(totals.ReceivedCount > 0 ? (double)totals.ZeroFrameDelayCount / totals.ReceivedCount * 100 : 0):F1}%");
@@ -228,8 +207,8 @@ internal static class ZeroFrameWaitCommand
     }
 
     /// <summary>
-    ///     CefUnityBrowserSample.ReceiveBeforeRender の忠実移植。
-    ///     カウンタの加算位置も原実装に合わせる (fresh/fallback は抑止スキップでも加算される)。
+    ///     CefUnityBrowserSample.ReceiveBeforeRender の忠実移植。集計は Unity と同じ
+    ///     CefZeroFrameWaitStatistics に委譲するため、カウンタの加算位置も自動的に一致する。
     /// </summary>
     private static void ReceiveBeforeRender(Browser browser, CefZeroFramePacer pacer,
                                             Stopwatch clock, float zeroFrameWaitMilliseconds,
@@ -237,30 +216,27 @@ internal static class ZeroFrameWaitCommand
     {
         if (zeroFrameWaitMilliseconds <= 0f)
         {
-            if (Receive(browser, pacer, clock, counters, beginFrameIndexThisFrame)) counters.FreshCount++;
-            else counters.FallbackCount++;
+            counters.Statistics.RecordNoWaitReceive(
+                Receive(browser, pacer, clock, counters, beginFrameIndexThisFrame));
             return;
         }
 
-        var blockStart = ElapsedSeconds(clock);
-
         if (pacer.ShouldSkipAsIdle(inputSentThisFrame: false))
         {
-            Receive(browser, pacer, clock, counters, beginFrameIndexThisFrame);
-            counters.IdleSkipCount++;
+            counters.Statistics.RecordIdleSkip(
+                Receive(browser, pacer, clock, counters, beginFrameIndexThisFrame));
             return;
         }
 
         if (pacer.ShouldSkipAsSuppressed())
         {
-            if (Receive(browser, pacer, clock, counters, beginFrameIndexThisFrame)) counters.FreshCount++;
-            else counters.FallbackCount++;
-            counters.SuppressedSkipCount++;
+            counters.Statistics.RecordSuppressedSkip(
+                Receive(browser, pacer, clock, counters, beginFrameIndexThisFrame));
             return;
         }
 
         // ここから先が実際の busy-wait。#11 が数えたい対象。
-        counters.WaitEnteredCount++;
+        var blockStart = ElapsedSeconds(clock);
         var window = pacer.OpenWaitWindow(zeroFrameWaitMilliseconds);
         while (true)
         {
@@ -270,13 +246,9 @@ internal static class ZeroFrameWaitCommand
             Thread.SpinWait(64);
         }
 
-        if (Receive(browser, pacer, clock, counters, beginFrameIndexThisFrame)) counters.FreshCount++;
-        else counters.FallbackCount++;
-
-        var spinMilliseconds = (ElapsedSeconds(clock) - blockStart) * 1000.0;
-        counters.SpinTotalMilliseconds += spinMilliseconds;
-        if (spinMilliseconds > counters.SpinMaxMilliseconds)
-            counters.SpinMaxMilliseconds = spinMilliseconds;
+        var receivedAfterWait = Receive(browser, pacer, clock, counters, beginFrameIndexThisFrame);
+        counters.Statistics.RecordWaitCompleted(
+            receivedAfterWait, (ElapsedSeconds(clock) - blockStart) * 1000.0);
     }
 
     private static double s_lastReceivedSeconds = -1;
