@@ -316,29 +316,11 @@ namespace CefUnity
         public static extern int cef_unity_get_iosurface_info(CefUnityBrowser* handle, uint* out_surface_id, int* out_width, int* out_height, uint* out_format);
 
         /// <summary>
-        ///  Create a Metal texture backed by an IOSurface.
-        ///  Uses the system default Metal device internally.
-        ///  Returns an opaque MTLTexture pointer, or null on failure.
-        /// </summary>
-        [DllImport(__DllName, EntryPoint = "cef_unity_create_metal_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern void* cef_unity_create_metal_texture(uint surface_id, int width, int height, uint format);
-
-        /// <summary>
-        ///  診断専用: 直近に受信した IOSurface から縦方向に等間隔な行の中央画素を
-        ///  `count` 個サンプルして `out_pixels` に書く。書き込んだ画素数を返す (0 = 未受信)。
-        ///
-        ///  全画面が単色のページで値が割れていれば、転送先が blit 未完了のまま読まれたか
-        ///  src が上書きされたことを意味する (ティアリング検出)。macOS 以外では常に 0。
-        /// </summary>
-        [DllImport(__DllName, EntryPoint = "cef_unity_sample_iosurface_pixels", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern int cef_unity_sample_iosurface_pixels(uint* out_pixels, int count);
-
-        /// <summary>
         ///  診断専用: 直近に受信した IOSurface を **GPU 経路で** 読み出して画素をサンプルする。
         ///
-        ///  CPU 読み (`cef_unity_sample_iosurface_pixels`) は IOSurfaceLock が GPU 同期を行う
-        ///  ため転送先の未完了を観測できない。こちらは自前の command queue で 1 列を staging
-        ///  buffer へ blit するので、Unity のサンプルと同じ条件で内容の破れを検出できる。
+        ///  自前の command queue で 1 列を staging buffer へ blit するので、Unity のサンプルと
+        ///  同じ条件で内容の破れ (ティアリング / ロールバック) を検出できる。CPU 読み
+        ///  (IOSurfaceLock) では lock 自体が GPU 同期を行うため破れを観測できない。
         ///  macOS 以外では常に 0。
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_verify_iosurface_pixels_gpu", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
@@ -374,7 +356,7 @@ namespace CefUnity
         public static extern int cef_unity_is_iosurface_connected();
 
         /// <summary>
-        ///  Release a Metal texture previously created by cef_unity_create_metal_texture.
+        ///  Release a Metal texture previously returned by cef_unity_receive_iosurface_texture.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_release_metal_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern void cef_unity_release_metal_texture(void* texture);

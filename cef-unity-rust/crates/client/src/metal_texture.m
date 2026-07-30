@@ -232,36 +232,6 @@ void* mach_iosurface_receive_texture(int32_t* out_width, int32_t* out_height, ui
     return (__bridge_retained void*)srgbView;
 }
 
-/// 直近に受信した IOSurface から、縦方向に等間隔な行の中央画素を count 個サンプルする
-/// (診断専用)。全画面が単色のページでは全て同じ値になるはずで、値が割れていれば
-/// ティアリング = 転送先が blit 未完了 or src が上書きされた証拠になる。
-/// 戻り値: 書き込んだ画素数。0 は未受信 or lock 失敗。
-int cef_unity_sample_iosurface_pixels_objc(uint32_t* out_pixels, int32_t count) {
-    if (out_pixels == NULL || count <= 0 || _lastReceivedSurface == NULL) return 0;
-
-    IOSurfaceRef surface = _lastReceivedSurface;
-    if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return 0;
-
-    uint8_t* base = (uint8_t*)IOSurfaceGetBaseAddress(surface);
-    size_t bytes_per_row = IOSurfaceGetBytesPerRow(surface);
-    size_t width = IOSurfaceGetWidth(surface);
-    size_t height = IOSurfaceGetHeight(surface);
-    if (base == NULL || width == 0 || height == 0) {
-        IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
-        return 0;
-    }
-
-    for (int32_t index = 0; index < count; index++) {
-        size_t row = (size_t)((double)index / (double)count * (double)height);
-        if (row >= height) row = height - 1;
-        uint32_t* pixels_in_row = (uint32_t*)(base + row * bytes_per_row);
-        out_pixels[index] = pixels_in_row[width / 2];
-    }
-
-    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
-    return count;
-}
-
 // GPU 読みティアリング検出 (診断専用)
 //
 // CPU 読み (IOSurfaceLock) は lock 自体が GPU 同期を行うため、「読んだ瞬間の内容」
@@ -351,50 +321,6 @@ int cef_unity_debug_iosurface_state_objc(uint32_t* out_receive_port, int32_t* ou
     if (out_receive_port) *out_receive_port = (uint32_t)g_receive_port;
     if (out_cache_count) *out_cache_count = _surfaceCacheCount;
     return 1;
-}
-
-// ---------------------------------------------------------------------------
-// Legacy IOSurfaceLookup (kept for backward compat, broken on macOS 16)
-// ---------------------------------------------------------------------------
-
-void* cef_unity_create_metal_texture_objc(
-    uint32_t surface_id,
-    int32_t width,
-    int32_t height,
-    uint32_t format)
-{
-    // Rust スレッドから呼ばれる (pool なし) — autoreleased な descriptor を
-    // 蓄積させないため必ず pool で囲む。
-    @autoreleasepool {
-        if (surface_id == 0 || width <= 0 || height <= 0) return NULL;
-
-        if (!_sharedDevice) {
-            _sharedDevice = MTLCreateSystemDefaultDevice();
-            if (!_sharedDevice) return NULL;
-        }
-
-        IOSurfaceRef surface = IOSurfaceLookup(surface_id);
-        if (!surface) return NULL;
-
-        MTLPixelFormat pixelFormat = (format == 1)
-            ? MTLPixelFormatRGBA8Unorm
-            : MTLPixelFormatBGRA8Unorm;
-
-        MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
-                                                                                       width:(NSUInteger)width
-                                                                                      height:(NSUInteger)height
-                                                                                   mipmapped:NO];
-        descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-        descriptor.storageMode = MTLStorageModeShared;
-
-        id<MTLTexture> texture = [_sharedDevice newTextureWithDescriptor:descriptor
-                                                                iosurface:surface
-                                                                    plane:0];
-        CFRelease(surface);
-        if (!texture) return NULL;
-
-        return (__bridge_retained void*)texture;
-    }
 }
 
 void cef_unity_release_metal_texture_objc(void* texture_pointer)

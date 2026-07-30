@@ -430,16 +430,7 @@ namespace CefUnity.Interop
         }
 
         /// <summary>
-        ///     IOSurface から Metal テクスチャを作成する。
-        ///     Metal デバイスは内部で自動取得される。成功時は MTLTexture ポインタを返す。
-        /// </summary>
-        public static unsafe IntPtr CreateMetalTexture(uint surfaceId, int width, int height, uint format)
-        {
-            return (IntPtr)NativeMethods.cef_unity_create_metal_texture(surfaceId, width, height, format);
-        }
-
-        /// <summary>
-        ///     CreateMetalTexture で作成した Metal テクスチャを解放する。
+        ///     TryReceiveIOSurfaceTexture が返した Metal テクスチャを解放する。
         /// </summary>
         public static unsafe void ReleaseMetalTexture(IntPtr texture)
         {
@@ -466,25 +457,9 @@ namespace CefUnity.Interop
 
 
         /// <summary>
-        ///     診断専用: 直近に受信した IOSurface から縦方向に等間隔な行の中央画素をサンプルする。
-        ///     全画面が単色のページで値が割れていれば、転送先が blit 未完了のまま読まれたか
-        ///     src が上書きされたことを意味する (ティアリング検出)。
-        ///     戻り値は書き込んだ画素数 (0 = 未受信)。macOS 以外では常に 0。
-        /// </summary>
-        public static unsafe int SampleIOSurfacePixels(uint[] pixels)
-        {
-            if (pixels == null || pixels.Length == 0) return 0;
-            fixed (uint* pointer = pixels)
-            {
-                return NativeMethods.cef_unity_sample_iosurface_pixels(pointer, pixels.Length);
-            }
-        }
-
-        /// <summary>
         ///     診断専用: 直近に受信した IOSurface を GPU 経路で読み出して画素をサンプルする。
-        ///     CPU 読み (<see cref="SampleIOSurfacePixels" />) は IOSurfaceLock が GPU 同期を
-        ///     行うため転送先の未完了を観測できない。こちらは Unity のサンプルと同じ条件で
-        ///     内容の破れ (ティアリング / ロールバック) を検出できる。
+        ///     Unity のサンプルと同じ条件で内容の破れ (ティアリング / ロールバック) を検出できる。
+        ///     CPU 読み (IOSurfaceLock) では lock 自体が GPU 同期を行うため破れを観測できない。
         /// </summary>
         public static unsafe int VerifyIOSurfacePixelsGpu(uint[] pixels)
         {

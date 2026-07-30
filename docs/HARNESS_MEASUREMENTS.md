@@ -80,6 +80,8 @@ GPU/CPU 競合が律速だから。この修正が直すのは **pump の健全�
 
 client 側に **GPU 読み**の検出器を追加した（自前 command queue で 1 列を staging buffer へ blit）。
 CPU 読み (`IOSurfaceLock`) は lock 自体が GPU 同期を行うため識別力が無く、既知不良構成でも検出ゼロだった。
+そのため **CPU 読みのサンプラは削除した**（残しても偽の安心を与えるだけなので）。検出器が生きていることは
+`distinct_steps`（観測できた色 step の種類数、ページは 0..255 を循環する）で確認する。
 
 | モード | gpu_verified | gpu_rollback |
 |---|---|---|
@@ -225,6 +227,14 @@ moorestech レポートの「dirty rect 面積は 2〜4%」は再現し、実際
 - CEF 本体ログ `cef_debug.log`: **749KB**（約 10 秒の実行で）
 
 `settings.log_file` / `log_severity = VERBOSE` が `LOG_ENABLED` と無関係に設定されていることを確認した。
+
+## この調査で削除したもの
+
+- **CPU 読みの画素サンプラ** (`cef_unity_sample_iosurface_pixels`): 既知不良構成でも検出ゼロで
+  識別力が無いことを実証したため削除。GPU 読み版のみ残す
+- **legacy IOSurfaceLookup 経路** (`cef_unity_create_metal_texture`): macOS 11 で deprecated・
+  macOS 16 でプロセス間無効化されており、リポジトリ内に呼び出し元が 1 つも無かった
+- **非 Windows 用の未使用スタブ** `pub type DXGI_FORMAT = u32` (`d3d11_pool.rs`): ビルド警告 2 件の原因
 
 ## 計測上の注意
 
