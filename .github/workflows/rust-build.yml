@@ -172,11 +172,87 @@ jobs:
           name: cef-unity-windows-${{ matrix.arch }}
           path: cef-unity-rust/bundle-win
 
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # PUBLIC リポジトリなので arm64 ネイティブランナーが無料で使える。
+          # クロスビルドではないので x64/arm64 で手順が分岐しない。
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-linux-${{ matrix.arch }}-${{ hashFiles('cef-unity-rust/Cargo.lock') }}
+
+      # CEF の実行時依存 (libcef.so が要求する共有ライブラリ)
+      - name: Install CEF runtime dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libnss3 libnspr4 libasound2t64 libatk1.0-0t64 libatk-bridge2.0-0t64 \
+            libcups2t64 libdrm2 libgbm1 libgtk-3-0t64 libxcomposite1 libxdamage1 \
+            libxfixes3 libxkbcommon0 libxrandr2 libpango-1.0-0 libcairo2 libx11-xcb1 libxss1
+
+      # 初回の cargo 実行は CEF (~1GB) ダウンロードを含むため 1 回リトライ
+      - name: Unit tests
+        working-directory: cef-unity-rust
+        run: cargo test --workspace --lib --release || cargo test --workspace --lib --release
+
+      - name: Build
+        working-directory: cef-unity-rust
+        run: cargo build --release
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Core unit tests (no Unity)
+        run: dotnet test cef-unity-csharp/CefUnity.Tests -c Release --logger "console;verbosity=minimal"
+
+      # ランナーには画面が無い。ここが「真のヘッドレス環境」での初めての検証になる。
+      #
+      # dotnet publish で Harness を 1 ディレクトリにまとめ、そこへ copy-linux-runtime.sh で
+      # ネイティブ成果物を重ねる。csproj の CopyServerApp と .so の <None> は
+      # Exists(target/debug/...) 条件付きで、CI は release ビルドのみなので発火しない。
+      - name: Harness smoke
+        run: |
+          dotnet publish cef-unity-csharp/CefUnity.Harness -c Release -o "$RUNNER_TEMP/harness"
+          bash cef-unity-rust/copy-linux-runtime.sh "$RUNNER_TEMP/harness" release
+          cd "$RUNNER_TEMP/harness"
+          ./CefUnity.Harness smoke
+
+      - name: Collect bundle
+        working-directory: cef-unity-rust
+        run: |
+          bash copy-linux-runtime.sh bundle-linux release
+          echo "=== bundle-linux ==="
+          ls -laR bundle-linux > "$RUNNER_TEMP/bundle_list.txt"
+          head -80 "$RUNNER_TEMP/bundle_list.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cef-unity-linux-${{ matrix.arch }}
+          path: cef-unity-rust/bundle-linux
+
   # 第3弾: タグ push (v*) または手動実行時、ビルド成果物を Plugins/ へコミット (LFS 経由)
   # し、タグ時は GitHub Release を作成する。publish のコミットは Unity 側パスのみ変更する
   # ため paths フィルタに合致せず、再ビルドはトリガーされない (ループ防止)。
   publish:
-    needs: [build-mac, build-win]
+    needs: [build-mac, build-win, build-linux]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
@@ -221,6 +297,20 @@ jobs:
             rsync -a --exclude archive.json "$SRC/cef/" "$WD/"
           done
 
+      # Linux は x64 のみ Unity に配置する。Unity にデスクトップ Linux arm64 の
+      # ターゲットが無いため、arm64 はリリース zip のみ (Assets には置かない)。
+      - name: Update Plugins (linux, フラット展開)
+        run: |
+          WORK_DIRECTORY=cef-unity-unityproject/Assets/CefUnity/Plugins/linux-x64
+          SOURCE=artifacts/cef-unity-linux-x64
+          if [ ! -d "$SOURCE" ]; then
+            echo "SKIP (artifact not found): $SOURCE"
+          else
+            mkdir -p "$WORK_DIRECTORY"
+            # .meta は Unity 管理なので保持
+            rsync -a --exclude '*.meta' "$SOURCE/" "$WORK_DIRECTORY/"
+          fi
+
       # CEF 更新でファイルが増えると、Unity Editor を起動しないこの job では .meta が
       # 無いままコミットされ、利用側の Unity が GUID をローカル生成して参照がぶれる。
       # パス由来の決定論的 GUID を与えて防ぐ。
@@ -254,6 +344,10 @@ jobs:
             if [ -d "artifacts/cef-unity-windows-$ARCH" ]; then
               (cd "artifacts/cef-unity-windows-$ARCH" && zip -qry "../../cef-unity-windows-$ARCH.zip" .)
               ASSETS+=("cef-unity-windows-$ARCH.zip")
+            fi
+            if [ -d "artifacts/cef-unity-linux-$ARCH" ]; then
+              (cd "artifacts/cef-unity-linux-$ARCH" && zip -qry "../../cef-unity-linux-$ARCH.zip" .)
+              ASSETS+=("cef-unity-linux-$ARCH.zip")
             fi
           done
           gh release create "$GITHUB_REF_NAME" "${ASSETS[@]}" --generate-notes

@@ -61,26 +61,54 @@ compute_guid() {
 # win-x64 と win-arm64 には同名の dll (libcef.dll 等) が並ぶ。インポーター設定が
 # 無いと Unity が両方を同じプラットフォーム向けと見なして "同名プラグインが複数ある"
 # と衝突扱いにするため、ネイティブ dll には CPU を明示した PluginImporter を書く。
+# Linux の .so も同様に、Windows プラグインと誤認されないよう明示が要る。
 #
 # Editor は x64 のみ有効にする (x64 Editor が ARM64 の dll を掴まないようにするため。
 # ARM64 の Unity Editor で開発する場合はここを見直す必要がある)。
-plugin_cpu_for() {
+#
+# 戻り値は "<Unity プラットフォームキー>:<CPU>"。該当しなければ空文字列。
+# Unity にはデスクトップ Linux arm64 のターゲットが無いため linux-arm64 は扱わない。
+plugin_platform_and_cpu_for() {
     local relative_path="$1"
     case "$relative_path" in
-        */Plugins/win-x64/*.dll) echo "x86_64" ;;
-        */Plugins/win-arm64/*.dll) echo "ARM64" ;;
+        */Plugins/win-x64/*.dll) echo "Win64:x86_64" ;;
+        */Plugins/win-arm64/*.dll) echo "Win64:ARM64" ;;
+        */Plugins/linux-x64/*.so) echo "Linux64:x86_64" ;;
         *) echo "" ;;
     esac
 }
 
 write_plugin_importer() {
-    local cpu="$1"
+    local platform="$1"
+    local cpu="$2"
+
     local editor_enabled=0
     local editor_cpu="None"
+    local editor_os="Windows"
+    local windows_enabled=0
+    local windows_cpu="None"
+    local linux_enabled=0
+    local linux_cpu="None"
+    local exclude_windows=1
+    local exclude_linux=1
+
+    if [ "$platform" = "Linux64" ]; then
+        linux_enabled=1
+        linux_cpu="$cpu"
+        exclude_linux=0
+        editor_os="Linux"
+    else
+        windows_enabled=1
+        windows_cpu="$cpu"
+        exclude_windows=0
+        editor_os="Windows"
+    fi
+
     if [ "$cpu" = "x86_64" ]; then
         editor_enabled=1
         editor_cpu="x86_64"
     fi
+
     cat <<EOF
 PluginImporter:
   externalObjects: {}
@@ -97,20 +125,20 @@ PluginImporter:
       enabled: 0
       settings:
         Exclude Editor: $((1 - editor_enabled))
-        Exclude Linux64: 1
+        Exclude Linux64: $exclude_linux
         Exclude OSXUniversal: 1
         Exclude Win: 1
-        Exclude Win64: 0
+        Exclude Win64: $exclude_windows
     Editor:
       enabled: $editor_enabled
       settings:
         CPU: $editor_cpu
         DefaultValueInitialized: true
-        OS: Windows
+        OS: $editor_os
     Linux64:
-      enabled: 0
+      enabled: $linux_enabled
       settings:
-        CPU: None
+        CPU: $linux_cpu
     OSXUniversal:
       enabled: 0
       settings:
@@ -120,9 +148,9 @@ PluginImporter:
       settings:
         CPU: None
     Win64:
-      enabled: 1
+      enabled: $windows_enabled
       settings:
-        CPU: $cpu
+        CPU: $windows_cpu
   userData:
   assetBundleName:
   assetBundleVariant:
@@ -136,8 +164,8 @@ write_meta() {
     local existing_guid="${2:-}"
     local relative_path="${asset_path#"$unity_project_root/"}"
     local guid="${existing_guid:-$(compute_guid "$relative_path")}"
-    local cpu
-    cpu="$(plugin_cpu_for "$relative_path")"
+    local platform_and_cpu
+    platform_and_cpu="$(plugin_platform_and_cpu_for "$relative_path")"
 
     {
         echo "fileFormatVersion: 2"
@@ -149,8 +177,8 @@ write_meta() {
             echo "  userData: "
             echo "  assetBundleName: "
             echo "  assetBundleVariant: "
-        elif [ -n "$cpu" ]; then
-            write_plugin_importer "$cpu"
+        elif [ -n "$platform_and_cpu" ]; then
+            write_plugin_importer "${platform_and_cpu%%:*}" "${platform_and_cpu##*:}"
         fi
     } >"$asset_path.meta"
 }
@@ -159,7 +187,7 @@ write_meta() {
 needs_plugin_importer() {
     local asset_path="$1"
     local relative_path="${asset_path#"$unity_project_root/"}"
-    [ -n "$(plugin_cpu_for "$relative_path")" ] || return 1
+    [ -n "$(plugin_platform_and_cpu_for "$relative_path")" ] || return 1
     ! grep -q "PluginImporter:" "$asset_path.meta"
 }
 

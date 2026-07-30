@@ -103,9 +103,21 @@ client が使う D3D11 device の取得元は 2 系統ある:
   コピー先 `Plugins/x86_64` が決め打ちで、`win-arm64` を見ない
 - `win-arm64` はクロスビルドのみで実行検証をしていない (CI も x64 ランナー上でビルドするだけ)
 
-#### Linux (x86_64)
+#### Linux
 
-フェーズ 1 時点では **Unity への deploy スクリプトは無い**。Rust 単体と C# Harness までの対応。
+Unity への配置は `deploy-linux.sh` を使う。**x86_64 ホスト専用**で、他アーキでは
+誤配置を防ぐためエラー終了する。
+
+```bash
+bash deploy-linux.sh
+```
+
+成果物は `cef-unity-unityproject/Assets/CefUnity/Plugins/linux-x64/` にフラット配置される
+(`libcef_unity_rust.so`, `cef-unity-server`, `cef-unity-rust-helper`, `libcef.so`,
+各種 `.pak` / `.dat` / `.bin`, `locales/`)。
+
+配置処理は `copy-linux-runtime.sh` に切り出されており、`build-server-sandbox.sh`
+(Harness の出力先) と共有している。
 
 必要な apt パッケージ:
 
@@ -137,10 +149,12 @@ apphost がランタイムを見つけられない場合は `export DOTNET_ROOT=
 
 - **software paint 経路のみ**。GPU ゼロコピー (dmabuf/EGL) は未実装
 - ネイティブ音声出力 (macOS の AudioUnit 経路に相当) は無い。Unity ミキサ経路のみ
-- Unity Editor / Player 対応は未着手
-- フェーズ 1 の実測では command line switch の追加は不要だった (`SMOKE_OK` を確認済み)。
-  ただし検証環境は WSLg (X11 が見える状態) であり、**X11 が無い真のヘッドレス環境は未検証**。
-  その場合は `--ozone-platform=headless` の追加が必要になる可能性がある
+- Unity への配置までは対応済み (`deploy-linux.sh`)。**Editor / Player での動作確認は未着手**
+- **ヘッドレス環境では `--ozone-platform=headless` が必須。** server が Linux ビルドで
+  常時指定している (`crates/server/src/server.rs` の `on_before_command_line_processing`)。
+  指定しないと ozone が X11 バックエンドを選び、`Missing X server or $DISPLAY` で
+  CEF 初期化が失敗する (CI ランナーで実測)。X11 がある WSLg でも headless 指定で
+  問題なく動くため、環境による分岐はしていない
 
 ## サポート対象プラットフォーム
 
@@ -149,7 +163,8 @@ apphost がランタイムを見つけられない場合は `export DOTNET_ROOT=
 | macOS arm64 | GPU ゼロコピー (IOSurface/Mach/Metal) |
 | Windows x64 | GPU ゼロコピー (D3D11/D3D12 共有テクスチャ + 共有 fence)。Editor / プレイヤーとも動作確認済み |
 | Windows arm64 | クロスビルドのみ。**実行未検証**、プレイヤービルド未対応 |
-| Linux x86_64 | software paint のみ。Rust + Harness まで (Unity 未対応) |
+| Linux x86_64 | software paint のみ。Unity 配置あり (`linux-x64`) |
+| Linux arm64 | software paint のみ。**Unity 配置なし** — Unity にデスクトップ Linux arm64 の<br>ターゲットが存在しないため、CI 検証と GitHub Release の zip のみ |
 | macOS x86_64 (Intel Mac) | **サポートしない** |
 
 ### プラットフォーム別の機能対応

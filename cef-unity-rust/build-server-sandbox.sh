@@ -12,39 +12,20 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # --- Linux: バンドル概念が無いのでフラット配置する ---
+# 配置処理は deploy-linux.sh と共有する (copy-windows-runtime.ps1 と同じ構造)。
 # macOS 側の処理 (以降) は変更しない。Linux はここで配置を終えて exit する。
 if [ "$(uname -s)" = "Linux" ]; then
-    # CEF 配布物ディレクトリ。アーキテクチャ名はワイルドカードで受ける
-    # (macOS 側の cef_macos_* と同じ方式。x86_64 / aarch64 の双方で通る)。
-    CEF_DIRECTORY=$(ls -d "$SCRIPT_DIR/target/debug/build/cef-dll-sys-"*/out/cef_linux_* 2>/dev/null | head -1)
-    if [ -z "$CEF_DIRECTORY" ]; then
-        echo "ERROR: CEF build output not found. Run 'cargo build' first."
-        exit 1
-    fi
+    bash "$SCRIPT_DIR/copy-linux-runtime.sh" "$OUTPUT_DIR" debug
 
-    mkdir -p "$OUTPUT_DIR"
-
-    # Rust 成果物。server は client の dylib と同じディレクトリ直下から起動される
-    # (crates/client/src/lib.rs の server_binary_path)。
-    for artifact in cef-unity-server cef-unity-rust-helper; do
-        cp "$SCRIPT_DIR/target/debug/$artifact" "$OUTPUT_DIR/"
+    # 共有スクリプトはソース欠落を警告のみで通す (Rust 未ビルド環境で dotnet build を
+    # 壊さないための方針)。直接叩かれた場合に空の配置で成功と表示しないよう、
+    # ここで必須ファイルを検査する。
+    for required in cef-unity-server cef-unity-rust-helper libcef.so; do
+        if [ ! -f "$OUTPUT_DIR/$required" ]; then
+            echo "ERROR: $required が $OUTPUT_DIR にありません。'cargo build' を先に実行してください。" >&2
+            exit 1
+        fi
     done
-
-    # CEF ランタイム共有ライブラリ (Chromium / Angle / SwiftShader / Vulkan)。
-    # chrome-sandbox は settings.no_sandbox = 1 のため配置しない。
-    for library in libcef.so libEGL.so libGLESv2.so libvk_swiftshader.so libvulkan.so.1; do
-        cp "$CEF_DIRECTORY/$library" "$OUTPUT_DIR/"
-    done
-
-    # リソース (V8 snapshot / ICU / pak / SwiftShader manifest)。
-    # Windows にある snapshot_blob.bin は Linux 配布物には存在しない。
-    for resource in icudtl.dat v8_context_snapshot.bin resources.pak \
-                    chrome_100_percent.pak chrome_200_percent.pak vk_swiftshader_icd.json; do
-        cp "$CEF_DIRECTORY/$resource" "$OUTPUT_DIR/"
-    done
-
-    rm -rf "$OUTPUT_DIR/locales"
-    cp -r "$CEF_DIRECTORY/locales" "$OUTPUT_DIR/locales"
 
     echo "server staged (flat) at $OUTPUT_DIR"
     exit 0
