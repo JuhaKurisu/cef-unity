@@ -94,20 +94,20 @@ namespace CefUnity.Runtime
         // present に乗せる (0F)。待ちの上限は BF#1 (EarlyUpdate) からの経過時間で cap する
         // ため、ゲーム処理が重いフレームでは自動的に待ちゼロになる (その場合 flush 結果は
         // 自然に到着済み)。間に合わなければ従来通り 1F フォールバック。
-        [SerializeField, Tooltip("BF#1 発行からこの時間 (ms) までは flush 結果の到着を待って 0F 化する " +
-            "(0 で待ち無効 = 常にノンブロッキング受信)。60fps 予算 16.7ms 内に収まる 10ms 程度を推奨。")]
+        [SerializeField, Tooltip("BF#1 発行からこの時間 (ms) までは flush 結果の到着を待って 0F 化する。" +
+            "既定 0 = 無効 (常にノンブロッキング受信)。正の値を入れると 0F 化と引き換えに " +
+            "メインスレッドが最大この時間 busy-wait する — 実測では間欠更新ページで実時間の 42.5% を " +
+            "spin に使い CPU が約 25 倍になるため、必要な場面でのみ opt-in すること " +
+            "(docs/HARNESS_MEASUREMENTS.md の #11)。")]
         [FormerlySerializedAs("_zeroFrameWaitMs")]
-        private float _zeroFrameWaitMilliseconds = 10f;
+        private float _zeroFrameWaitMilliseconds = 0f;
         // 待ち判定の状態機械 (定数・streak 推定・プローブ窓は CefZeroFramePacer に集約)。
         private readonly CefZeroFramePacer _pacer = new CefZeroFramePacer();
         // このフレームで CEF へ入力イベントを送ったか (アクティブ判定の即時トリガー)。
         private bool _inputSentThisFrame;
-        // 0F 待ち検証メトリクス
-        private int _doublePumpFreshCount;     // 待ちの後 (or 待ちゼロで) 新 paint を取得できた回数
-        private int _doublePumpFallbackCount;  // デッドラインまでに届かず諦めた回数 (前フレーム内容を継続表示)
-        private int _doublePumpIdleCount;      // 非アクティブで待ちをスキップした回数
-        private double _doublePumpBlockSumMilliseconds;  // recv hook でのブロック時間合計
-        private double _doublePumpBlockMaxMilliseconds;
+        // 0F 待ち検証メトリクス (集計は CefZeroFrameWaitStatistics に集約。待機パス専用の
+        // wait_entered を分母にするため、抑止スキップが block_avg を薄めない)。
+        private readonly CefZeroFrameWaitStatistics _zeroFrameWaitStatistics = new CefZeroFrameWaitStatistics();
 
         // -----------------------------------------------------------------------
         // Jitter 計装 (機構切り分け用)
@@ -204,11 +204,11 @@ namespace CefUnity.Runtime
                     Debug.Log("[CefUnity] VSYNC MODE: vSyncCount=0 (no vsync)");
                 }
 
-                // 開発トグル: cef_no_zero_wait マーカーで 0F 待ちを無効化 (baseline 比較用)。
+                // 開発トグル: cef_zero_wait マーカーで 0F 待ちを有効化 (既定は OFF、A/B 比較用)。
                 // シーンの serialized 値は Editor が外部変更を再読込しないため、既存の開発
                 // トグル群と同じ temp ファイル方式で切り替える。
-                if (System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_no_zero_wait")))
-                    _zeroFrameWaitMilliseconds = 0f;
+                if (System.IO.File.Exists(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "cef_zero_wait")))
+                    _zeroFrameWaitMilliseconds = 10f;
 #endif
 
                 // ログのマスタースイッチ: Unity 側 (CefLog) と Rust 側 (client/server)
@@ -392,17 +392,11 @@ namespace CefUnity.Runtime
                         _recentSamples.Clear();
                     }
 
-                    // 0F 待ち専用メトリクス (fresh=新paint取得 / fallback=届かず1F / idle=待ちスキップ)。
+                    // 0F 待ち専用メトリクス (待ちを有効にしたときだけ出力する)。
                     if (_zeroFrameWaitMilliseconds > 0f && _useAcceleratedPaint)
                     {
-                        var doublePumpActive = _doublePumpFreshCount + _doublePumpFallbackCount;
-                        var blockAverage = doublePumpActive > 0 ? _doublePumpBlockSumMilliseconds / doublePumpActive : 0.0;
-                        CefLog.Log($"[CefUnity] 0F-wait: fresh={_doublePumpFreshCount} fallback(1F)={_doublePumpFallbackCount} idle={_doublePumpIdleCount} block_avg={blockAverage:F2}ms block_max={_doublePumpBlockMaxMilliseconds:F2}ms");
-                        _doublePumpFreshCount = 0;
-                        _doublePumpFallbackCount = 0;
-                        _doublePumpIdleCount = 0;
-                        _doublePumpBlockSumMilliseconds = 0;
-                        _doublePumpBlockMaxMilliseconds = 0;
+                        CefLog.Log($"[CefUnity] 0F-wait: {_zeroFrameWaitStatistics.FormatLine()}");
+                        _zeroFrameWaitStatistics.Reset();
                     }
 
                     // jitter 計装: 機構1 (フレーム時間=present 間隔) と 機構2 (content 更新間隔)。
@@ -565,43 +559,47 @@ namespace CefUnity.Runtime
         }
 
         /// <summary>
-        /// 描画発行前の recv 本体。server-side flush の結果 (accel_frame_id 増分) を
-        /// _zeroFrameWaitMilliseconds (BF#1 からの経過時間 cap) まで待ち、届いた最新 paint を
-        /// 同フレームの present に乗せる (0F)。ゲーム処理が重いフレームではここへの到達が
-        /// 遅く cap を過ぎているため自動的に待ちゼロ (flush 結果は自然に到着済み)。
-        /// デッドラインまでに届かなければ従来通り 1F フォールバック。待ちは SHM カウンタの
-        /// busy-wait のみで IPC を発行しない (旧 client-side double-pump の reflush による
-        /// IPC フラッディング → 46ms ブロック問題は構造的に発生しない)。
+        /// 描画発行前の recv 本体。既定 (_zeroFrameWaitMilliseconds = 0) では待たずに
+        /// ノンブロッキング受信のみを行う (CefUnity.Viewer の CefFrameSource と同じ挙動)。
+        /// 正の値を設定した場合のみ以下の 0F 待ちが有効になる:
+        /// server-side flush の結果 (accel_frame_id 増分) を _zeroFrameWaitMilliseconds
+        /// (BF#1 からの経過時間 cap) まで待ち、届いた最新 paint を同フレームの present に
+        /// 乗せる (0F)。ゲーム処理が重いフレームではここへの到達が遅く cap を過ぎているため
+        /// 自動的に待ちゼロ (flush 結果は自然に到着済み)。デッドラインまでに届かなければ
+        /// 従来通り 1F フォールバック。待ちは SHM カウンタの busy-wait のみで IPC を発行しない
+        /// (旧 client-side double-pump の reflush による IPC フラッディング → 46ms ブロック問題は
+        /// 構造的に発生しない)。
         /// </summary>
         private void ReceiveBeforeRender()
         {
-            // software 経路 / 待ち無効時は従来のノンブロッキング受信のみ。
+            // software 経路 / 待ち無効時 (既定) は従来のノンブロッキング受信のみ。
             if (!_useAcceleratedPaint || _zeroFrameWaitMilliseconds <= 0f)
             {
-                if (TryUpdateTextureOnce()) OnFreshPaint();
-                else OnNoPaint();
+                var receivedWithoutWait = TryUpdateTextureOnce();
+                if (receivedWithoutWait) OnFreshPaint(); else OnNoPaint();
+                _zeroFrameWaitStatistics.RecordNoWaitReceive(receivedWithoutWait);
                 return;
             }
-
-            var blockStart = Time.realtimeSinceStartup;
 
             // プローブ判定 (静止中は待たない)。判定根拠は CefZeroFramePacer 参照。
             if (_pacer.ShouldSkipAsIdle(_inputSentThisFrame))
             {
-                if (TryUpdateTextureOnce()) OnFreshPaint();
-                else OnNoPaint();
-                _doublePumpIdleCount++;
+                var receivedWhileIdle = TryUpdateTextureOnce();
+                if (receivedWhileIdle) OnFreshPaint(); else OnNoPaint();
+                _zeroFrameWaitStatistics.RecordIdleSkip(receivedWhileIdle);
                 return;
             }
 
             // damage streak 抑止推定・連続入力中は待ちスキップ (根拠は CefZeroFramePacer 参照)。
             if (_pacer.ShouldSkipAsSuppressed())
             {
-                if (TryUpdateTextureOnce()) { OnFreshPaint(); _doublePumpFreshCount++; }
-                else { OnNoPaint(); _doublePumpFallbackCount++; }
+                var receivedWhileSuppressed = TryUpdateTextureOnce();
+                if (receivedWhileSuppressed) OnFreshPaint(); else OnNoPaint();
+                _zeroFrameWaitStatistics.RecordSuppressedSkip(receivedWhileSuppressed);
                 return;
             }
 
+            var blockStart = Time.realtimeSinceStartup;
             var window = _pacer.OpenWaitWindow(_zeroFrameWaitMilliseconds);
             while (true)
             {
@@ -616,12 +614,10 @@ namespace CefUnity.Runtime
 
             // 増分で抜けた場合はその paint を、デッドライン切れでも直前に届いた分があれば拾う
             // (TryReceive は queue を drain して最新を返すため、どちらでも最新が取れる)。
-            if (TryUpdateTextureOnce()) { OnFreshPaint(); _doublePumpFreshCount++; }
-            else { OnNoPaint(); _doublePumpFallbackCount++; }
-
-            var blockMilliseconds = (Time.realtimeSinceStartup - blockStart) * 1000.0;
-            _doublePumpBlockSumMilliseconds += blockMilliseconds;
-            if (blockMilliseconds > _doublePumpBlockMaxMilliseconds) _doublePumpBlockMaxMilliseconds = blockMilliseconds;
+            var receivedAfterWait = TryUpdateTextureOnce();
+            if (receivedAfterWait) OnFreshPaint(); else OnNoPaint();
+            _zeroFrameWaitStatistics.RecordWaitCompleted(
+                receivedAfterWait, (Time.realtimeSinceStartup - blockStart) * 1000.0);
         }
 
         /// <summary>recv 成功時の共通処理 (verify 計装 + activity/streak カウンタ更新)。</summary>
