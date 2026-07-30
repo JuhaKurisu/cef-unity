@@ -202,8 +202,11 @@ Unity 側 `ReceiveBeforeRender` を harness へ忠実移植（判定は同一の
 | rAF 毎フレーム・競合なし・ON | **0** | 0% | 33ms/s | 0% | 60.0 |
 | rAF・GPU+CPU 競合・ON | 1〜28 | 5〜22% | 20〜139ms/s | **0.9%** | 46〜50 |
 | rAF・競合・OFF | 0 | 0% | 15〜37ms/s | 0% | 46〜50 |
-| **5Hz 間欠・競合なし・ON** | **60（全フレーム）** | **42.5%** | **423ms/s** | **69%** | 5.2 |
+| **5Hz 間欠・競合なし・ON** | **60（全フレーム）** | **42.5%** | **423ms/s** | **69%※** | 5.2 |
 | 5Hz 間欠・競合なし・OFF | 0 | 0% | 9〜25ms/s | 0% | 5.2 |
+
+※単一サンプル（1 回のみの計測）。後述「修正後」節の A/B 検証で 20.9〜56.3%（平均 33.4〜42.9%）まで
+ばらつくことが判明しており、単一の 69% ではなくこの分布として扱うべきである。
 
 - 健常な連続アニメーション中は抑止パスが常に効き、**spin はゼロ**
 - 発動するのは paint を取り逃し始めた時だけで、**その状態では 0F 達成 0.9%**（効かない時に限って発動する）
@@ -222,6 +225,15 @@ Unity 側 `ReceiveBeforeRender` を harness へ忠実移植（判定は同一の
 `cef_no_zero_wait`→`cef_zero_wait` に反転、計装カウンタを `CefZeroFrameWaitStatistics`
 (`CefUnity.Core/Scroll/`) として恒久化し `block_avg` の分母を「実際に待機へ入った回数
 (`wait_entered`)」に統一した。
+
+**既知の制限（serialized 値による既定値の無効化）**: この既定値の変更は新規に追加した
+コンポーネントにのみ効く。フィールドには `[FormerlySerializedAs("_zeroFrameWaitMs")]` が付いて
+おり、既存の scene/prefab に `_zeroFrameWaitMs`（または `_zeroFrameWaitMilliseconds`）が
+保存されている場合は serialized 値が優先されるため、初期化子の `0f` は上書きされる。
+アップグレード時は Inspector で明示的に 0 へ変更する必要がある。既知の該当例:
+moorestech `MainGameUI.prefab` に `_zeroFrameWaitMs: 10` が保存済み
+（`docs/MOORESTECH_PR1097_VERIFICATION.md:42`）。つまり主要な下流消費者ではこの opt-in 化の
+効果がそのままでは 0 になる。
 
 `CefUnity.Harness zero-frame-wait` で Unity と同じ `CefZeroFramePacer` /
 `CefZeroFrameWaitStatistics` を使い、既定 OFF と opt-in ON を再計測した
@@ -243,6 +255,9 @@ Unity 側 `ReceiveBeforeRender` を harness へ忠実移植（判定は同一の
   opt-in 経路そのものは壊れていない
 - **`zero_frame_share`（0F 達成率）は 4 回で 36.0% / 40.7% / 56.3% / 38.4%（平均 42.9%）と
   試行ごとに大きくばらつき、旧基準の 69% には毎回届かなかった。**
+- **load average の但し書き**: 実装後 4 回目 (`zero_frame_share=38.4%`) は計測直前の `uptime` が
+  load average 5.62 で、計測手順の上限（5 未満）を超過していた。ただし `wait_entered`・
+  `spin_share`・`block_avg` は他 3 回と一致していたため、この試行を除外していない
 - **paint 供給の回帰確認**（`paint-statistics 20 1920 1080 animation`）: `received` 中央値
   61/s（`received_min=58` を除き概ね 60〜61）、`gpu_verified=1306` に対し `gpu_torn=0` /
   `gpu_rollback=0` で回帰なし。`BeginFrame→paint latency` はサーバーログ実測で
@@ -250,6 +265,22 @@ Unity 側 `ReceiveBeforeRender` を harness へ忠実移植（判定は同一の
 - **ライフサイクルの回帰確認**（`lifecycle 5`）: 5/5 サイクル完走、`mach_ports` は
   70→72→73→74→75（+2, +1, +1, +1）で #10 の既知水準（+1〜2/サイクル）から悪化なし、
   `server_processes_final=0`
+
+**戻し方と代償**: 0F 待ちが必要な場面では以下のいずれかで opt-in できる。
+①Inspector で `_zeroFrameWaitMilliseconds` に正の値（旧既定は `10`）を入れる。
+②開発ビルド限定 (`#if CEF_UNITY_DEV_TOOLS && (UNITY_EDITOR || DEVELOPMENT_BUILD)` 配下、
+リリースビルドでは効かない) で `$TMPDIR/cef_zero_wait` にマーカーファイルを置く。
+③戻さない場合（既定 OFF のまま）の代償: 5Hz 級の間欠更新ページで最大 16.7ms（1 フレーム分）の
+追加遅延が生じる。ただし `received/s` とフレーム間ギャップは ON/OFF で不変なので、コマ落ちや
+供給量そのものの劣化は起きない。
+
+**server-side flush の位置づけメモ**: 既定 OFF ではクライアントが flush 結果の到着を待たなく
+なるため、server-side flush（server.rs の BF#1 +3/+6ms 内部 flush）由来の paint は同フレームの
+present には乗らず、次フレームの受信で拾われる。つまり「0F 化」自体の効果は既定では消え、
+残るのは「次フレームの内容が数 ms 新しい」という効果だけになる（実測では received/s・paints/s
+とも ON/OFF で不変であり、コストが増えた証拠もない）。残作業 7 番の「次の一手 = サーバーからの
+damage なし通知」と併せて、server-side flush の存在意義そのものも opt-in 化後の構成でどこまで
+必要かを再評価する必要がある。
 
 #### A/B: 実装前 (commit `0ed5391`) の harness との比較（2026-07-31 追加検証）
 

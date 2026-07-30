@@ -392,12 +392,15 @@ namespace CefUnity.Runtime
                         _recentSamples.Clear();
                     }
 
-                    // 0F 待ち専用メトリクス (待ちを有効にしたときだけ出力する)。
+                    // 0F 待ち専用メトリクス (ログ出力は待ちを有効にしたときだけだが、Reset() は
+                    // 既定 OFF でも毎窓必ず呼ぶ。if の内側に置くと待ち無効時は RecordNoWaitReceive
+                    // が窓をまたいで加算され続け、途中で有効化した瞬間の 1 行目で
+                    // 「2 軸の合計 = 窓のフレーム数」という不変条件が崩れる)。
                     if (_zeroFrameWaitMilliseconds > 0f && _useAcceleratedPaint)
                     {
                         CefLog.Log($"[CefUnity] 0F-wait: {_zeroFrameWaitStatistics.FormatLine()}");
-                        _zeroFrameWaitStatistics.Reset();
                     }
+                    _zeroFrameWaitStatistics.Reset();
 
                     // jitter 計装: 機構1 (フレーム時間=present 間隔) と 機構2 (content 更新間隔)。
                     // 0F 待ち ON/OFF どちらでも出力して比較できるようにする。

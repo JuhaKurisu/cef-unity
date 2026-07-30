@@ -39,6 +39,21 @@ namespace CefUnity.Runtime.Tests
         }
 
         [Test]
+        public void RecordWaitCompleted_DoesNotLowerSpinMaximumWhenLaterCallIsSmaller()
+        {
+            // BlockAverage_UsesWaitEnteredCountAsDenominator は「後の呼び出しの方が大きい」
+            // (6.0 → 8.0) 側しか踏まないため、逆方向 (8.0 → 6.0、最大値を更新しない分岐) も踏む。
+            var statistics = new CefZeroFrameWaitStatistics();
+            statistics.RecordWaitCompleted(receivedFreshPaint: true, spinMilliseconds: 8.0);
+            statistics.RecordWaitCompleted(receivedFreshPaint: false, spinMilliseconds: 6.0);
+
+            Assert.AreEqual(2, statistics.WaitEnteredCount);
+            Assert.AreEqual(14.0, statistics.SpinTotalMilliseconds, 1e-9);
+            Assert.AreEqual(8.0, statistics.SpinMaximumMilliseconds, 1e-9,
+                "後の呼び出しが小さくても最大値は下がらない");
+        }
+
+        [Test]
         public void BlockAverage_IsNotDilutedBySuppressedSkips()
         {
             // 実測条件の再現: 60 フレーム中 42 が抑止スキップ、18 が実待機で 1 回 7ms。
@@ -95,6 +110,22 @@ namespace CefUnity.Runtime.Tests
             Assert.AreEqual(9.0, totals.SpinMaximumMilliseconds, 1e-9, "最大値は大きい方が残る");
             Assert.AreEqual(2, totals.FreshCount);
             Assert.AreEqual(1, totals.FallbackCount);
+        }
+
+        [Test]
+        public void Add_AdoptsWindowMaximumWhenItExceedsTotals()
+        {
+            // Add_AccumulatesWindowsIntoTotals は totals(9.0) > window(4.0) の false 側しか
+            // 踏まないため、逆方向 (window の方が大きく totals を更新する true 側) も踏む。
+            var window = new CefZeroFrameWaitStatistics();
+            window.RecordWaitCompleted(receivedFreshPaint: true, spinMilliseconds: 12.0);
+
+            var totals = new CefZeroFrameWaitStatistics();
+            totals.RecordWaitCompleted(receivedFreshPaint: true, spinMilliseconds: 5.0);
+            totals.Add(window);
+
+            Assert.AreEqual(12.0, totals.SpinMaximumMilliseconds, 1e-9,
+                "window の最大値が totals を上回るときは totals 側を更新する");
         }
 
         [Test]
