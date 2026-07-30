@@ -41,7 +41,7 @@ server 側のトグル（すべて環境変数）:
 | #8 P0 shutdown が server を回収しない | ✅ | 競合下で **5 サイクル中 2 回**、Shutdown 復帰後も server が存命 |
 | #9 P1 server が親の FD を継承する | ✅ (条件付き) | CLOEXEC を外した LISTEN ソケットが同一 fd 番号で server に出現 |
 | #10 P1 Mach port / キャッシュのリーク | ✅ | Mach port が **+1〜2/サイクル**で単調増加、surface キャッシュは上限 4 まで蓄積 |
-| #11 P1 メインスレッドの busy-wait | ✅ | 間欠ページで spin が実時間の **42.5%**・CPU 約 25 倍、0F 達成 69% |
+| #11 P1 メインスレッドの busy-wait | ✅ **修正済** | 既定 OFF 化で spin 0%、opt-in 時のみ従来動作 (間欠ページで spin **42.4%**・CPU 約 25 倍) |
 | #12 P1 1000Hz 固定 pump | ✅ | 間隔 1→16ms で **paint 60/s・レイテンシ・0F 達成率は不変**、CPU 120→85ms/s |
 | #13 P2 BeginFrame の burst drain | △ 部分的 | 競合下でも burst 最大 **1〜4**。規模は pump 停止時間に比例するので #7 の下流 |
 | #14 P2 dirty rect 未使用 | ✅ | 小 damage ページで damage 面積は転送面積の **0.0〜3.3%** |
@@ -216,6 +216,45 @@ Unity 側 `ReceiveBeforeRender` を harness へ忠実移植（判定は同一の
 サーバーが「このフレームは damage なし」を shm に 1 ビット書けば即座に抜けられるので、
 #11 は「廃止」ではなく「サーバーからの damage 通知 + opt-in」に落とせる。
 
+### 修正後 (2026-07-31)
+
+修正内容: Unity `_zeroFrameWaitMilliseconds` の既定を `10f`→`0f` にして opt-in 化、開発トグルを
+`cef_no_zero_wait`→`cef_zero_wait` に反転、計装カウンタを `CefZeroFrameWaitStatistics`
+(`CefUnity.Core/Scroll/`) として恒久化し `block_avg` の分母を「実際に待機へ入った回数
+(`wait_entered`)」に統一した。
+
+`CefUnity.Harness zero-frame-wait` で Unity と同じ `CefZeroFramePacer` /
+`CefZeroFrameWaitStatistics` を使い、既定 OFF と opt-in ON を再計測した
+(load average 2.1〜6.5、5Hz 間欠ページ、各 20 秒 = 有効窓 17 秒):
+
+| 条件 | wait_entered/s | spin_share | block_avg (wait_entered 分母) | 0F 達成率 | received/s |
+|---|---|---|---|---|---|
+| 既定 OFF (`zeroFrameWaitMilliseconds=0`) | **0.0** | **0.0%** | 0.00ms | 0.0% | 5.1 |
+| opt-in ON (`=10`、1 回目) | 60.6 | 42.4% | 6.99ms | 36.0% | 5.1 |
+| opt-in ON (`=10`、2 回目) | 60.6 | 42.4% | 7.00ms | 40.7% | 5.1 |
+
+- **既定 OFF**: `wait_entered_per_second=0.0` / `spin_share=0.0%`、各窓の `no_wait` がほぼ全数
+  (60〜61/61) になり、busy-wait が既定で消えたことを実行時証拠として確認した
+- **opt-in ON**: `wait_entered_per_second` / `spin_share` / `block_avg` / `process_cpu`
+  (~420〜430ms/s) は旧実測 (wait_entered 60・spin 42.5%・cpu 423ms/s) とほぼ一致し、
+  opt-in 経路そのものは壊れていない
+- **`zero_frame_share`（0F 達成率）は 36.0%・40.7% で、旧基準の 69% から低下した。**
+  ただし今回のリファクタは `delay_0F`/`delay_1F` の判定コード
+  (`ZeroFrameWaitCommand.Receive()`) を一切変更していない（diff で確認済み）。
+  旧基準（commit `969a6bf`, 2026-07-30 21:49）は issue #7 の非同期コピー化
+  （commit `6316c57`, 2026-07-31 01:13）より前の計測であり、#7 の修正（blit の完了を
+  completion handler へ非同期化したことで paint の実配達が 1 tick 遅れる方向に働く）が
+  frame delay の分布を動かした可能性が高い。**#11 の opt-in 化そのものが 0F 達成率を
+  悪化させたという証拠ではない**が、opt-in を再度 ON にする効果を語るときは今回の
+  36〜41% を基準にすべきで、69% は #7 修正前の値である点に注意
+- **paint 供給の回帰確認**（`paint-statistics 20 1920 1080 animation`）: `received` 中央値
+  61/s（`received_min=58` を除き概ね 60〜61）、`gpu_verified=1306` に対し `gpu_torn=0` /
+  `gpu_rollback=0` で回帰なし。`BeginFrame→paint latency` はサーバーログ実測で
+  平均 4.36ms（n=21 窓の平均、期待 3〜4ms よりわずかに高いが #12 記載の 3.67ms と同水準）
+- **ライフサイクルの回帰確認**（`lifecycle 5`）: 5/5 サイクル完走、`mach_ports` は
+  70→72→73→74→75（+2, +1, +1, +1）で #10 の既知水準（+1〜2/サイクル）から悪化なし、
+  `server_processes_final=0`
+
 ## #12 — 1000Hz 固定 message pump
 
 `CEF_UNITY_PUMP_INTERVAL_MILLISECONDS` で fallback 間隔を変えて比較（CEF 要求駆動 `schedule_pump` は常に併存）。
@@ -287,8 +326,10 @@ moorestech レポートの「dirty rect 面積は 2〜4%」は再現し、実際
 5. **#8**: 500ms 固定 sleep → 期限付き待ち + `kill` + `Drop`。検証は `lifecycle` で 5/5 サイクル 0
 6. **#12**: one-shot timer 化。回帰確認（paints 60/s・レイテンシ・0F 達成率が不変、CPU が下がる）は
    harness で自動化済み
-7. **#11**: まずカウンタ分離 + 既定 `_zeroFrameWaitMilliseconds = 0`（opt-in 化）。手調整の塊なので
-   一気にやらない。0F を取り戻すなら後から「サーバー側の damage なし通知」を足す
+7. ~~**#11**~~ **完了**（2026-07-31）: カウンタ分離 (`CefZeroFrameWaitStatistics`) + 既定
+   `_zeroFrameWaitMilliseconds = 0`（opt-in 化、開発トグル `cef_zero_wait`）で spin を既定 0 にした。
+   0F を取り戻すなら次の一手として「サーバー側の damage なし通知」（#11 セクション参照）が
+   残っている。未着手
 8. **#9**: 先に Unity 実機で `lsof -p <server_pid> | grep <ゲームサーバーのポート>` を 1 回。
    **測る前に直さない**
 9. **#14**: 棚上げ（P3 相当）
