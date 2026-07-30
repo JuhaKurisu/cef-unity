@@ -69,9 +69,18 @@ fn tick(state: &mut ServerState) {
 }
 
 fn drain_commands(state: &mut ServerState) {
+    let mut command_count: u64 = 0;
+    let mut begin_frame_count: u64 = 0;
     loop {
         match state.command_receiver.try_recv() {
             Ok(envelope) => {
+                command_count += 1;
+                if matches!(
+                    envelope.command,
+                    cef_unity_ipc::Command::SendExternalBeginFrame { .. }
+                ) {
+                    begin_frame_count += 1;
+                }
                 let is_shutdown = matches!(envelope.command, cef_unity_ipc::Command::Shutdown);
                 if envelope.expects_response {
                     log(&format!("received command: {:?}", envelope.command));
@@ -97,4 +106,5 @@ fn drain_commands(state: &mut ServerState) {
             }
         }
     }
+    crate::server::record_drain_burst(command_count, begin_frame_count);
 }

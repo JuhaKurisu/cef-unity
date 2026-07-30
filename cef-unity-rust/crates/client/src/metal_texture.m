@@ -326,6 +326,33 @@ int cef_unity_verify_last_iosurface_gpu_objc(uint32_t* out_pixels, int32_t count
     return count;
 }
 
+/// 診断専用 (issue #10): このプロセスが保持している Mach port 名の総数を返す。
+/// connect 毎に receive port が増えていくリークを外部ツール無しで観測するため。
+int cef_unity_debug_mach_port_count_objc(void) {
+    mach_port_name_array_t names = NULL;
+    mach_msg_type_number_t name_count = 0;
+    mach_port_type_array_t types = NULL;
+    mach_msg_type_number_t type_count = 0;
+    if (mach_port_names(mach_task_self(), &names, &name_count, &types, &type_count)
+            != KERN_SUCCESS) {
+        return -1;
+    }
+    int result = (int)name_count;
+    if (names) vm_deallocate(mach_task_self(), (vm_address_t)names,
+                             name_count * sizeof(mach_port_name_t));
+    if (types) vm_deallocate(mach_task_self(), (vm_address_t)types,
+                             type_count * sizeof(mach_port_type_t));
+    return result;
+}
+
+/// 診断専用 (issue #10): 受信ポートと surface キャッシュの現在値を返す。
+/// receive_port が connect 毎に変わり、古いポートが解放されていないことを見るため。
+int cef_unity_debug_iosurface_state_objc(uint32_t* out_receive_port, int32_t* out_cache_count) {
+    if (out_receive_port) *out_receive_port = (uint32_t)g_receive_port;
+    if (out_cache_count) *out_cache_count = _surfaceCacheCount;
+    return 1;
+}
+
 // ---------------------------------------------------------------------------
 // Legacy IOSurfaceLookup (kept for backward compat, broken on macOS 16)
 // ---------------------------------------------------------------------------

@@ -1649,6 +1649,12 @@ unsafe extern "C" {
 
     fn cef_unity_verify_last_iosurface_gpu_objc(out_pixels: *mut u32, count: i32) -> i32;
 
+    fn cef_unity_debug_mach_port_count_objc() -> i32;
+    fn cef_unity_debug_iosurface_state_objc(
+        out_receive_port: *mut u32,
+        out_cache_count: *mut i32,
+    ) -> i32;
+
 }
 
 /// Check if a new accelerated paint frame is available via IOSurface.
@@ -1759,6 +1765,42 @@ pub extern "C" fn cef_unity_verify_iosurface_pixels_gpu(out_pixels: *mut u32, co
         }
         #[cfg(not(target_os = "macos"))]
         {
+            0
+        }
+    })
+}
+
+/// 診断専用 (issue #10): このプロセスが保持している Mach port 名の総数を返す。
+/// Initialize/Shutdown を繰り返したときの単調増加 (リーク) を観測するために使う。
+/// macOS 以外・取得失敗時は -1。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_debug_mach_port_count() -> i32 {
+    ffi_guard(-1, || {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe { cef_unity_debug_mach_port_count_objc() }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            -1
+        }
+    })
+}
+
+/// 診断専用 (issue #10): 現在の Mach 受信ポート番号と surface キャッシュ数を返す。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_debug_iosurface_state(
+    out_receive_port: *mut u32,
+    out_cache_count: *mut i32,
+) -> i32 {
+    ffi_guard(0, || {
+        #[cfg(target_os = "macos")]
+        {
+            unsafe { cef_unity_debug_iosurface_state_objc(out_receive_port, out_cache_count) }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (out_receive_port, out_cache_count);
             0
         }
     })

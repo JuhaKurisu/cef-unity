@@ -496,6 +496,27 @@ namespace CefUnity.Interop
         }
 
         /// <summary>
+        ///     診断専用 (issue #10): このプロセスが保持している Mach port 名の総数。
+        ///     Initialize/Shutdown の繰り返しで単調増加すればリークの証拠になる。
+        /// </summary>
+        public static int DebugMachPortCount()
+        {
+            return NativeMethods.cef_unity_debug_mach_port_count();
+        }
+
+        /// <summary>
+        ///     診断専用 (issue #10): 現在の Mach 受信ポート番号と surface キャッシュ数。
+        /// </summary>
+        public static unsafe void DebugIOSurfaceState(out uint receivePort, out int cacheCount)
+        {
+            uint nativeReceivePort;
+            int nativeCacheCount;
+            NativeMethods.cef_unity_debug_iosurface_state(&nativeReceivePort, &nativeCacheCount);
+            receivePort = nativeReceivePort;
+            cacheCount = nativeCacheCount;
+        }
+
+        /// <summary>
         ///     Mach IOSurface port チャネルが接続済みかどうかを返す。
         /// </summary>
         public static bool IsIOSurfaceConnected()

@@ -195,6 +195,55 @@ static COPY_WAIT_MAX_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
 static SEND_WAIT_TOTAL_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
 static SEND_WAIT_MAX_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
 
+// issue #14: dirty rect の面積が転送面積のどれだけかを測る (全面コピーの無駄の定量)。
+static DAMAGE_AREA_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SURFACE_AREA_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+// issue #13: 1 tick で drain したコマンド数と、そのうち BeginFrame の数のバースト最大。
+static DRAIN_MAX_BURST: AtomicU64 = AtomicU64::new(0);
+static DRAIN_MAX_BEGIN_FRAME_BURST: AtomicU64 = AtomicU64::new(0);
+static DRAIN_BEGIN_FRAME_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// event loop から 1 tick 分の drain 結果を記録する (issue #13 の計測)。
+pub fn record_drain_burst(command_count: u64, begin_frame_count: u64) {
+    if !paint_statistics_enabled() {
+        return;
+    }
+    DRAIN_MAX_BURST.fetch_max(command_count, Ordering::Relaxed);
+    DRAIN_MAX_BEGIN_FRAME_BURST.fetch_max(begin_frame_count, Ordering::Relaxed);
+    DRAIN_BEGIN_FRAME_TOTAL.fetch_add(begin_frame_count, Ordering::Relaxed);
+}
+
+/// プロセスの CPU 時間 (user + sys) をミリ秒で返す。issue #12 の 1000Hz pump の
+/// コストを測るために使う。
+fn process_cpu_milliseconds() -> u64 {
+    #[repr(C)]
+    struct TimeValue {
+        seconds: i64,
+        microseconds: i32,
+    }
+    #[repr(C)]
+    struct ResourceUsage {
+        user_time: TimeValue,
+        system_time: TimeValue,
+        rest: [u64; 30],
+    }
+    unsafe extern "C" {
+        fn getrusage(who: i32, usage: *mut ResourceUsage) -> i32;
+    }
+    let mut usage = ResourceUsage {
+        user_time: TimeValue { seconds: 0, microseconds: 0 },
+        system_time: TimeValue { seconds: 0, microseconds: 0 },
+        rest: [0; 30],
+    };
+    if unsafe { getrusage(0, &mut usage) } != 0 {
+        return 0;
+    }
+    let user = usage.user_time.seconds as u64 * 1000 + usage.user_time.microseconds as u64 / 1000;
+    let system = usage.system_time.seconds as u64 * 1000 + usage.system_time.microseconds as u64 / 1000;
+    user + system
+}
+
 /// 統計を有効化するか (= ログ有効か) を返す。
 fn paint_statistics_enabled() -> bool {
     LOG_ENABLED.load(Ordering::Relaxed)
@@ -311,6 +360,7 @@ struct PaintStatisticsWindow {
     started_at: Instant,
     pump_count_at_start: u64,
     paint_count_at_start: u64,
+    cpu_milliseconds_at_start: u64,
 }
 
 static PAINT_STATISTICS_WINDOW: Mutex<Option<PaintStatisticsWindow>> = Mutex::new(None);
@@ -327,6 +377,7 @@ pub fn report_paint_statistics(pump_count: u64) {
         started_at: Instant::now(),
         pump_count_at_start: pump_count,
         paint_count_at_start: PAINT_COUNT.load(Ordering::Relaxed),
+        cpu_milliseconds_at_start: process_cpu_milliseconds(),
     });
     let elapsed = window.started_at.elapsed();
     if elapsed.as_millis() < 1000 {
@@ -342,17 +393,32 @@ pub fn report_paint_statistics(pump_count: u64) {
     let copy_wait_max = COPY_WAIT_MAX_MICROSECONDS.swap(0, Ordering::Relaxed);
     let send_wait_total = SEND_WAIT_TOTAL_MICROSECONDS.swap(0, Ordering::Relaxed);
     let send_wait_max = SEND_WAIT_MAX_MICROSECONDS.swap(0, Ordering::Relaxed);
+    let cpu_milliseconds_now = process_cpu_milliseconds();
+    let cpu_milliseconds = cpu_milliseconds_now.saturating_sub(window.cpu_milliseconds_at_start);
+    let damage_area = DAMAGE_AREA_TOTAL.swap(0, Ordering::Relaxed);
+    let surface_area = SURFACE_AREA_TOTAL.swap(0, Ordering::Relaxed);
+    let damage_ratio = if surface_area > 0 {
+        damage_area as f64 / surface_area as f64 * 100.0
+    } else {
+        0.0
+    };
+    let drain_max_burst = DRAIN_MAX_BURST.swap(0, Ordering::Relaxed);
+    let drain_max_begin_frame_burst = DRAIN_MAX_BEGIN_FRAME_BURST.swap(0, Ordering::Relaxed);
+    let drain_begin_frames = DRAIN_BEGIN_FRAME_TOTAL.swap(0, Ordering::Relaxed);
     *window = PaintStatisticsWindow {
         started_at: Instant::now(),
         pump_count_at_start: pump_count,
         paint_count_at_start: paint_count,
+        cpu_milliseconds_at_start: cpu_milliseconds_now,
     };
     drop(guard);
 
     log(&format!(
         "STATISTICS tick_thread={:?} mode={} window={}ms pump_ticks={} paints={} copies={} dropped={} \
          copy_wait_total={}.{:03}ms copy_wait_max={}.{:03}ms \
-         send_wait_total={}.{:03}ms send_wait_max={}.{:03}ms",
+         send_wait_total={}.{:03}ms send_wait_max={}.{:03}ms \
+         cpu={}ms damage_ratio={:.1}% \
+         drain_max={} begin_frame_drained={} begin_frame_burst_max={}",
         std::thread::current().id(),
         if use_async_copy() {
             "async"
@@ -370,6 +436,11 @@ pub fn report_paint_statistics(pump_count: u64) {
         copy_wait_max / 1000, copy_wait_max % 1000,
         send_wait_total / 1000, send_wait_total % 1000,
         send_wait_max / 1000, send_wait_max % 1000,
+        cpu_milliseconds,
+        damage_ratio,
+        drain_max_burst,
+        drain_begin_frames,
+        drain_max_begin_frame_burst,
     ));
 }
 
@@ -504,6 +575,21 @@ wrap_render_handler! {
                 let io_surface = info.shared_texture_io_surface;
                 if io_surface.is_null() {
                     return;
+                }
+                // issue #14: 実際に damage している面積を記録する (コピーは常に全面)。
+                if paint_statistics_enabled() {
+                    let damage: u64 = _dirty_rects
+                        .map(|rects| {
+                            rects
+                                .iter()
+                                .map(|rect| (rect.width as u64) * (rect.height as u64))
+                                .sum()
+                        })
+                        .unwrap_or(0);
+                    let surface = (info.extra.coded_size.width as u64)
+                        * (info.extra.coded_size.height as u64);
+                    DAMAGE_AREA_TOTAL.fetch_add(damage, Ordering::Relaxed);
+                    SURFACE_AREA_TOTAL.fetch_add(surface, Ordering::Relaxed);
                 }
                 let width = info.extra.coded_size.width as u32;
                 let height = info.extra.coded_size.height as u32;

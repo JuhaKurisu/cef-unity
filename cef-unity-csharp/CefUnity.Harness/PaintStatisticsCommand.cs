@@ -42,17 +42,41 @@ internal static class PaintStatisticsCommand
         </body>
         """;
 
-    public static int Run(int durationSeconds, int viewportWidth = 1280, int viewportHeight = 720)
+    /// <summary>
+    ///     進捗バー相当の小さな領域だけを毎フレーム更新するページ (issue #14 用)。
+    ///     dirty rect 面積が転送面積のごく一部になる条件を作る。
+    /// </summary>
+    private const string SmallDamageHtml = """
+        <!doctype html><meta charset="utf-8">
+        <body style="margin:0;overflow:hidden;background:#111">
+        <div id="bar" style="position:absolute;left:0;top:0;height:8px;width:0;background:#4af"></div>
+        <script>
+        let step = 0;
+        const bar = document.getElementById('bar');
+        function frame() {
+            step = (step + 1) % 400;
+            bar.style.width = step + 'px';
+            requestAnimationFrame(frame);
+        }
+        requestAnimationFrame(frame);
+        </script>
+        </body>
+        """;
+
+    public static int Run(int durationSeconds, int viewportWidth = 1280, int viewportHeight = 720,
+                          string pageMode = "animation")
     {
-        var pagePath = Path.Combine(Path.GetTempPath(), "cef_unity_paint_statistics.html");
-        File.WriteAllText(pagePath, AnimationHtml);
+        var smallDamage = pageMode == "small-damage";
+        var pagePath = Path.Combine(Path.GetTempPath(),
+            smallDamage ? "cef_unity_paint_small_damage.html" : "cef_unity_paint_statistics.html");
+        File.WriteAllText(pagePath, smallDamage ? SmallDamageHtml : AnimationHtml);
         var url = new Uri(pagePath).AbsoluteUri;
 
         CefRuntime.Initialize(useGpu: true, enableLog: true);
         try
         {
             using var browser = new Browser(viewportWidth, viewportHeight, url);
-            Console.WriteLine($"viewport={viewportWidth}x{viewportHeight}");
+            Console.WriteLine($"viewport={viewportWidth}x{viewportHeight} page={pageMode}");
 
             // ページのロードと GPU 経路の接続を待つ (2 秒相当)。
             var beginFrameIndex = 0UL;
