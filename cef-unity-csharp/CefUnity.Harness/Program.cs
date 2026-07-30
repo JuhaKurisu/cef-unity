@@ -59,6 +59,16 @@ if (command == "paint-statistics")
     var viewportHeight = args.Length > 3 && int.TryParse(args[3], out var parsedHeight) ? parsedHeight : 720;
     return CefUnity.Harness.PaintStatisticsCommand.Run(durationSeconds, viewportWidth, viewportHeight);
 }
+if (command == "zero-frame-wait")
+{
+    // usage: zero-frame-wait [seconds] [zeroFrameWaitMilliseconds] [width] [height] [animation|intermittent]
+    var durationSeconds = args.Length > 1 && int.TryParse(args[1], out var waitSeconds) ? waitSeconds : 20;
+    var zeroFrameWaitMilliseconds = args.Length > 2 && float.TryParse(args[2], out var parsedWait) ? parsedWait : 10f;
+    var width = args.Length > 3 && int.TryParse(args[3], out var parsedW) ? parsedW : 1920;
+    var height = args.Length > 4 && int.TryParse(args[4], out var parsedH) ? parsedH : 1080;
+    var pageMode = args.Length > 5 ? args[5] : "animation";
+    return CefUnity.Harness.ZeroFrameWaitCommand.Run(durationSeconds, zeroFrameWaitMilliseconds, width, height, pageMode);
+}
 if (command == "replay")
 {
     if (args.Length < 2) { Console.Error.WriteLine("usage: replay <recording-csv>"); return 2; }
