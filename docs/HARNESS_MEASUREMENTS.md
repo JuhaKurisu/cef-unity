@@ -232,21 +232,52 @@ Unity 側 `ReceiveBeforeRender` を harness へ忠実移植（判定は同一の
 | 既定 OFF (`zeroFrameWaitMilliseconds=0`) | **0.0** | **0.0%** | 0.00ms | 0.0% | 5.1 |
 | opt-in ON (`=10`、1 回目) | 60.6 | 42.4% | 6.99ms | 36.0% | 5.1 |
 | opt-in ON (`=10`、2 回目) | 60.6 | 42.4% | 7.00ms | 40.7% | 5.1 |
+| opt-in ON (`=10`、3 回目) | 60.8 | 42.5% | 7.00ms | 56.3% | 5.1 |
+| opt-in ON (`=10`、4 回目) | 60.7 | 42.5% | 6.99ms | 38.4% | 5.1 |
 
 - **既定 OFF**: `wait_entered_per_second=0.0` / `spin_share=0.0%`、各窓の `no_wait` がほぼ全数
   (60〜61/61) になり、busy-wait が既定で消えたことを実行時証拠として確認した
-- **opt-in ON**: `wait_entered_per_second` / `spin_share` / `block_avg` / `process_cpu`
-  (~420〜430ms/s) は旧実測 (wait_entered 60・spin 42.5%・cpu 423ms/s) とほぼ一致し、
-  opt-in 経路そのものは壊れていない
-- **`zero_frame_share`（0F 達成率）は 36.0%・40.7% で、旧基準の 69% から低下した。**
-  ただし今回のリファクタは `delay_0F`/`delay_1F` の判定コード
-  (`ZeroFrameWaitCommand.Receive()`) を一切変更していない（diff で確認済み）。
-  旧基準（commit `969a6bf`, 2026-07-30 21:49）は issue #7 の非同期コピー化
-  （commit `6316c57`, 2026-07-31 01:13）より前の計測であり、#7 の修正（blit の完了を
-  completion handler へ非同期化したことで paint の実配達が 1 tick 遅れる方向に働く）が
-  frame delay の分布を動かした可能性が高い。**#11 の opt-in 化そのものが 0F 達成率を
-  悪化させたという証拠ではない**が、opt-in を再度 ON にする効果を語るときは今回の
-  36〜41% を基準にすべきで、69% は #7 修正前の値である点に注意
+- **opt-in ON**: `wait_entered_per_second`（60.6〜60.8）/ `spin_share`（42.4〜42.5%）/
+  `block_avg`（6.99〜7.00ms）は 4 回とも安定しており、旧実測 (wait_entered 60・spin 42.5%・
+  cpu 423ms/s) ともほぼ一致する。opt-in 経路そのものは壊れていない
+- **`zero_frame_share`（0F 達成率）は 4 回で 36.0% / 40.7% / 56.3% / 38.4%（平均 42.9%）と
+  試行ごとに大きくばらつき、旧基準の 69% には毎回届かなかった。**
+
+#### A/B: 実装前 (commit `0ed5391`) の harness との比較（2026-07-31 追加検証）
+
+`zero_frame_share` の低下が「今回の Task 1〜3 のリファクタが待機ロジックを壊した」せいか、
+「測定対象が変わっただけ」なのかを切り分けるため、リファクタ前の
+`ZeroFrameWaitCommand.cs`（commit `0ed5391`、`CefZeroFramePacer` や `Receive()` の判定ロジックは
+現行と同一で、集計先が独自フィールドか `CefZeroFrameWaitStatistics` かだけが違う）を一時的に
+チェックアウトしてビルドし、同一条件・同一手順（`pkill` → `uptime` →
+`zero-frame-wait 20 10 1920 1080 intermittent`）で 4 回計測した:
+
+```bash
+git checkout 0ed5391 -- cef-unity-csharp/CefUnity.Harness/ZeroFrameWaitCommand.cs
+dotnet build cef-unity-csharp/CefUnity.Harness -c Debug
+# 計測後
+git checkout HEAD -- cef-unity-csharp/CefUnity.Harness/ZeroFrameWaitCommand.cs
+dotnet build cef-unity-csharp/CefUnity.Harness -c Debug
+```
+
+| 版 | 試行1 | 試行2 | 試行3 | 試行4 | 平均 | 範囲 |
+|---|---|---|---|---|---|---|
+| 実装前 (`0ed5391`) | 52.3% | 29.1% | 20.9% | 31.4% | **33.4%** | 20.9〜52.3% |
+| 実装後 (現行 HEAD) | 36.0% | 40.7% | 56.3% | 38.4% | **42.9%** | 36.0〜56.3% |
+
+**判定: 今回の Task 1〜3 のリファクタは無罪。** 実装前の harness でも `zero_frame_share` は
+20.9〜52.3%（平均 33.4%）まで大きくばらつき、69% には一度も届かなかった。実装後（平均 42.9%）
+より低い試行すらあり、両者の分布は明確に重なる（実装前 3 回が実装後の最小値 36.0% を下回る）。
+`wait_entered_per_second`・`spin_share`・`block_avg` は両版で試行間・版間ともに安定していた
+一方、`zero_frame_share` だけが両版で ±20〜30 ポイントも揺れている。5Hz 間欠ページの
+`setInterval(200ms)` と 60Hz の `SendExternalBeginFrame` は独立クロックなので、この揺れは
+プロセス起動ごとの位相関係（スケジューリングジッタ）に由来する**測定対象そのものの高分散**
+であり、コードの版差ではないと判断した。
+
+したがって、旧基準の 69% は #7 修正の影響というより、**そもそも 1 回しか採取していない
+サンプルが高分散な分布のたまたま高い側に当たっていた**可能性が高い。#11 の opt-in を
+語る際は「単一の 69%」ではなく、今回得られた 20.9〜56.3%（8 試行全体、実装前後合算）を
+分布として扱うべきである。
 - **paint 供給の回帰確認**（`paint-statistics 20 1920 1080 animation`）: `received` 中央値
   61/s（`received_min=58` を除き概ね 60〜61）、`gpu_verified=1306` に対し `gpu_torn=0` /
   `gpu_rollback=0` で回帰なし。`BeginFrame→paint latency` はサーバーログ実測で
