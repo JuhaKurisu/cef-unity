@@ -48,6 +48,9 @@ unsafe extern "C" {
         height: u32,
         format: u32,
     ) -> i32;
+    fn iosurface_pool_in_flight_copies() -> i32;
+    fn iosurface_pool_poisoned_copies() -> u64;
+    fn iosurface_pool_poison_copies_reading(source: *mut std::os::raw::c_void) -> i32;
 }
 
 use cef_unity_ipc::{self as ipc, AudioSharedMemoryWriter, Command, Response, SharedMemoryWriter};
@@ -188,8 +191,10 @@ static LATENCY_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 // `--logging` 有効時のみ計測する (無効時は Instant::now() も呼ばない)。
 
 static COPY_COUNT: AtomicU64 = AtomicU64::new(0);
-/// 非同期モードで in-flight 上限に達して捨てた paint 数。
+/// 非同期モードで in-flight 追跡スロットが枯渇して捨てた paint 数。
 static COPY_DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
+/// GPU コピー未完了のため BeginFrame の発行を見送った回数 (issue #7 のゲート)。
+static BEGIN_FRAME_DEFERRED_COUNT: AtomicU64 = AtomicU64::new(0);
 static COPY_WAIT_TOTAL_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
 static COPY_WAIT_MAX_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
 static SEND_WAIT_TOTAL_MICROSECONDS: AtomicU64 = AtomicU64::new(0);
@@ -250,21 +255,62 @@ fn paint_statistics_enabled() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// 非同期 GPU コピー (issue #7 の修正候補) — CEF_UNITY_ASYNC_COPY=1 で有効
+// 非同期 GPU コピー (issue #7 の修正) — 既定で有効
 // ---------------------------------------------------------------------------
 
-/// 非同期コピーを使うか。環境変数で切り替え、同一バイナリで A/B できるようにする。
+/// 非同期コピーを使うか (既定 true)。`CEF_UNITY_SYNC_COPY=1` で従来の同期版に戻せる。
+///
+/// 同期版は `waitUntilCompleted` を CEF の message pump スレッド上で行うため、外部の
+/// GPU/CPU 競合下で pump ごと数百 ms 止まる (実測 copy_wait_max 796ms、pump 1000→7
+/// ticks/s)。入力・JS タイマー・IPC がまとめて凍結するのが issue #7 の症状。
 #[cfg(target_os = "macos")]
 pub fn use_async_copy() -> bool {
     static USE_ASYNC_COPY: OnceLock<bool> = OnceLock::new();
     *USE_ASYNC_COPY.get_or_init(|| {
-        std::env::var("CEF_UNITY_ASYNC_COPY").is_ok_and(|value| value == "1")
+        // 検証用の既知不良構成は同期経路側にあるので、指定されていたら非同期を降りる。
+        !use_unsafe_no_wait_copy()
+            && !std::env::var("CEF_UNITY_SYNC_COPY").is_ok_and(|value| value == "1")
     })
 }
 
 #[cfg(not(target_os = "macos"))]
 pub fn use_async_copy() -> bool {
     false
+}
+
+/// 新しい BeginFrame を発行してよいか。
+///
+/// CEF は BeginFrame を受けて初めて次のフレームを描き、描き先は転送元プールの
+/// IOSurface である。非同期コピー中はその IOSurface をまだ GPU が読んでいるため、
+/// 読み終わるまで BeginFrame を発行しない。ここで「待つ」のではなく「発行しない」
+/// ことが要点で、pump は回り続ける (= 入力・JS タイマー・IPC は止まらない)。
+/// 供給が追いつかない分はフレームレートの低下として現れる。
+///
+/// 1 枚先行させる余地は無い: CEF の転送元プールは枚数固定ではなく (競合下で十数枚に
+/// 増えるのを実測)、返却済みの surface を次フレームに再び選ぶ可能性を排除できない。
+/// 直列でもフレーム供給レートは同期版と同じ (同期版も 1 コピー完了ごとに 1 フレーム)。
+#[cfg(target_os = "macos")]
+fn begin_frame_gate_open() -> bool {
+    if !use_async_copy() || disable_begin_frame_gate() {
+        return true;
+    }
+    unsafe { iosurface_pool_in_flight_copies() == 0 }
+}
+
+/// 検証用: BeginFrame ゲートを外す。転送元の契約 (コールバックから返るとプールへ戻る)
+/// を破る既知不良構成で、poison 検出器が実際に反応することを確かめる positive control
+/// 専用。実運用では使わない。
+#[cfg(target_os = "macos")]
+fn disable_begin_frame_gate() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("CEF_UNITY_NO_BEGIN_FRAME_GATE").is_ok_and(|value| value == "1")
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn begin_frame_gate_open() -> bool {
+    true
 }
 
 /// 検証用の既知不良構成 (完了を待たずに送る) を使うか。ティアリング検出器の
@@ -405,6 +451,12 @@ pub fn report_paint_statistics(pump_count: u64) {
     let drain_max_burst = DRAIN_MAX_BURST.swap(0, Ordering::Relaxed);
     let drain_max_begin_frame_burst = DRAIN_MAX_BEGIN_FRAME_BURST.swap(0, Ordering::Relaxed);
     let drain_begin_frames = DRAIN_BEGIN_FRAME_TOTAL.swap(0, Ordering::Relaxed);
+    let begin_frames_deferred = BEGIN_FRAME_DEFERRED_COUNT.swap(0, Ordering::Relaxed);
+    // 転送元の契約違反で捨てたフレームの累計 (ゲートが効いていれば 0 のまま)。
+    #[cfg(target_os = "macos")]
+    let poisoned_copies = unsafe { iosurface_pool_poisoned_copies() };
+    #[cfg(not(target_os = "macos"))]
+    let poisoned_copies = 0u64;
     *window = PaintStatisticsWindow {
         started_at: Instant::now(),
         pump_count_at_start: pump_count,
@@ -418,7 +470,8 @@ pub fn report_paint_statistics(pump_count: u64) {
          copy_wait_total={}.{:03}ms copy_wait_max={}.{:03}ms \
          send_wait_total={}.{:03}ms send_wait_max={}.{:03}ms \
          cpu={}ms damage_ratio={:.1}% \
-         drain_max={} begin_frame_drained={} begin_frame_burst_max={}",
+         drain_max={} begin_frame_drained={} begin_frame_burst_max={} \
+         begin_frame_deferred={} poisoned_total={}",
         std::thread::current().id(),
         if use_async_copy() {
             "async"
@@ -441,6 +494,8 @@ pub fn report_paint_statistics(pump_count: u64) {
         drain_max_burst,
         drain_begin_frames,
         drain_max_begin_frame_burst,
+        begin_frames_deferred,
+        poisoned_copies,
     ));
 }
 
@@ -613,14 +668,36 @@ wrap_render_handler! {
 
                 // 非同期モード: blit を投げるだけで返り、送信と shm 書き込みは完了ハンドラで行う。
                 if use_async_copy() {
+                    // CEF はコールバックから返った時点で転送元をプールへ戻す (ヘッダの契約)。
+                    // つまり今回交付された転送元は、前回それを読んだ blit の途中で
+                    // 上書きされている可能性がある。まだ読んでいる blit があればその結果を
+                    // 捨てる。BeginFrame ゲートが効いていればここは常に 0 件になる。
+                    let poisoned =
+                        unsafe { iosurface_pool_poison_copies_reading(io_surface) };
+                    if poisoned > 0 {
+                        log(&format!(
+                            "on_accelerated_paint #{}: CEF が読み取り中の転送元を再交付した \
+                             (poisoned={}) — BeginFrame ゲートが機能していない",
+                            count, poisoned
+                        ));
+                    }
                     {
                         let mut guard = ASYNC_COPY_SHARED_MEMORY
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner);
-                        if guard.is_none() {
-                            unsafe {
-                                iosurface_pool_set_completion_callback(on_async_copy_completed)
-                            };
+                        // 同期版は self.shared_memory を直接使うので browser ごとに正しい。
+                        // 非同期版は完了ハンドラから触るため global に置くが、別 browser の
+                        // paint が来たら差し替える (置きっぱなしだと最初の browser の shm に
+                        // 書き続けてしまう)。
+                        let matches_current = guard
+                            .as_ref()
+                            .is_some_and(|target| Arc::ptr_eq(&target.0, &self.shared_memory));
+                        if !matches_current {
+                            if guard.is_none() {
+                                unsafe {
+                                    iosurface_pool_set_completion_callback(on_async_copy_completed)
+                                };
+                            }
                             *guard = Some(AsyncCopyTarget(Arc::clone(&self.shared_memory)));
                         }
                     }
@@ -1266,6 +1343,9 @@ pub struct CefServer {
     last_begin_frame_1_suppressed: bool,
     /// 抑止トライアル失敗後のクールダウン残フレーム数。0 なら抑止を試してよい。
     suppression_cooldown: u32,
+    /// GPU コピー未完了で発行を見送った BF#1。tick でゲートが開き次第発行する。
+    /// (browser_id, unity_frame)。新しい BF#1 が来たら上書きする — 溜めても意味がない。
+    deferred_begin_frame: Option<(u32, u64)>,
 }
 
 /// 抑止トライアル失敗 (抑止フレームで paint が来ない = BF#1-only パイプラインが
@@ -1291,6 +1371,7 @@ impl CefServer {
             damage_streak: 0,
             last_begin_frame_1_suppressed: false,
             suppression_cooldown: 0,
+            deferred_begin_frame: None,
         }
     }
 
@@ -1996,6 +2077,16 @@ impl CefServer {
                 message: format!("browser {} not found", browser_id),
             };
         }
+        // 前フレームの GPU コピーが転送元をまだ読んでいる間は発行できない (issue #7)。
+        // 待たずに保留し、tick で再試行する。damage streak の判定はここでは進めない
+        // — 実際に発行するときに 1 回だけ行う。
+        if !begin_frame_gate_open() {
+            self.deferred_begin_frame = Some((browser_id, unity_frame));
+            BEGIN_FRAME_DEFERRED_COUNT.fetch_add(1, Ordering::Relaxed);
+            return Response::Ok;
+        }
+        self.deferred_begin_frame = None;
+
         // damage streak 判定: 前フレームに paint があったか (= ページが連続描画中か)。
         // スクロール/アニメーション中は毎フレーム damage が出るため streak が伸びる。
         // その間 flush (BF#2..) を撃つと draw/blit/送信が倍増して renderer/GPU が飽和し、
@@ -2051,6 +2142,15 @@ impl CefServer {
     /// ブロックしない。BF#1 由来の renderer submit を跨ぐタイミングで撃つことで、display が
     /// 最新内容を draw → on_accelerated_paint が fresh #B を Mach 送信する。
     pub fn process_pending_flushes(&mut self) {
+        // ゲート待ちで見送った BF#1 を、転送元の読み出しが終わり次第発行する。
+        // flush より先に処理する — 保留中の BF#1 が無いのに flush だけ撃っても意味がない。
+        if let Some((browser_id, unity_frame)) = self.deferred_begin_frame
+            && begin_frame_gate_open()
+        {
+            self.deferred_begin_frame = None;
+            self.send_external_begin_frame(browser_id, unity_frame);
+        }
+
         let action = {
             let Some(pending_flush) = self.pending_flush.as_mut() else {
                 return;
@@ -2081,7 +2181,11 @@ impl CefServer {
         };
         match action {
             Some((browser_id, unity_frame, done)) => {
-                self.issue_begin_frame(browser_id, unity_frame);
+                // flush は最新内容を取り直すための追加 BeginFrame。ゲートが閉じている
+                // ときは撃たない (BF#1 と違い保留はしない — 次フレームで撃ち直せばよい)。
+                if begin_frame_gate_open() {
+                    self.issue_begin_frame(browser_id, unity_frame);
+                }
                 if done as usize >= FLUSH_THRESHOLDS_MILLISECONDS.len() {
                     self.pending_flush = None;
                 }

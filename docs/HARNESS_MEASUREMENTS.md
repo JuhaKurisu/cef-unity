@@ -1,6 +1,6 @@
 # Unity 抜き harness による issue #7〜#15 の再現・計測
 
-- 計測日: 2026-07-30
+- 計測日: 2026-07-30（#7 の修正と再計測は 2026-07-31）
 - 環境: Apple M3 / macOS 26.2 / 1920x1080 viewport / CEF 145.5.0
 - 対象: [issue #7〜#15](https://github.com/JuhaKurisu/cef-unity/issues)（`docs/MOORESTECH_PR1097_VERIFICATION.md` にもとづき起票したもの）
 - 手段: `CefUnity.Harness` の診断コマンド + server 側の STATISTICS 計装。**Unity Editor は一切使わない**
@@ -23,19 +23,21 @@ CefUnity.Harness lifecycle [サイクル数] [listenPort] [1 サイクルのフ�
 競合条件は `cef-unity-rust/tools/gpu-contention-hog.m` をビルドして `hog` を複数本起動し、
 CPU 飽和は busy loop を ncpu 本走らせて作る。
 
-server 側のトグル（すべて環境変数、既定は従来動作）:
+server 側のトグル（すべて環境変数）:
 
 | 変数 | 効果 |
 |---|---|
-| `CEF_UNITY_ASYNC_COPY=1` | GPU コピーを非同期化（#7 の修正候補） |
-| `CEF_UNITY_UNSAFE_NO_WAIT=1` | 完了を待たず即送信（**既知不良**。検出器の negative control 専用） |
+| `CEF_UNITY_SYNC_COPY=1` | GPU コピーを同期版（issue #7 の修正前）に戻す。既定は非同期 |
+| `CEF_UNITY_NO_BEGIN_FRAME_GATE=1` | BeginFrame ゲートを外す（**既知不良**。poison 検出器の positive control 専用） |
+| `CEF_UNITY_SLOW_COPY=n` | blit をバンド分割して n 回のダミー全面 blit を挟み、転送元の読み出し時間を広げる（検証専用） |
+| `CEF_UNITY_UNSAFE_NO_WAIT=1` | 完了を待たず即送信（**既知不良**。転送先側の検出器の negative control 専用） |
 | `CEF_UNITY_PUMP_INTERVAL_MILLISECONDS=n` | pump fallback 間隔（既定 1、#12 の A/B 用） |
 
 ## 結果一覧
 
 | issue | 再現 | 実測 |
 |---|---|---|
-| #7 P0 同期 GPU コピーが pump を止める | ✅ | copy_wait が実時間の 50〜67%、単発最大 **356ms**、pump 1000→43〜333 ticks/s |
+| #7 P0 同期 GPU コピーが pump を止める | ✅ **修正済** | copy_wait が実時間の 50〜67%、単発最大 **796ms**。非同期化 + BeginFrame ゲートで解消 |
 | #8 P0 shutdown が server を回収しない | ✅ | 競合下で **5 サイクル中 2 回**、Shutdown 復帰後も server が存命 |
 | #9 P1 server が親の FD を継承する | ✅ (条件付き) | CLOEXEC を外した LISTEN ソケットが同一 fd 番号で server に出現 |
 | #10 P1 Mach port / キャッシュのリーク | ✅ | Mach port が **+1〜2/サイクル**で単調増加、surface キャッシュは上限 4 まで蓄積 |
@@ -55,46 +57,89 @@ server 側のトグル（すべて環境変数、既定は従来動作）:
 | 競合なし | ~1000 | 42〜153ms (4〜15%) | 2〜24ms | 58〜61 |
 | GPU 競合 | 459〜780 | 260〜665ms | 13〜47ms | 51〜59 |
 | GPU + CPU 飽和 | 43〜499 | 316〜666ms (32〜67%) | **356ms** | 33〜54 |
+| GPU + CPU 飽和（強め・追試） | 7〜295 | 291〜768ms | **796ms** | 1〜22 |
 
 - **競合が無くても実時間の 4〜15% は `waitUntilCompleted` で寝ている**
 - 単発 300ms 超は「GPU 競合だけ」では起きず、**待機スレッドの CPU 追い出しが加わって初めて**再現する
 - Mach 送信 (`mach_msg`、10ms timeout の blocking send) も同じ pump 上にあり、最大 4.4ms を実測
 
-### 修正候補（非同期コピー）の A/B
+### CEF の転送元契約 — 「非同期化するだけ」では不正
 
-`CEF_UNITY_ASYNC_COPY=1`。blit を encode + commit して即 return し、Mach 送信と shm 書き込みを
-completion handler（直列 dispatch queue）で行う。in-flight 上限 2 で backpressure。
+`cef_render_handler_capi.h` の `on_accelerated_paint` に明文の契約がある:
 
-| 指標 | sync | async |
+> The handle's resource cannot be cached and cannot be accessed outside of this callback. …
+> **The contents of |info| will be released back to the pool after this callback returns.**
+
+つまり「blit を投げて即 return する」だけの非同期化は、GPU がコールバック復帰後も転送元を
+読み続けるので契約違反になる。当初の実装（in-flight 上限 2 で backpressure するだけ）は
+これに該当していた。ティアリングが観測されなかったのは運が良かっただけで、安全性の根拠にならない。
+
+前提の実測も 2 つ外れていた:
+
+- **転送元プールは 2 枚固定ではない**。競合なし 1280x720 では `id=315, 813` の厳密な交互だが、
+  GPU 競合下 1920x1080 では十数個の id が出る。「1 枚だけ先行させてよい」とは言えない
+- **CEF は同じ surface に対して毎回異なる `IOSurfaceRef` ポインタを渡す**
+  （`id=315` に対し `0x11409cffe40` / `0x11409abbd00` / `0x1140a2316c0`）。
+  ポインタで同一性を判定するコードは常に不一致になる。`g_src_cache` はこれで毎フレーム
+  cache miss して `MTLTexture` を作り直していた（キーを `IOSurfaceID` に修正済み）
+
+### 修正: 非同期コピー + BeginFrame ゲート
+
+1. blit を encode + commit して即 return し、Mach 送信と shm 書き込みを completion handler
+   （直列 dispatch queue）で行う。**pump スレッド上に GPU 待ちが一切無くなる**
+2. 転送元を読んでいる blit がある間は **BeginFrame を発行しない**（`begin_frame_gate_open`）。
+   CEF は BeginFrame でしか描かず、BeginFrame は pump 上でしか処理されないので、これで
+   「読み取り中の転送元に CEF が描き込む」ことが構造的に起きない。**待つのではなく発行しない**
+   のが要点で、pump は回り続ける = 入力・JS タイマー・IPC は止まらない。
+   見送った BF#1 は tick でゲートが開き次第発行する（`begin_frame_deferred` に計上）
+3. 防御として、CEF が読み取り中の転送元を再交付したらその blit の結果を捨てる
+   （poison、`poisoned_total` に計上）。ゲートが効いていれば 0 のまま
+
+直列化してもフレーム供給レートは同期版と変わらない（同期版も 1 コピー完了ごとに 1 フレーム）。
+
+#### A/B（GPU 競合 2 本 + CPU 飽和 4 本、順序を入れ替えて各 2 回、1920x1080）
+
+| 指標 | sync | async（修正後） |
 |---|---|---|
-| pump_ticks（中央値） | 210〜333 | **407〜832** |
-| copy_wait_total/s（中央値） | 515〜571ms | **26〜55ms** |
-| copy_wait_max | 91〜356ms | 29〜46ms |
-| received/s（中央値） | 45〜49 | 47〜51（有意差なし） |
-| dropped | 0 | 1〜2/s |
+| copy_wait_total/s（中央値） | 464 / 537ms | **9.4 / 10.0ms** |
+| copy_wait_max（最大） | 66 / 202ms | 17 / 94ms |
+| received/s（中央値） | 54 / 38 | 54 / 32 |
+| poisoned | 0 | **0** |
 
-順序を入れ替えても pump_ticks の優劣は一貫する。received/s に差が出ないのは、フレーム供給量そのものは
-GPU/CPU 競合が律速だから。この修正が直すのは **pump の健全性**である。
+競合なし（1920x1080）では sync の `copy_wait_total` 74〜113ms/s・`copy_wait_max` 2.9〜5.3ms に対し、
+async は 1.9〜8.5ms/s・0.08〜3.8ms で、**paints は両者とも 60/s**（ゲートによるフレームレート低下は無い）。
+
+`copy_wait_total` の 50 倍差は順序を入れ替えても一貫する。`pump_ticks` と `received/s` は
+実行順（マシン負荷の漂流）の影響が支配的で、A/B の判定には使えない。
+**この修正が直すのは pump の健全性**であり、フレームレートそのものではない。
 
 ### 正しさの検証
 
-client 側に **GPU 読み**の検出器を追加した（自前 command queue で 1 列を staging buffer へ blit）。
-CPU 読み (`IOSurfaceLock`) は lock 自体が GPU 同期を行うため識別力が無く、既知不良構成でも検出ゼロだった。
-そのため **CPU 読みのサンプラは削除した**（残しても偽の安心を与えるだけなので）。検出器が生きていることは
-`distinct_steps`（観測できた色 step の種類数、ページは 0..255 を循環する）で確認する。
+**転送先側**（client が blit 未完了の surface を読む）: client 側に GPU 読みの検出器がある
+（自前 command queue で 1 列を staging buffer へ blit）。CPU 読み (`IOSurfaceLock`) は lock 自体が
+GPU 同期を行うため識別力が無く、既知不良構成でも検出ゼロだったので **CPU 読みのサンプラは削除した**。
 
 | モード | gpu_verified | gpu_rollback |
 |---|---|---|
 | unsafe-no-wait（既知不良） | 2552（4 回分） | **6**（毎回 1〜2 検出） |
-| sync（現行） | 2687 | 0 |
-| async（修正案） | 1525 | 0 |
+| sync | 2687 | 0 |
+| async（修正後、競合下 4 回 + 低速コピー下 4 回） | 3400+ | 0 |
 
-検出器は既知不良で 4/4 回反応し、async は sync と区別できない（既知不良のロールバック率 0.24% に対し
-async 1525 フレームで 0 なので p≈0.025）。
+**転送元側**（CEF が読み取り中の転送元へ描き込む）: `CEF_UNITY_SLOW_COPY=64` で転送元の
+読み出し時間を人為的に広げ（16 バンドに分割し、バンド間に全面ダミー blit を 64 回挟む）、
+ゲートの有無で比較した。
 
-**未検証**: ティアリング (`gpu_torn`) は既知不良でも一度も観測できず、この腕は未検証。観測できた破れは
-常にロールバック（フレーム全体が古い）だった。async 固有の残存リスク「CEF がコールバック復帰後に src を
-プールへ戻し、GPU がまだ読んでいる」はティアリングとして現れるはずなので、上記では除外できていない。
+| 構成 | poisoned（20 秒 × 2 回） |
+|---|---|
+| ゲート **OFF** + 低速コピー（既知不良） | **2, 3**（2/2 回で発火） |
+| ゲート **ON** + 低速コピー | **0, 0** |
+
+検出器が生きていること（ゲート OFF で 2/2 発火）と、ゲートが実際に上書きを防いでいること
+（ON で 0）の両方を確認した。既知不良の発生率 ~2.5 件/18 秒に対しゲート ON は 38 秒で 0 件なので
+p ≈ 0.007。**前回「未検証」としていたティアリングのリスクは、観測を待つ代わりに構造的に潰す形で解決した**。
+
+さらにゲート ON では `distinct_steps == gpu_verified`（80/80, 72/72 = 受信フレームの色 step が
+すべて異なる）だが、ゲート OFF では 64/87, 59/82 と重複が出る。
 
 ## #8 — shutdown が 500ms 以内に終了しない server を回収しない
 
@@ -230,10 +275,8 @@ moorestech レポートの「dirty rect 面積は 2〜4%」は再現し、実際
 
 ## 残作業（優先順、2026-07-30 時点）
 
-1. **#7 を終わらせる（残り 1 手）**: ティアリング検証だけがブロッカー。`CEF_UNITY_SLOW_COPY=n` 相当の
-   デバッグモードで blit を重ねて GPU 読み窓を広げ、「CEF がコールバック復帰後に src をプールへ戻し、
-   GPU がまだ読んでいる」リスクが実在するか判定する。白なら既定を async に切替 → `deploy.sh` →
-   main マージ。採用理由は fps ではなく「入力・JS タイマー・IPC が最大 356ms 凍結するのを止める」こと
+1. ~~**#7**~~ **完了**（2026-07-31）: 非同期コピー + BeginFrame ゲートで既定を切り替えた。
+   転送元契約の破れは `CEF_UNITY_SLOW_COPY` を使った positive/negative control で検証済み
 2. **#10**: `mach_iosurface_client_disconnect()` を作り `cef_unity_shutdown` から呼ぶ。描画に触らず
    リスクほぼゼロ。検証は `lifecycle` で `mach_ports` が横ばいになるかを見るだけ
 3. **software 経路の seqlock 欠陥（未起票）**: `read_frame_does_not_mix_frames_while_writer_advances`

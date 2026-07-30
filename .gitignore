@@ -9,3 +9,6 @@
 
 # subagent-driven-development の作業ディレクトリ (ledger / brief / レビュー材料)
 .superpowers/
+
+# 診断ツールのビルド成果物 (ソースは .m を追跡。ビルド方法はファイル冒頭のコメント参照)
+/cef-unity-rust/tools/gpu-contention-hog
