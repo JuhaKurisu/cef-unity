@@ -19,7 +19,7 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
-    # RegisterClassW / WNDCLASSW (Raw Input 用のメッセージ専用ウィンドウ) がここに gate されている
+    # RegisterClassW / WNDCLASSW (scroll_monitor_windows のテスト用ウィンドウ) がここに gate されている
     "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
     "Win32_System_Com",

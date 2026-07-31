@@ -3,11 +3,14 @@ using System;
 namespace CefUnity.Runtime
 {
     /// <summary>
-    ///     Windows の Raw Input (client dll 内 scroll_monitor_windows.rs) から生スクロール
+    ///     Windows のメッセージフック (client dll 内 scroll_monitor_windows.rs) から生スクロール
     ///     イベントを取得する <see cref="IScrollEventSource" /> 実装。
     ///     <para>
-    ///         ネイティブ側は専用スレッドのメッセージループで WM_INPUT を受けてリングバッファに
-    ///         積むため、Poll は Unity のメインスレッドから毎フレーム呼ぶだけでよい。
+    ///         ネイティブ側は Start を呼んだスレッドに WH_GETMESSAGE フックを張り、メッセージ
+    ///         ポンプが取り出す WM_MOUSEWHEEL / WM_MOUSEHWHEEL を観測してリングバッファに積む。
+    ///         Raw Input は登録しない (登録はプロセス単位の後勝ちで、Unity Input System の
+    ///         Mouse.delta 配送を奪ってしまうため)。Start / Poll とも Unity のメインスレッド
+    ///         から呼ぶこと (フックは呼び出しスレッドにのみ張られる)。
     ///     </para>
     ///     <para>
     ///         単位: Windows のホイールは 120 = 1 ノッチ。ネイティブ側が 120 で割った
@@ -18,7 +21,7 @@ namespace CefUnity.Runtime
     /// </summary>
     public sealed class WindowsNativeScrollSource : IScrollEventSource
     {
-        // Raw Input のホイール符号は WM_MOUSEWHEEL と同じで「手前から奥 = 正」。
+        // WM_MOUSEWHEEL のホイール符号は「手前から奥 = 正」。
         // 現行の Input.mouseScrollDelta 経路と同じ向きなので変換は不要。
         // 実機で逆だった場合はここを -1 にする。
         private const float SignX = 1f;
