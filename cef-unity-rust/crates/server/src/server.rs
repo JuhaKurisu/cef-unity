@@ -323,6 +323,14 @@ pub fn use_unsafe_no_wait_copy() -> bool {
     })
 }
 
+/// 既知不良構成は IOSurface プール (macOS 専用) の中にしか無いので、他プラットフォーム
+/// では常に false。統計ログの mode 表示は全プラットフォームでコンパイルされるため、
+/// `use_async_copy` と同様にスタブが要る。
+#[cfg(not(target_os = "macos"))]
+pub fn use_unsafe_no_wait_copy() -> bool {
+    false
+}
+
 /// 完了ハンドラ (Metal の直列送信キュー) から shm へ書くためのラッパ。
 ///
 /// `SharedMemoryWriter` は `Send` だが `Sync` ではないため static に直接置けない。
