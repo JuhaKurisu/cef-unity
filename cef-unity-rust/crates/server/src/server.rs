@@ -221,6 +221,7 @@ pub fn record_drain_burst(command_count: u64, begin_frame_count: u64) {
 
 /// プロセスの CPU 時間 (user + sys) をミリ秒で返す。issue #12 の 1000Hz pump の
 /// コストを測るために使う。
+#[cfg(not(windows))]
 fn process_cpu_milliseconds() -> u64 {
     #[repr(C)]
     struct TimeValue {
@@ -247,6 +248,36 @@ fn process_cpu_milliseconds() -> u64 {
     let user = usage.user_time.seconds as u64 * 1000 + usage.user_time.microseconds as u64 / 1000;
     let system = usage.system_time.seconds as u64 * 1000 + usage.system_time.microseconds as u64 / 1000;
     user + system
+}
+
+/// Windows には `getrusage` が無いので、同じ値 (kernel + user) を `GetProcessTimes`
+/// から取る。取得に失敗したら 0 を返す (統計ログの cpu= が 0 になるだけ)。
+#[cfg(windows)]
+fn process_cpu_milliseconds() -> u64 {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let mut creation_time = FILETIME::default();
+    let mut exit_time = FILETIME::default();
+    let mut kernel_time = FILETIME::default();
+    let mut user_time = FILETIME::default();
+    let result = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation_time,
+            &mut exit_time,
+            &mut kernel_time,
+            &mut user_time,
+        )
+    };
+    if result.is_err() {
+        return 0;
+    }
+    // FILETIME は 100 ナノ秒単位。
+    let to_milliseconds = |time: FILETIME| {
+        (((time.dwHighDateTime as u64) << 32) | (time.dwLowDateTime as u64)) / 10_000
+    };
+    to_milliseconds(kernel_time) + to_milliseconds(user_time)
 }
 
 /// 統計を有効化するか (= ログ有効か) を返す。
