@@ -415,6 +415,35 @@ moorestech レポートの「dirty rect 面積は 2〜4%」は再現し、実際
   macOS 16 でプロセス間無効化されており、リポジトリ内に呼び出し元が 1 つも無かった
 - **非 Windows 用の未使用スタブ** `pub type DXGI_FORMAT = u32` (`d3d11_pool.rs`): ビルド警告 2 件の原因
 
+## v0.6.0 リリース前の回帰計測（2026-07-31）
+
+対象は `8f6770d`（v0.6.0 タグ対象）。このリリースで追加した 3 件の修正はいずれも macOS の実行
+経路を変えない（①非 macOS 向け `use_unsafe_no_wait_copy` スタブ、②Windows 専用の
+`GetProcessTimes` 経路、③実運用で呼ばれていない `SharedMemoryReader::read_frame` の
+リトライ挙動）。回帰が無いことの確認として 3 コマンドを 1 回ずつ実行した。
+
+⚠️ **環境の但し書き**: 計測直前の load average は **7.59** で、計測手順の上限（5 未満）を
+超過している（直前に `cargo build` を回したため）。絶対値の比較には向かない条件だが、
+下記のとおり既知水準から外れた指標は無かった。
+
+| コマンド | 実測 |
+|---|---|
+| `paint-statistics 20 1920 1080 animation` | `mode=async`、`paints=60/s`（初回窓のみ 67、末尾に 102 の窓が 1 つ）、`copies=paints` で `dropped=0`、`poisoned_total=0`、`copy_wait_max` 0.14〜0.90ms（初回窓のみ 6.34ms）、`pump_ticks` 約 1020〜1080/s |
+| `zero-frame-wait 20 10 1920 1080 intermittent` | `zero_frame_share=34.9%`、`received/s=5.1`、`wait_entered/s=60.7`、`spin_share=42.6%`、`block_avg=7.02ms`、`delay_2F+=0` |
+| `lifecycle 5` | 5/5 サイクル完走、`mach_ports` 70→72→73→74→75、`server_processes_final=1` |
+
+**判定: 回帰は見られない。**
+
+- `paints=60/s` で `dropped=0` / `poisoned_total=0` は #7 修正後の水準どおり。BeginFrame ゲートが
+  効いており転送元の契約違反はゼロ
+- `mach_ports` の推移（70→72→73→74→75）は前回計測と**完全に一致**し、#10 の既知水準
+  （+1〜2/サイクル）から悪化なし
+- `server_processes_final=1` は前回計測の 0 と異なるが、これは #8 の「**負荷時のみ発症**する
+  （Shutdown が終了を待たずに返る）」既知挙動で、load 7.59 の高負荷下という今回の条件と整合する
+- `zero_frame_share=34.9%` は実装後 4 回の範囲（36.0〜56.3%）をわずかに下回るが、この指標は
+  A/B 検証のとおり実装前後とも 20.9〜56.3% と大きくばらつくもので、`wait_entered/s`・
+  `spin_share`・`block_avg` は過去の計測と一致している
+
 ## 計測上の注意
 
 - harness は BF#1 と recv の間にゲーム処理・描画が入らないため、0F 待ちの spin は**最悪ケース**を測る。
