@@ -704,13 +704,17 @@ impl SharedMemoryReader {
 
         // seqlock: コピー中に writer が 2 フレーム進むと、リーダーが読んでいる
         // バッファへ writer が書き戻して新旧フレームが混在する。コピー前後で
-        // (frame_id, active_buffer) を照合し、変化していたら 1 回だけ読み直す。
+        // (frame_id, active_buffer) を照合し、変化していたら読み直す。
         //
-        // リトライを 1 回に固定するのは、高負荷時に reader がスピンして
-        // フレームレートを壊すのを避けるため。2 回目も競合した場合はその結果を
-        // 返す (60fps を守ることを優先する)。
-        const MAX_ATTEMPTS: usize = 2;
-        for attempt in 0..MAX_ATTEMPTS {
+        // 上限まで競合し続けたら None を返してこのフレームは諦める。混在したまま
+        // 返すとティアリングが画面に出るが、諦めれば呼び出し側が前フレームを保つ
+        // だけで済む。`last_frame_id` は進めないので、次の呼び出しで最新フレームを
+        // 読み直せる (失うのは 1 フレーム分の更新だけ)。
+        //
+        // 上限を設けるのは、高負荷時に reader がスピンし続けてフレームレートを
+        // 壊すのを避けるため。
+        const MAX_ATTEMPTS: usize = 4;
+        for _ in 0..MAX_ATTEMPTS {
             let observed_frame_id = header.frame_id.load(Ordering::Acquire);
             let active = header.active_buffer.load(Ordering::Acquire);
             let width = header.width.load(Ordering::Acquire);
@@ -731,7 +735,7 @@ impl SharedMemoryReader {
 
             let unchanged = header.frame_id.load(Ordering::Acquire) == observed_frame_id
                 && header.active_buffer.load(Ordering::Acquire) == active;
-            if unchanged || attempt == MAX_ATTEMPTS - 1 {
+            if unchanged {
                 // コピーが確定してから消費済み frame_id を進める。
                 // 先に進めると、リトライ時に「新フレーム無し」と誤判定する。
                 self.last_frame_id = observed_frame_id;
