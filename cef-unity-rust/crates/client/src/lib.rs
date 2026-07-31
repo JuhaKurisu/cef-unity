@@ -457,7 +457,10 @@ pub struct CefScrollEvent {
 }
 
 /// 生スクロールモニタを開始する。1=成功 0=失敗 (ヘッドレス等)。
-/// macOS は NSEvent ローカルモニタ、Windows は Raw Input。
+/// macOS は NSEvent ローカルモニタ、Windows は WH_GETMESSAGE メッセージフック
+/// (いずれも観測型 — ホストの入力配送に影響しない)。
+/// Windows は呼び出しスレッドにフックを張るため、対象ウィンドウを所有し
+/// メッセージポンプを回すスレッド (Unity のメインスレッド) から呼ぶこと。
 /// 対応外プラットフォームは常に 0 (呼び出し側がフォールバックする)。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_scroll_monitor_start() -> i32 {

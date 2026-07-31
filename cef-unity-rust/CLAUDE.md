@@ -173,7 +173,7 @@ apphost がランタイムを見つけられない場合は `export DOTNET_ROOT=
 |---|---|---|---|
 | GPU ゼロコピー | IOSurface/Metal | D3D11 / D3D12 | 未実装 (software) |
 | ネイティブ音声出力 | AudioUnit | WASAPI | 無し (Unity ミキサのみ) |
-| 生スクロール入力 | NSEvent モニタ | Raw Input | 無し (frame-polled) |
+| 生スクロール入力 | NSEvent モニタ | メッセージフック (WH_GETMESSAGE) | 無し (frame-polled) |
 | キーリピート設定 | NSEvent の OS 値 | `SystemParametersInfo` の OS 値 | 既定値固定 |
 
 ネイティブ音声出力と生スクロール入力は、出力/入力デバイス層だけがプラットフォーム依存で、

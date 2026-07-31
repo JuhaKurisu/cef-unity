@@ -1,50 +1,66 @@
-//! Windows の生スクロール入力 (Raw Input) モニタ。
+//! Windows の生スクロール入力モニタ (メッセージフック観測型)。
 //!
 //! macOS の `scroll_monitor.m` (NSEvent ローカルモニタ) に対応する Windows 実装。
 //! Unity の `Input.mouseScrollDelta` はフレーム境界で量子化されるため、
-//! リサンプラ (`ScrollResampler`) に渡す生イベントをここで拾う。
+//! パイプライン (`ScrollInputPipeline`) に渡す生イベントをここで拾う。
+//!
+//! # 実装方式: WH_GETMESSAGE フック (観測型) — Raw Input は使わないこと
+//!
+//! 旧実装 (v0.6.0 まで) は専用スレッドのメッセージ専用ウィンドウに
+//! `RegisterRawInputDevices(RIDEV_INPUTSINK)` で generic mouse を購読していたが、
+//! **Windows の Raw Input 登録はプロセス単位・同一デバイスクラスにつき
+//! 「最後に登録した 1 ウィンドウ」だけが受領する仕様**のため、Unity Input System
+//! の登録を上書きしてしまい、`Mouse.delta` (WM_INPUT の RAWMOUSE 由来) が全て
+//! 0 になる不具合を起こした (カメラ回転が死ぬ)。MSDN も「ライブラリから
+//! RegisterRawInputDevices を呼ぶとホストアプリの Raw Input 処理を妨げる」と
+//! この構成を明示的に警告している。
+//!
+//! 現実装は `start()` を呼んだスレッド (= Unity のメインスレッド) に
+//! `WH_GETMESSAGE` のスレッドスコープフックを張り、メッセージポンプが取り出す
+//! `WM_MOUSEWHEEL` / `WM_MOUSEHWHEEL` を覗くだけの観測型。何も登録せず、
+//! メッセージは `CallNextHookEx` でそのまま流すため、Unity の入力配送には
+//! 一切影響しない (macOS の NSEvent ローカルモニタと対称の設計)。
+//!
+//! 旧実装にあった前景プロセス判定は不要になった: フックに流れてくるのは
+//! 自プロセスのウィンドウへ OS が配送したメッセージだけで、他アプリ上の
+//! スクロールが混入する経路が存在しない (INPUTSINK 固有の問題だった)。
+//! アプリ内での位置ゲートは従来どおり C# 側 (`Drain` の overBrowser) が行う。
+//!
+//! # 呼び出しスレッド規約 (重要)
+//!
+//! `start()` は**対象ウィンドウを所有しメッセージポンプを回すスレッド**
+//! (Unity のメインスレッド / Viewer のウィンドウスレッド) から呼ぶこと。
+//! フックは呼び出しスレッドにのみ張られるため、別スレッドから呼ぶと
+//! イベントが観測されない。`poll` は同スレッドから毎フレーム呼ぶ。
 //!
 //! # 単位規約 (重要)
 //!
-//! `WM_INPUT` の `RI_MOUSE_WHEEL` は 120 = 1 ノッチ。既存の `ScrollInputEvent` は
-//! macOS 由来で「precise = CSS ピクセル / 非 precise = ノッチ数」という規約なので、
-//! **Windows は非 precise (`precise = 0`) として `値 / 120.0` をノッチ数で渡す**。
-//! `WheelPixelsPerStep` の乗算は呼び出し側 (`ScrollResampler`) が行うため、
-//! ここで掛けてはいけない (掛けると 120 倍のスクロールになる)。
-//! 高精度ホイール (120 未満の刻みを送るデバイス) もそのまま比率で表現される。
+//! `WM_MOUSEWHEEL` の wParam 上位 16bit は 120 = 1 ノッチ。既存の
+//! `ScrollInputEvent` は macOS 由来で「precise = CSS ピクセル / 非 precise =
+//! ノッチ数」という規約なので、**Windows は非 precise (`precise = 0`) として
+//! `値 / 120.0` をノッチ数で渡す**。`WheelPixelsPerStep` の乗算は呼び出し側
+//! (`ScrollSmoother` 経路) が行うため、ここで掛けてはいけない (掛けると
+//! 120 倍のスクロールになる)。高精度ホイール (120 未満の刻みを送るデバイス)
+//! もそのまま比率で表現される。
 //!
 //! # フェーズ
 //!
 //! Windows の標準ホイールには macOS のようなジェスチャフェーズが無いので
 //! `phase = 0` (None) 固定。フェーズ非対応プラットフォームはパイプライン側の
 //! GraceTimeout で扱われる。
-//!
-//! # スレッド構成
-//!
-//! Raw Input はウィンドウメッセージで届くため、専用スレッドにメッセージ専用
-//! ウィンドウ (`HWND_MESSAGE` の子) を作ってそこで受ける。受けたイベントは
-//! Mutex 付きリングバッファに積み、Unity のメインスレッドが `poll` で drain する。
 
 #![cfg(target_os = "windows")]
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::GetCurrentProcessId;
-use windows::Win32::UI::Input::{
-    GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT,
-    RIDEV_INPUTSINK, RIM_TYPEMOUSE, RegisterRawInputDevices,
-};
+use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
-    GetMessageW, GetWindowThreadProcessId, HWND_MESSAGE, MSG, PostThreadMessageW, RegisterClassW,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT, WM_QUIT, WNDCLASSW,
+    CallNextHookEx, HC_ACTION, HHOOK, MSG, PM_REMOVE, SetWindowsHookExW, UnhookWindowsHookEx,
+    WH_GETMESSAGE, WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
 };
-use windows::core::{PCWSTR, w};
 
 use crate::CefScrollEvent;
 
@@ -52,13 +68,8 @@ use crate::CefScrollEvent;
 /// 溢れた場合は最古から捨てる (最新の入力を優先する)。
 pub const SCROLL_EVENT_CAPACITY: usize = 256;
 
-/// Raw Input が報告するホイール 1 ノッチ分の値 (WHEEL_DELTA)。
+/// ホイール 1 ノッチ分の値 (winuser.h の WHEEL_DELTA)。
 const WHEEL_DELTA: f32 = 120.0;
-
-/// `RAWMOUSE.usButtonFlags` のホイールビット (winuser.h)。
-/// windows-rs のモジュールパスが版によって動くため、ここで定義して依存を避ける。
-const RI_MOUSE_WHEEL: u16 = 0x0400;
-const RI_MOUSE_HWHEEL: u16 = 0x0800;
 
 // ---- リングバッファ ----
 
@@ -110,12 +121,9 @@ static BUFFER: ScrollEventBuffer = ScrollEventBuffer::new();
 /// (イベントの timestamp と `now()` が同一クロックである必要がある)。
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
-/// Raw Input スレッドの実行状態。
-static RUNNING: AtomicBool = AtomicBool::new(false);
-/// Raw Input スレッドの OS スレッド ID (停止時に WM_QUIT を送る宛先)。
-static MONITOR_THREAD_ID: AtomicU32 = AtomicU32::new(0);
-
-static MONITOR_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+/// インストール済みフックの HHOOK 値。`HHOOK` は `Send` でないため
+/// 生ポインタ値 (isize) で保持する。`None` = 未インストール。
+static INSTALLED_HOOK: Mutex<Option<isize>> = Mutex::new(None);
 
 fn elapsed_seconds() -> f64 {
     EPOCH.get_or_init(Instant::now).elapsed().as_secs_f64()
@@ -126,210 +134,99 @@ pub fn now() -> f64 {
     elapsed_seconds()
 }
 
-// ---- Raw Input ウィンドウ ----
+// ---- メッセージフック ----
 
-/// 前景ウィンドウが自プロセスのものか。
-///
-/// `RIDEV_INPUTSINK` を付けると非前景でも入力が届く。付けないとメッセージ専用
-/// ウィンドウにはそもそも届かない (Raw Input はキーボードフォーカスを持つ
-/// ウィンドウへ配送されるため) ので INPUTSINK は必須だが、そのままだと
-/// Unity が背面にいるときのスクロールまで拾ってしまう。ここで front を確認して弾く。
-fn foreground_window_is_ours() -> bool {
-    unsafe {
-        let foreground = GetForegroundWindow();
-        if foreground.0.is_null() {
-            return false;
-        }
-        let mut process_id: u32 = 0;
-        GetWindowThreadProcessId(foreground, Some(&mut process_id));
-        process_id != 0 && process_id == GetCurrentProcessId()
-    }
+/// wParam の上位 16bit (符号付き WHEEL_DELTA 倍数) をノッチ数へ換算する。
+/// 120 = 1 ノッチ、下方向/左方向が負。CSS ピクセル換算は C# 側の責務。
+fn wheel_notches(wheel_parameter: usize) -> f32 {
+    ((wheel_parameter >> 16) & 0xFFFF) as u16 as i16 as f32 / WHEEL_DELTA
 }
 
-unsafe extern "system" fn window_procedure(
-    window: HWND,
-    message: u32,
+/// ポンプが取り出した 1 メッセージを観測し、ホイールならリングバッファに積む。
+fn handle_retrieved_message(message_id: u32, wheel_parameter: usize) {
+    let is_vertical = message_id == WM_MOUSEWHEEL;
+    let is_horizontal = message_id == WM_MOUSEHWHEEL;
+    if !is_vertical && !is_horizontal {
+        return;
+    }
+    let notches = wheel_notches(wheel_parameter);
+    let (delta_x, delta_y) = if is_vertical {
+        (0.0, notches)
+    } else {
+        (notches, 0.0)
+    };
+    BUFFER.push(CefScrollEvent {
+        timestamp: elapsed_seconds(),
+        delta_x,
+        delta_y,
+        phase: 0,   // Windows の標準ホイールにジェスチャフェーズは無い
+        precise: 0, // ノッチ数単位 (CSS ピクセルではない)
+    });
+}
+
+/// WH_GETMESSAGE フック本体。PM_REMOVE (実際に取り出された) のときだけ観測する
+/// (PM_NOREMOVE の覗き見も通知されるため、見るだけだと二重計上になる)。
+unsafe extern "system" fn get_message_hook_procedure(
+    code: i32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if message == WM_INPUT {
-        handle_raw_input(lparam);
-        // WM_INPUT は DefWindowProc にも渡す必要がある (クリーンアップのため)。
-        return unsafe { DefWindowProcW(window, message, wparam, lparam) };
+    if code == HC_ACTION as i32 && wparam.0 == PM_REMOVE.0 as usize && lparam.0 != 0 {
+        let message = unsafe { &*(lparam.0 as *const MSG) };
+        handle_retrieved_message(message.message, message.wParam.0);
     }
-    unsafe { DefWindowProcW(window, message, wparam, lparam) }
-}
-
-fn handle_raw_input(lparam: LPARAM) {
-    if !foreground_window_is_ours() {
-        return;
-    }
-    unsafe {
-        let mut raw_input = RAWINPUT::default();
-        let mut size = std::mem::size_of::<RAWINPUT>() as u32;
-        let header_size = std::mem::size_of::<RAWINPUTHEADER>() as u32;
-        let written = GetRawInputData(
-            HRAWINPUT(lparam.0 as *mut _),
-            RID_INPUT,
-            Some(&mut raw_input as *mut _ as *mut _),
-            &mut size,
-            header_size,
-        );
-        // 失敗時は u32::MAX が返る
-        if written == u32::MAX || written == 0 {
-            return;
-        }
-        if raw_input.header.dwType != RIM_TYPEMOUSE.0 {
-            return;
-        }
-        let mouse = &raw_input.data.mouse;
-        let button_flags = mouse.Anonymous.Anonymous.usButtonFlags;
-        let is_vertical = button_flags & RI_MOUSE_WHEEL != 0;
-        let is_horizontal = button_flags & RI_MOUSE_HWHEEL != 0;
-        if !is_vertical && !is_horizontal {
-            return;
-        }
-        // usButtonData は符号付き 16bit (WHEEL_DELTA の倍数、下方向/左方向が負)
-        let raw_delta = mouse.Anonymous.Anonymous.usButtonData as i16 as f32 / WHEEL_DELTA;
-        let (delta_x, delta_y) = if is_vertical {
-            (0.0, raw_delta)
-        } else {
-            (raw_delta, 0.0)
-        };
-        BUFFER.push(CefScrollEvent {
-            timestamp: elapsed_seconds(),
-            delta_x,
-            delta_y,
-            phase: 0,   // Windows の標準ホイールにジェスチャフェーズは無い
-            precise: 0, // ノッチ数単位 (CSS ピクセルではない)
-        });
-    }
-}
-
-const WINDOW_CLASS_NAME: PCWSTR = w!("CefUnityScrollMonitorWindow");
-
-/// メッセージ専用ウィンドウを作り、Raw Input を購読してメッセージループを回す。
-/// `WM_QUIT` を受けるまで戻らない。
-fn monitor_thread_main() {
-    unsafe {
-        let instance = match GetModuleHandleW(None) {
-            Ok(handle) => handle,
-            Err(_) => return,
-        };
-
-        let window_class = WNDCLASSW {
-            lpfnWndProc: Some(window_procedure),
-            hInstance: instance.into(),
-            lpszClassName: WINDOW_CLASS_NAME,
-            ..Default::default()
-        };
-        // 既に登録済み (2 回目の start) でも失敗するだけなので戻り値は見ない。
-        RegisterClassW(&window_class);
-
-        let window = match CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            WINDOW_CLASS_NAME,
-            w!("CefUnityScrollMonitor"),
-            WINDOW_STYLE(0),
-            0,
-            0,
-            0,
-            0,
-            Some(HWND_MESSAGE),
-            None,
-            Some(instance.into()),
-            None,
-        ) {
-            Ok(window) => window,
-            Err(_) => return,
-        };
-
-        // generic mouse (usage page 0x01 / usage 0x02) を購読する。
-        let devices = [RAWINPUTDEVICE {
-            usUsagePage: 0x01,
-            usUsage: 0x02,
-            dwFlags: RIDEV_INPUTSINK,
-            hwndTarget: window,
-        }];
-        if RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32).is_err()
-        {
-            let _ = DestroyWindow(window);
-            return;
-        }
-
-        MONITOR_THREAD_ID.store(
-            windows::Win32::System::Threading::GetCurrentThreadId(),
-            Ordering::Release,
-        );
-        RUNNING.store(true, Ordering::Release);
-
-        let mut message = MSG::default();
-        // GetMessageW は WM_QUIT で 0 を返す
-        while GetMessageW(&mut message, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
-
-        let _ = DestroyWindow(window);
-        RUNNING.store(false, Ordering::Release);
-    }
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
 /// スクロールモニタを開始する。1 = 成功 / 0 = 失敗。
+///
+/// 呼び出しスレッドに WH_GETMESSAGE フックを張るため、対象ウィンドウを所有し
+/// メッセージポンプを回すスレッド (Unity のメインスレッド) から呼ぶこと。
 pub fn start() -> i32 {
-    let mut guard = MONITOR_THREAD.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut guard = INSTALLED_HOOK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     if guard.is_some() {
         return 1; // 既に動作中
     }
-    // タイムスタンプ基準を先に確定させる (スレッド開始前に now() が呼ばれても揃うように)
+    // タイムスタンプ基準を先に確定させる (フック前に now() が呼ばれても揃うように)
     let _ = EPOCH.get_or_init(Instant::now);
     BUFFER.clear();
 
-    let handle = std::thread::Builder::new()
-        .name("cef-scroll-monitor".to_string())
-        .spawn(monitor_thread_main);
-    let handle = match handle {
-        Ok(handle) => handle,
-        Err(_) => return 0,
+    let hook = unsafe {
+        SetWindowsHookExW(
+            WH_GETMESSAGE,
+            Some(get_message_hook_procedure),
+            None, // 自プロセスのスレッドフックなのでモジュールハンドル不要
+            GetCurrentThreadId(),
+        )
     };
-
-    // スレッドがウィンドウを作って RUNNING を立てるまで少し待つ。
-    // 失敗 (RegisterRawInputDevices エラー等) の場合はスレッドが即終了する。
-    for _ in 0..200 {
-        if RUNNING.load(Ordering::Acquire) {
-            *guard = Some(handle);
-            crate::logging::write("scroll", "raw input monitor started");
-            return 1;
+    match hook {
+        Ok(handle) => {
+            *guard = Some(handle.0 as isize);
+            crate::logging::write("scroll", "message hook monitor started");
+            1
         }
-        if handle.is_finished() {
-            crate::logging::write("scroll", "raw input monitor failed to start");
-            return 0;
+        Err(_) => {
+            crate::logging::write("scroll", "message hook monitor failed to start");
+            0
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    // 立ち上がりを確認できなかった場合もハンドルは保持しておく (stop で回収する)
-    *guard = Some(handle);
-    crate::logging::write("scroll", "raw input monitor start timed out (kept running)");
-    0
 }
 
-/// スクロールモニタを停止する。
+/// スクロールモニタを停止する (フックを外す)。
 pub fn stop() {
-    let mut guard = MONITOR_THREAD.lock().unwrap_or_else(PoisonError::into_inner);
-    let Some(handle) = guard.take() else {
+    let mut guard = INSTALLED_HOOK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let Some(hook_handle_value) = guard.take() else {
         return;
     };
-    let thread_id = MONITOR_THREAD_ID.load(Ordering::Acquire);
-    if thread_id != 0 {
-        unsafe {
-            let _ = PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
-        }
+    unsafe {
+        let _ = UnhookWindowsHookEx(HHOOK(hook_handle_value as *mut _));
     }
-    let _ = handle.join();
-    MONITOR_THREAD_ID.store(0, Ordering::Release);
-    RUNNING.store(false, Ordering::Release);
     BUFFER.clear();
-    crate::logging::write("scroll", "raw input monitor stopped");
+    crate::logging::write("scroll", "message hook monitor stopped");
 }
 
 /// 新着イベントを `out` へ書き、件数を返す。
@@ -347,6 +244,16 @@ pub unsafe fn poll(out: *mut CefScrollEvent, max: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::Input::{GetRegisteredRawInputDevices, RAWINPUTDEVICE};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, HWND_MESSAGE,
+        PM_NOREMOVE, PeekMessageW, PostMessageW, RegisterClassW, TranslateMessage, WINDOW_EX_STYLE,
+        WINDOW_STYLE, WM_APP, WNDCLASSW,
+    };
+    use windows::core::w;
 
     fn event(timestamp: f64, delta_y: f32) -> CefScrollEvent {
         CefScrollEvent {
@@ -412,11 +319,195 @@ mod tests {
     }
 
     /// ホイール値の単位換算。120 = 1 ノッチで、CSS ピクセル換算は
-    /// 呼び出し側 (ScrollResampler) の責務なのでここでは掛けない。
+    /// C# 側 (WheelPixelsPerStep) の責務なのでここでは掛けない。
     #[test]
-    fn wheel_delta_converts_to_notches() {
-        assert_eq!(120i16 as f32 / WHEEL_DELTA, 1.0, "120 は 1 ノッチ");
-        assert_eq!(-240i16 as f32 / WHEEL_DELTA, -2.0, "負値は逆方向");
-        assert_eq!(60i16 as f32 / WHEEL_DELTA, 0.5, "高精度ホイールは比率で表現");
+    fn wheel_parameter_converts_to_notches() {
+        assert_eq!(wheel_notches(make_wheel_parameter(120)), 1.0, "120 は 1 ノッチ");
+        assert_eq!(
+            wheel_notches(make_wheel_parameter(-240)),
+            -2.0,
+            "負値は逆方向"
+        );
+        assert_eq!(
+            wheel_notches(make_wheel_parameter(60)),
+            0.5,
+            "高精度ホイールは比率で表現"
+        );
+    }
+
+    /// wParam 下位 16bit (修飾キーフラグ) はノッチ換算に影響しないこと。
+    #[test]
+    fn wheel_parameter_ignores_low_word_key_flags() {
+        let with_key_flags = make_wheel_parameter(120) | 0x0008; // MK_CONTROL
+        assert_eq!(wheel_notches(with_key_flags), 1.0);
+    }
+
+    /// WM_MOUSEWHEEL の wParam を組み立てる (上位 16bit = 符号付き delta)。
+    fn make_wheel_parameter(delta: i16) -> usize {
+        ((delta as u16 as usize) << 16) & 0xFFFF_0000
+    }
+
+    /// テスト用ウィンドウの window procedure (既定処理へ流すだけ)。
+    /// `DefWindowProcW` は windows-rs では Rust ABI ラッパーなので直接
+    /// `lpfnWndProc` に渡せず、extern "system" で包む必要がある。
+    unsafe extern "system" fn test_window_procedure(
+        window: HWND,
+        message_id: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        unsafe { DefWindowProcW(window, message_id, wparam, lparam) }
+    }
+
+    /// テスト用のメッセージ専用ウィンドウ (フック対象スレッドの投函先)。
+    fn create_message_window() -> HWND {
+        unsafe {
+            let instance = GetModuleHandleW(None).expect("GetModuleHandleW");
+            let class_name = w!("CefUnityScrollMonitorTestWindow");
+            let window_class = WNDCLASSW {
+                lpfnWndProc: Some(test_window_procedure),
+                hInstance: instance.into(),
+                lpszClassName: class_name,
+                ..Default::default()
+            };
+            // 既に登録済み (別テスト実行後) でも失敗するだけなので戻り値は見ない。
+            RegisterClassW(&window_class);
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                class_name,
+                w!("CefUnityScrollMonitorTest"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                Some(instance.into()),
+                None,
+            )
+            .expect("CreateWindowExW")
+        }
+    }
+
+    /// 溜まっているメッセージを全て取り出してディスパッチする
+    /// (PeekMessageW の PM_REMOVE 取り出しで WH_GETMESSAGE フックが発火する)。
+    fn pump_pending_messages(window: HWND) {
+        unsafe {
+            let mut message = MSG::default();
+            while PeekMessageW(&mut message, Some(window), 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+
+    /// 自プロセスに登録されている Raw Input デバイス数。
+    fn registered_raw_input_device_count() -> u32 {
+        unsafe {
+            let mut device_count: u32 = 0;
+            let result = GetRegisteredRawInputDevices(
+                None,
+                &mut device_count,
+                std::mem::size_of::<RAWINPUTDEVICE>() as u32,
+            );
+            assert_eq!(result, 0, "件数問い合わせ自体は成功すること");
+            device_count
+        }
+    }
+
+    /// フック監視の一連のシナリオ。グローバル状態 (フック + BUFFER) を使うため
+    /// 並行実行で干渉しないよう 1 テストにまとめている。
+    #[test]
+    fn hook_monitor_observes_wheel_messages_without_registering_raw_input() {
+        assert_eq!(start(), 1, "開始できること");
+        assert_eq!(start(), 1, "二重開始は成功扱い (冪等) であること");
+
+        // ★回帰テスト (カメラ回転バグの再発防止):
+        // モニタ開始で Raw Input を一切登録しないこと。登録するとプロセス単位の
+        // 後勝ちルールでホストアプリ (Unity) の WM_INPUT 配送を奪ってしまう。
+        assert_eq!(
+            registered_raw_input_device_count(),
+            0,
+            "RegisterRawInputDevices を呼んでいないこと"
+        );
+
+        let window = create_message_window();
+        let mut destination = empty_destination(8);
+
+        unsafe {
+            // 縦ホイール 2 ノッチ下 (delta = -240)
+            PostMessageW(
+                Some(window),
+                WM_MOUSEWHEEL,
+                WPARAM(make_wheel_parameter(-240)),
+                LPARAM(0),
+            )
+            .expect("PostMessageW vertical");
+            // PM_NOREMOVE の覗き見では計上されないこと (二重計上防止) を先に確認
+            let mut peeked = MSG::default();
+            let _ = PeekMessageW(&mut peeked, Some(window), 0, 0, PM_NOREMOVE);
+        }
+        assert_eq!(
+            BUFFER.drain_into(&mut destination),
+            0,
+            "PM_NOREMOVE の覗き見では計上しないこと"
+        );
+
+        pump_pending_messages(window);
+        assert_eq!(
+            BUFFER.drain_into(&mut destination),
+            1,
+            "取り出しで 1 件だけ計上されること (覗き見と合わせて二重計上しない)"
+        );
+        assert_eq!(destination[0].delta_y, -2.0, "縦は delta_y に入ること");
+        assert_eq!(destination[0].delta_x, 0.0);
+        assert_eq!(destination[0].precise, 0, "ノッチ数単位 (非 precise) であること");
+        assert_eq!(destination[0].phase, 0);
+
+        unsafe {
+            // 横ホイール 1 ノッチ右 (delta = +120) と、無関係なメッセージ
+            PostMessageW(
+                Some(window),
+                WM_MOUSEHWHEEL,
+                WPARAM(make_wheel_parameter(120)),
+                LPARAM(0),
+            )
+            .expect("PostMessageW horizontal");
+            PostMessageW(Some(window), WM_APP, WPARAM(0), LPARAM(0)).expect("PostMessageW app");
+        }
+        pump_pending_messages(window);
+        assert_eq!(
+            BUFFER.drain_into(&mut destination),
+            1,
+            "ホイール以外のメッセージは計上しないこと"
+        );
+        assert_eq!(destination[0].delta_x, 1.0, "横は delta_x に入ること");
+        assert_eq!(destination[0].delta_y, 0.0);
+
+        stop();
+        unsafe {
+            PostMessageW(
+                Some(window),
+                WM_MOUSEWHEEL,
+                WPARAM(make_wheel_parameter(120)),
+                LPARAM(0),
+            )
+            .expect("PostMessageW after stop");
+        }
+        pump_pending_messages(window);
+        assert_eq!(
+            BUFFER.drain_into(&mut destination),
+            0,
+            "停止後は観測しないこと"
+        );
+
+        // 再開できること (Unity の Play サイクルで start/stop が繰り返される)
+        assert_eq!(start(), 1, "停止後に再開できること");
+        stop();
+
+        unsafe {
+            let _ = DestroyWindow(window);
+        }
     }
 }
