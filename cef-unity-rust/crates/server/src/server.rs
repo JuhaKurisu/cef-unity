@@ -664,6 +664,28 @@ wrap_render_handler! {
             if type_.get_raw() != PaintElementType::VIEW.get_raw() {
                 return;
             }
+            // 実験 (恒久化しないこと): Linux で dmabuf が実際に届くかを記録する。
+            #[cfg(target_os = "linux")]
+            {
+                let count = PAINT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if count <= 3 {
+                    match info {
+                        Some(info) => log(&format!(
+                            "LINUX_ACCEL_PAINT #{} plane_count={} modifier={:#x} format={} \
+                             size={}x{} fd0={}",
+                            count,
+                            info.plane_count,
+                            info.modifier,
+                            info.format.get_raw(),
+                            info.extra.coded_size.width,
+                            info.extra.coded_size.height,
+                            info.planes[0].fd,
+                        )),
+                        None => log(&format!("LINUX_ACCEL_PAINT #{} info=None", count)),
+                    }
+                }
+                return;
+            }
             #[cfg(target_os = "macos")]
             if let Some(info) = info {
                 let io_surface = info.shared_texture_io_surface;
@@ -1249,9 +1271,14 @@ wrap_app! {
                 // headless バックエンドを指定する。X11 が無い環境 (CI ランナー、
                 // コンテナ、サーバー) で初期化が失敗するのを防ぐ。
                 #[cfg(target_os = "linux")]
+                let ozone_platform = std::env::var("CEF_UNITY_OZONE")
+                    .unwrap_or_else(|_| "headless".to_string());
+                #[cfg(target_os = "linux")]
+                log(&format!("ozone-platform = {}", ozone_platform));
+                #[cfg(target_os = "linux")]
                 command_line.append_switch_with_value(
                     Some(&CefString::from("ozone-platform")),
-                    Some(&CefString::from("headless")),
+                    Some(&CefString::from(ozone_platform.as_str())),
                 );
 
                 if !self.use_gpu {
@@ -1673,6 +1700,13 @@ impl CefServer {
         }
         #[cfg(target_os = "windows")]
         if d3d11_pool.is_some() {
+            window_info.shared_texture_enabled = 1;
+        }
+        // 実験 (恒久化しないこと): Linux で CEF が dmabuf 経由の accelerated paint を
+        // 実際に供給できるかを判定するためだけに立てる。供給されなければ on_paint が
+        // 止まるだけなので、判定後は必ず戻す。
+        #[cfg(target_os = "linux")]
+        if self.use_gpu {
             window_info.shared_texture_enabled = 1;
         }
         // External BeginFrame: Unity の LateUpdate から SendExternalBeginFrame で 1 フレーム

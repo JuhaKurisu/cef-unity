@@ -5,7 +5,12 @@ var command = args.Length > 0 ? args[0] : "smoke";
 if (command == "smoke")
 {
     var frames = 0;
-    CefRuntime.Initialize(useGpu: false);
+    // 実験 (恒久化しないこと): Linux の GPU 経路を判定するため、環境変数で
+    // GPU モードとサーバーログを有効にできるようにする。既定は従来どおり。
+    var useGpu = Environment.GetEnvironmentVariable("CEF_UNITY_USE_GPU") == "1";
+    var enableLog = Environment.GetEnvironmentVariable("CEF_UNITY_LOG") == "1";
+    Console.WriteLine($"[probe] useGpu={useGpu} enableLog={enableLog}");
+    CefRuntime.Initialize(useGpu: useGpu, enableLog: enableLog);
     using (var browser = new Browser(1280, 720, "https://example.com"))
     {
         for (var frameIndex = 0; frameIndex < 600; frameIndex++)
