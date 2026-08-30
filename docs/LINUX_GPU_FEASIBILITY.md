@@ -51,9 +51,30 @@ dmabuf は 1 プレーン、modifier は `0x0` (DRM_FORMAT_MOD_LINEAR)、stride 
 同じ機械で **software paint 経路は同じページを正しく描画する**ため、CEF・ドライバ・
 ネットワークはいずれも正常である。
 
+さらに Vulkan (`VK_EXT_image_drm_format_modifier` で import → `vkCmdCopyImageToBuffer` →
+読取) でも全ゼロだった。**書いた本人 (Chromium は GaneshVulkan) と同じ API で読んでも
+空**なので、取り込み方の問題ではなく「エクスポートされたメモリに一度も書かれていない」
+ことが確定した。
+
+追加で確定した事実:
+
+- fd は本物の dmabuf (`readlink /proc/self/fd/N` → `/dmabuf:`、3.7 MB)
+- CEF 145 (branch 7632) は viz に `kPreferGpuMemoryBuffer` を正しく渡している
+- viz (`FrameSinkVideoCapturerImpl`) は `BlitRequest(populates_gpu_memory_buffer=true)`
+  を発行し、フレームを「成功」として配送している — つまり失敗は無音
+- 全 600 フレームをサンプルしても全ゼロ (初回フレームだけの問題ではない)
+- **nvidia-driver-595-open と 610.43.02-open の両方で再現** (ドライバ更新では直らない)
+- 試して効果が無かった Chromium スイッチ: `use-angle=vulkan` / `use-vulkan=native` /
+  外部 BeginFrame 無効化。`SkiaGraphite` / `DefaultANGLEVulkan` / `in-process-gpu` は
+  コールバック自体が止まる
+
 CEF の [issue #3687](https://github.com/chromiumembedded/cef/issues/3687) が
 「Linux の `OnAcceleratedPaint` は cefclient に実装が無く未検証」としているのと整合する。
-**API は呼ばれるが中身が来ない**、というのが現時点の観測。
+**API は呼ばれるが中身が来ない**、というのが現時点の観測。上流への報告が妥当。
+
+なお本リポジトリ側の実装 (fd 転送・blit・取り込み・Viewer 表示) は、既知の色を入れた
+自前バッファでの単体テストと fd 転送の E2E で全て動作確認済みであり、ソースが空である
+こと以外に問題は無い。
 
 ## 検証環境
 
