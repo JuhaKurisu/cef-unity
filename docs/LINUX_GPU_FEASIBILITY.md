@@ -63,7 +63,8 @@ dmabuf は 1 プレーン、modifier は `0x0` (DRM_FORMAT_MOD_LINEAR)、stride 
 - viz (`FrameSinkVideoCapturerImpl`) は `BlitRequest(populates_gpu_memory_buffer=true)`
   を発行し、フレームを「成功」として配送している — つまり失敗は無音
 - 全 600 フレームをサンプルしても全ゼロ (初回フレームだけの問題ではない)
-- **nvidia-driver-595-open と 610.43.02-open の両方で再現** (ドライバ更新では直らない)
+- **nvidia-driver-595-open / 610.43.02-open / 610.43.02-proprietary の 3 構成すべてで再現**
+  (ドライバのバージョンにもフレーバーにも依存しない)
 - 試して効果が無かった Chromium スイッチ: `use-angle=vulkan` / `use-vulkan=native` /
   外部 BeginFrame 無効化。`SkiaGraphite` / `DefaultANGLEVulkan` / `in-process-gpu` は
   コールバック自体が止まる
