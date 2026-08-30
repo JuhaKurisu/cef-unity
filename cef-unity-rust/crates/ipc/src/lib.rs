@@ -519,6 +519,14 @@ impl SharedMemoryWriter {
         header.accelerated_frame_id.fetch_add(1, Ordering::Release);
     }
 
+    /// Linux: dmabuf の世代情報を共有メモリヘッダへ書く。
+    /// レイアウトは IOSurface と同じで、`accelerated_surface_id` の位置に generation を入れる。
+    /// クライアントはこの値と一致する fd を受け取っているときだけテクスチャを使う。
+    #[cfg(target_os = "linux")]
+    pub fn write_dmabuf_info(&self, generation: u32, width: u32, height: u32, format: u32) {
+        self.write_iosurface_info(generation, width, height, format);
+    }
+
     /// この paint に対応する SendExternalBeginFrame 発行時の Unity frame 番号を書き込む。
     /// accelerated_frame_id / d3d11_frame_id を更新する**前**に書くこと
     /// (クライアントは frame_id 増分を検出してから他フィールドを読むため)。

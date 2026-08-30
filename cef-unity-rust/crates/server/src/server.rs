@@ -364,15 +364,174 @@ pub fn use_unsafe_no_wait_copy() -> bool {
 /// `display` は `DISPLAY` 環境変数の値。Wayland のみで Xwayland が無い環境は
 /// 未設定になるため、保守的に software paint となる。
 #[cfg(target_os = "linux")]
-fn linux_accelerated_paint_available(use_gpu: bool, display: Option<&str>) -> bool {
-    use_gpu && display.is_some_and(|value| !value.is_empty())
+fn linux_accelerated_paint_available(
+    use_gpu: bool,
+    display: Option<&str>,
+    pool_available: bool,
+) -> bool {
+    use_gpu && display.is_some_and(|value| !value.is_empty()) && pool_available
 }
 
 /// 環境から `linux_accelerated_paint_available` を評価する。
 /// ozone プラットフォームの選択と `shared_texture_enabled` の双方で同じ判定を使う。
+/// DRM の fourcc。CEF が渡すピクセル順に合わせて選ぶ。
+/// `'A','R','2','4'` — メモリ上は B,G,R,A の順。
+#[cfg(target_os = "linux")]
+const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
+/// `'A','B','2','4'` — メモリ上は R,G,B,A の順。
+#[cfg(target_os = "linux")]
+const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241;
+
+/// 生の file descriptor を複製して所有権付きにする。
+///
+/// CEF が渡す fd はコールバックの間だけ借りているものなので、複製して寿命を分ける。
+#[cfg(target_os = "linux")]
+fn borrow_file_descriptor(raw: std::os::fd::RawFd) -> Option<std::os::fd::OwnedFd> {
+    unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) }
+        .try_clone_to_owned()
+        .ok()
+}
+
+/// accelerated paint が成立しない理由を記録する。毎フレーム出すとログが溢れるので
+/// 先頭数回だけにする。黙って捨てると原因が分からなくなるため、無言にはしない。
+#[cfg(target_os = "linux")]
+fn log_once_linux_accelerated_paint_problem(reason: &str) {
+    static LOGGED_COUNT: AtomicU64 = AtomicU64::new(0);
+    let count = LOGGED_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 5 {
+        log(&format!(
+            "on_accelerated_paint (Linux) をスキップ: {} — フレームは供給されない",
+            reason
+        ));
+    }
+}
+
+// EGL コンテキストは作成したスレッドでしか current にできないため、プールは
+// スレッドローカルに持つ。`on_accelerated_paint` と `create_browser` が同じ
+// スレッドで動く限りプールは 1 つだけ作られる。違うスレッドで初期化されたら
+// GPU リソースを二重に掴むことになるので、検出して警告する
+// (`d3d11.rs` が呼び出しスレッド ID を記録しているのと同じ流儀)。
+#[cfg(target_os = "linux")]
+thread_local! {
+    static DMABUF_POOL: std::cell::OnceCell<Option<crate::dmabuf_pool::DmabufPool>> =
+        const { std::cell::OnceCell::new() };
+}
+
+#[cfg(target_os = "linux")]
+static DMABUF_POOL_INITIALIZED_THREADS: AtomicU32 = AtomicU32::new(0);
+
+/// 出力バッファの fd をクライアントへ渡すチャネル。
+/// `pending_flush` と同じく現状は単一 Browser 構成を想定している。
+#[cfg(target_os = "linux")]
+static DMABUF_CHANNEL: Mutex<Option<cef_unity_ipc::file_descriptor_channel::FileDescriptorChannel>> =
+    Mutex::new(None);
+
+/// 直近にクライアントへ送った世代。0 は未送信。
+#[cfg(target_os = "linux")]
+static SENT_DMABUF_GENERATION: AtomicU32 = AtomicU32::new(0);
+
+/// blit 済みの出力バッファをクライアントへ公開する。
+///
+/// 出力バッファが作り直された (= generation が進んだ) ときだけ fd を送る。
+/// 定常状態では 1 本も送らない。書き込み順は「fd 送信 → 共有メモリヘッダ更新」で、
+/// クライアントがヘッダの世代を見た時点では必ず対応する fd が届いている。
+#[cfg(target_os = "linux")]
+fn publish_linux_accelerated_frame(
+    shared_memory: &SharedMemoryWriter,
+    pool: &crate::dmabuf_pool::DmabufPool,
+) {
+    let Some((output_file_descriptor, descriptor)) = pool.output() else {
+        log_once_linux_accelerated_paint_problem("出力記述子が取れない");
+        return;
+    };
+
+    if SENT_DMABUF_GENERATION.load(Ordering::Relaxed) != descriptor.generation {
+        let channel_guard = DMABUF_CHANNEL.lock().unwrap();
+        let Some(channel) = channel_guard.as_ref() else {
+            // クライアントがまだ接続していない。次フレームで再試行する。
+            return;
+        };
+        if let Err(error) = channel.send(
+            &descriptor.to_bytes(),
+            &[std::os::fd::AsRawFd::as_raw_fd(&output_file_descriptor)],
+        ) {
+            log(&format!("dmabuf の fd を送れない: {}", error));
+            return;
+        }
+        SENT_DMABUF_GENERATION.store(descriptor.generation, Ordering::Relaxed);
+        log(&format!(
+            "dmabuf を送信: generation={} {}x{} stride={} modifier={:#x}",
+            descriptor.generation, descriptor.width, descriptor.height,
+            descriptor.stride, descriptor.modifier
+        ));
+    }
+
+    // d3d11 経路と同じく、frame_id 増分の前に Unity frame を書く。
+    shared_memory.write_paint_unity_frame(LAST_BEGIN_FRAME_UNITY_FRAME.load(Ordering::Relaxed));
+    shared_memory.write_dmabuf_info(
+        descriptor.generation,
+        descriptor.width,
+        descriptor.height,
+        // クライアントは dmabuf の fourcc で解釈するので、format タグは 0 固定にする。
+        0,
+    );
+}
+
+/// 待ち受けを開始し、クライアントの接続を別スレッドで受け付ける。
+///
+/// accept は接続が来るまで戻らないため、ブラウザ生成を止めないようスレッドに逃がす。
+#[cfg(target_os = "linux")]
+fn start_dmabuf_listener(socket_path: String) {
+    std::thread::spawn(move || {
+        let listener =
+            match cef_unity_ipc::file_descriptor_channel::FileDescriptorChannel::listen(
+                &socket_path,
+            ) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    log(&format!("dmabuf ソケットを listen できない: {}", error));
+                    return;
+                }
+            };
+        match listener.accept() {
+            Ok(channel) => {
+                *DMABUF_CHANNEL.lock().unwrap() = Some(channel);
+                log("dmabuf チャネルにクライアントが接続した");
+            }
+            Err(error) => log(&format!("dmabuf チャネルの accept に失敗: {}", error)),
+        }
+        // listener を保持し続ける (drop するとソケットファイルが消える)。
+        std::thread::park();
+    });
+}
+
+#[cfg(target_os = "linux")]
+/// プールを、それを使う処理と同じスレッドで操作する。
+/// スレッドローカルの参照は持ち出せないため、操作はクロージャで受け取る。
+fn with_dmabuf_pool<T>(action: impl FnOnce(Option<&crate::dmabuf_pool::DmabufPool>) -> T) -> T {
+    DMABUF_POOL.with(|cell| {
+        let pool = cell.get_or_init(|| {
+            let count = DMABUF_POOL_INITIALIZED_THREADS.fetch_add(1, Ordering::Relaxed) + 1;
+            if count > 1 {
+                log(&format!(
+                    "警告: dmabuf プールが {} 本目のスレッドで初期化された。\
+                     EGL コンテキストはスレッド束縛なので GPU リソースを二重に掴んでいる",
+                    count
+                ));
+            }
+            crate::dmabuf_pool::DmabufPool::create()
+        });
+        action(pool.as_ref())
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn linux_use_accelerated_paint(use_gpu: bool) -> bool {
-    linux_accelerated_paint_available(use_gpu, std::env::var("DISPLAY").ok().as_deref())
+    let display = std::env::var("DISPLAY").ok();
+    // プールの構築は EGL の初期化を伴うので、安い条件が揃ってから評価する。
+    let cheap_conditions_hold =
+        linux_accelerated_paint_available(use_gpu, display.as_deref(), true);
+    cheap_conditions_hold && with_dmabuf_pool(|pool| pool.is_some())
 }
 
 /// 既知不良構成は IOSurface プール (macOS 専用) の中にしか無いので、他プラットフォーム
@@ -685,26 +844,55 @@ wrap_render_handler! {
             if type_.get_raw() != PaintElementType::VIEW.get_raw() {
                 return;
             }
-            // Linux: dmabuf は届くが、クライアントへ渡す仕組み (SCM_RIGHTS による fd
-            // 転送と取り込み) が未実装。ここで捨てているため、この経路を有効にすると
-            // フレームは供給されない。黙って落ちると原因が分からなくなるので、
-            // 最初の 1 回だけ受信内容を記録する。
+            // Linux: CEF の dmabuf を自前の出力バッファへ blit する。CEF のバッファは
+            // プールの借用で、このコールバックを抜けると再利用されるため、ここで
+            // コピーを完了させる (macOS / Windows と同じ構造)。
             #[cfg(target_os = "linux")]
             {
-                PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
-                static LOGGED: OnceLock<()> = OnceLock::new();
-                LOGGED.get_or_init(|| {
-                    match info {
-                        Some(info) => log(&format!(
-                            "on_accelerated_paint (Linux): plane_count={} modifier={:#x} \
-                             size={}x{} — クライアントへの転送は未実装のため破棄する",
-                            info.plane_count,
-                            info.modifier,
-                            info.extra.coded_size.width,
-                            info.extra.coded_size.height,
-                        )),
-                        None => log("on_accelerated_paint (Linux): info=None"),
+                let Some(info) = info else {
+                    log_once_linux_accelerated_paint_problem("info=None");
+                    return;
+                };
+                if info.plane_count != 1 {
+                    // 複数プレーンは想定していない (CEF は RGBA 1 プレーンを渡す)。
+                    log_once_linux_accelerated_paint_problem("plane_count が 1 ではない");
+                    return;
+                }
+
+                let width = info.extra.coded_size.width as u32;
+                let height = info.extra.coded_size.height as u32;
+                let source = crate::dmabuf_pool::DmabufSource {
+                    // CEF が所有する fd を借りるだけなので、複製して所有権を分ける。
+                    file_descriptor: match borrow_file_descriptor(info.planes[0].fd) {
+                        Some(file_descriptor) => file_descriptor,
+                        None => {
+                            log_once_linux_accelerated_paint_problem("fd を複製できない");
+                            return;
+                        }
+                    },
+                    stride: info.planes[0].stride,
+                    modifier: info.modifier,
+                    fourcc: if info.format.get_raw() == ColorType::RGBA_8888.get_raw() {
+                        DRM_FORMAT_ABGR8888
+                    } else {
+                        DRM_FORMAT_ARGB8888
+                    },
+                    width,
+                    height,
+                };
+
+                with_dmabuf_pool(|pool| {
+                    let Some(pool) = pool else {
+                        log_once_linux_accelerated_paint_problem("プールが無い");
+                        return;
                     };
+                    if !pool.blit(&source) {
+                        log_once_linux_accelerated_paint_problem("blit に失敗");
+                        return;
+                    }
+                    record_paint_latency();
+                    PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    publish_linux_accelerated_frame(&self.shared_memory, pool);
                 });
                 return;
             }
@@ -1747,6 +1935,9 @@ impl CefServer {
         #[cfg(target_os = "linux")]
         if linux_use_accelerated_paint(self.use_gpu) {
             window_info.shared_texture_enabled = 1;
+            // 出力バッファの fd を渡す経路。パスはクライアントも server_pid と
+            // browser_id から同じ規則で導出する (macOS の Mach サービス名と同じ流儀)。
+            start_dmabuf_listener(cef_unity_ipc::dmabuf_socket_path(self.server_pid, id));
         }
         // External BeginFrame: Unity の LateUpdate から SendExternalBeginFrame で 1 フレーム
         // ずつ駆動する。これにより CEF の Viz Compositor は自発的に paint せず、
@@ -2353,23 +2544,29 @@ mod linux_accelerated_paint_tests {
     use super::linux_accelerated_paint_available;
 
     #[test]
-    fn gpu_モードでディスプレイがあれば有効() {
-        assert!(linux_accelerated_paint_available(true, Some(":0")));
+    fn 三条件が揃えば有効() {
+        assert!(linux_accelerated_paint_available(true, Some(":0"), true));
     }
 
     #[test]
     fn cpu_モードでは無効() {
-        assert!(!linux_accelerated_paint_available(false, Some(":0")));
+        assert!(!linux_accelerated_paint_available(false, Some(":0"), true));
     }
 
     #[test]
     fn ディスプレイが無ければ無効() {
         // CI ランナーとコンテナがこれに該当する。headless + software paint に落ちる。
-        assert!(!linux_accelerated_paint_available(true, None));
+        assert!(!linux_accelerated_paint_available(true, None, true));
     }
 
     #[test]
     fn 空文字の_display_はディスプレイ無しとして扱う() {
-        assert!(!linux_accelerated_paint_available(true, Some("")));
+        assert!(!linux_accelerated_paint_available(true, Some(""), true));
+    }
+
+    #[test]
+    fn プールを構築できなければ無効() {
+        // EGL の拡張が足りない、ドライバが古い、といった環境。
+        assert!(!linux_accelerated_paint_available(true, Some(":0"), false));
     }
 }
