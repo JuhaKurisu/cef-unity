@@ -12,7 +12,8 @@ the cefclient side or debugging the export path.
 ## Environment
 
 - Ubuntu 26.04.1, kernel 7.0.0-30-generic, X11 ozone (`--ozone-platform=x11`)
-- GeForce RTX 3060 Ti, nvidia-driver-595-open (595.84)
+- GeForce RTX 3060 Ti; reproduced identically on nvidia-driver-595-open (595.84),
+  610-open (610.43.02) and 610 proprietary (610.43.02)
 - `windowless_rendering_enabled=1`, `shared_texture_enabled=1`,
   `external_begin_frame_enabled=1`, `--enable-features=Vulkan`
 - chrome://gpu confirms: Compositing/Rasterization Hardware accelerated,
