@@ -11,6 +11,9 @@ namespace CefUnity.Viewer
         /// <summary>Windows: DXGI スワップチェーンへのコピー (D3D11FrameRenderer)。</summary>
         Direct3D11,
 
+        /// <summary>Linux: dmabuf 由来の GL テクスチャを既定フレームバッファへ (OpenGLFrameRenderer)。</summary>
+        OpenGL,
+
         /// <summary>表示バックエンドが無いプラットフォーム。</summary>
         Unsupported,
     }
@@ -23,16 +26,18 @@ namespace CefUnity.Viewer
     /// </summary>
     public static class FrameRendererFactory
     {
-        public static FrameRendererKind SelectKind(bool isMacOS, bool isWindows)
+        public static FrameRendererKind SelectKind(bool isMacOS, bool isWindows, bool isLinux)
         {
             if (isMacOS) return FrameRendererKind.Metal;
             if (isWindows) return FrameRendererKind.Direct3D11;
+            if (isLinux) return FrameRendererKind.OpenGL;
             return FrameRendererKind.Unsupported;
         }
 
         public static FrameRendererKind SelectKind()
             => SelectKind(
                 RuntimeInformation.IsOSPlatform(OSPlatform.OSX),
-                RuntimeInformation.IsOSPlatform(OSPlatform.Windows));
+                RuntimeInformation.IsOSPlatform(OSPlatform.Windows),
+                RuntimeInformation.IsOSPlatform(OSPlatform.Linux));
     }
 }

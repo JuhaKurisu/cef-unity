@@ -548,6 +548,22 @@ namespace CefUnity.Interop
         }
 
         /// <summary>
+        /// Linux: 最新フレームの dmabuf 由来 GL テクスチャ名を取得する。
+        /// 0 は「今使えるテクスチャが無い」で、呼び出し側は前フレームの絵を維持する。
+        /// 解放は native 側が世代交代時に行うため、呼び出し側では解放しない。
+        /// **ホストの GL コンテキストが current なスレッドから呼ぶこと。**
+        /// </summary>
+        public unsafe uint ReceiveDmabufTexture(out int width, out int height)
+        {
+            ThrowIfDisposed();
+            int nativeWidth, nativeHeight;
+            var texture = NativeMethods.cef_unity_get_dmabuf_texture(_handle, &nativeWidth, &nativeHeight);
+            width = nativeWidth;
+            height = nativeHeight;
+            return texture;
+        }
+
+        /// <summary>
         /// Unity の D3D12 device と接続済みかどうかを返す (Windows 用)。
         /// </summary>
         public static bool IsD3D12Connected()

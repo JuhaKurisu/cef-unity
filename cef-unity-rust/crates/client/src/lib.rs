@@ -176,7 +176,7 @@ fn handle_to_reference<'a>(handle: *mut CefUnityBrowser) -> &'a mut ClientBrowse
 /// 0 は「今使えるテクスチャが無い」を意味し、呼び出し側は前フレームの絵を維持する。
 /// **ホストの GL コンテキストが current なスレッドから呼ぶこと。**
 #[cfg(target_os = "linux")]
-fn update_dmabuf_texture(instance: &mut ClientBrowserInstance) -> u32 {
+fn update_dmabuf_texture(instance: &mut ClientBrowserInstance) -> (u32, u32, u32) {
     use cef_unity_ipc::file_descriptor_channel::{
         DmabufDescriptor, FileDescriptorChannel, DMABUF_DESCRIPTOR_BYTES,
     };
@@ -189,7 +189,7 @@ fn update_dmabuf_texture(instance: &mut ClientBrowserInstance) -> u32 {
         );
         instance.dmabuf_channel = FileDescriptorChannel::connect(&socket_path).ok();
         if instance.dmabuf_channel.is_none() {
-            return 0;
+            return (0, 0, 0);
         }
         log_to_file("dmabuf チャネルに接続した");
     }
@@ -237,25 +237,35 @@ fn update_dmabuf_texture(instance: &mut ClientBrowserInstance) -> u32 {
     }
 
     // 共有メモリヘッダの世代と一致するテクスチャだけを使う。
-    let Some((generation, _width, _height, _format)) = instance.shared_memory.get_iosurface_info()
+    let Some((generation, width, height, _format)) = instance.shared_memory.get_iosurface_info()
     else {
-        return 0;
+        return (0, 0, 0);
     };
-    instance
-        .dmabuf_cache
-        .texture_for_generation(generation)
-        .unwrap_or(0)
+    match instance.dmabuf_cache.texture_for_generation(generation) {
+        Some(texture) => (texture, width, height),
+        None => (0, 0, 0),
+    }
 }
 
-/// Linux: 最新の dmabuf テクスチャ名を返す。0 は「新しい絵は無い」。
+/// Linux: 最新の dmabuf テクスチャ名を返す。0 は「今使えるテクスチャが無い」で、
+/// 呼び出し側は前フレームの絵を維持する。
 #[cfg(target_os = "linux")]
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_get_dmabuf_texture(handle: *mut CefUnityBrowser) -> u32 {
+pub extern "C" fn cef_unity_get_dmabuf_texture(
+    handle: *mut CefUnityBrowser,
+    out_width: *mut i32,
+    out_height: *mut i32,
+) -> u32 {
     ffi_guard(0, || {
-        if handle.is_null() {
+        if handle.is_null() || out_width.is_null() || out_height.is_null() {
             return 0;
         }
-        update_dmabuf_texture(handle_to_reference(handle))
+        let (texture, width, height) = update_dmabuf_texture(handle_to_reference(handle));
+        unsafe {
+            *out_width = width as i32;
+            *out_height = height as i32;
+        }
+        texture
     })
 }
 

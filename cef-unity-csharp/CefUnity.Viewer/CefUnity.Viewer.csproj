@@ -15,6 +15,8 @@
     <PackageReference Include="Silk.NET.Input" Version="2.22.0" />
     <PackageReference Include="Silk.NET.Input.Sdl" Version="2.22.0" />
     <PackageReference Include="Silk.NET.SDL" Version="2.22.0" />
+    <!-- Linux: dmabuf 由来の GL テクスチャを表示する (OpenGLFrameRenderer) -->
+    <PackageReference Include="Silk.NET.OpenGL" Version="2.22.0" />
     <!-- Windows の表示経路 (D3D11FrameRenderer)。非 Windows でもビルドは通る (P/Invoke は実行時解決)。 -->
     <PackageReference Include="Silk.NET.Direct3D11" Version="2.22.0" />
     <PackageReference Include="Silk.NET.DXGI" Version="2.22.0" />

@@ -19,10 +19,11 @@ namespace CefUnity
 
 
         /// <summary>
-        ///  Linux: 最新の dmabuf テクスチャ名を返す。0 は「新しい絵は無い」。
+        ///  Linux: 最新の dmabuf テクスチャ名を返す。0 は「今使えるテクスチャが無い」で、
+        ///  呼び出し側は前フレームの絵を維持する。
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_get_dmabuf_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern uint cef_unity_get_dmabuf_texture(CefUnityBrowser* handle);
+        public static extern uint cef_unity_get_dmabuf_texture(CefUnityBrowser* handle, int* out_width, int* out_height);
 
         /// <summary>
         ///  Initialize: launch CEF server process and connect via ipc-channel.

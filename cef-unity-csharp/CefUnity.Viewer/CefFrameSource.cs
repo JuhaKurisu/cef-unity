@@ -5,12 +5,13 @@ namespace CefUnity.Viewer
 {
     /// <summary>
     ///     CEF 側窓口: BeginFrame/Pump/テクスチャ受信/リサイズ (spec §CefFrameSource)。
-    ///     受信 API は macOS (IOSurface → MTLTexture) と Windows (D3D11 共有テクスチャ) で
-    ///     異なるため、その分岐はこのクラスに封じ込める。
+    ///     受信 API は macOS (IOSurface → MTLTexture)、Windows (D3D11 共有テクスチャ)、
+    ///     Linux (dmabuf → GL テクスチャ) で異なるため、その分岐はこのクラスに封じ込める。
     /// </summary>
     internal sealed class CefFrameSource : IDisposable
     {
         private static readonly bool IsWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        private static readonly bool IsLinux = RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
 
         private readonly Browser _browser;
         private IntPtr _currentTexture;
@@ -45,6 +46,20 @@ namespace CefUnity.Viewer
                     _currentFormat = d3d11Format;
                 }
             }
+            else if (IsLinux)
+            {
+                // dmabuf 由来の GL テクスチャ名。0 は「今使えるテクスチャが無い」で、
+                // 直前のテクスチャを描き続ける (世代が揃うまで待つ)。
+                // 解放は native 側が世代交代時に行うので、こちらでは触らない。
+                var glTexture = _browser.ReceiveDmabufTexture(out var glWidth, out var glHeight);
+                if (glTexture != 0)
+                {
+                    _currentTexture = (IntPtr)glTexture;
+                    _textureWidth = glWidth;
+                    _textureHeight = glHeight;
+                    _currentFormat = 0;
+                }
+            }
             else if (Browser.TryReceiveIOSurfaceTexture(out var newTexture, out var newWidth, out var newHeight, out var newFormat))
             {
                 if (_currentTexture != IntPtr.Zero) Browser.ReleaseMetalTexture(_currentTexture);
@@ -65,8 +80,8 @@ namespace CefUnity.Viewer
 
         public void Dispose()
         {
-            // Windows の受信テクスチャは native 側のキャッシュなので解放しない
-            if (_currentTexture != IntPtr.Zero && !IsWindows)
+            // Windows と Linux の受信テクスチャは native 側のキャッシュなので解放しない
+            if (_currentTexture != IntPtr.Zero && !IsWindows && !IsLinux)
             {
                 Browser.ReleaseMetalTexture(_currentTexture);
             }

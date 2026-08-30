@@ -81,7 +81,7 @@ try
     var rendererKind = FrameRendererFactory.SelectKind();
     if (rendererKind == FrameRendererKind.Unsupported)
     {
-        Console.Error.WriteLine("このプラットフォームには表示バックエンドがありません (macOS / Windows のみ対応)");
+        Console.Error.WriteLine("このプラットフォームには表示バックエンドがありません (macOS / Windows / Linux のみ対応)");
         return 1;
     }
     if (rendererKind == FrameRendererKind.Direct3D11)
@@ -129,6 +129,9 @@ static Func<Sdl, IFrameRenderer> RendererFactoryFor(FrameRendererKind kind, D3D1
     // D3D11 は Sdl を使わない (HWND は IView から取る)。
     if (kind == FrameRendererKind.Direct3D11)
         return _ => new D3D11FrameRenderer(graphicsDevice!);
+    // Linux も Sdl を使わない (GL コンテキストは IView から取る)。
+    if (kind == FrameRendererKind.OpenGL)
+        return _ => new OpenGLFrameRenderer();
     return sdl => new MetalFrameRenderer(sdl);
 }
 
