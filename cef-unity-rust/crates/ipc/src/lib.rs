@@ -3,6 +3,11 @@
 // Transport: ipc-channel (Mach ports on macOS)
 // Pixel data: shared_memory crate (POSIX shm)
 
+// dmabuf の fd 転送 (Linux 専用)。SCM_RIGHTS を使うため、
+// バイト列しか運べない他の経路とは分けてある。
+#[cfg(target_os = "linux")]
+pub mod file_descriptor_channel;
+
 use ipc_channel::ipc::{IpcReceiver, IpcSender};
 use serde::{Deserialize, Serialize};
 use shared_memory::{Shmem, ShmemConf};

@@ -7,3 +7,6 @@ edition = "2024"
 ipc-channel = "0.21"
 serde = { version = "1", features = ["derive"] }
 shared_memory = "0.12"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
