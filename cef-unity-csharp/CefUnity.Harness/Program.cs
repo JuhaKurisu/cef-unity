@@ -32,9 +32,12 @@ if (command == "dump")
     // chrome://gpu を software paint で撮って Chromium 自身の GPU 診断を読むのに使う。
     var dumpUrl = Environment.GetEnvironmentVariable("CEFUNITY_URL") ?? "https://example.com";
     var dumpUseGpu = Environment.GetEnvironmentVariable("CEFUNITY_USE_GPU") == "1";
+    // chrome://gpu の Problems Detected 節まで 1 枚に収めるため、縦長も指定できるようにする。
+    var dumpWidth = int.TryParse(Environment.GetEnvironmentVariable("CEFUNITY_WIDTH"), out var parsedDumpWidth) ? parsedDumpWidth : 1280;
+    var dumpHeight = int.TryParse(Environment.GetEnvironmentVariable("CEFUNITY_HEIGHT"), out var parsedDumpHeight) ? parsedDumpHeight : 720;
     CefRuntime.Initialize(useGpu: dumpUseGpu, enableLog: Environment.GetEnvironmentVariable("CEFUNITY_LOG") == "1");
     var written = false;
-    using (var browser = new Browser(1280, 720, dumpUrl))
+    using (var browser = new Browser(dumpWidth, dumpHeight, dumpUrl))
     {
         for (var frameIndex = 0; frameIndex < 600 && !written; frameIndex++)
         {
@@ -43,6 +46,15 @@ if (command == "dump")
             Thread.Sleep(16);
             // 最初の 120 フレームはページのロード待ちに使い、白紙を掴まないようにする
             if (frameIndex < 120) continue;
+            // 診断用: 長いページ (chrome://gpu) の下部を撮るためスクロール位置を指定できる。
+            if (frameIndex == 120 &&
+                int.TryParse(Environment.GetEnvironmentVariable("CEFUNITY_SCROLL"), out var scrollY) &&
+                scrollY > 0)
+            {
+                browser.ExecuteJavaScriptBlocking($"window.scrollTo(0, {scrollY});");
+                continue; // スクロール後の再描画を 1 フレーム待つ
+            }
+            if (frameIndex < 140 && Environment.GetEnvironmentVariable("CEFUNITY_SCROLL") != null) continue;
             if (browser.TryGetBuffer(out var bgra, out var width, out var height))
             {
                 CefUnity.Harness.PortableNetworkGraphicsWriter.WriteBgra(outputPath, bgra.ToArray(), width, height);

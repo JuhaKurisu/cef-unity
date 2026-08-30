@@ -909,9 +909,46 @@ wrap_render_handler! {
                 };
 
                 {
-                    // 診断: CEF が渡してくるパラメータを 1 度だけ記録する。
+                    // 診断: 最初の 1 回だけでなく定期的に読む。最初のフレームは
+                    // ページロード前の透明で当然なので、1 回だけの検査は誤診の元。
+                    static SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
+                    let sample_index = SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    if sample_index % 60 == 0 && sample_index < 600 {
+                        match crate::dmabuf_pool::read_center_via_cpu(&source) {
+                            Some((pixel, non_zero)) => log(&format!(
+                                "frame#{}: CPU 中心 RGBA=({},{},{},{}) 非ゼロ={}",
+                                sample_index, pixel[0], pixel[1], pixel[2], pixel[3], non_zero
+                            )),
+                            None => log(&format!("frame#{}: mmap 不可", sample_index)),
+                        }
+                        match crate::dmabuf_pool::read_via_vulkan(&source) {
+                            Ok((pixel, non_zero)) => log(&format!(
+                                "frame#{}: Vulkan 中心 RGBA=({},{},{},{}) 非ゼロ={}",
+                                sample_index, pixel[0], pixel[1], pixel[2], pixel[3], non_zero
+                            )),
+                            Err(stage) => log(&format!("frame#{}: Vulkan 読み失敗 stage={}", sample_index, stage)),
+                        }
+                    }
+                    // CEF が渡してくるパラメータを 1 度だけ記録する。
                     static LOGGED: OnceLock<()> = OnceLock::new();
                     LOGGED.get_or_init(|| {
+                        // fd の実体を確認する。本物の dmabuf なら readlink が
+                        // "dmabuf:" になり、shared memory フォールバックなら "memfd:" になる。
+                        {
+                            let link = std::fs::read_link(format!(
+                                "/proc/self/fd/{}",
+                                std::os::fd::AsRawFd::as_raw_fd(&source.file_descriptor)
+                            ));
+                            let size = std::fs::metadata(format!(
+                                "/proc/self/fd/{}",
+                                std::os::fd::AsRawFd::as_raw_fd(&source.file_descriptor)
+                            ))
+                            .map(|metadata| metadata.len());
+                            log(&format!(
+                                "fd の実体: {:?} サイズ={:?} plane_size={}",
+                                link, size, info.planes[0].size
+                            ));
+                        }
                         match crate::dmabuf_pool::read_center_via_cpu(&source) {
                             Some((pixel, non_zero)) => log(&format!(
                                 "CPU 直読み: 中心 RGBA=({},{},{},{}) 非ゼロバイト数={}",

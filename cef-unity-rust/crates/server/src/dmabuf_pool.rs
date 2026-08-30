@@ -53,6 +53,15 @@ unsafe extern "C" {
         height: std::ffi::c_int,
         out_rgba: *mut u8,
     ) -> std::ffi::c_int;
+    fn dmabuf_vulkan_probe_read(
+        dmabuf_file_descriptor: std::ffi::c_int,
+        width: u32,
+        height: u32,
+        stride: u32,
+        modifier: u64,
+        out_rgba: *mut u8,
+        out_non_zero: *mut u64,
+    ) -> std::ffi::c_int;
     fn dmabuf_pool_clear_check(
         pool: *mut std::ffi::c_void,
         out_rgba: *mut u8,
@@ -109,6 +118,25 @@ pub struct DmabufSource {
     pub fourcc: u32,
     pub width: u32,
     pub height: u32,
+}
+
+/// 診断: dmabuf を Vulkan で import して読む。書いた本人 (Vulkan) と同じ経路。
+/// 戻り値: Ok((中心ピクセル, 非ゼロバイト数)) / Err(失敗段階)。
+pub fn read_via_vulkan(source: &DmabufSource) -> Result<([u8; 4], u64), i32> {
+    let mut pixel = [0u8; 4];
+    let mut non_zero: u64 = 0;
+    let result = unsafe {
+        dmabuf_vulkan_probe_read(
+            std::os::fd::AsRawFd::as_raw_fd(&source.file_descriptor),
+            source.width,
+            source.height,
+            source.stride,
+            source.modifier,
+            pixel.as_mut_ptr(),
+            &mut non_zero,
+        )
+    };
+    if result == 0 { Ok((pixel, non_zero)) } else { Err(result) }
 }
 
 /// 診断: dmabuf を CPU から直接読んで中心ピクセルを返す。

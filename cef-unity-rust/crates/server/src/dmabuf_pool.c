@@ -14,6 +14,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -484,6 +486,10 @@ int dmabuf_read_center_via_cpu(int file_descriptor, unsigned int stride,
     if (mapped == MAP_FAILED) {
         return 0;
     }
+    // dmabuf の CPU 読みは DMA_BUF_IOCTL_SYNC で囲まないとキャッシュ不整合で
+    // 古い内容 (ゼロ) を見ることがある。
+    struct dma_buf_sync sync_arguments = {DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ};
+    ioctl(file_descriptor, DMA_BUF_IOCTL_SYNC, &sync_arguments);
     unsigned char *base = (unsigned char *)mapped + offset;
     unsigned char *pixel = base + (size_t)(height / 2) * stride + (size_t)(width / 2) * 4;
     out_rgba[0] = pixel[0];
@@ -501,6 +507,8 @@ int dmabuf_read_center_via_cpu(int file_descriptor, unsigned int stride,
     }
     out_rgba[4] = (unsigned char)(non_zero > 0);
     *((size_t *)(out_rgba + 8)) = non_zero;
+    struct dma_buf_sync sync_end = {DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ};
+    ioctl(file_descriptor, DMA_BUF_IOCTL_SYNC, &sync_end);
     munmap(mapped, length);
     return 1;
 }
