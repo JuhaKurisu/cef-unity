@@ -5,6 +5,8 @@
 
 mod logging;
 
+#[cfg(target_os = "linux")]
+mod dmabuf;
 #[cfg(target_os = "windows")]
 mod d3d11;
 #[cfg(target_os = "windows")]
@@ -156,10 +158,105 @@ struct ClientBrowserInstance {
     /// ネイティブ音声出力 (Windows)。Unity ミキサを迂回して WASAPI で再生。
     #[cfg(target_os = "windows")]
     native_voice: Option<wasapi_output::WasapiOutput>,
+    /// Linux: サーバから dmabuf の fd を受け取るチャネル。接続はブラウザ生成後に
+    /// 遅延して行う (サーバが listen を開始するのを待つため)。
+    #[cfg(target_os = "linux")]
+    dmabuf_channel: Option<cef_unity_ipc::file_descriptor_channel::FileDescriptorChannel>,
+    /// Linux: 取り込み済みテクスチャの世代キャッシュ。
+    #[cfg(target_os = "linux")]
+    dmabuf_cache: dmabuf::DmabufTextureCache,
 }
 
 fn handle_to_reference<'a>(handle: *mut CefUnityBrowser) -> &'a mut ClientBrowserInstance {
     unsafe { &mut *(handle as *mut ClientBrowserInstance) }
+}
+
+/// Linux: サーバから届いた dmabuf を GL テクスチャとして取り込み、テクスチャ名を返す。
+///
+/// 0 は「今使えるテクスチャが無い」を意味し、呼び出し側は前フレームの絵を維持する。
+/// **ホストの GL コンテキストが current なスレッドから呼ぶこと。**
+#[cfg(target_os = "linux")]
+fn update_dmabuf_texture(instance: &mut ClientBrowserInstance) -> u32 {
+    use cef_unity_ipc::file_descriptor_channel::{
+        DmabufDescriptor, FileDescriptorChannel, DMABUF_DESCRIPTOR_BYTES,
+    };
+
+    // サーバが listen を始めるまで接続できないので、成功するまで毎回試みる。
+    if instance.dmabuf_channel.is_none() {
+        let socket_path = cef_unity_ipc::dmabuf_socket_path(
+            SERVER_PROCESS_ID.load(Ordering::Relaxed),
+            instance.browser_id,
+        );
+        instance.dmabuf_channel = FileDescriptorChannel::connect(&socket_path).ok();
+        if instance.dmabuf_channel.is_none() {
+            return 0;
+        }
+        log_to_file("dmabuf チャネルに接続した");
+    }
+
+    // 届いている記述子をすべて処理する。世代が進むのはリサイズ時だけなので
+    // 定常状態では 1 通も来ない。
+    if let Some(channel) = instance.dmabuf_channel.as_ref() {
+        let mut payload = [0u8; DMABUF_DESCRIPTOR_BYTES];
+        while let Ok((length, mut file_descriptors)) = channel.receive_non_blocking(&mut payload) {
+            if length == 0 {
+                break;
+            }
+            let Some(descriptor) = DmabufDescriptor::from_bytes(&payload[..length]) else {
+                log_to_file("dmabuf 記述子を解釈できない");
+                break;
+            };
+            let Some(file_descriptor) = file_descriptors.pop() else {
+                log_to_file("dmabuf 記述子に fd が付いていない");
+                break;
+            };
+            let Some(texture) = dmabuf::import_texture(
+                &file_descriptor,
+                descriptor.width,
+                descriptor.height,
+                descriptor.stride,
+                descriptor.modifier,
+                descriptor.fourcc,
+            ) else {
+                break;
+            };
+            // 古い世代のテクスチャは使われなくなるのでここで解放する。
+            if let Some(previous_generation) = instance.dmabuf_cache.current_generation() {
+                if let Some(previous_texture) =
+                    instance.dmabuf_cache.texture_for_generation(previous_generation)
+                {
+                    dmabuf::release_texture(previous_texture);
+                }
+            }
+            instance.dmabuf_cache.store(descriptor.generation, texture);
+            log_to_file(&format!(
+                "dmabuf を取り込んだ: generation={} {}x{}",
+                descriptor.generation, descriptor.width, descriptor.height
+            ));
+        }
+    }
+
+    // 共有メモリヘッダの世代と一致するテクスチャだけを使う。
+    let Some((generation, _width, _height, _format)) = instance.shared_memory.get_iosurface_info()
+    else {
+        return 0;
+    };
+    instance
+        .dmabuf_cache
+        .texture_for_generation(generation)
+        .unwrap_or(0)
+}
+
+/// Linux: 最新の dmabuf テクスチャ名を返す。0 は「新しい絵は無い」。
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_get_dmabuf_texture(handle: *mut CefUnityBrowser) -> u32 {
+    ffi_guard(0, || {
+        if handle.is_null() {
+            return 0;
+        }
+        update_dmabuf_texture(handle_to_reference(handle))
+    })
 }
 
 /// ネイティブ音声を停止する (排水待ち)。destroy の先頭で呼ぶこと —
@@ -181,6 +278,11 @@ fn stop_native_voice(instance: &mut ClientBrowserInstance) {
 // ---------------------------------------------------------------------------
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// サーバのプロセス ID。dmabuf ソケットのパスを導出するのに使う
+/// (macOS が Mach サービス名を導出するのと同じ)。
+#[cfg(target_os = "linux")]
+static SERVER_PROCESS_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static IOSURFACE_CONNECTED: AtomicBool = AtomicBool::new(false);
 /// GPU (accelerated paint) を使うか。Init 時にセットされ、以降は不変。
 /// false の場合は server が software paint で動作し、client 側でも
@@ -356,6 +458,11 @@ pub extern "C" fn cef_unity_initialize(use_gpu: i32, enable_log: i32) -> i32 {
             }
         };
         log_to_file("bootstrap received from server");
+
+        // dmabuf ソケットのパスを導出するために覚えておく
+        // (macOS が Mach サービス名を導出するのと同じ)。
+        #[cfg(target_os = "linux")]
+        SERVER_PROCESS_ID.store(bootstrap.server_pid, Ordering::Relaxed);
 
         *CONNECTION.lock().unwrap_or_else(PoisonError::into_inner) = Some(ServerConnection {
             command_sender: bootstrap.command_sender,
@@ -631,6 +738,12 @@ pub extern "C" fn cef_unity_create_browser(
                     audio_flink: audio_shared_memory_flink.clone(),
                     #[cfg(any(target_os = "macos", target_os = "windows"))]
                     native_voice: None,
+                    // 接続はサーバが listen を始めた後でないと失敗するため、
+                    // 最初のテクスチャ取得時に遅延して行う。
+                    #[cfg(target_os = "linux")]
+                    dmabuf_channel: None,
+                    #[cfg(target_os = "linux")]
+                    dmabuf_cache: dmabuf::DmabufTextureCache::new(),
                 });
                 Box::into_raw(instance) as *mut CefUnityBrowser
             }

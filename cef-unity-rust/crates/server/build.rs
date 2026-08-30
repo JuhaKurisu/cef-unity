@@ -1,4 +1,9 @@
 fn main() {
+    // cc はファイル監視を出力しないため、src/ をディレクトリごと明示監視する。
+    // これが無いと .c / .m の変更が検知されず、古い .o がリンクされ続ける
+    // (client/build.rs と同じ理由。実際にこの罠を踏んだ)。
+    println!("cargo:rerun-if-changed=src");
+
     // Linux: libcef.so は実行ファイルと同じディレクトリに配置されるため、
     // $ORIGIN を RPATH に入れて LD_LIBRARY_PATH なしで解決させる。
     #[cfg(target_os = "linux")]

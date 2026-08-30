@@ -19,6 +19,12 @@ namespace CefUnity
 
 
         /// <summary>
+        ///  Linux: 最新の dmabuf テクスチャ名を返す。0 は「新しい絵は無い」。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_get_dmabuf_texture", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern uint cef_unity_get_dmabuf_texture(CefUnityBrowser* handle);
+
+        /// <summary>
         ///  Initialize: launch CEF server process and connect via ipc-channel.
         ///  `use_gpu`: 非 0 で accelerated paint (GPU 共有テクスチャ / IOSurface) を使う。
         ///  0 で software paint (CPU 経由の shm BGRA 転送) を強制する。

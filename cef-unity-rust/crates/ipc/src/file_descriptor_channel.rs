@@ -138,10 +138,37 @@ impl FileDescriptorChannel {
         Ok(())
     }
 
+    /// 届いていなければ長さ 0 で即座に戻る受信。
+    ///
+    /// クライアントは毎フレーム呼ぶため、届いていないときにブロックしては困る。
+    pub fn receive_non_blocking(
+        &self,
+        payload_buffer: &mut [u8],
+    ) -> std::io::Result<(usize, Vec<OwnedFd>)> {
+        match self.receive_with_flags(payload_buffer, libc::MSG_DONTWAIT) {
+            Ok(result) => Ok(result),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == Some(libc::EAGAIN) =>
+            {
+                Ok((0, Vec::new()))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// バイト列と file descriptor を受け取る。戻り値はペイロードの長さと file descriptor。
     ///
     /// 受け取った file descriptor の所有権は呼び出し側に移る (`OwnedFd` が閉じる)。
     pub fn receive(&self, payload_buffer: &mut [u8]) -> std::io::Result<(usize, Vec<OwnedFd>)> {
+        self.receive_with_flags(payload_buffer, 0)
+    }
+
+    fn receive_with_flags(
+        &self,
+        payload_buffer: &mut [u8],
+        flags: std::ffi::c_int,
+    ) -> std::io::Result<(usize, Vec<OwnedFd>)> {
         let control_length =
             unsafe { libc::CMSG_SPACE((size_of::<RawFd>() * MAXIMUM_FILE_DESCRIPTORS) as u32) }
                 as usize;
@@ -156,7 +183,7 @@ impl FileDescriptorChannel {
         message.msg_control = control_buffer.as_mut_ptr() as *mut libc::c_void;
         message.msg_controllen = control_length;
 
-        let received = unsafe { libc::recvmsg(self.socket.as_raw_fd(), &mut message, 0) };
+        let received = unsafe { libc::recvmsg(self.socket.as_raw_fd(), &mut message, flags) };
         if received < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -230,6 +257,28 @@ mod tests {
             .read_to_string(&mut received)
             .unwrap();
         assert_eq!(received, "dmabuf");
+    }
+
+    #[test]
+    fn 何も届いていなければ受信は長さ_0_で戻る() {
+        // 毎フレーム呼ぶため、届いていないときにブロックしては困る。
+        let (_sender, receiver) = FileDescriptorChannel::pair().unwrap();
+        let mut payload_buffer = [0u8; 8];
+        let (length, file_descriptors) = receiver.receive_non_blocking(&mut payload_buffer).unwrap();
+        assert_eq!(length, 0);
+        assert!(file_descriptors.is_empty());
+    }
+
+    #[test]
+    fn 届いていれば非ブロッキング受信でも取れる() {
+        let (sender, receiver) = FileDescriptorChannel::pair().unwrap();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        sender.send(b"z", &[file.as_raw_fd()]).unwrap();
+
+        let mut payload_buffer = [0u8; 8];
+        let (length, file_descriptors) = receiver.receive_non_blocking(&mut payload_buffer).unwrap();
+        assert_eq!(length, 1);
+        assert_eq!(file_descriptors.len(), 1);
     }
 
     #[test]

@@ -12,6 +12,16 @@ fn main() {
         .parent()
         .unwrap();
 
+    #[cfg(target_os = "linux")]
+    {
+        // dmabuf をホストの GL コンテキストへ取り込む層。
+        cc::Build::new()
+            .file("src/dmabuf_import.c")
+            .compile("dmabuf_import");
+        println!("cargo:rustc-link-lib=EGL");
+        println!("cargo:rustc-link-lib=GLESv2");
+    }
+
     #[cfg(target_os = "macos")]
     {
         cc::Build::new()
