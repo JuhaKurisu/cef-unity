@@ -354,6 +354,27 @@ pub fn use_unsafe_no_wait_copy() -> bool {
     })
 }
 
+/// Linux で accelerated paint 経路を使えるかを判定する。
+///
+/// Chromium の GL 初期化は実ディスプレイを要求するため、ヘッドレス環境では GPU
+/// プロセスが起動できない (`--ozone-platform=headless` で SIGSEGV する。詳細は
+/// `docs/LINUX_GPU_FEASIBILITY.md`)。ディスプレイが無い環境では software paint に
+/// 落とす。CI ランナーとコンテナはこちらに該当する。
+///
+/// `display` は `DISPLAY` 環境変数の値。Wayland のみで Xwayland が無い環境は
+/// 未設定になるため、保守的に software paint となる。
+#[cfg(target_os = "linux")]
+fn linux_accelerated_paint_available(use_gpu: bool, display: Option<&str>) -> bool {
+    use_gpu && display.is_some_and(|value| !value.is_empty())
+}
+
+/// 環境から `linux_accelerated_paint_available` を評価する。
+/// ozone プラットフォームの選択と `shared_texture_enabled` の双方で同じ判定を使う。
+#[cfg(target_os = "linux")]
+fn linux_use_accelerated_paint(use_gpu: bool) -> bool {
+    linux_accelerated_paint_available(use_gpu, std::env::var("DISPLAY").ok().as_deref())
+}
+
 /// 既知不良構成は IOSurface プール (macOS 専用) の中にしか無いので、他プラットフォーム
 /// では常に false。統計ログの mode 表示は全プラットフォームでコンパイルされるため、
 /// `use_async_copy` と同様にスタブが要る。
@@ -662,6 +683,29 @@ wrap_render_handler! {
             info: Option<&AcceleratedPaintInfo>,
         ) {
             if type_.get_raw() != PaintElementType::VIEW.get_raw() {
+                return;
+            }
+            // Linux: dmabuf は届くが、クライアントへ渡す仕組み (SCM_RIGHTS による fd
+            // 転送と取り込み) が未実装。ここで捨てているため、この経路を有効にすると
+            // フレームは供給されない。黙って落ちると原因が分からなくなるので、
+            // 最初の 1 回だけ受信内容を記録する。
+            #[cfg(target_os = "linux")]
+            {
+                PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
+                static LOGGED: OnceLock<()> = OnceLock::new();
+                LOGGED.get_or_init(|| {
+                    match info {
+                        Some(info) => log(&format!(
+                            "on_accelerated_paint (Linux): plane_count={} modifier={:#x} \
+                             size={}x{} — クライアントへの転送は未実装のため破棄する",
+                            info.plane_count,
+                            info.modifier,
+                            info.extra.coded_size.width,
+                            info.extra.coded_size.height,
+                        )),
+                        None => log("on_accelerated_paint (Linux): info=None"),
+                    };
+                });
                 return;
             }
             #[cfg(target_os = "macos")]
@@ -1245,14 +1289,36 @@ wrap_app! {
                 // 無効 (no_sandbox=1) なので、GPU サンドボックスも不要)
                 command_line.append_switch(Some(&CefString::from("disable-gpu-sandbox")));
 
-                // Linux: OSR にはウィンドウが無く画面を要求する理由がないため、
-                // headless バックエンドを指定する。X11 が無い環境 (CI ランナー、
-                // コンテナ、サーバー) で初期化が失敗するのを防ぐ。
+                // Linux: 既定は headless バックエンド。OSR にはウィンドウが無く画面を
+                // 要求する理由がないうえ、X11 が無い環境 (CI ランナー、コンテナ、
+                // サーバー) で初期化が失敗するのを防げる。
+                //
+                // ただし accelerated paint (dmabuf) 経路だけは実ディスプレイを要求する
+                // ため x11 を選ぶ。headless では GPU プロセスが起動できない。
+                // 詳細と実測データは docs/LINUX_GPU_FEASIBILITY.md を参照。
                 #[cfg(target_os = "linux")]
-                command_line.append_switch_with_value(
-                    Some(&CefString::from("ozone-platform")),
-                    Some(&CefString::from("headless")),
-                );
+                {
+                    let accelerated = linux_use_accelerated_paint(self.use_gpu);
+                    let ozone_platform = if accelerated { "x11" } else { "headless" };
+                    log(&format!(
+                        "ozone-platform = {} (accelerated paint = {})",
+                        ozone_platform, accelerated
+                    ));
+                    command_line.append_switch_with_value(
+                        Some(&CefString::from("ozone-platform")),
+                        Some(&CefString::from(ozone_platform)),
+                    );
+                    if accelerated {
+                        // Skia を Vulkan バックエンドにする。ANGLE の GL 経由で dmabuf を
+                        // インポートするとテクスチャがレンダリング可能にならず
+                        // (GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT)、SkSurface を作れずに
+                        // paint がまったく発生しない。
+                        command_line.append_switch_with_value(
+                            Some(&CefString::from("enable-features")),
+                            Some(&CefString::from("Vulkan")),
+                        );
+                    }
+                }
 
                 if !self.use_gpu {
                     // CPU モード: Chromium に GPU を一切使わせない。
@@ -1673,6 +1739,13 @@ impl CefServer {
         }
         #[cfg(target_os = "windows")]
         if d3d11_pool.is_some() {
+            window_info.shared_texture_enabled = 1;
+        }
+        // Linux: ozone プラットフォームの選択と同じ判定を使う。x11 を選んでいない
+        // (= headless) のに立てると、CEF が software paint を止めるだけで
+        // accelerated paint も来ず、フレームが一切供給されなくなる。
+        #[cfg(target_os = "linux")]
+        if linux_use_accelerated_paint(self.use_gpu) {
             window_info.shared_texture_enabled = 1;
         }
         // External BeginFrame: Unity の LateUpdate から SendExternalBeginFrame で 1 フレーム
@@ -2273,4 +2346,30 @@ fn helper_binary_path(executable_directory: &std::path::Path) -> std::path::Path
     // ".exe" は Windows の実行ファイル拡張子であり識別子ではない (命名規約の展開対象外)。
     // ここが実ファイル名と食い違うと CEF のサブプロセス起動が error_code=63 で失敗する。
     executable_directory.join("cef-unity-rust-helper.exe")
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_accelerated_paint_tests {
+    use super::linux_accelerated_paint_available;
+
+    #[test]
+    fn gpu_モードでディスプレイがあれば有効() {
+        assert!(linux_accelerated_paint_available(true, Some(":0")));
+    }
+
+    #[test]
+    fn cpu_モードでは無効() {
+        assert!(!linux_accelerated_paint_available(false, Some(":0")));
+    }
+
+    #[test]
+    fn ディスプレイが無ければ無効() {
+        // CI ランナーとコンテナがこれに該当する。headless + software paint に落ちる。
+        assert!(!linux_accelerated_paint_available(true, None));
+    }
+
+    #[test]
+    fn 空文字の_display_はディスプレイ無しとして扱う() {
+        assert!(!linux_accelerated_paint_available(true, Some("")));
+    }
 }

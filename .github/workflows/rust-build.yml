@@ -41,7 +41,7 @@ jobs:
       # 初回の cargo 実行は CEF (~1GB) ダウンロードを含むため 1 回リトライ
       - name: Unit tests
         working-directory: cef-unity-rust
-        run: cargo test --workspace --lib --release || cargo test --workspace --lib --release
+        run: cargo test --workspace --lib --bins --release || cargo test --workspace --lib --bins --release
 
       # 既存スクリプト再利用: release ビルド + server.app バンドル + ad-hoc 署名 +
       # cef-unity-unityproject/Assets/CefUnity/Plugins/osx-arm64/ へ配置
@@ -97,7 +97,7 @@ jobs:
         if: matrix.arch == 'x64'
         working-directory: cef-unity-rust
         shell: bash
-        run: cargo test --workspace --lib --release || cargo test --workspace --lib --release
+        run: cargo test --workspace --lib --bins --release || cargo test --workspace --lib --bins --release
 
       - name: Build
         working-directory: cef-unity-rust
@@ -209,7 +209,7 @@ jobs:
       # 初回の cargo 実行は CEF (~1GB) ダウンロードを含むため 1 回リトライ
       - name: Unit tests
         working-directory: cef-unity-rust
-        run: cargo test --workspace --lib --release || cargo test --workspace --lib --release
+        run: cargo test --workspace --lib --bins --release || cargo test --workspace --lib --bins --release
 
       - name: Build
         working-directory: cef-unity-rust

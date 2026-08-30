@@ -147,14 +147,22 @@ apphost がランタイムを見つけられない場合は `export DOTNET_ROOT=
 
 既知の制約:
 
-- **software paint 経路のみ**。GPU ゼロコピー (dmabuf/EGL) は未実装
+- **software paint 経路のみ**。GPU ゼロコピー (dmabuf) は main には入っていない。
+  CEF から dmabuf を受け取れること自体は実証済み (実測 60 paints/秒) だが、
+  クライアントへの fd 転送と取り込みが未実装のため、揃うまで main には入れない。
+  作業は `feat/linux-gpu-ozone-selection` ブランチ。動作構成・実測データ・再現手順は
+  `docs/LINUX_GPU_FEASIBILITY.md`
 - ネイティブ音声出力 (macOS の AudioUnit 経路に相当) は無い。Unity ミキサ経路のみ
 - Unity への配置までは対応済み (`deploy-linux.sh`)。**Editor / Player での動作確認は未着手**
-- **ヘッドレス環境では `--ozone-platform=headless` が必須。** server が Linux ビルドで
-  常時指定している (`crates/server/src/server.rs` の `on_before_command_line_processing`)。
-  指定しないと ozone が X11 バックエンドを選び、`Missing X server or $DISPLAY` で
-  CEF 初期化が失敗する (CI ランナーで実測)。X11 がある WSLg でも headless 指定で
-  問題なく動くため、環境による分岐はしていない
+- **ヘッドレス環境では `--ozone-platform=headless` が必須。** 指定しないと ozone が
+  X11 バックエンドを選び、`Missing X server or $DISPLAY` で CEF 初期化が失敗する
+  (CI ランナーで実測)。server は `on_before_command_line_processing`
+  (`crates/server/src/server.rs`) で既定として指定する。
+  **例外は accelerated paint 経路のみで、こちらは逆に実ディスプレイを要求するため
+  `x11` + `--enable-features=Vulkan` を選ぶ** (headless だと GPU プロセスが SIGSEGV する)。
+  判定は `linux_accelerated_paint_available` の 1 箇所に集約してあり、ozone の選択と
+  `shared_texture_enabled` の双方が同じ判定を使う。片方だけ立てるとフレームが
+  一切供給されなくなるので分離しないこと
 
 ## サポート対象プラットフォーム
 
@@ -163,7 +171,7 @@ apphost がランタイムを見つけられない場合は `export DOTNET_ROOT=
 | macOS arm64 | GPU ゼロコピー (IOSurface/Mach/Metal) |
 | Windows x64 | GPU ゼロコピー (D3D11/D3D12 共有テクスチャ + 共有 fence)。Editor / プレイヤーとも動作確認済み |
 | Windows arm64 | クロスビルドのみ。**実行未検証**、プレイヤービルド未対応 |
-| Linux x86_64 | software paint のみ。Unity 配置あり (`linux-x64`) |
+| Linux x86_64 | software paint のみ。Unity 配置あり (`linux-x64`)。<br>GPU ゼロコピーは実装中 (main 未投入) |
 | Linux arm64 | software paint のみ。**Unity 配置なし** — Unity にデスクトップ Linux arm64 の<br>ターゲットが存在しないため、CI 検証と GitHub Release の zip のみ |
 | macOS x86_64 (Intel Mac) | **サポートしない** |
 
@@ -171,7 +179,7 @@ apphost がランタイムを見つけられない場合は `export DOTNET_ROOT=
 
 | 機能 | macOS | Windows | Linux |
 |---|---|---|---|
-| GPU ゼロコピー | IOSurface/Metal | D3D11 / D3D12 | 未実装 (software) |
+| GPU ゼロコピー | IOSurface/Metal | D3D11 / D3D12 | 実装中 (main 未投入) |
 | ネイティブ音声出力 | AudioUnit | WASAPI | 無し (Unity ミキサのみ) |
 | 生スクロール入力 | NSEvent モニタ | Raw Input | 無し (frame-polled) |
 | キーリピート設定 | NSEvent の OS 値 | `SystemParametersInfo` の OS 値 | 既定値固定 |
