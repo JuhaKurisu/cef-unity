@@ -1,9 +1,13 @@
-// Linux: CEF の on_accelerated_paint が渡す dmabuf はプールの借用で、
-// コールバックを抜けると再利用される。そのため自前の出力バッファへ blit し、
-// その dmabuf をクライアントへ渡す。macOS の iosurface_pool.m に相当する。
+// Linux 半ゼロコピー: CEF の software paint (on_paint) のピクセルを出力 dmabuf へ
+// アップロードし、その fd をクライアントへ渡す。クライアント〜表示側はゼロコピー。
+// macOS の iosurface_pool.m、Windows の d3d11_pool.rs に相当する層。
 //
-// EGL コンテキストは作成したスレッドでしか current にできない。このプールは
-// on_accelerated_paint が来るスレッドで生成し、同じスレッドから使うこと。
+// CEF の accelerated paint (dmabuf 直渡し) を使わないのは、NVIDIA では渡される
+// dmabuf に中身が一度も書かれない上流問題があるため (docs/LINUX_GPU_FEASIBILITY.md)。
+//
+// GBM + EGL surfaceless なので X ディスプレイに依存しない (ヘッドレスでも動く)。
+// EGL コンテキストは作成したスレッドでしか current にできないため、このプールは
+// 生成したスレッドから使うこと (upload 側が退避・復帰で守っている)。
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -30,14 +34,11 @@ static const char *VERTEX_SHADER_SOURCE =
     "  gl_Position = vec4(position, 0.0, 1.0);\n"
     "}\n";
 
-// CEF が渡す dmabuf は GL_TEXTURE_2D では黒くしかサンプルできない。
-// EGLImage 由来のテクスチャは GL_TEXTURE_EXTERNAL_OES とし、samplerExternalOES で読む
-// (GL_OES_EGL_image_external)。出力バッファ側は描画対象なので通常の 2D のまま。
-static const char *FRAGMENT_SHADER_SOURCE =
-    "#extension GL_OES_EGL_image_external : require\n"
+// upload 経路のフラグメントシェーダ。ステージングは通常の sampler2D。
+static const char *FRAGMENT_SHADER_2D_SOURCE =
     "precision mediump float;\n"
     "varying vec2 texture_coordinate;\n"
-    "uniform samplerExternalOES source_texture;\n"
+    "uniform sampler2D source_texture;\n"
     "void main() {\n"
     "  gl_FragColor = texture2D(source_texture, texture_coordinate);\n"
     "}\n";
@@ -52,6 +53,14 @@ typedef struct {
     GLint position_attribute;
     GLint source_texture_uniform;
 
+    // upload 経路: ステージングテクスチャと sampler2D 版プログラム。
+    GLuint program_2d;
+    GLint position_attribute_2d;
+    GLint source_texture_uniform_2d;
+    GLuint staging_texture;
+    int staging_width;
+    int staging_height;
+
     struct gbm_bo *output_buffer_object;
     EGLImageKHR output_image;
     GLuint output_texture;
@@ -59,14 +68,6 @@ typedef struct {
     int output_width;
     int output_height;
     unsigned int generation;
-
-    // 診断: 入力テクスチャの中心ピクセルと FBO の状態。
-    unsigned char source_inspect_result[4];
-    int source_inspect_status;
-    // 診断: クリア直後の即時読み戻し。
-    unsigned char clear_check_result[4];
-    int clear_check_error;
-    int clear_check_status;
 
     PFNEGLCREATEIMAGEKHRPROC create_image;
     PFNEGLDESTROYIMAGEKHRPROC destroy_image;
@@ -217,35 +218,6 @@ static GLuint compile_shader(GLenum type, const char *source) {
     return shader;
 }
 
-// シェーダは 1 度だけ作って使い回す。
-static int ensure_program(DmabufPool *pool) {
-    if (pool->program) {
-        return 1;
-    }
-    GLuint vertex_shader = compile_shader(GL_VERTEX_SHADER, VERTEX_SHADER_SOURCE);
-    GLuint fragment_shader = compile_shader(GL_FRAGMENT_SHADER, FRAGMENT_SHADER_SOURCE);
-    if (!vertex_shader || !fragment_shader) {
-        return 0;
-    }
-    GLuint program = glCreateProgram();
-    glAttachShader(program, vertex_shader);
-    glAttachShader(program, fragment_shader);
-    glLinkProgram(program);
-    glDeleteShader(vertex_shader);
-    glDeleteShader(fragment_shader);
-
-    GLint linked = 0;
-    glGetProgramiv(program, GL_LINK_STATUS, &linked);
-    if (!linked) {
-        glDeleteProgram(program);
-        return 0;
-    }
-    pool->program = program;
-    pool->position_attribute = glGetAttribLocation(program, "position");
-    pool->source_texture_uniform = glGetUniformLocation(program, "source_texture");
-    return 1;
-}
-
 // dmabuf を EGLImage 経由で GL テクスチャにする。失敗したら 0。
 static GLuint import_dmabuf_texture(DmabufPool *pool, EGLImageKHR *out_image, GLenum target,
                                     int file_descriptor, unsigned int stride,
@@ -293,6 +265,33 @@ static GLuint import_dmabuf_texture(DmabufPool *pool, EGLImageKHR *out_image, GL
     }
     *out_image = image;
     return texture;
+}
+
+static int ensure_program_2d(DmabufPool *pool) {
+    if (pool->program_2d) {
+        return 1;
+    }
+    GLuint vertex_shader = compile_shader(GL_VERTEX_SHADER, VERTEX_SHADER_SOURCE);
+    GLuint fragment_shader = compile_shader(GL_FRAGMENT_SHADER, FRAGMENT_SHADER_2D_SOURCE);
+    if (!vertex_shader || !fragment_shader) {
+        return 0;
+    }
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vertex_shader);
+    glAttachShader(program, fragment_shader);
+    glLinkProgram(program);
+    glDeleteShader(vertex_shader);
+    glDeleteShader(fragment_shader);
+    GLint linked = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        glDeleteProgram(program);
+        return 0;
+    }
+    pool->program_2d = program;
+    pool->position_attribute_2d = glGetAttribLocation(program, "position");
+    pool->source_texture_uniform_2d = glGetUniformLocation(program, "source_texture");
+    return 1;
 }
 
 // 出力バッファはサイズが変わったときだけ作り直す (d3d11_pool.rs と同じ方針)。
@@ -355,68 +354,69 @@ static int ensure_output(DmabufPool *pool, int width, int height) {
     return 1;
 }
 
-int dmabuf_pool_blit(void *handle, int source_file_descriptor, unsigned int source_stride,
-                     unsigned long long source_offset, unsigned long long source_modifier,
-                     unsigned int source_fourcc, int width, int height) {
+// CPU の BGRA ピクセルを出力バッファへアップロードする (半ゼロコピー経路)。
+// CEF の software paint (on_paint) の出力を dmabuf 化してクライアントへ
+// ゼロコピーで渡すために使う。GBM/EGL surfaceless なので X ディスプレイ不要。
+int dmabuf_pool_upload(void *handle, const unsigned char *pixels, int width, int height) {
     DmabufPool *pool = (DmabufPool *)handle;
-    if (!pool) {
+    if (!pool || !pixels) {
         return 0;
     }
     SavedEglState saved;
     save_and_make_current(pool, &saved);
-    if (!ensure_program(pool) || !ensure_output(pool, width, height)) {
+    if (!ensure_output(pool, width, height)) {
+        restore_current(&saved);
+        return 0;
+    }
+    if (!ensure_program_2d(pool)) {
         restore_current(&saved);
         return 0;
     }
 
-    EGLImageKHR source_image = NULL;
-    GLuint source_texture =
-        import_dmabuf_texture(pool, &source_image, GL_TEXTURE_EXTERNAL_OES, source_file_descriptor,
-                              source_stride,
-                              source_offset, source_modifier, source_fourcc, width, height);
-    if (!source_texture) {
+    // EGLImage 束縛テクスチャへの TexSubImage はドライバによって黙って
+    // 関連が切れる (実測: エラー無しで出力が全ゼロのまま)。そのため
+    // ステージングテクスチャへアップロードし、FBO 描画で出力へ写す。
+    if (pool->staging_texture == 0 || pool->staging_width != width
+        || pool->staging_height != height) {
+        if (pool->staging_texture) {
+            glDeleteTextures(1, &pool->staging_texture);
+        }
+        glGenTextures(1, &pool->staging_texture);
+        glBindTexture(GL_TEXTURE_2D, pool->staging_texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        // CEF の on_paint は BGRA (GL_EXT_texture_format_BGRA8888)。
+        glTexImage2D(GL_TEXTURE_2D, 0, 0x80E1 /* GL_BGRA_EXT */, width, height, 0,
+                     0x80E1, GL_UNSIGNED_BYTE, NULL);
+        pool->staging_width = width;
+        pool->staging_height = height;
+    }
+    glBindTexture(GL_TEXTURE_2D, pool->staging_texture);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, 0x80E1, GL_UNSIGNED_BYTE, pixels);
+    if (glGetError() != GL_NO_ERROR) {
         restore_current(&saved);
         return 0;
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, pool->output_framebuffer);
     glViewport(0, 0, width, height);
-    // 診断 (一時): 出力 FBO が本当に共有バッファを指しているかを確かめるため、
-    // 描画前に既知の色でクリアする。読み戻しが赤なら FBO は正しく、
-    // 問題は入力テクスチャのサンプリング側にある。
-    if (getenv("CEF_UNITY_DEBUG_CLEAR")) {
-        glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        glFinish();
-        // 同じコンテキスト・同じ FBO のまま即座に読み戻す。
-        // ここで赤が読めなければ書き込み自体が届いていない。
-        static int clear_checked = 0;
-        if (!clear_checked) {
-            clear_checked = 1;
-            glReadPixels(width / 2, height / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE,
-                         pool->clear_check_result);
-            pool->clear_check_error = (int)glGetError();
-            pool->clear_check_status = (int)glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        }
-    }
-    glUseProgram(pool->program);
+    glUseProgram(pool->program_2d);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_EXTERNAL_OES, source_texture);
-    glUniform1i(pool->source_texture_uniform, 0);
-
+    glBindTexture(GL_TEXTURE_2D, pool->staging_texture);
+    glUniform1i(pool->source_texture_uniform_2d, 0);
     static const GLfloat QUAD[] = {-1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f};
-    glEnableVertexAttribArray((GLuint)pool->position_attribute);
-    glVertexAttribPointer((GLuint)pool->position_attribute, 2, GL_FLOAT, GL_FALSE, 0, QUAD);
+    glEnableVertexAttribArray((GLuint)pool->position_attribute_2d);
+    glVertexAttribPointer((GLuint)pool->position_attribute_2d, 2, GL_FLOAT, GL_FALSE, 0, QUAD);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glDisableVertexAttribArray((GLuint)pool->position_attribute);
+    glDisableVertexAttribArray((GLuint)pool->position_attribute_2d);
 
-    // macOS の waitUntilCompleted と同じ位置づけ。完了を待ってから frame_id を進める。
+    GLenum upload_error = glGetError();
+    // 完了を待ってから公開する (macOS の waitUntilCompleted と同じ位置づけ)。
     glFinish();
-
-    glDeleteTextures(1, &source_texture);
-    pool->destroy_image(pool->display, source_image);
     restore_current(&saved);
-    return 1;
+    return upload_error == GL_NO_ERROR;
 }
 
 int dmabuf_pool_output(void *handle, int *out_file_descriptor, unsigned int *out_stride,
@@ -440,103 +440,6 @@ int dmabuf_pool_output(void *handle, int *out_file_descriptor, unsigned int *out
     return 1;
 }
 
-// テスト専用: ソースバッファを単色で塗る。blit がピクセルを運んでいるかの検証に使う。
-int dmabuf_pool_fill_test_source(void *handle, int file_descriptor, unsigned int stride,
-                                 unsigned long long modifier, unsigned int fourcc, int width,
-                                 int height, unsigned char red, unsigned char green,
-                                 unsigned char blue, unsigned char alpha) {
-    unsigned long long offset = 0;
-    DmabufPool *pool = (DmabufPool *)handle;
-    if (!pool) {
-        return 0;
-    }
-    EGLImageKHR image = NULL;
-    GLuint texture = import_dmabuf_texture(pool, &image, GL_TEXTURE_2D, file_descriptor, stride,
-                                           offset, modifier, fourcc, width, height);
-    if (!texture) {
-        return 0;
-    }
-    GLuint framebuffer = 0;
-    glGenFramebuffers(1, &framebuffer);
-    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
-    int complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
-    if (complete) {
-        glViewport(0, 0, width, height);
-        glClearColor(red / 255.0f, green / 255.0f, blue / 255.0f, alpha / 255.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        glFinish();
-    }
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glDeleteFramebuffers(1, &framebuffer);
-    glDeleteTextures(1, &texture);
-    pool->destroy_image(pool->display, image);
-    return complete;
-}
-
-// 診断: 入力テクスチャの検査結果を返す。1 = 読めた、それ以外は FBO のステータス。
-// 診断: CEF の dmabuf を CPU から直接読む。GL の取り込みを疑う前に
-// 「そもそもデータが入っているか」を確定させるための経路。
-// 戻り値 1 = 読めた。out_rgba にはリニア配置前提で中心ピクセルが入る。
-int dmabuf_read_center_via_cpu(int file_descriptor, unsigned int stride,
-                               unsigned long long offset, int width, int height,
-                               unsigned char *out_rgba) {
-    size_t length = (size_t)offset + (size_t)stride * (size_t)height;
-    void *mapped = mmap(NULL, length, PROT_READ, MAP_SHARED, file_descriptor, 0);
-    if (mapped == MAP_FAILED) {
-        return 0;
-    }
-    // dmabuf の CPU 読みは DMA_BUF_IOCTL_SYNC で囲まないとキャッシュ不整合で
-    // 古い内容 (ゼロ) を見ることがある。
-    struct dma_buf_sync sync_arguments = {DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ};
-    ioctl(file_descriptor, DMA_BUF_IOCTL_SYNC, &sync_arguments);
-    unsigned char *base = (unsigned char *)mapped + offset;
-    unsigned char *pixel = base + (size_t)(height / 2) * stride + (size_t)(width / 2) * 4;
-    out_rgba[0] = pixel[0];
-    out_rgba[1] = pixel[1];
-    out_rgba[2] = pixel[2];
-    out_rgba[3] = pixel[3];
-    // バッファ全体を走査して非ゼロが 1 バイトでもあるかを数える。
-    // 中心だけ見て「空」と判断しないため。
-    size_t non_zero = 0;
-    for (int row = 0; row < height; row++) {
-        unsigned char *line = base + (size_t)row * stride;
-        for (int column = 0; column < width * 4; column++) {
-            if (line[column] != 0) non_zero++;
-        }
-    }
-    out_rgba[4] = (unsigned char)(non_zero > 0);
-    *((size_t *)(out_rgba + 8)) = non_zero;
-    struct dma_buf_sync sync_end = {DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ};
-    ioctl(file_descriptor, DMA_BUF_IOCTL_SYNC, &sync_end);
-    munmap(mapped, length);
-    return 1;
-}
-
-// 診断: クリア直後の即時読み戻し結果。
-int dmabuf_pool_clear_check(void *handle, unsigned char *out_rgba, int *out_error,
-                            int *out_status) {
-    DmabufPool *pool = (DmabufPool *)handle;
-    if (!pool) return 0;
-    out_rgba[0] = pool->clear_check_result[0];
-    out_rgba[1] = pool->clear_check_result[1];
-    out_rgba[2] = pool->clear_check_result[2];
-    out_rgba[3] = pool->clear_check_result[3];
-    *out_error = pool->clear_check_error;
-    *out_status = pool->clear_check_status;
-    return 1;
-}
-
-int dmabuf_pool_source_inspect(void *handle, unsigned char *out_rgba) {
-    DmabufPool *pool = (DmabufPool *)handle;
-    if (!pool) return 0;
-    out_rgba[0] = pool->source_inspect_result[0];
-    out_rgba[1] = pool->source_inspect_result[1];
-    out_rgba[2] = pool->source_inspect_result[2];
-    out_rgba[3] = pool->source_inspect_result[3];
-    return pool->source_inspect_status;
-}
-
 // 出力バッファの 1 ピクセルを読み戻す。テストと、blit が効いているかの診断に使う。
 int dmabuf_pool_read_output_pixel(void *handle, int x, int y, unsigned char *out_rgba) {
     DmabufPool *pool = (DmabufPool *)handle;
@@ -553,27 +456,6 @@ int dmabuf_pool_read_output_pixel(void *handle, int x, int y, unsigned char *out
 }
 
 // テスト専用: CEF から渡されたものに見立てたソースバッファを確保する。
-// gbm_bo は破棄するが、エクスポートした fd が参照を保持するのでメモリは生きている。
-int dmabuf_pool_create_test_source(void *handle, int width, int height,
-                                   int *out_file_descriptor, unsigned int *out_stride,
-                                   unsigned long long *out_modifier, unsigned int *out_fourcc) {
-    DmabufPool *pool = (DmabufPool *)handle;
-    if (!pool) {
-        return 0;
-    }
-    struct gbm_bo *buffer_object = gbm_bo_create(pool->gbm_device, width, height,
-                                                 GBM_FORMAT_ARGB8888, GBM_BO_USE_RENDERING);
-    if (!buffer_object) {
-        return 0;
-    }
-    *out_file_descriptor = gbm_bo_get_fd(buffer_object);
-    *out_stride = gbm_bo_get_stride(buffer_object);
-    *out_modifier = gbm_bo_get_modifier(buffer_object);
-    *out_fourcc = GBM_FORMAT_ARGB8888;
-    gbm_bo_destroy(buffer_object);
-    return *out_file_descriptor >= 0;
-}
-
 void dmabuf_pool_destroy(void *handle) {
     DmabufPool *pool = (DmabufPool *)handle;
     if (!pool) {
@@ -581,6 +463,12 @@ void dmabuf_pool_destroy(void *handle) {
     }
     if (pool->program) {
         glDeleteProgram(pool->program);
+    }
+    if (pool->program_2d) {
+        glDeleteProgram(pool->program_2d);
+    }
+    if (pool->staging_texture) {
+        glDeleteTextures(1, &pool->staging_texture);
     }
     if (pool->output_framebuffer) {
         glDeleteFramebuffers(1, &pool->output_framebuffer);

@@ -14,11 +14,7 @@ fn main() {
         cc::Build::new()
             .file("src/dmabuf_pool.c")
             .compile("dmabuf_pool");
-        // 診断専用: dmabuf を Vulkan で読むプローブ。
-        cc::Build::new()
-            .file("src/dmabuf_vulkan_probe.c")
-            .compile("dmabuf_vulkan_probe");
-        println!("cargo:rustc-link-lib=vulkan");
+
         println!("cargo:rustc-link-lib=gbm");
         println!("cargo:rustc-link-lib=EGL");
         println!("cargo:rustc-link-lib=GLESv2");

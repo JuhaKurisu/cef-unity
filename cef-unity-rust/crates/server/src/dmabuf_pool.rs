@@ -11,13 +11,9 @@ use cef_unity_ipc::file_descriptor_channel::DmabufDescriptor;
 unsafe extern "C" {
     fn dmabuf_pool_create(failure_stage: *mut std::ffi::c_int) -> *mut std::ffi::c_void;
     fn dmabuf_pool_destroy(pool: *mut std::ffi::c_void);
-    fn dmabuf_pool_blit(
+    fn dmabuf_pool_upload(
         pool: *mut std::ffi::c_void,
-        source_file_descriptor: std::ffi::c_int,
-        source_stride: u32,
-        source_offset: u64,
-        source_modifier: u64,
-        source_fourcc: u32,
+        pixels: *const u8,
         width: std::ffi::c_int,
         height: std::ffi::c_int,
     ) -> std::ffi::c_int;
@@ -31,62 +27,11 @@ unsafe extern "C" {
         out_width: *mut std::ffi::c_int,
         out_height: *mut std::ffi::c_int,
     ) -> std::ffi::c_int;
-    #[cfg(test)]
-    fn dmabuf_pool_fill_test_source(
-        pool: *mut std::ffi::c_void,
-        file_descriptor: std::ffi::c_int,
-        stride: u32,
-        modifier: u64,
-        fourcc: u32,
-        width: std::ffi::c_int,
-        height: std::ffi::c_int,
-        red: u8,
-        green: u8,
-        blue: u8,
-        alpha: u8,
-    ) -> std::ffi::c_int;
-    fn dmabuf_read_center_via_cpu(
-        file_descriptor: std::ffi::c_int,
-        stride: u32,
-        offset: u64,
-        width: std::ffi::c_int,
-        height: std::ffi::c_int,
-        out_rgba: *mut u8,
-    ) -> std::ffi::c_int;
-    fn dmabuf_vulkan_probe_read(
-        dmabuf_file_descriptor: std::ffi::c_int,
-        width: u32,
-        height: u32,
-        stride: u32,
-        modifier: u64,
-        out_rgba: *mut u8,
-        out_non_zero: *mut u64,
-    ) -> std::ffi::c_int;
-    fn dmabuf_pool_clear_check(
-        pool: *mut std::ffi::c_void,
-        out_rgba: *mut u8,
-        out_error: *mut std::ffi::c_int,
-        out_status: *mut std::ffi::c_int,
-    ) -> std::ffi::c_int;
-    fn dmabuf_pool_source_inspect(
-        pool: *mut std::ffi::c_void,
-        out_rgba: *mut u8,
-    ) -> std::ffi::c_int;
     fn dmabuf_pool_read_output_pixel(
         pool: *mut std::ffi::c_void,
         x: std::ffi::c_int,
         y: std::ffi::c_int,
         out_rgba: *mut u8,
-    ) -> std::ffi::c_int;
-    #[cfg(test)]
-    fn dmabuf_pool_create_test_source(
-        pool: *mut std::ffi::c_void,
-        width: std::ffi::c_int,
-        height: std::ffi::c_int,
-        out_file_descriptor: *mut std::ffi::c_int,
-        out_stride: *mut u32,
-        out_modifier: *mut u64,
-        out_fourcc: *mut u32,
     ) -> std::ffi::c_int;
 }
 
@@ -107,59 +52,10 @@ fn failure_stage_name(stage: std::ffi::c_int) -> &'static str {
     }
 }
 
-/// CEF から渡された dmabuf の記述。`on_accelerated_paint` の引数をそのまま写したもの。
-pub struct DmabufSource {
-    pub file_descriptor: std::os::fd::OwnedFd,
-    pub stride: u32,
-    /// プレーン先頭のバイトオフセット。0 決め打ちにすると CEF のバッファで
-    /// 誤った領域を読み、絵が真っ黒になる。
-    pub offset: u64,
-    pub modifier: u64,
-    pub fourcc: u32,
-    pub width: u32,
-    pub height: u32,
-}
 
 /// 診断: dmabuf を Vulkan で import して読む。書いた本人 (Vulkan) と同じ経路。
-/// 戻り値: Ok((中心ピクセル, 非ゼロバイト数)) / Err(失敗段階)。
-pub fn read_via_vulkan(source: &DmabufSource) -> Result<([u8; 4], u64), i32> {
-    let mut pixel = [0u8; 4];
-    let mut non_zero: u64 = 0;
-    let result = unsafe {
-        dmabuf_vulkan_probe_read(
-            std::os::fd::AsRawFd::as_raw_fd(&source.file_descriptor),
-            source.width,
-            source.height,
-            source.stride,
-            source.modifier,
-            pixel.as_mut_ptr(),
-            &mut non_zero,
-        )
-    };
-    if result == 0 { Ok((pixel, non_zero)) } else { Err(result) }
-}
 
 /// 診断: dmabuf を CPU から直接読んで中心ピクセルを返す。
-/// GL 経由の取り込みを疑う前に、データの有無を確定させる。
-pub fn read_center_via_cpu(source: &DmabufSource) -> Option<([u8; 4], usize)> {
-    // out_rgba は 16 バイト確保する: 先頭 4 = 中心ピクセル、8 以降 = 非ゼロバイト数。
-    let mut pixel = [0u8; 16];
-    let result = unsafe {
-        dmabuf_read_center_via_cpu(
-            std::os::fd::AsRawFd::as_raw_fd(&source.file_descriptor),
-            source.stride,
-            source.offset,
-            source.width as std::ffi::c_int,
-            source.height as std::ffi::c_int,
-            pixel.as_mut_ptr(),
-        )
-    };
-    if result == 0 {
-        return None;
-    }
-    let non_zero = usize::from_ne_bytes(pixel[8..16].try_into().ok()?);
-    Some(([pixel[0], pixel[1], pixel[2], pixel[3]], non_zero))
-}
 
 /// EGL / GBM のリソースを束ねたプール。
 pub struct DmabufPool {
@@ -190,18 +86,21 @@ impl DmabufPool {
 impl DmabufPool {
     /// CEF の dmabuf を取り込み、出力バッファへ描画して完了を待つ。
     ///
+
+    /// CPU の BGRA ピクセルを出力バッファへアップロードする (半ゼロコピー経路)。
+    ///
+    /// CEF の software paint の出力を dmabuf 化してクライアントへゼロコピーで渡す。
     /// 出力バッファはサイズが変わったときだけ作り直し、そのとき `generation` が進む。
-    pub fn blit(&self, source: &DmabufSource) -> bool {
+    pub fn upload(&self, pixels: &[u8], width: u32, height: u32) -> bool {
+        if pixels.len() < (width as usize) * (height as usize) * 4 {
+            return false;
+        }
         let result = unsafe {
-            dmabuf_pool_blit(
+            dmabuf_pool_upload(
                 self.handle,
-                std::os::fd::AsRawFd::as_raw_fd(&source.file_descriptor),
-                source.stride,
-                source.offset,
-                source.modifier,
-                source.fourcc,
-                source.width as std::ffi::c_int,
-                source.height as std::ffi::c_int,
+                pixels.as_ptr(),
+                width as std::ffi::c_int,
+                height as std::ffi::c_int,
             )
         };
         result != 0
@@ -246,45 +145,9 @@ impl DmabufPool {
         ))
     }
 
-    /// テスト専用: ソースバッファを単色で塗る。
-    #[cfg(test)]
-    fn fill_test_source(&self, source: &DmabufSource, red: u8, green: u8, blue: u8, alpha: u8) {
-        let result = unsafe {
-            dmabuf_pool_fill_test_source(
-                self.handle,
-                std::os::fd::AsRawFd::as_raw_fd(&source.file_descriptor),
-                source.stride,
-                source.modifier,
-                source.fourcc,
-                source.width as std::ffi::c_int,
-                source.height as std::ffi::c_int,
-                red,
-                green,
-                blue,
-                alpha,
-            )
-        };
-        assert_ne!(result, 0, "テスト用ソースを塗れない");
-    }
 
-    /// 診断: クリア直後に同じ FBO から読み戻した結果。
-    pub fn clear_check(&self) -> ([u8; 4], std::ffi::c_int, std::ffi::c_int) {
-        let mut pixel = [0u8; 4];
-        let mut error: std::ffi::c_int = 0;
-        let mut status: std::ffi::c_int = 0;
-        unsafe {
-            dmabuf_pool_clear_check(self.handle, pixel.as_mut_ptr(), &mut error, &mut status)
-        };
-        (pixel, error, status)
-    }
 
     /// 診断: CEF から取り込んだ入力テクスチャの中心ピクセル。
-    /// 戻り値が 1 なら読めた、それ以外は FBO のステータス。
-    pub fn source_inspect(&self) -> (std::ffi::c_int, [u8; 4]) {
-        let mut pixel = [0u8; 4];
-        let status = unsafe { dmabuf_pool_source_inspect(self.handle, pixel.as_mut_ptr()) };
-        (status, pixel)
-    }
 
     /// 出力バッファの 1 ピクセルを読み戻す。blit が効いているかの診断に使う。
     pub fn read_output_pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
@@ -300,37 +163,6 @@ impl DmabufPool {
         if result == 0 { None } else { Some(pixel) }
     }
 
-    /// テスト専用: CEF から渡されたものに見立てたソースバッファを確保する。
-    #[cfg(test)]
-    fn create_test_source(&self, width: u32, height: u32) -> Option<DmabufSource> {
-        let mut file_descriptor: std::ffi::c_int = -1;
-        let mut stride: u32 = 0;
-        let mut modifier: u64 = 0;
-        let mut fourcc: u32 = 0;
-        let result = unsafe {
-            dmabuf_pool_create_test_source(
-                self.handle,
-                width as std::ffi::c_int,
-                height as std::ffi::c_int,
-                &mut file_descriptor,
-                &mut stride,
-                &mut modifier,
-                &mut fourcc,
-            )
-        };
-        if result == 0 {
-            return None;
-        }
-        Some(DmabufSource {
-            file_descriptor: unsafe { std::os::fd::FromRawFd::from_raw_fd(file_descriptor) },
-            stride,
-            offset: 0,
-            modifier,
-            fourcc,
-            width,
-            height,
-        })
-    }
 }
 
 impl Drop for DmabufPool {
@@ -371,72 +203,66 @@ mod tests {
         Some(DmabufPool::create().expect("レンダーノードがあるのにプールを構築できない"))
     }
 
+
+
     #[test]
-    fn blit_すると出力記述子が取れる() {
+    fn upload_した色が出力バッファから読める() {
+        // 半ゼロコピー経路の本体: CPU の BGRA ピクセルを出力 dmabuf へアップロードする。
         let _guard = lock_gpu_tests();
         let Some(pool) = pool_or_skip() else { return };
-        let source = pool.create_test_source(256, 256).expect("ソースを確保できない");
-        assert!(pool.blit(&source));
+        // BGRA で (B=255, G=128, R=0, A=255) = 青っぽい色
+        let mut pixels = vec![0u8; 64 * 64 * 4];
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel[0] = 255; // B
+            pixel[1] = 128; // G
+            pixel[2] = 0;   // R
+            pixel[3] = 255; // A
+        }
+        assert!(pool.upload(&pixels, 64, 64));
 
-        let (_file_descriptor, descriptor) = pool.output().expect("出力記述子が取れない");
-        assert_eq!(descriptor.width, 256);
-        assert_eq!(descriptor.height, 256);
-        assert!(descriptor.stride >= 256 * 4);
+        let (_fd, descriptor) = pool.output().expect("出力記述子が取れない");
+        assert_eq!(descriptor.width, 64);
         assert_eq!(descriptor.generation, 1);
+
+        let read = pool.read_output_pixel(32, 32).expect("読み戻せない");
+        // read_output_pixel は RGBA で返る
+        assert!(read[0] <= 2, "R が乗っている: {:?}", read);
+        assert!((126..=130).contains(&read[1]), "G が合わない: {:?}", read);
+        assert!(read[2] >= 253, "B が合わない: {:?}", read);
     }
 
-    #[test]
-    fn blit_がソースの色を出力バッファへ運ぶ() {
-        let _guard = lock_gpu_tests();
-        // 記述子が取れるだけでは経路の検証にならない。既知の色を入れたソースを
-        // blit して、出力バッファから同じ色が読めることを確かめる。
-        let Some(pool) = pool_or_skip() else { return };
-        let source = pool.create_test_source(64, 64).unwrap();
-        pool.fill_test_source(&source, 0, 128, 255, 255);
 
-        assert!(pool.blit(&source));
-
-        let pixel = pool.read_output_pixel(32, 32).expect("出力を読み戻せない");
-        // 8bit の丸めで 1 ずれることがあるため許容幅を持たせる。
-        assert!(pixel[0] <= 2, "赤が乗っている: {:?}", pixel);
-        assert!((126..=130).contains(&pixel[1]), "緑が合わない: {:?}", pixel);
-        assert!(pixel[2] >= 253, "青が合わない: {:?}", pixel);
-        assert!(pixel[3] >= 253, "アルファが合わない: {:?}", pixel);
-    }
 
     #[test]
     fn サイズが変わると_generation_が進む() {
         let _guard = lock_gpu_tests();
         let Some(pool) = pool_or_skip() else { return };
-        let first = pool.create_test_source(256, 256).unwrap();
-        assert!(pool.blit(&first));
-        let (_first_fd, first_descriptor) = pool.output().unwrap();
+        let small = vec![0u8; 64 * 64 * 4];
+        assert!(pool.upload(&small, 64, 64));
+        let (_fd1, first) = pool.output().unwrap();
 
-        let second = pool.create_test_source(512, 512).unwrap();
-        assert!(pool.blit(&second));
-        let (_second_fd, second_descriptor) = pool.output().unwrap();
+        let large = vec![0u8; 128 * 128 * 4];
+        assert!(pool.upload(&large, 128, 128));
+        let (_fd2, second) = pool.output().unwrap();
 
-        assert_eq!(second_descriptor.generation, first_descriptor.generation + 1);
-        assert_eq!(second_descriptor.width, 512);
+        assert_eq!(second.generation, first.generation + 1);
+        assert_eq!(second.width, 128);
     }
 
     #[test]
     fn 同じサイズなら_generation_は進まない() {
         let _guard = lock_gpu_tests();
         let Some(pool) = pool_or_skip() else { return };
-        let first = pool.create_test_source(256, 256).unwrap();
-        assert!(pool.blit(&first));
-        let (_first_fd, first_descriptor) = pool.output().unwrap();
-
-        let second = pool.create_test_source(256, 256).unwrap();
-        assert!(pool.blit(&second));
-        let (_second_fd, second_descriptor) = pool.output().unwrap();
-
-        assert_eq!(second_descriptor.generation, first_descriptor.generation);
+        let pixels = vec![0u8; 64 * 64 * 4];
+        assert!(pool.upload(&pixels, 64, 64));
+        let (_fd1, first) = pool.output().unwrap();
+        assert!(pool.upload(&pixels, 64, 64));
+        let (_fd2, second) = pool.output().unwrap();
+        assert_eq!(second.generation, first.generation);
     }
 
     #[test]
-    fn blit_前は出力記述子が取れない() {
+    fn upload_前は出力記述子が取れない() {
         let _guard = lock_gpu_tests();
         let Some(pool) = pool_or_skip() else { return };
         assert!(pool.output().is_none());

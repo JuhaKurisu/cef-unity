@@ -354,45 +354,7 @@ pub fn use_unsafe_no_wait_copy() -> bool {
     })
 }
 
-/// Linux で accelerated paint 経路を使えるかを判定する。
-///
-/// Chromium の GL 初期化は実ディスプレイを要求するため、ヘッドレス環境では GPU
-/// プロセスが起動できない (`--ozone-platform=headless` で SIGSEGV する。詳細は
-/// `docs/LINUX_GPU_FEASIBILITY.md`)。ディスプレイが無い環境では software paint に
-/// 落とす。CI ランナーとコンテナはこちらに該当する。
-///
-/// `display` は `DISPLAY` 環境変数の値。Wayland のみで Xwayland が無い環境は
-/// 未設定になるため、保守的に software paint となる。
-#[cfg(target_os = "linux")]
-fn linux_accelerated_paint_available(
-    use_gpu: bool,
-    display: Option<&str>,
-    pool_available: bool,
-) -> bool {
-    use_gpu && display.is_some_and(|value| !value.is_empty()) && pool_available
-}
-
-/// 環境から `linux_accelerated_paint_available` を評価する。
-/// ozone プラットフォームの選択と `shared_texture_enabled` の双方で同じ判定を使う。
-/// DRM の fourcc。CEF が渡すピクセル順に合わせて選ぶ。
-/// `'A','R','2','4'` — メモリ上は B,G,R,A の順。
-#[cfg(target_os = "linux")]
-const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
-/// `'A','B','2','4'` — メモリ上は R,G,B,A の順。
-#[cfg(target_os = "linux")]
-const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241;
-
-/// 生の file descriptor を複製して所有権付きにする。
-///
-/// CEF が渡す fd はコールバックの間だけ借りているものなので、複製して寿命を分ける。
-#[cfg(target_os = "linux")]
-fn borrow_file_descriptor(raw: std::os::fd::RawFd) -> Option<std::os::fd::OwnedFd> {
-    unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) }
-        .try_clone_to_owned()
-        .ok()
-}
-
-/// accelerated paint が成立しない理由を記録する。毎フレーム出すとログが溢れるので
+/// dmabuf 経路が成立しない理由を記録する。毎フレーム出すとログが溢れるので
 /// 先頭数回だけにする。黙って捨てると原因が分からなくなるため、無言にはしない。
 #[cfg(target_os = "linux")]
 fn log_once_linux_accelerated_paint_problem(reason: &str) {
@@ -400,7 +362,7 @@ fn log_once_linux_accelerated_paint_problem(reason: &str) {
     let count = LOGGED_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if count <= 5 {
         log(&format!(
-            "on_accelerated_paint (Linux) をスキップ: {} — フレームは供給されない",
+            "Linux dmabuf 経路をスキップ: {} — クライアントは shm 経路へフォールバックする",
             reason
         ));
     }
@@ -466,32 +428,6 @@ fn publish_linux_accelerated_frame(
         ));
     }
 
-    // 最初の 1 回だけ、blit の結果が実際に出力バッファへ入っているかを記録する。
-    // 「クライアント側が黒い」ときに、サーバとクライアントのどちらの問題かを切り分ける。
-    {
-        static LOGGED: OnceLock<()> = OnceLock::new();
-        LOGGED.get_or_init(|| {
-            let (clear_pixel, clear_error, clear_status) = pool.clear_check();
-            log(&format!(
-                "クリア直後の即時読み戻し RGBA=({},{},{},{}) glError={:#x} fboStatus={:#x}",
-                clear_pixel[0], clear_pixel[1], clear_pixel[2], clear_pixel[3],
-                clear_error, clear_status
-            ));
-            let (inspect_status, inspect_pixel) = pool.source_inspect();
-            log(&format!(
-                "CEF 入力テクスチャの中心 status={} RGBA=({},{},{},{})",
-                inspect_status, inspect_pixel[0], inspect_pixel[1], inspect_pixel[2], inspect_pixel[3]
-            ));
-            match pool.read_output_pixel(descriptor.width / 2, descriptor.height / 2) {
-                Some(pixel) => log(&format!(
-                    "出力バッファの中心 RGBA=({},{},{},{})",
-                    pixel[0], pixel[1], pixel[2], pixel[3]
-                )),
-                None => log("出力バッファを読み戻せない"),
-            }
-        });
-    }
-
     // d3d11 経路と同じく、frame_id 増分の前に Unity frame を書く。
     shared_memory.write_paint_unity_frame(LAST_BEGIN_FRAME_UNITY_FRAME.load(Ordering::Relaxed));
     shared_memory.write_dmabuf_info(
@@ -551,14 +487,7 @@ fn with_dmabuf_pool<T>(action: impl FnOnce(Option<&crate::dmabuf_pool::DmabufPoo
     })
 }
 
-#[cfg(target_os = "linux")]
-fn linux_use_accelerated_paint(use_gpu: bool) -> bool {
-    let display = std::env::var("DISPLAY").ok();
-    // プールの構築は EGL の初期化を伴うので、安い条件が揃ってから評価する。
-    let cheap_conditions_hold =
-        linux_accelerated_paint_available(use_gpu, display.as_deref(), true);
-    cheap_conditions_hold && with_dmabuf_pool(|pool| pool.is_some())
-}
+
 
 /// 既知不良構成は IOSurface プール (macOS 専用) の中にしか無いので、他プラットフォーム
 /// では常に false。統計ログの mode 表示は全プラットフォームでコンパイルされるため、
@@ -858,6 +787,24 @@ wrap_render_handler! {
             let size = (width as usize) * (height as usize) * 4;
             let source = unsafe { std::slice::from_raw_parts(buffer, size) };
             self.shared_memory.write_frame(source, width, height);
+
+            // Linux 半ゼロコピー: software paint のピクセルを dmabuf へアップロードし、
+            // クライアントへゼロコピーで渡す。CEF の accelerated paint (dmabuf) は
+            // NVIDIA で中身が書かれない上流問題があるため (docs/LINUX_GPU_FEASIBILITY.md)、
+            // CEF には software paint をもらい、dmabuf 化はこちらで行う。
+            // プールが構築できない環境では従来どおり shm のみ (上の write_frame)。
+            #[cfg(target_os = "linux")]
+            with_dmabuf_pool(|pool| {
+                let Some(pool) = pool else {
+                    log_once_linux_accelerated_paint_problem("プールが構築できない環境");
+                    return;
+                };
+                if pool.upload(source, width as u32, height as u32) {
+                    publish_linux_accelerated_frame(&self.shared_memory, pool);
+                } else {
+                    log_once_linux_accelerated_paint_problem("upload に失敗");
+                }
+            });
         }
 
         fn on_accelerated_paint(
@@ -870,144 +817,15 @@ wrap_render_handler! {
             if type_.get_raw() != PaintElementType::VIEW.get_raw() {
                 return;
             }
-            // Linux: CEF の dmabuf を自前の出力バッファへ blit する。CEF のバッファは
-            // プールの借用で、このコールバックを抜けると再利用されるため、ここで
-            // コピーを完了させる (macOS / Windows と同じ構造)。
+            // Linux: shared texture を CEF に要求していないため、ここは呼ばれない
+            // はず。もし呼ばれたら構成の矛盾なので記録だけして無視する
+            // (dmabuf 化は on_paint 側の upload で行う)。
             #[cfg(target_os = "linux")]
             {
-                let Some(info) = info else {
-                    log_once_linux_accelerated_paint_problem("info=None");
-                    return;
-                };
-                if info.plane_count != 1 {
-                    // 複数プレーンは想定していない (CEF は RGBA 1 プレーンを渡す)。
-                    log_once_linux_accelerated_paint_problem("plane_count が 1 ではない");
-                    return;
-                }
-
-                let width = info.extra.coded_size.width as u32;
-                let height = info.extra.coded_size.height as u32;
-                let source = crate::dmabuf_pool::DmabufSource {
-                    // CEF が所有する fd を借りるだけなので、複製して所有権を分ける。
-                    file_descriptor: match borrow_file_descriptor(info.planes[0].fd) {
-                        Some(file_descriptor) => file_descriptor,
-                        None => {
-                            log_once_linux_accelerated_paint_problem("fd を複製できない");
-                            return;
-                        }
-                    },
-                    stride: info.planes[0].stride,
-                    offset: info.planes[0].offset,
-                    modifier: info.modifier,
-                    fourcc: if info.format.get_raw() == ColorType::RGBA_8888.get_raw() {
-                        DRM_FORMAT_ABGR8888
-                    } else {
-                        DRM_FORMAT_ARGB8888
-                    },
-                    width,
-                    height,
-                };
-
-                {
-                    // 診断: 最初の 1 回だけでなく定期的に読む。最初のフレームは
-                    // ページロード前の透明で当然なので、1 回だけの検査は誤診の元。
-                    static SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
-                    let sample_index = SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed);
-                    if sample_index % 60 == 0 && sample_index < 600 {
-                        match crate::dmabuf_pool::read_center_via_cpu(&source) {
-                            Some((pixel, non_zero)) => log(&format!(
-                                "frame#{}: CPU 中心 RGBA=({},{},{},{}) 非ゼロ={}",
-                                sample_index, pixel[0], pixel[1], pixel[2], pixel[3], non_zero
-                            )),
-                            None => log(&format!("frame#{}: mmap 不可", sample_index)),
-                        }
-                        match crate::dmabuf_pool::read_via_vulkan(&source) {
-                            Ok((pixel, non_zero)) => log(&format!(
-                                "frame#{}: Vulkan 中心 RGBA=({},{},{},{}) 非ゼロ={}",
-                                sample_index, pixel[0], pixel[1], pixel[2], pixel[3], non_zero
-                            )),
-                            Err(stage) => log(&format!("frame#{}: Vulkan 読み失敗 stage={}", sample_index, stage)),
-                        }
-                    }
-                    // CEF が渡してくるパラメータを 1 度だけ記録する。
-                    static LOGGED: OnceLock<()> = OnceLock::new();
-                    LOGGED.get_or_init(|| {
-                        // fd の実体を確認する。本物の dmabuf なら readlink が
-                        // "dmabuf:" になり、shared memory フォールバックなら "memfd:" になる。
-                        {
-                            let link = std::fs::read_link(format!(
-                                "/proc/self/fd/{}",
-                                std::os::fd::AsRawFd::as_raw_fd(&source.file_descriptor)
-                            ));
-                            let size = std::fs::metadata(format!(
-                                "/proc/self/fd/{}",
-                                std::os::fd::AsRawFd::as_raw_fd(&source.file_descriptor)
-                            ))
-                            .map(|metadata| metadata.len());
-                            log(&format!(
-                                "fd の実体: {:?} サイズ={:?} plane_size={}",
-                                link, size, info.planes[0].size
-                            ));
-                        }
-                        match crate::dmabuf_pool::read_center_via_cpu(&source) {
-                            Some((pixel, non_zero)) => log(&format!(
-                                "CPU 直読み: 中心 RGBA=({},{},{},{}) 非ゼロバイト数={}",
-                                pixel[0], pixel[1], pixel[2], pixel[3], non_zero
-                            )),
-                            None => log("CPU 直読みできない (mmap 不可)"),
-                        }
-                        log(&format!(
-                            "CEF の dmabuf: format_raw={} fourcc={:#x} stride={} offset={} \
-                             modifier={:#x} size={}x{} coded={}x{}",
-                            info.format.get_raw(),
-                            source.fourcc,
-                            source.stride,
-                            source.offset,
-                            source.modifier,
-                            source.width,
-                            source.height,
-                            info.extra.coded_size.width,
-                            info.extra.coded_size.height,
-                        ));
-                        log(&format!(
-                            "CEF の矩形: visible=({},{},{}x{}) content=({},{},{}x{}) source={}x{}",
-                            info.extra.visible_rect.x, info.extra.visible_rect.y,
-                            info.extra.visible_rect.width, info.extra.visible_rect.height,
-                            info.extra.content_rect.x, info.extra.content_rect.y,
-                            info.extra.content_rect.width, info.extra.content_rect.height,
-                            info.extra.source_size.width, info.extra.source_size.height,
-                        ))
-                    });
-                }
-                // 切り分け: GPU の書き込み完了を待てていない可能性を見るため、
-                // CEF_UNITY_DELAY_BLIT=1 で「1 つ前のフレームを blit する」動作にする。
-                // fd は dup 済みなのでコールバックを抜けても有効。
-                let source = if std::env::var("CEF_UNITY_DELAY_BLIT").is_ok() {
-                    thread_local! {
-                        static PREVIOUS: std::cell::RefCell<Option<crate::dmabuf_pool::DmabufSource>> =
-                            const { std::cell::RefCell::new(None) };
-                    }
-                    match PREVIOUS.with(|cell| cell.borrow_mut().replace(source)) {
-                        Some(previous) => previous,
-                        None => return, // 1 フレーム目は前フレームが無いので捨てる
-                    }
-                } else {
-                    source
-                };
-
-                with_dmabuf_pool(|pool| {
-                    let Some(pool) = pool else {
-                        log_once_linux_accelerated_paint_problem("プールが無い");
-                        return;
-                    };
-                    if !pool.blit(&source) {
-                        log_once_linux_accelerated_paint_problem("blit に失敗");
-                        return;
-                    }
-                    record_paint_latency();
-                    PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
-                    publish_linux_accelerated_frame(&self.shared_memory, pool);
-                });
+                let _ = info;
+                log_once_linux_accelerated_paint_problem(
+                    "on_accelerated_paint が呼ばれた (想定外の構成)",
+                );
                 return;
             }
             #[cfg(target_os = "macos")]
@@ -1591,55 +1409,26 @@ wrap_app! {
                 // 無効 (no_sandbox=1) なので、GPU サンドボックスも不要)
                 command_line.append_switch(Some(&CefString::from("disable-gpu-sandbox")));
 
-                // Linux: 既定は headless バックエンド。OSR にはウィンドウが無く画面を
-                // 要求する理由がないうえ、X11 が無い環境 (CI ランナー、コンテナ、
-                // サーバー) で初期化が失敗するのを防げる。
-                //
-                // ただし accelerated paint (dmabuf) 経路だけは実ディスプレイを要求する
-                // ため x11 を選ぶ。headless では GPU プロセスが起動できない。
-                // 詳細と実測データは docs/LINUX_GPU_FEASIBILITY.md を参照。
+                // Linux: OSR にはウィンドウが無く画面を要求する理由がないため、
+                // headless バックエンドを指定する。X11 が無い環境 (CI ランナー、
+                // コンテナ、サーバー) で初期化が失敗するのを防ぐ。
+                // CEF に shared texture は要求しない (NVIDIA で dmabuf に中身が
+                // 書かれない上流問題のため。docs/LINUX_GPU_FEASIBILITY.md)。
+                // GPU 相当の経路は on_paint のピクセルを dmabuf 化する半ゼロコピーで
+                // 実現しており、そちらは X にもこのスイッチにも依存しない。
                 #[cfg(target_os = "linux")]
-                {
-                    let accelerated = linux_use_accelerated_paint(self.use_gpu);
-                    let ozone_platform = if accelerated { "x11" } else { "headless" };
-                    log(&format!(
-                        "ozone-platform = {} (accelerated paint = {})",
-                        ozone_platform, accelerated
-                    ));
-                    command_line.append_switch_with_value(
-                        Some(&CefString::from("ozone-platform")),
-                        Some(&CefString::from(ozone_platform)),
-                    );
-                    if accelerated {
-                        // Skia を Vulkan バックエンドにする。ANGLE の GL 経由で dmabuf を
-                        // インポートするとテクスチャがレンダリング可能にならず
-                        // (GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT)、SkSurface を作れずに
-                        // paint がまったく発生しない。
-                        // 切り分け用に環境変数で無効化できるようにしてある。
-                        if std::env::var("CEF_UNITY_NO_VULKAN").is_err() {
-                            command_line.append_switch_with_value(
-                                Some(&CefString::from("enable-features")),
-                                Some(&CefString::from("Vulkan")),
-                            );
-                        }
-                        // 追加スイッチの切り分け用。
-                        for switch in std::env::var("CEF_UNITY_EXTRA_SWITCHES")
-                            .unwrap_or_default()
-                            .split_whitespace()
-                        {
-                            match switch.split_once('=') {
-                                Some((name, value)) => command_line.append_switch_with_value(
-                                    Some(&CefString::from(name)),
-                                    Some(&CefString::from(value)),
-                                ),
-                                None => command_line
-                                    .append_switch(Some(&CefString::from(switch))),
-                            }
-                        }
-                    }
-                }
+                command_line.append_switch_with_value(
+                    Some(&CefString::from("ozone-platform")),
+                    Some(&CefString::from("headless")),
+                );
 
-                if !self.use_gpu {
+                // Linux では use_gpu でも Chromium の GPU プロセスを使わない。
+                // headless ozone + GPU プロセスは X エラーで死に全体を巻き添えにする
+                // (実測: exit_code=256 → zygote 通信断)。半ゼロコピー経路は CEF の
+                // GPU を必要とせず (software paint を dmabuf 化するのはこちら)、
+                // software 経路は従来から安定稼働している。
+                let force_cpu = cfg!(target_os = "linux");
+                if !self.use_gpu || force_cpu {
                     // CPU モード: Chromium に GPU を一切使わせない。
                     // これにより on_paint 用の GPU→CPU readback が発生しなくなり、
                     // Skia software pipeline のみで動く。
@@ -2060,27 +1849,21 @@ impl CefServer {
         if d3d11_pool.is_some() {
             window_info.shared_texture_enabled = 1;
         }
-        // Linux: ozone プラットフォームの選択と同じ判定を使う。x11 を選んでいない
-        // (= headless) のに立てると、CEF が software paint を止めるだけで
-        // accelerated paint も来ず、フレームが一切供給されなくなる。
+        // Linux: CEF には shared texture を要求しない。NVIDIA では CEF の
+        // accelerated paint が渡す dmabuf に中身が一度も書かれない上流問題がある
+        // (docs/LINUX_GPU_FEASIBILITY.md)。software paint をもらい、dmabuf 化は
+        // on_paint 側の upload で行う (半ゼロコピー)。fd を渡すソケットだけ
+        // 立てておく。パスはクライアントも server_pid と browser_id から同じ規則で
+        // 導出する (macOS の Mach サービス名と同じ流儀)。
         #[cfg(target_os = "linux")]
-        if linux_use_accelerated_paint(self.use_gpu)
-            && std::env::var("CEF_UNITY_NO_SHARED_TEXTURE").is_err()
-        {
-            window_info.shared_texture_enabled = 1;
-            // 出力バッファの fd を渡す経路。パスはクライアントも server_pid と
-            // browser_id から同じ規則で導出する (macOS の Mach サービス名と同じ流儀)。
+        if self.use_gpu && with_dmabuf_pool(|pool| pool.is_some()) {
             start_dmabuf_listener(cef_unity_ipc::dmabuf_socket_path(self.server_pid, id));
         }
         // External BeginFrame: Unity の LateUpdate から SendExternalBeginFrame で 1 フレーム
         // ずつ駆動する。これにより CEF の Viz Compositor は自発的に paint せず、
         // Unity のフレーム周期と完全に同期する (二重レート/位相ドリフトの解消)。
         // windowless_frame_rate はこのモードでは無視される。
-        // 切り分け: 外部 BeginFrame を有効にすると Chromium 側で
-        // force_software_compositor が立ち、共有テクスチャが書かれなくなるという
-        // 報告がある。CEF_UNITY_NO_EXTERNAL_BEGIN_FRAME=1 で外して確認できるようにする。
-        window_info.external_begin_frame_enabled =
-            if std::env::var("CEF_UNITY_NO_EXTERNAL_BEGIN_FRAME").is_ok() { 0 } else { 1 };
+        window_info.external_begin_frame_enabled = 1;
         let ok = browser_host_create_browser(
             Some(&window_info),
             Some(&mut client),
@@ -2676,34 +2459,4 @@ fn helper_binary_path(executable_directory: &std::path::Path) -> std::path::Path
     executable_directory.join("cef-unity-rust-helper.exe")
 }
 
-#[cfg(all(test, target_os = "linux"))]
-mod linux_accelerated_paint_tests {
-    use super::linux_accelerated_paint_available;
 
-    #[test]
-    fn 三条件が揃えば有効() {
-        assert!(linux_accelerated_paint_available(true, Some(":0"), true));
-    }
-
-    #[test]
-    fn cpu_モードでは無効() {
-        assert!(!linux_accelerated_paint_available(false, Some(":0"), true));
-    }
-
-    #[test]
-    fn ディスプレイが無ければ無効() {
-        // CI ランナーとコンテナがこれに該当する。headless + software paint に落ちる。
-        assert!(!linux_accelerated_paint_available(true, None, true));
-    }
-
-    #[test]
-    fn 空文字の_display_はディスプレイ無しとして扱う() {
-        assert!(!linux_accelerated_paint_available(true, Some(""), true));
-    }
-
-    #[test]
-    fn プールを構築できなければ無効() {
-        // EGL の拡張が足りない、ドライバが古い、といった環境。
-        assert!(!linux_accelerated_paint_available(true, Some(":0"), false));
-    }
-}
