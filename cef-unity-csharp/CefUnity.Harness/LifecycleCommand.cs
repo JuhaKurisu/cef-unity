@@ -117,8 +117,14 @@ internal static class LifecycleCommand
                 UseShellExecute = false,
             });
             if (process == null) return -1;
-            var output = process.StandardOutput.ReadToEnd();
-            process.WaitForExit();
+            // Process.Dispose() は StandardOutput のストリームを閉じない (.NET の仕様)。
+            // reader を閉じないと pgrep の stdout パイプの fd が GC まで残り、
+            // 「fd リーク検出の計測コード自身が fd をリークする」ことになる
+            // (lifecycle の file_descriptors が +1/cycle 増える実測 + strace で発覚)。
+            using var scopedProcess = process;
+            using var outputReader = scopedProcess.StandardOutput;
+            var output = outputReader.ReadToEnd();
+            scopedProcess.WaitForExit();
             return output.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length;
         }
         catch (Exception)
