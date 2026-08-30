@@ -2027,7 +2027,9 @@ impl CefServer {
         // (= headless) のに立てると、CEF が software paint を止めるだけで
         // accelerated paint も来ず、フレームが一切供給されなくなる。
         #[cfg(target_os = "linux")]
-        if linux_use_accelerated_paint(self.use_gpu) {
+        if linux_use_accelerated_paint(self.use_gpu)
+            && std::env::var("CEF_UNITY_NO_SHARED_TEXTURE").is_err()
+        {
             window_info.shared_texture_enabled = 1;
             // 出力バッファの fd を渡す経路。パスはクライアントも server_pid と
             // browser_id から同じ規則で導出する (macOS の Mach サービス名と同じ流儀)。
@@ -2037,7 +2039,11 @@ impl CefServer {
         // ずつ駆動する。これにより CEF の Viz Compositor は自発的に paint せず、
         // Unity のフレーム周期と完全に同期する (二重レート/位相ドリフトの解消)。
         // windowless_frame_rate はこのモードでは無視される。
-        window_info.external_begin_frame_enabled = 1;
+        // 切り分け: 外部 BeginFrame を有効にすると Chromium 側で
+        // force_software_compositor が立ち、共有テクスチャが書かれなくなるという
+        // 報告がある。CEF_UNITY_NO_EXTERNAL_BEGIN_FRAME=1 で外して確認できるようにする。
+        window_info.external_begin_frame_enabled =
+            if std::env::var("CEF_UNITY_NO_EXTERNAL_BEGIN_FRAME").is_ok() { 0 } else { 1 };
         let ok = browser_host_create_browser(
             Some(&window_info),
             Some(&mut client),

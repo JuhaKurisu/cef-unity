@@ -28,9 +28,13 @@ if (command == "smoke")
 if (command == "dump")
 {
     var outputPath = args.Length > 1 ? args[1] : "frame.png";
-    CefRuntime.Initialize(useGpu: false);
+    // 診断用: URL と GPU モードを環境変数で差し替えられるようにする。
+    // chrome://gpu を software paint で撮って Chromium 自身の GPU 診断を読むのに使う。
+    var dumpUrl = Environment.GetEnvironmentVariable("CEFUNITY_URL") ?? "https://example.com";
+    var dumpUseGpu = Environment.GetEnvironmentVariable("CEFUNITY_USE_GPU") == "1";
+    CefRuntime.Initialize(useGpu: dumpUseGpu, enableLog: Environment.GetEnvironmentVariable("CEFUNITY_LOG") == "1");
     var written = false;
-    using (var browser = new Browser(1280, 720, "https://example.com"))
+    using (var browser = new Browser(1280, 720, dumpUrl))
     {
         for (var frameIndex = 0; frameIndex < 600 && !written; frameIndex++)
         {
