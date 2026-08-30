@@ -17,6 +17,12 @@ Windows では MSVC 環境が要る (下記「落とし穴」参照):
 cmd /c '"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul && cargo test'
 ```
 
+**落とし穴: C / Obj-C ソースを変更したら `cargo clean -p <クレート>` が必要。**
+`cargo build` は `.c` / `.m` の変更を検知せず古い `.o` をリンクし続けるため、
+変更が反映されず「実装したのに動かない」という誤診に繋がる。`cc` クレートで
+ビルドしている全てのソースが対象 (`metal_texture.m`、`iosurface_pool.m`、
+`dmabuf_pool.c` など)。
+
 ### 2. C# 側の同期更新
 
 FFI 関数の追加・変更時は **`cef-unity-csharp/CefUnity.Core/Interop/NativeMethods.g.cs` + `CefUnity.cs`** を更新する (namespace は `CefUnity` / `CefUnity.Interop`)。

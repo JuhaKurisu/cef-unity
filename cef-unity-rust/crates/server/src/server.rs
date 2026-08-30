@@ -72,7 +72,7 @@ pub fn set_logging(enabled: bool) {
     LOG_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-fn log(message: &str) {
+pub(crate) fn log(message: &str) {
     if !LOG_ENABLED.load(Ordering::Relaxed) {
         return;
     }

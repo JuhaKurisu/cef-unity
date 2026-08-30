@@ -4,6 +4,8 @@
 // Platform-specific event loop is in the event_loop module.
 
 mod d3d11_pool;
+#[cfg(target_os = "linux")]
+mod dmabuf_pool;
 mod event_loop;
 mod server;
 

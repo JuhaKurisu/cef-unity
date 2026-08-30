@@ -2,7 +2,17 @@ fn main() {
     // Linux: libcef.so は実行ファイルと同じディレクトリに配置されるため、
     // $ORIGIN を RPATH に入れて LD_LIBRARY_PATH なしで解決させる。
     #[cfg(target_os = "linux")]
-    println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+    {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+
+        // dmabuf プール (EGL / GBM / GLES)。macOS の iosurface_pool.m に相当する。
+        cc::Build::new()
+            .file("src/dmabuf_pool.c")
+            .compile("dmabuf_pool");
+        println!("cargo:rustc-link-lib=gbm");
+        println!("cargo:rustc-link-lib=EGL");
+        println!("cargo:rustc-link-lib=GLESv2");
+    }
 
     #[cfg(target_os = "macos")]
     {
