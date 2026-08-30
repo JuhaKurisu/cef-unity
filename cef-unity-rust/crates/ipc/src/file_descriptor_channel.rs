@@ -15,6 +15,52 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 /// 1 メッセージで運べる file descriptor の上限。dmabuf のプレーン数上限に合わせてある。
 const MAXIMUM_FILE_DESCRIPTORS: usize = 4;
 
+/// 出力バッファの記述子をバイト列にしたときの長さ。
+pub const DMABUF_DESCRIPTOR_BYTES: usize = 28;
+
+/// 出力バッファの記述子。dmabuf の file descriptor と一緒に送る。
+///
+/// `serde` を使わず固定長にしてある。相手は同一マシンの同一ビルドで、
+/// 1 メッセージにつき 1 個しか載せないため、可変長にする理由がない。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct DmabufDescriptor {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub modifier: u64,
+    /// DRM の fourcc (例: `GBM_FORMAT_ARGB8888`)。
+    pub fourcc: u32,
+    /// 出力バッファを作り直すたびに進む。共有メモリヘッダの値と一致したものだけを使う。
+    pub generation: u32,
+}
+
+impl DmabufDescriptor {
+    pub fn to_bytes(&self) -> [u8; DMABUF_DESCRIPTOR_BYTES] {
+        let mut bytes = [0u8; DMABUF_DESCRIPTOR_BYTES];
+        bytes[0..4].copy_from_slice(&self.width.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.height.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.stride.to_le_bytes());
+        bytes[12..20].copy_from_slice(&self.modifier.to_le_bytes());
+        bytes[20..24].copy_from_slice(&self.fourcc.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.generation.to_le_bytes());
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < DMABUF_DESCRIPTOR_BYTES {
+            return None;
+        }
+        Some(Self {
+            width: u32::from_le_bytes(bytes[0..4].try_into().ok()?),
+            height: u32::from_le_bytes(bytes[4..8].try_into().ok()?),
+            stride: u32::from_le_bytes(bytes[8..12].try_into().ok()?),
+            modifier: u64::from_le_bytes(bytes[12..20].try_into().ok()?),
+            fourcc: u32::from_le_bytes(bytes[20..24].try_into().ok()?),
+            generation: u32::from_le_bytes(bytes[24..28].try_into().ok()?),
+        })
+    }
+}
+
 /// `SCM_RIGHTS` で file descriptor を運べる双方向チャネル。
 pub struct FileDescriptorChannel {
     socket: std::os::unix::net::UnixStream,
@@ -184,6 +230,52 @@ mod tests {
             .read_to_string(&mut received)
             .unwrap();
         assert_eq!(received, "dmabuf");
+    }
+
+    #[test]
+    fn 記述子がバイト列を往復する() {
+        let descriptor = DmabufDescriptor {
+            width: 1280,
+            height: 720,
+            stride: 5120,
+            modifier: 0x0300_0000_0e08_0140,
+            fourcc: 0x3432_5241, // "AR24"
+            generation: 3,
+        };
+        let restored = DmabufDescriptor::from_bytes(&descriptor.to_bytes()).unwrap();
+        assert_eq!(restored, descriptor);
+    }
+
+    #[test]
+    fn 短すぎるバイト列は_none_になる() {
+        assert!(DmabufDescriptor::from_bytes(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn 記述子を_fd_と一緒に送れる() {
+        let (sender, receiver) = FileDescriptorChannel::pair().unwrap();
+        let descriptor = DmabufDescriptor {
+            width: 640,
+            height: 480,
+            stride: 2560,
+            modifier: 0,
+            fourcc: 0x3432_5241,
+            generation: 1,
+        };
+        let file = std::fs::File::open("/dev/null").unwrap();
+        sender
+            .send(&descriptor.to_bytes(), &[file.as_raw_fd()])
+            .unwrap();
+
+        let mut payload_buffer = [0u8; DMABUF_DESCRIPTOR_BYTES];
+        let (length, file_descriptors) = receiver.receive(&mut payload_buffer).unwrap();
+
+        assert_eq!(length, DMABUF_DESCRIPTOR_BYTES);
+        assert_eq!(file_descriptors.len(), 1);
+        assert_eq!(
+            DmabufDescriptor::from_bytes(&payload_buffer).unwrap(),
+            descriptor
+        );
     }
 
     #[test]

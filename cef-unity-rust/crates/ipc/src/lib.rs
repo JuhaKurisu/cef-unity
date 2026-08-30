@@ -201,7 +201,6 @@ use std::sync::atomic::AtomicI32;
 
 const _: () = assert!(std::mem::size_of::<SharedMemoryHeader>() == SHARED_MEMORY_HEADER_SIZE);
 
-/// Generate a shared memory flink path for a browser.
 /// dmabuf の file descriptor を渡す Unix ドメインソケットのパス。
 /// 命名規則は `shared_memory_flink_path` に揃えてある。
 #[cfg(target_os = "linux")]
@@ -214,6 +213,7 @@ pub fn dmabuf_socket_path(server_pid: u32, browser_id: u32) -> String {
         .to_string()
 }
 
+/// Generate a shared memory flink path for a browser.
 pub fn shared_memory_flink_path(server_pid: u32, browser_id: u32) -> String {
     let temporary_directory = std::env::temp_dir();
     temporary_directory.join(format!("cef-unity-shm-{}-{}", server_pid, browser_id))
@@ -763,7 +763,7 @@ impl SharedMemoryReader {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod dmabuf_socket_path_tests {
     use super::*;
 

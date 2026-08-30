@@ -222,6 +222,7 @@ name = "cef-unity-ipc"
 version = "0.1.0"
 dependencies = [
  "ipc-channel",
+ "libc",
  "serde",
  "shared_memory",
 ]
