@@ -8,4 +8,4 @@ name = "cef-unity-rust-helper"
 path = "src/main.rs"
 
 [dependencies]
-cef = "145.5.0"
+cef = "151.8.0"

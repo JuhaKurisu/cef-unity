@@ -20,8 +20,14 @@ fn main() {
             .compile("dmabuf_vulkan_probe");
         println!("cargo:rustc-link-lib=vulkan");
         println!("cargo:rustc-link-lib=gbm");
-        println!("cargo:rustc-link-lib=EGL");
-        println!("cargo:rustc-link-lib=GLESv2");
+        // EGL と GLESv2 は soname で指定する。cef クレート (151+) が CEF 配布物の
+        // ディレクトリをリンクパスに入れるため、-lGLESv2 だと同梱の ANGLE 版
+        // libGLESv2.so (gl* シンボルを export しない) を掴んで undefined symbol になる。
+        // libGLESv2.so.2 / libEGL.so.1 という名前は CEF 配布物に存在しないので、
+        // システム (mesa) 側が確実に選ばれる。
+        println!("cargo:rustc-link-arg=-l:libEGL.so.1");
+        println!("cargo:rustc-link-arg=-l:libGLESv2.so.2");
+        println!("cargo:rustc-link-arg=-lvulkan");
     }
 
     #[cfg(target_os = "macos")]
