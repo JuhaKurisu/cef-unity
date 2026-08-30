@@ -6,28 +6,117 @@
 //!
 //! macOS の Mach port 転送 (`mach_iosurface.c`)、Windows の NT 共有ハンドル
 //! (`DuplicateHandle`) に相当する層。
+//!
+//! `ipc-channel` の高レベル API は任意の file descriptor を運べないため別建てにしてある。
 
-use std::os::fd::{OwnedFd, RawFd};
+use std::mem::size_of;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+
+/// 1 メッセージで運べる file descriptor の上限。dmabuf のプレーン数上限に合わせてある。
+const MAXIMUM_FILE_DESCRIPTORS: usize = 4;
 
 /// `SCM_RIGHTS` で file descriptor を運べる双方向チャネル。
 pub struct FileDescriptorChannel {
-    _socket: std::os::unix::net::UnixStream,
+    socket: std::os::unix::net::UnixStream,
 }
 
 impl FileDescriptorChannel {
-    /// 接続済みの 1 対を作る。
+    /// 接続済みの 1 対を作る。テストと、親子プロセスを直接繋ぐ用途に使う。
     pub fn pair() -> std::io::Result<(Self, Self)> {
-        todo!("not implemented")
+        let (first, second) = std::os::unix::net::UnixStream::pair()?;
+        Ok((Self { socket: first }, Self { socket: second }))
     }
 
     /// バイト列と file descriptor をまとめて送る。
-    pub fn send(&self, _payload: &[u8], _file_descriptors: &[RawFd]) -> std::io::Result<()> {
-        todo!("not implemented")
+    ///
+    /// file descriptor は複製されて相手に渡るため、呼び出し側は送信後に
+    /// 自分の分を閉じてよい。
+    pub fn send(&self, payload: &[u8], file_descriptors: &[RawFd]) -> std::io::Result<()> {
+        if file_descriptors.len() > MAXIMUM_FILE_DESCRIPTORS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "file descriptor が多すぎる",
+            ));
+        }
+
+        let control_length =
+            unsafe { libc::CMSG_SPACE((size_of::<RawFd>() * file_descriptors.len()) as u32) }
+                as usize;
+        let mut control_buffer = vec![0u8; control_length.max(1)];
+        let mut io_vector = libc::iovec {
+            iov_base: payload.as_ptr() as *mut libc::c_void,
+            iov_len: payload.len(),
+        };
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut io_vector;
+        message.msg_iovlen = 1;
+
+        if !file_descriptors.is_empty() {
+            message.msg_control = control_buffer.as_mut_ptr() as *mut libc::c_void;
+            message.msg_controllen = control_length;
+            unsafe {
+                let control_message = libc::CMSG_FIRSTHDR(&message);
+                (*control_message).cmsg_level = libc::SOL_SOCKET;
+                (*control_message).cmsg_type = libc::SCM_RIGHTS;
+                (*control_message).cmsg_len =
+                    libc::CMSG_LEN((size_of::<RawFd>() * file_descriptors.len()) as u32) as usize;
+                std::ptr::copy_nonoverlapping(
+                    file_descriptors.as_ptr(),
+                    libc::CMSG_DATA(control_message) as *mut RawFd,
+                    file_descriptors.len(),
+                );
+            }
+        }
+
+        let sent = unsafe { libc::sendmsg(self.socket.as_raw_fd(), &message, 0) };
+        if sent < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
-    /// バイト列と file descriptor を受け取る。戻り値はペイロードの長さと fd。
-    pub fn receive(&self, _payload_buffer: &mut [u8]) -> std::io::Result<(usize, Vec<OwnedFd>)> {
-        todo!("not implemented")
+    /// バイト列と file descriptor を受け取る。戻り値はペイロードの長さと file descriptor。
+    ///
+    /// 受け取った file descriptor の所有権は呼び出し側に移る (`OwnedFd` が閉じる)。
+    pub fn receive(&self, payload_buffer: &mut [u8]) -> std::io::Result<(usize, Vec<OwnedFd>)> {
+        let control_length =
+            unsafe { libc::CMSG_SPACE((size_of::<RawFd>() * MAXIMUM_FILE_DESCRIPTORS) as u32) }
+                as usize;
+        let mut control_buffer = vec![0u8; control_length];
+        let mut io_vector = libc::iovec {
+            iov_base: payload_buffer.as_mut_ptr() as *mut libc::c_void,
+            iov_len: payload_buffer.len(),
+        };
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut io_vector;
+        message.msg_iovlen = 1;
+        message.msg_control = control_buffer.as_mut_ptr() as *mut libc::c_void;
+        message.msg_controllen = control_length;
+
+        let received = unsafe { libc::recvmsg(self.socket.as_raw_fd(), &mut message, 0) };
+        if received < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut file_descriptors = Vec::new();
+        unsafe {
+            let mut control_message = libc::CMSG_FIRSTHDR(&message);
+            while !control_message.is_null() {
+                if (*control_message).cmsg_level == libc::SOL_SOCKET
+                    && (*control_message).cmsg_type == libc::SCM_RIGHTS
+                {
+                    let payload_length =
+                        (*control_message).cmsg_len - libc::CMSG_LEN(0) as usize;
+                    let count = payload_length / size_of::<RawFd>();
+                    let data = libc::CMSG_DATA(control_message) as *const RawFd;
+                    for index in 0..count {
+                        file_descriptors.push(OwnedFd::from_raw_fd(*data.add(index)));
+                    }
+                }
+                control_message = libc::CMSG_NXTHDR(&message, control_message);
+            }
+        }
+        Ok((received as usize, file_descriptors))
     }
 }
 
@@ -46,7 +135,7 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
 
         let (sender, receiver) = FileDescriptorChannel::pair().unwrap();
-        sender.send(b"x", &[std::os::fd::AsRawFd::as_raw_fd(&file)]).unwrap();
+        sender.send(b"x", &[file.as_raw_fd()]).unwrap();
 
         let mut payload_buffer = [0u8; 8];
         let (_length, file_descriptors) = receiver.receive(&mut payload_buffer).unwrap();
@@ -57,5 +146,17 @@ mod tests {
             .read_to_string(&mut received)
             .unwrap();
         assert_eq!(received, "dmabuf");
+    }
+
+    #[test]
+    fn ペイロードが往復する() {
+        let (sender, receiver) = FileDescriptorChannel::pair().unwrap();
+        sender.send(b"hello", &[]).unwrap();
+
+        let mut payload_buffer = [0u8; 16];
+        let (length, file_descriptors) = receiver.receive(&mut payload_buffer).unwrap();
+
+        assert_eq!(&payload_buffer[..length], b"hello");
+        assert!(file_descriptors.is_empty());
     }
 }
