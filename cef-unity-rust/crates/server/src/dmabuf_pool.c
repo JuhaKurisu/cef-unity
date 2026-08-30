@@ -16,11 +16,34 @@
 #include <string.h>
 #include <unistd.h>
 
+// CEF のテクスチャを出力バッファへ写すだけの最小シェーダ。
+// 頂点は正規化デバイス座標の全画面クアッドで、UV は Y を反転させてある
+// (CEF/Chromium のテクスチャ原点は左上、GL のテクスチャ原点は左下)。
+static const char *VERTEX_SHADER_SOURCE =
+    "attribute vec2 position;\n"
+    "varying vec2 texture_coordinate;\n"
+    "void main() {\n"
+    "  texture_coordinate = vec2((position.x + 1.0) * 0.5, (1.0 - position.y) * 0.5);\n"
+    "  gl_Position = vec4(position, 0.0, 1.0);\n"
+    "}\n";
+
+static const char *FRAGMENT_SHADER_SOURCE =
+    "precision mediump float;\n"
+    "varying vec2 texture_coordinate;\n"
+    "uniform sampler2D source_texture;\n"
+    "void main() {\n"
+    "  gl_FragColor = texture2D(source_texture, texture_coordinate);\n"
+    "}\n";
+
 typedef struct {
     int drm_file_descriptor;
     struct gbm_device *gbm_device;
     EGLDisplay display;
     EGLContext context;
+
+    GLuint program;
+    GLint position_attribute;
+    GLint source_texture_uniform;
 
     struct gbm_bo *output_buffer_object;
     EGLImageKHR output_image;
@@ -141,10 +164,276 @@ void *dmabuf_pool_create(int *failure_stage) {
     return pool;
 }
 
+static GLuint compile_shader(GLenum type, const char *source) {
+    GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &source, NULL);
+    glCompileShader(shader);
+    GLint compiled = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    if (!compiled) {
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+// シェーダは 1 度だけ作って使い回す。
+static int ensure_program(DmabufPool *pool) {
+    if (pool->program) {
+        return 1;
+    }
+    GLuint vertex_shader = compile_shader(GL_VERTEX_SHADER, VERTEX_SHADER_SOURCE);
+    GLuint fragment_shader = compile_shader(GL_FRAGMENT_SHADER, FRAGMENT_SHADER_SOURCE);
+    if (!vertex_shader || !fragment_shader) {
+        return 0;
+    }
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vertex_shader);
+    glAttachShader(program, fragment_shader);
+    glLinkProgram(program);
+    glDeleteShader(vertex_shader);
+    glDeleteShader(fragment_shader);
+
+    GLint linked = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        glDeleteProgram(program);
+        return 0;
+    }
+    pool->program = program;
+    pool->position_attribute = glGetAttribLocation(program, "position");
+    pool->source_texture_uniform = glGetUniformLocation(program, "source_texture");
+    return 1;
+}
+
+// dmabuf を EGLImage 経由で GL テクスチャにする。失敗したら 0。
+static GLuint import_dmabuf_texture(DmabufPool *pool, EGLImageKHR *out_image,
+                                    int file_descriptor, unsigned int stride,
+                                    unsigned long long modifier, unsigned int fourcc,
+                                    int width, int height) {
+    EGLint image_attributes[] = {
+        EGL_WIDTH,                          width,
+        EGL_HEIGHT,                         height,
+        EGL_LINUX_DRM_FOURCC_EXT,           (EGLint)fourcc,
+        EGL_DMA_BUF_PLANE0_FD_EXT,          file_descriptor,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT,      0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT,       (EGLint)stride,
+        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(modifier & 0xffffffff),
+        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(modifier >> 32),
+        EGL_NONE};
+    EGLImageKHR image = pool->create_image(pool->display, EGL_NO_CONTEXT,
+                                           EGL_LINUX_DMA_BUF_EXT, NULL, image_attributes);
+    if (image == EGL_NO_IMAGE_KHR) {
+        return 0;
+    }
+    GLuint texture = 0;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    pool->image_target_texture(GL_TEXTURE_2D, image);
+    if (glGetError() != GL_NO_ERROR) {
+        glDeleteTextures(1, &texture);
+        pool->destroy_image(pool->display, image);
+        return 0;
+    }
+    *out_image = image;
+    return texture;
+}
+
+// 出力バッファはサイズが変わったときだけ作り直す (d3d11_pool.rs と同じ方針)。
+static int ensure_output(DmabufPool *pool, int width, int height) {
+    if (pool->output_buffer_object && pool->output_width == width
+        && pool->output_height == height) {
+        return 1;
+    }
+    if (pool->output_framebuffer) {
+        glDeleteFramebuffers(1, &pool->output_framebuffer);
+        pool->output_framebuffer = 0;
+    }
+    if (pool->output_texture) {
+        glDeleteTextures(1, &pool->output_texture);
+        pool->output_texture = 0;
+    }
+    if (pool->output_image) {
+        pool->destroy_image(pool->display, pool->output_image);
+        pool->output_image = NULL;
+    }
+    if (pool->output_buffer_object) {
+        gbm_bo_destroy(pool->output_buffer_object);
+        pool->output_buffer_object = NULL;
+    }
+
+    // リニア modifier は NVIDIA の GBM で確保に失敗するため要求しない。
+    pool->output_buffer_object = gbm_bo_create(pool->gbm_device, width, height,
+                                               GBM_FORMAT_ARGB8888, GBM_BO_USE_RENDERING);
+    if (!pool->output_buffer_object) {
+        return 0;
+    }
+
+    int output_file_descriptor = gbm_bo_get_fd(pool->output_buffer_object);
+    if (output_file_descriptor < 0) {
+        return 0;
+    }
+    EGLImageKHR image = NULL;
+    pool->output_texture = import_dmabuf_texture(
+        pool, &image, output_file_descriptor,
+        gbm_bo_get_stride(pool->output_buffer_object),
+        gbm_bo_get_modifier(pool->output_buffer_object), GBM_FORMAT_ARGB8888, width, height);
+    // EGLImage が参照を保持するので、ここで閉じてよい。
+    close(output_file_descriptor);
+    if (!pool->output_texture) {
+        return 0;
+    }
+    pool->output_image = image;
+
+    glGenFramebuffers(1, &pool->output_framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, pool->output_framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                           pool->output_texture, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        return 0;
+    }
+
+    pool->output_width = width;
+    pool->output_height = height;
+    pool->generation += 1;
+    return 1;
+}
+
+int dmabuf_pool_blit(void *handle, int source_file_descriptor, unsigned int source_stride,
+                     unsigned long long source_modifier, unsigned int source_fourcc,
+                     int width, int height) {
+    DmabufPool *pool = (DmabufPool *)handle;
+    if (!pool || !ensure_program(pool) || !ensure_output(pool, width, height)) {
+        return 0;
+    }
+
+    EGLImageKHR source_image = NULL;
+    GLuint source_texture =
+        import_dmabuf_texture(pool, &source_image, source_file_descriptor, source_stride,
+                              source_modifier, source_fourcc, width, height);
+    if (!source_texture) {
+        return 0;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, pool->output_framebuffer);
+    glViewport(0, 0, width, height);
+    glUseProgram(pool->program);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, source_texture);
+    glUniform1i(pool->source_texture_uniform, 0);
+
+    static const GLfloat QUAD[] = {-1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f};
+    glEnableVertexAttribArray((GLuint)pool->position_attribute);
+    glVertexAttribPointer((GLuint)pool->position_attribute, 2, GL_FLOAT, GL_FALSE, 0, QUAD);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray((GLuint)pool->position_attribute);
+
+    // macOS の waitUntilCompleted と同じ位置づけ。完了を待ってから frame_id を進める。
+    glFinish();
+
+    glDeleteTextures(1, &source_texture);
+    pool->destroy_image(pool->display, source_image);
+    return 1;
+}
+
+int dmabuf_pool_output(void *handle, int *out_file_descriptor, unsigned int *out_stride,
+                       unsigned long long *out_modifier, unsigned int *out_fourcc,
+                       unsigned int *out_generation, int *out_width, int *out_height) {
+    DmabufPool *pool = (DmabufPool *)handle;
+    if (!pool || !pool->output_buffer_object) {
+        return 0;
+    }
+    // 呼び出し側が閉じる。
+    *out_file_descriptor = gbm_bo_get_fd(pool->output_buffer_object);
+    if (*out_file_descriptor < 0) {
+        return 0;
+    }
+    *out_stride = gbm_bo_get_stride(pool->output_buffer_object);
+    *out_modifier = gbm_bo_get_modifier(pool->output_buffer_object);
+    *out_fourcc = GBM_FORMAT_ARGB8888;
+    *out_generation = pool->generation;
+    *out_width = pool->output_width;
+    *out_height = pool->output_height;
+    return 1;
+}
+
+// テスト専用: ソースバッファを単色で塗る。blit がピクセルを運んでいるかの検証に使う。
+int dmabuf_pool_fill_test_source(void *handle, int file_descriptor, unsigned int stride,
+                                 unsigned long long modifier, unsigned int fourcc, int width,
+                                 int height, unsigned char red, unsigned char green,
+                                 unsigned char blue, unsigned char alpha) {
+    DmabufPool *pool = (DmabufPool *)handle;
+    if (!pool) {
+        return 0;
+    }
+    EGLImageKHR image = NULL;
+    GLuint texture = import_dmabuf_texture(pool, &image, file_descriptor, stride, modifier,
+                                           fourcc, width, height);
+    if (!texture) {
+        return 0;
+    }
+    GLuint framebuffer = 0;
+    glGenFramebuffers(1, &framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+    int complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    if (complete) {
+        glViewport(0, 0, width, height);
+        glClearColor(red / 255.0f, green / 255.0f, blue / 255.0f, alpha / 255.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glFinish();
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &framebuffer);
+    glDeleteTextures(1, &texture);
+    pool->destroy_image(pool->display, image);
+    return complete;
+}
+
+// テスト専用: 出力バッファの 1 ピクセルを読み戻す。
+int dmabuf_pool_read_output_pixel(void *handle, int x, int y, unsigned char *out_rgba) {
+    DmabufPool *pool = (DmabufPool *)handle;
+    if (!pool || !pool->output_framebuffer) {
+        return 0;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, pool->output_framebuffer);
+    glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, out_rgba);
+    return glGetError() == GL_NO_ERROR;
+}
+
+// テスト専用: CEF から渡されたものに見立てたソースバッファを確保する。
+// gbm_bo は破棄するが、エクスポートした fd が参照を保持するのでメモリは生きている。
+int dmabuf_pool_create_test_source(void *handle, int width, int height,
+                                   int *out_file_descriptor, unsigned int *out_stride,
+                                   unsigned long long *out_modifier, unsigned int *out_fourcc) {
+    DmabufPool *pool = (DmabufPool *)handle;
+    if (!pool) {
+        return 0;
+    }
+    struct gbm_bo *buffer_object = gbm_bo_create(pool->gbm_device, width, height,
+                                                 GBM_FORMAT_ARGB8888, GBM_BO_USE_RENDERING);
+    if (!buffer_object) {
+        return 0;
+    }
+    *out_file_descriptor = gbm_bo_get_fd(buffer_object);
+    *out_stride = gbm_bo_get_stride(buffer_object);
+    *out_modifier = gbm_bo_get_modifier(buffer_object);
+    *out_fourcc = GBM_FORMAT_ARGB8888;
+    gbm_bo_destroy(buffer_object);
+    return *out_file_descriptor >= 0;
+}
+
 void dmabuf_pool_destroy(void *handle) {
     DmabufPool *pool = (DmabufPool *)handle;
     if (!pool) {
         return;
+    }
+    if (pool->program) {
+        glDeleteProgram(pool->program);
     }
     if (pool->output_framebuffer) {
         glDeleteFramebuffers(1, &pool->output_framebuffer);
