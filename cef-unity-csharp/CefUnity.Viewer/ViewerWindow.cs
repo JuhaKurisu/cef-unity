@@ -52,15 +52,29 @@ namespace CefUnity.Viewer
             _statistics = statistics;
             _replaySource = replaySource;
             SdlWindowing.Use();
+            // Metal と D3D11 はネイティブハンドルへ後付けするので API は要らないが、
+            // Linux の OpenGLFrameRenderer は Silk が作る GL コンテキストを使う。
+            // ここを None のままにすると Linux では SDL のウィンドウ生成自体が失敗する。
+            // GLES を選ぶのは意図的。SDL は GLES 要求時に EGL コンテキストを作り、
+            // dmabuf の取り込み (glEGLImageTargetTexture2DOES) が EGL を要求するため。
+            // デスクトップ GL を要求すると X11 では GLX になり eglGetCurrentDisplay() が
+            // EGL_NO_DISPLAY を返して取り込みが失敗する。
+            var graphicsApi = FrameRendererFactory.SelectKind() == FrameRendererKind.OpenGL
+                ? new GraphicsAPI(ContextAPI.OpenGLES, ContextProfile.Core, ContextFlags.Default,
+                                  new APIVersion(3, 0))
+                : GraphicsAPI.None;
             _window = SilkWindow.Create(WindowOptions.Default with
             {
-                API = GraphicsAPI.None,
+                API = graphicsApi,
                 Size = new Vector2D<int>(options.Width, options.Height),
                 Title = "CefUnity.Viewer (loading)",
-                // ペーシングはタイマーではなく CAMetalLayer displaySync + nextDrawable ブロックに任せる
+                // ペーシングはタイマーではなく CAMetalLayer displaySync + nextDrawable ブロックに任せる。
+                // Linux/GL にはそれに相当するブロックが無く、放置すると毎秒 1 万回以上
+                // BeginFrame を送ってしまい CEF が paint しなくなる (実測: paints=1)。
+                // GL 経路だけ VSync で律速する。
                 FramesPerSecond = 0,
                 UpdatesPerSecond = 0,
-                VSync = false,
+                VSync = FrameRendererFactory.SelectKind() == FrameRendererKind.OpenGL,
             });
             _sdl = SdlWindowing.GetExistingApi(_window)
                    ?? throw new InvalidOperationException("SDL backend not active");

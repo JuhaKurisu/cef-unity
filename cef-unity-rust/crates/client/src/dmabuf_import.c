@@ -10,12 +10,22 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// 失敗段階。呼び出し側 (Rust) がログに出して原因を切り分けるために返す。
+#define DMABUF_IMPORT_STAGE_SUCCESS 0
+#define DMABUF_IMPORT_STAGE_NO_EGL_DISPLAY 1
+#define DMABUF_IMPORT_STAGE_NO_EXTENSIONS 2
+#define DMABUF_IMPORT_STAGE_CREATE_IMAGE 3
+#define DMABUF_IMPORT_STAGE_BIND_TEXTURE 4
+
 int dmabuf_import_texture(int file_descriptor, int width, int height, unsigned int stride,
                           unsigned long long modifier, unsigned int fourcc,
-                          unsigned int *out_texture) {
+                          unsigned int *out_texture, int *failure_stage) {
+    *failure_stage = DMABUF_IMPORT_STAGE_SUCCESS;
     // 現在 current な EGLDisplay を使う。ホストが用意したものを借りる。
+    // ホストが GLX コンテキストを使っていると EGL_NO_DISPLAY が返る。
     EGLDisplay display = eglGetCurrentDisplay();
     if (display == EGL_NO_DISPLAY) {
+        *failure_stage = DMABUF_IMPORT_STAGE_NO_EGL_DISPLAY;
         return 0;
     }
 
@@ -24,6 +34,7 @@ int dmabuf_import_texture(int file_descriptor, int width, int height, unsigned i
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC image_target_texture =
         (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
     if (!create_image || !image_target_texture) {
+        *failure_stage = DMABUF_IMPORT_STAGE_NO_EXTENSIONS;
         return 0;
     }
 
@@ -40,6 +51,7 @@ int dmabuf_import_texture(int file_descriptor, int width, int height, unsigned i
     EGLImageKHR image =
         create_image(display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, image_attributes);
     if (image == EGL_NO_IMAGE_KHR) {
+        *failure_stage = DMABUF_IMPORT_STAGE_CREATE_IMAGE;
         return 0;
     }
 
@@ -59,6 +71,7 @@ int dmabuf_import_texture(int file_descriptor, int width, int height, unsigned i
         if (destroy_image) {
             destroy_image(display, image);
         }
+        *failure_stage = DMABUF_IMPORT_STAGE_BIND_TEXTURE;
         return 0;
     }
     // テクスチャが内容を参照し続けるため EGLImage 自体はここで解放してよい。

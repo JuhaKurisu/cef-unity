@@ -466,6 +466,32 @@ fn publish_linux_accelerated_frame(
         ));
     }
 
+    // 最初の 1 回だけ、blit の結果が実際に出力バッファへ入っているかを記録する。
+    // 「クライアント側が黒い」ときに、サーバとクライアントのどちらの問題かを切り分ける。
+    {
+        static LOGGED: OnceLock<()> = OnceLock::new();
+        LOGGED.get_or_init(|| {
+            let (clear_pixel, clear_error, clear_status) = pool.clear_check();
+            log(&format!(
+                "クリア直後の即時読み戻し RGBA=({},{},{},{}) glError={:#x} fboStatus={:#x}",
+                clear_pixel[0], clear_pixel[1], clear_pixel[2], clear_pixel[3],
+                clear_error, clear_status
+            ));
+            let (inspect_status, inspect_pixel) = pool.source_inspect();
+            log(&format!(
+                "CEF 入力テクスチャの中心 status={} RGBA=({},{},{},{})",
+                inspect_status, inspect_pixel[0], inspect_pixel[1], inspect_pixel[2], inspect_pixel[3]
+            ));
+            match pool.read_output_pixel(descriptor.width / 2, descriptor.height / 2) {
+                Some(pixel) => log(&format!(
+                    "出力バッファの中心 RGBA=({},{},{},{})",
+                    pixel[0], pixel[1], pixel[2], pixel[3]
+                )),
+                None => log("出力バッファを読み戻せない"),
+            }
+        });
+    }
+
     // d3d11 経路と同じく、frame_id 増分の前に Unity frame を書く。
     shared_memory.write_paint_unity_frame(LAST_BEGIN_FRAME_UNITY_FRAME.load(Ordering::Relaxed));
     shared_memory.write_dmabuf_info(
@@ -871,6 +897,7 @@ wrap_render_handler! {
                         }
                     },
                     stride: info.planes[0].stride,
+                    offset: info.planes[0].offset,
                     modifier: info.modifier,
                     fourcc: if info.format.get_raw() == ColorType::RGBA_8888.get_raw() {
                         DRM_FORMAT_ABGR8888
@@ -879,6 +906,56 @@ wrap_render_handler! {
                     },
                     width,
                     height,
+                };
+
+                {
+                    // 診断: CEF が渡してくるパラメータを 1 度だけ記録する。
+                    static LOGGED: OnceLock<()> = OnceLock::new();
+                    LOGGED.get_or_init(|| {
+                        match crate::dmabuf_pool::read_center_via_cpu(&source) {
+                            Some((pixel, non_zero)) => log(&format!(
+                                "CPU 直読み: 中心 RGBA=({},{},{},{}) 非ゼロバイト数={}",
+                                pixel[0], pixel[1], pixel[2], pixel[3], non_zero
+                            )),
+                            None => log("CPU 直読みできない (mmap 不可)"),
+                        }
+                        log(&format!(
+                            "CEF の dmabuf: format_raw={} fourcc={:#x} stride={} offset={} \
+                             modifier={:#x} size={}x{} coded={}x{}",
+                            info.format.get_raw(),
+                            source.fourcc,
+                            source.stride,
+                            source.offset,
+                            source.modifier,
+                            source.width,
+                            source.height,
+                            info.extra.coded_size.width,
+                            info.extra.coded_size.height,
+                        ));
+                        log(&format!(
+                            "CEF の矩形: visible=({},{},{}x{}) content=({},{},{}x{}) source={}x{}",
+                            info.extra.visible_rect.x, info.extra.visible_rect.y,
+                            info.extra.visible_rect.width, info.extra.visible_rect.height,
+                            info.extra.content_rect.x, info.extra.content_rect.y,
+                            info.extra.content_rect.width, info.extra.content_rect.height,
+                            info.extra.source_size.width, info.extra.source_size.height,
+                        ))
+                    });
+                }
+                // 切り分け: GPU の書き込み完了を待てていない可能性を見るため、
+                // CEF_UNITY_DELAY_BLIT=1 で「1 つ前のフレームを blit する」動作にする。
+                // fd は dup 済みなのでコールバックを抜けても有効。
+                let source = if std::env::var("CEF_UNITY_DELAY_BLIT").is_ok() {
+                    thread_local! {
+                        static PREVIOUS: std::cell::RefCell<Option<crate::dmabuf_pool::DmabufSource>> =
+                            const { std::cell::RefCell::new(None) };
+                    }
+                    match PREVIOUS.with(|cell| cell.borrow_mut().replace(source)) {
+                        Some(previous) => previous,
+                        None => return, // 1 フレーム目は前フレームが無いので捨てる
+                    }
+                } else {
+                    source
                 };
 
                 with_dmabuf_pool(|pool| {
@@ -1501,10 +1578,27 @@ wrap_app! {
                         // インポートするとテクスチャがレンダリング可能にならず
                         // (GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT)、SkSurface を作れずに
                         // paint がまったく発生しない。
-                        command_line.append_switch_with_value(
-                            Some(&CefString::from("enable-features")),
-                            Some(&CefString::from("Vulkan")),
-                        );
+                        // 切り分け用に環境変数で無効化できるようにしてある。
+                        if std::env::var("CEF_UNITY_NO_VULKAN").is_err() {
+                            command_line.append_switch_with_value(
+                                Some(&CefString::from("enable-features")),
+                                Some(&CefString::from("Vulkan")),
+                            );
+                        }
+                        // 追加スイッチの切り分け用。
+                        for switch in std::env::var("CEF_UNITY_EXTRA_SWITCHES")
+                            .unwrap_or_default()
+                            .split_whitespace()
+                        {
+                            match switch.split_once('=') {
+                                Some((name, value)) => command_line.append_switch_with_value(
+                                    Some(&CefString::from(name)),
+                                    Some(&CefString::from(value)),
+                                ),
+                                None => command_line
+                                    .append_switch(Some(&CefString::from(switch))),
+                            }
+                        }
                     }
                 }
 

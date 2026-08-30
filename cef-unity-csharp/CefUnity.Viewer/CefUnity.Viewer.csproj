@@ -8,6 +8,13 @@
     <RustProjectDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\cef-unity-rust'))</RustProjectDir>
     <RustTargetDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\cef-unity-rust\target\debug'))</RustTargetDir>
   </PropertyGroup>
+  <!-- 表示内容を自動検証するため、描画結果を PNG に書き出す (CEFUNITY_CAPTURE)。
+       Harness の PNG ライターを共有する。ProjectReference にすると Harness の
+       CopyServerApp が走るためリンク参照にする (CefUnity.Tests と同じ方式)。 -->
+  <ItemGroup>
+    <Compile Include="..\CefUnity.Harness\PortableNetworkGraphicsWriter.cs"
+             Link="PortableNetworkGraphicsWriter.cs" />
+  </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\CefUnity.Core\CefUnity.Core.csproj" />
     <PackageReference Include="Silk.NET.Windowing" Version="2.22.0" />
@@ -16,7 +23,10 @@
     <PackageReference Include="Silk.NET.Input.Sdl" Version="2.22.0" />
     <PackageReference Include="Silk.NET.SDL" Version="2.22.0" />
     <!-- Linux: dmabuf 由来の GL テクスチャを表示する (OpenGLFrameRenderer) -->
-    <PackageReference Include="Silk.NET.OpenGL" Version="2.22.0" />
+    <!-- Linux: SDL は OpenGL ES を要求されたとき EGL コンテキストを作る。
+         dmabuf の取り込み (glEGLImageTargetTexture2DOES) が EGL を要求するため
+         デスクトップ GL ではなく GLES を使う。 -->
+    <PackageReference Include="Silk.NET.OpenGLES" Version="2.22.0" />
     <!-- Windows の表示経路 (D3D11FrameRenderer)。非 Windows でもビルドは通る (P/Invoke は実行時解決)。 -->
     <PackageReference Include="Silk.NET.Direct3D11" Version="2.22.0" />
     <PackageReference Include="Silk.NET.DXGI" Version="2.22.0" />

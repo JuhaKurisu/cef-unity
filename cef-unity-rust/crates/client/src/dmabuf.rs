@@ -64,6 +64,7 @@ unsafe extern "C" {
         modifier: u64,
         fourcc: u32,
         out_texture: *mut u32,
+        failure_stage: *mut std::ffi::c_int,
     ) -> std::ffi::c_int;
     fn dmabuf_release_texture(texture: u32);
 }
@@ -83,6 +84,7 @@ pub fn import_texture(
 ) -> Option<u32> {
     warn_if_calling_thread_changed();
     let mut texture: u32 = 0;
+    let mut failure_stage: std::ffi::c_int = 0;
     let result = unsafe {
         dmabuf_import_texture(
             std::os::fd::AsRawFd::as_raw_fd(file_descriptor),
@@ -92,13 +94,28 @@ pub fn import_texture(
             modifier,
             fourcc,
             &mut texture,
+            &mut failure_stage,
         )
     };
     if result == 0 {
-        crate::logging::write("[dmabuf] ", "GL テクスチャに取り込めない");
+        crate::logging::write(
+            "[dmabuf] ",
+            &format!("GL テクスチャに取り込めない: {}", import_failure_name(failure_stage)),
+        );
         return None;
     }
     Some(texture)
+}
+
+/// 取り込みが失敗した段階の名前。C 側の `DMABUF_IMPORT_STAGE_*` と対応する。
+fn import_failure_name(stage: std::ffi::c_int) -> &'static str {
+    match stage {
+        1 => "current な EGLDisplay が無い (ホストが GLX コンテキストを使っている)",
+        2 => "EGL/GL の拡張関数が取れない",
+        3 => "eglCreateImageKHR に失敗",
+        4 => "glEGLImageTargetTexture2DOES に失敗",
+        _ => "不明",
+    }
 }
 
 /// 取り込んだテクスチャを解放する。世代が変わったときに古いものを捨てる。

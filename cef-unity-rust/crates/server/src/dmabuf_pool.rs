@@ -15,6 +15,7 @@ unsafe extern "C" {
         pool: *mut std::ffi::c_void,
         source_file_descriptor: std::ffi::c_int,
         source_stride: u32,
+        source_offset: u64,
         source_modifier: u64,
         source_fourcc: u32,
         width: std::ffi::c_int,
@@ -44,7 +45,24 @@ unsafe extern "C" {
         blue: u8,
         alpha: u8,
     ) -> std::ffi::c_int;
-    #[cfg(test)]
+    fn dmabuf_read_center_via_cpu(
+        file_descriptor: std::ffi::c_int,
+        stride: u32,
+        offset: u64,
+        width: std::ffi::c_int,
+        height: std::ffi::c_int,
+        out_rgba: *mut u8,
+    ) -> std::ffi::c_int;
+    fn dmabuf_pool_clear_check(
+        pool: *mut std::ffi::c_void,
+        out_rgba: *mut u8,
+        out_error: *mut std::ffi::c_int,
+        out_status: *mut std::ffi::c_int,
+    ) -> std::ffi::c_int;
+    fn dmabuf_pool_source_inspect(
+        pool: *mut std::ffi::c_void,
+        out_rgba: *mut u8,
+    ) -> std::ffi::c_int;
     fn dmabuf_pool_read_output_pixel(
         pool: *mut std::ffi::c_void,
         x: std::ffi::c_int,
@@ -84,10 +102,35 @@ fn failure_stage_name(stage: std::ffi::c_int) -> &'static str {
 pub struct DmabufSource {
     pub file_descriptor: std::os::fd::OwnedFd,
     pub stride: u32,
+    /// プレーン先頭のバイトオフセット。0 決め打ちにすると CEF のバッファで
+    /// 誤った領域を読み、絵が真っ黒になる。
+    pub offset: u64,
     pub modifier: u64,
     pub fourcc: u32,
     pub width: u32,
     pub height: u32,
+}
+
+/// 診断: dmabuf を CPU から直接読んで中心ピクセルを返す。
+/// GL 経由の取り込みを疑う前に、データの有無を確定させる。
+pub fn read_center_via_cpu(source: &DmabufSource) -> Option<([u8; 4], usize)> {
+    // out_rgba は 16 バイト確保する: 先頭 4 = 中心ピクセル、8 以降 = 非ゼロバイト数。
+    let mut pixel = [0u8; 16];
+    let result = unsafe {
+        dmabuf_read_center_via_cpu(
+            std::os::fd::AsRawFd::as_raw_fd(&source.file_descriptor),
+            source.stride,
+            source.offset,
+            source.width as std::ffi::c_int,
+            source.height as std::ffi::c_int,
+            pixel.as_mut_ptr(),
+        )
+    };
+    if result == 0 {
+        return None;
+    }
+    let non_zero = usize::from_ne_bytes(pixel[8..16].try_into().ok()?);
+    Some(([pixel[0], pixel[1], pixel[2], pixel[3]], non_zero))
 }
 
 /// EGL / GBM のリソースを束ねたプール。
@@ -126,6 +169,7 @@ impl DmabufPool {
                 self.handle,
                 std::os::fd::AsRawFd::as_raw_fd(&source.file_descriptor),
                 source.stride,
+                source.offset,
                 source.modifier,
                 source.fourcc,
                 source.width as std::ffi::c_int,
@@ -195,9 +239,27 @@ impl DmabufPool {
         assert_ne!(result, 0, "テスト用ソースを塗れない");
     }
 
-    /// テスト専用: 出力バッファの 1 ピクセルを読み戻す。
-    #[cfg(test)]
-    fn read_output_pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
+    /// 診断: クリア直後に同じ FBO から読み戻した結果。
+    pub fn clear_check(&self) -> ([u8; 4], std::ffi::c_int, std::ffi::c_int) {
+        let mut pixel = [0u8; 4];
+        let mut error: std::ffi::c_int = 0;
+        let mut status: std::ffi::c_int = 0;
+        unsafe {
+            dmabuf_pool_clear_check(self.handle, pixel.as_mut_ptr(), &mut error, &mut status)
+        };
+        (pixel, error, status)
+    }
+
+    /// 診断: CEF から取り込んだ入力テクスチャの中心ピクセル。
+    /// 戻り値が 1 なら読めた、それ以外は FBO のステータス。
+    pub fn source_inspect(&self) -> (std::ffi::c_int, [u8; 4]) {
+        let mut pixel = [0u8; 4];
+        let status = unsafe { dmabuf_pool_source_inspect(self.handle, pixel.as_mut_ptr()) };
+        (status, pixel)
+    }
+
+    /// 出力バッファの 1 ピクセルを読み戻す。blit が効いているかの診断に使う。
+    pub fn read_output_pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
         let mut pixel = [0u8; 4];
         let result = unsafe {
             dmabuf_pool_read_output_pixel(
@@ -234,6 +296,7 @@ impl DmabufPool {
         Some(DmabufSource {
             file_descriptor: unsafe { std::os::fd::FromRawFd::from_raw_fd(file_descriptor) },
             stride,
+            offset: 0,
             modifier,
             fourcc,
             width,

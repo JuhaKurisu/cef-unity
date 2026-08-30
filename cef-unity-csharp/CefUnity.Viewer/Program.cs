@@ -74,7 +74,9 @@ if (viewerOptions.Record)
 Environment.SetEnvironmentVariable("SDL_IME_SUPPORT_EXTENDED_TEXT", "1");
 MacMomentumScrollSupport.Enable();
 
-CefRuntime.Initialize(useGpu: true);
+// CEFUNITY_LOG=1 でネイティブ側のログを有効にする (dmabuf 経路の切り分け用)。
+CefRuntime.Initialize(useGpu: true,
+                      enableLog: Environment.GetEnvironmentVariable("CEFUNITY_LOG") == "1");
 D3D11GraphicsDevice? graphicsDevice = null;
 try
 {
