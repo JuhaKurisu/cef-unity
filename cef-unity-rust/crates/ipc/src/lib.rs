@@ -202,6 +202,18 @@ use std::sync::atomic::AtomicI32;
 const _: () = assert!(std::mem::size_of::<SharedMemoryHeader>() == SHARED_MEMORY_HEADER_SIZE);
 
 /// Generate a shared memory flink path for a browser.
+/// dmabuf の file descriptor を渡す Unix ドメインソケットのパス。
+/// 命名規則は `shared_memory_flink_path` に揃えてある。
+#[cfg(target_os = "linux")]
+pub fn dmabuf_socket_path(server_pid: u32, browser_id: u32) -> String {
+    let temporary_directory = std::env::temp_dir();
+    temporary_directory
+        .join(format!("cef-unity-dmabuf-{}-{}.sock", server_pid, browser_id))
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
 pub fn shared_memory_flink_path(server_pid: u32, browser_id: u32) -> String {
     let temporary_directory = std::env::temp_dir();
     temporary_directory.join(format!("cef-unity-shm-{}-{}", server_pid, browser_id))
@@ -748,6 +760,23 @@ impl SharedMemoryReader {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod dmabuf_socket_path_tests {
+    use super::*;
+
+    #[test]
+    fn 既存の共有メモリと同じ命名規則になっている() {
+        let path = dmabuf_socket_path(1234, 7);
+        assert!(path.ends_with("cef-unity-dmabuf-1234-7.sock"), "実際の値: {}", path);
+        assert!(path.starts_with(std::env::temp_dir().to_str().unwrap()));
+    }
+
+    #[test]
+    fn browser_id_が違えば別のパスになる() {
+        assert_ne!(dmabuf_socket_path(1234, 7), dmabuf_socket_path(1234, 8));
     }
 }
 

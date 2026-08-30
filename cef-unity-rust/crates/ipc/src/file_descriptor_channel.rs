@@ -27,6 +27,23 @@ impl FileDescriptorChannel {
         Ok((Self { socket: first }, Self { socket: second }))
     }
 
+    /// 待ち受けを開始する。既存のソケットファイルは作り直す。
+    pub fn listen(path: &str) -> std::io::Result<FileDescriptorListener> {
+        // 前回の残置があると bind が EADDRINUSE で失敗する。
+        let _ = std::fs::remove_file(path);
+        Ok(FileDescriptorListener {
+            listener: std::os::unix::net::UnixListener::bind(path)?,
+            path: path.to_string(),
+        })
+    }
+
+    /// 待ち受けているサーバへ接続する。
+    pub fn connect(path: &str) -> std::io::Result<Self> {
+        Ok(Self {
+            socket: std::os::unix::net::UnixStream::connect(path)?,
+        })
+    }
+
     /// バイト列と file descriptor をまとめて送る。
     ///
     /// file descriptor は複製されて相手に渡るため、呼び出し側は送信後に
@@ -120,6 +137,27 @@ impl FileDescriptorChannel {
     }
 }
 
+/// 接続を待ち受ける側。落とすとソケットファイルを削除する。
+pub struct FileDescriptorListener {
+    listener: std::os::unix::net::UnixListener,
+    path: String,
+}
+
+impl FileDescriptorListener {
+    /// クライアントの接続を 1 つ受け付ける。
+    pub fn accept(&self) -> std::io::Result<FileDescriptorChannel> {
+        let (socket, _address) = self.listener.accept()?;
+        Ok(FileDescriptorChannel { socket })
+    }
+}
+
+impl Drop for FileDescriptorListener {
+    fn drop(&mut self) {
+        // 残置するとサーバ再起動時に bind が EADDRINUSE で失敗する。
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +184,43 @@ mod tests {
             .read_to_string(&mut received)
             .unwrap();
         assert_eq!(received, "dmabuf");
+    }
+
+    #[test]
+    fn listen_と_connect_で_fd_を渡せる() {
+        let path = std::env::temp_dir()
+            .join("cef_unity_fd_channel_listen_test.sock")
+            .to_string_lossy()
+            .into_owned();
+        let listener = FileDescriptorChannel::listen(&path).unwrap();
+
+        let connect_path = path.clone();
+        let client_thread = std::thread::spawn(move || {
+            let channel = FileDescriptorChannel::connect(&connect_path).unwrap();
+            let mut payload_buffer = [0u8; 8];
+            let (_length, file_descriptors) = channel.receive(&mut payload_buffer).unwrap();
+            file_descriptors.len()
+        });
+
+        let accepted = listener.accept().unwrap();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        accepted.send(b"y", &[file.as_raw_fd()]).unwrap();
+
+        assert_eq!(client_thread.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn listener_を落とすとソケットファイルが消える() {
+        // 残置すると次回の bind が EADDRINUSE で失敗する。
+        let path = std::env::temp_dir()
+            .join("cef_unity_fd_channel_unlink_test.sock")
+            .to_string_lossy()
+            .into_owned();
+        {
+            let _listener = FileDescriptorChannel::listen(&path).unwrap();
+            assert!(std::path::Path::new(&path).exists());
+        }
+        assert!(!std::path::Path::new(&path).exists());
     }
 
     #[test]
