@@ -19,6 +19,8 @@
   <ItemGroup>
     <Compile Include="..\CefUnity.Harness\PortableNetworkGraphicsWriter.cs"
              Link="PortableNetworkGraphicsWriter.cs" />
+    <Compile Include="..\CefUnity.Harness\OpenFileDescriptorCounter.cs"
+             Link="OpenFileDescriptorCounter.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="fixtures/**" CopyToOutputDirectory="PreserveNewest" />

@@ -90,12 +90,14 @@ internal static class LifecycleCommand
             Browser.DebugIOSurfaceState(out var receivePort, out var cacheCount);
             Console.WriteLine(
                 $"cycle={cycle,2} mach_ports={Browser.DebugMachPortCount(),5} " +
+                FileDescriptorColumn() +
                 $"receive_port={receivePort,6} surface_cache={cacheCount} " +
                 $"server_processes={CountServerProcesses()}");
             Thread.Sleep(300);
         }
 
         Console.WriteLine($"LIFECYCLE_DONE cycles={cycleCount} " +
+                          FileDescriptorFinalColumn() +
                           $"mach_ports_final={Browser.DebugMachPortCount()} " +
                           $"server_processes_final={CountServerProcesses()}");
         listener?.Stop();
@@ -123,6 +125,19 @@ internal static class LifecycleCommand
         {
             return -1;
         }
+    }
+
+    /// <summary>dmabuf の fd リーク検出用。Linux 以外では列そのものを出さない。</summary>
+    private static string FileDescriptorColumn()
+    {
+        var count = OpenFileDescriptorCounter.Count();
+        return count < 0 ? "" : $"file_descriptors={count,5} ";
+    }
+
+    private static string FileDescriptorFinalColumn()
+    {
+        var count = OpenFileDescriptorCounter.Count();
+        return count < 0 ? "" : $"file_descriptors_final={count} ";
     }
 }
 
