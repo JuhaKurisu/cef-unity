@@ -204,7 +204,8 @@ jobs:
           sudo apt-get install -y -qq \
             libnss3 libnspr4 libasound2t64 libatk1.0-0t64 libatk-bridge2.0-0t64 \
             libcups2t64 libdrm2 libgbm1 libgtk-3-0t64 libxcomposite1 libxdamage1 \
-            libxfixes3 libxkbcommon0 libxrandr2 libpango-1.0-0 libcairo2 libx11-xcb1 libxss1
+            libxfixes3 libxkbcommon0 libxrandr2 libpango-1.0-0 libcairo2 libx11-xcb1 libxss1 \
+            libegl-dev libgles-dev libgbm-dev libvulkan-dev
 
       # 初回の cargo 実行は CEF (~1GB) ダウンロードを含むため 1 回リトライ
       - name: Unit tests
