@@ -1276,6 +1276,28 @@ wrap_app! {
                 #[cfg(target_os = "linux")]
                 log(&format!("ozone-platform = {}", ozone_platform));
                 #[cfg(target_os = "linux")]
+                // 実験 (恒久化しないこと): GPU 初期化の組み合わせを探るため、任意の
+                // Chromium スイッチを空白区切りで差し込めるようにする。
+                //   例: CEF_UNITY_EXTRA_SWITCHES="use-angle=vulkan in-process-gpu"
+                #[cfg(target_os = "linux")]
+                for switch in std::env::var("CEF_UNITY_EXTRA_SWITCHES")
+                    .unwrap_or_default()
+                    .split_whitespace()
+                {
+                    match switch.split_once('=') {
+                        Some((name, value)) => {
+                            log(&format!("extra switch: {} = {}", name, value));
+                            command_line.append_switch_with_value(
+                                Some(&CefString::from(name)),
+                                Some(&CefString::from(value)),
+                            );
+                        }
+                        None => {
+                            log(&format!("extra switch: {}", switch));
+                            command_line.append_switch(Some(&CefString::from(switch)));
+                        }
+                    }
+                }
                 command_line.append_switch_with_value(
                     Some(&CefString::from("ozone-platform")),
                     Some(&CefString::from(ozone_platform.as_str())),
