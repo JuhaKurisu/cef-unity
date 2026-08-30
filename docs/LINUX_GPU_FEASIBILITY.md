@@ -4,10 +4,17 @@
 
 ## 結論
 
-**ベアメタル Linux では GPU ゼロコピー (dmabuf) が動く。60 paints/秒が持続することを実測した。**
-**WSL2 では動かない。**
+**未解決。** ベアメタル Linux で `on_accelerated_paint` は 60 回/秒 呼ばれるが、
+**渡される dmabuf の中身は空**である (2026-08-30 に判明)。
+**WSL2 ではそもそも GPU プロセスが起動しない。**
 
-動作した構成:
+> **訂正 (2026-08-30):** この文書は当初「GPU ゼロコピーが動く。60 paints/秒が持続する」と
+> 結論していたが、**誤りだった**。根拠にしていたのは `on_accelerated_paint` の呼び出し回数
+> だけで、バッファの中身を一度も検証していなかった。後に dmabuf を CPU から mmap して全走査
+> したところ、**非ゼロバイトが 1 つも無い**ことが分かった。
+> **呼び出し回数は経路が動いていることの証拠にならない。**
+
+`on_accelerated_paint` が呼ばれる構成 (中身は空):
 
 | 項目 | 値 |
 |---|---|
@@ -15,14 +22,38 @@
 | 追加スイッチ | **`--enable-features=Vulkan`** (Skia の Vulkan バックエンド) |
 | `window_info.shared_texture_enabled` | `1` |
 
-実測結果 (`paint-statistics 10 1280 720 animation`):
+実測結果:
 
 ```
-paints=60 copies=0    ← 1 秒ごと、10 秒間安定
-LINUX_ACCEL_PAINT #1 plane_count=1 modifier=0x0 format=1 size=1280x720 fd0=149
+paints=60 copies=0                              ← 呼び出しは 1 秒ごとに 60 回、安定
+CPU 直読み: 中心 RGBA=(0,0,0,0) 非ゼロバイト数=0  ← しかしバッファは全ゼロ
+CEF の矩形: visible=(0,0,1280x720) content=(0,0,1280x720) source=1280x720
 ```
 
-dmabuf は 1 プレーン、modifier は `0x0` (DRM_FORMAT_MOD_LINEAR)。
+dmabuf は 1 プレーン、modifier は `0x0` (DRM_FORMAT_MOD_LINEAR)、stride 5120 = 1280×4。
+矩形はフルフレームなので「内容が別の位置にある」わけでもない。
+
+## 中身が空である件の切り分け (2026-08-30)
+
+以下はすべて計測で否定した。**取り込み側 (我々のコード) の問題ではない。**
+
+| 疑った箇所 | 判定 |
+|---|---|
+| GL の取り込み (EGLImage) の不備 | **否定** — dmabuf を CPU から mmap しても全ゼロ |
+| GPU の書き込み完了を待てていない | **否定** — 1 フレーム遅らせて読んでも全ゼロ |
+| modifier の指定方法 | **否定** — 明示しても省略しても全ゼロ |
+| `visible_rect` / `content_rect` のオフセット | **否定** — フルフレーム |
+| 出力 FBO が共有バッファを指していない | **否定** — 赤でクリアすると読み戻せる |
+| プールが別スレッドで二重初期化 | **否定** — 警告ゼロ |
+| Chromium が GL コンテキストを奪う | **否定** — 退避・復帰を入れても不変 |
+| Vulkan バックエンドの要否 | Vulkan 無しでは paint 自体が 0 件。**必須だが十分ではない** |
+
+同じ機械で **software paint 経路は同じページを正しく描画する**ため、CEF・ドライバ・
+ネットワークはいずれも正常である。
+
+CEF の [issue #3687](https://github.com/chromiumembedded/cef/issues/3687) が
+「Linux の `OnAcceleratedPaint` は cefclient に実装が無く未検証」としているのと整合する。
+**API は呼ばれるが中身が来ない**、というのが現時点の観測。
 
 ## 検証環境
 
@@ -139,4 +170,4 @@ CEF 145 の Linux ヘッダには accelerated paint の定義がある
 (`cef_types_linux.h:181` の `_cef_accelerated_paint_info_t` — `planes` が dmabuf の fd、
 `modifier` は EGL 用)。ただし cefclient に Linux 実装が無く、
 [issue #3687](https://github.com/chromiumembedded/cef/issues/3687) は現在も open で
-「未検証」の扱い。**本計測はその未検証部分が実際に動くことを確認したことになる。**
+「未検証」の扱い。**本計測は、その未検証部分が「呼ばれはするが中身が来ない」状態にあることを示している。**
