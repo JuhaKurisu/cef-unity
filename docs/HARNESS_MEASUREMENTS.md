@@ -504,6 +504,34 @@ GPU プロセスが起動直後に 3 回落ち (X の GLX `BadMatch` を 3 回�
 
 **判定: 回帰なし。** macOS は PR #20 前の計測と一致 (`mach_ports` の推移も完全一致)。
 
+## `--disable-extensions` 追加のマージ前計測（2026-09-23）
+
+対象は `fix/linux-cef-extensions-dir`。server が全プラットフォームで `--disable-extensions` を
+付けるようにした。付けないと Chromium が起動時に libcef と同じディレクトリへ `extensions/`
+(外部拡張機能の置き場) を作り、Unity では `Plugins/linux-x64/extensions/` と `.meta` が Play の
+たびに生まれていた。効果は Viewer で確認: 付ける前は PDF・通常ページとも `extensions/` が
+作られ、付けた後はどちらも作られない。PDF ビューア (組み込み拡張) は 10 秒後の画面で
+ツールバー・サムネイル・本文まで描画された。
+
+**Ubuntu 26.04 実機** (load 0.77):
+
+| コマンド | 実測 |
+|---|---|
+| `paint-statistics` | `paints=60/s` の窓が 14/19 (残りは 61〜62)、`begin_frame_drained=60/s`・`dropped=0`・`poisoned_total=0` |
+| `lifecycle 5` | 5/5 完走、`server_processes_final=0` |
+| `smoke` | `SMOKE_OK`。Harness 出力先にも `extensions/` は作られない |
+
+**macOS** (1 回目はビルド直後で load 31 と過負荷だったため、paint-statistics と zero-frame-wait は load 10 で取り直した):
+
+| コマンド | 実測 |
+|---|---|
+| `paint-statistics 20 1920 1080 animation` | 60/s 前後 (59〜61) の窓が 17/19、`received_median=61`、`gap_max=33.7ms`、`gpu_torn=0` / `gpu_rollback=0` |
+| `zero-frame-wait 20 10 1920 1080 intermittent` | `zero_frame_share=49.4%`、`received/s=5.1`、`wait_entered/s=60.8`、`spin_share=42.7%`、`spin_max=8.25ms`、`block_avg=7.03ms`、`delay_2F+=0` (過負荷時の 1 回目は 58.8% / `spin_max=56.10ms`) |
+| `lifecycle 5` | 5/5 完走、`mach_ports` 70→72→73→74→75、`server_processes_final=0` |
+| `dump` | `DUMP_OK`。macOS はもともと `extensions/` を作らない (置き場がバンドル外) |
+
+**判定: 回帰なし。** macOS の各指標は過去の計測範囲内で、`mach_ports` の推移も一致した。
+
 ## 計測上の注意
 
 - harness は BF#1 と recv の間にゲーム処理・描画が入らないため、0F 待ちの spin は**最悪ケース**を測る。
