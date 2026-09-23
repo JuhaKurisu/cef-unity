@@ -475,6 +475,35 @@ Raw Input 登録から `WH_GETMESSAGE` 観測に置き換えるもので、macOS
 
 **判定: 実行コードに変更が無く、回帰の余地はない。** Linux の software paint 経路は 60fps で供給されている。
 
+## Linux Viewer と Linux の CPU モード固定のマージ前計測（2026-09-23）
+
+対象は `feat/linux-viewer`。Viewer に Linux の OpenGL ES 表示を足し、server は Linux で
+`use_gpu` を要求されても CPU モード (`--disable-gpu`) で動くようにした
+(`accelerated_paint_supported`)。後者は `cfg!(target_os = "linux")` で分岐するため、
+macOS / Windows の実行経路は変わらない。
+
+**Ubuntu 26.04 実機** (RTX 3060 Ti、load 1.08、Harness は `use_gpu=false` なので server 変更の影響外):
+
+| コマンド | 実測 |
+|---|---|
+| `paint-statistics` | `paints=60/s`・`begin_frame_drained=60/s`・`dropped=0`・`poisoned_total=0`。クライアントの `received=0` は GPU 経路の指標で Linux では想定どおり |
+| `zero-frame-wait` | 同上の理由で `received=0` |
+| `lifecycle 5` | 5/5 完走、`server_processes_final=0` |
+
+**server 変更の効果** (Viewer と Unity Editor はどちらも `use_gpu=true` で起動する): 変更前は
+GPU プロセスが起動直後に 3 回落ち (X の GLX `BadMatch` を 3 回出力)、paint は BeginFrame の倍の
+120/s 出ていた。変更後は X Error 0 件、paint は 60/s で BeginFrame と 1:1。
+
+**macOS** (M 系、計測中の load average 5〜18 と高負荷。server 変更を外した版と同条件で比較):
+
+| コマンド | 実測 |
+|---|---|
+| `paint-statistics 20 1920 1080 animation` | 変更あり: 60/s の窓が 13/19 (立ち上がりに 70〜81 が数窓)、`received_median=60`、`gpu_torn=0` / `gpu_rollback=0`。変更なし: 60/s の窓が 15/20 で同じ分布 |
+| `zero-frame-wait 20 10 1920 1080 intermittent` | `zero_frame_share=40.7%`、`received/s=5.1`、`wait_entered/s=60.7`、`spin_share=42.7%`、`block_avg=7.03ms`、`delay_2F+=0` |
+| `lifecycle 5` | 5/5 完走、`mach_ports` 70→72→73→74→75、`server_processes_final=0` |
+
+**判定: 回帰なし。** macOS は PR #20 前の計測と一致 (`mach_ports` の推移も完全一致)。
+
 ## 計測上の注意
 
 - harness は BF#1 と recv の間にゲーム処理・描画が入らないため、0F 待ちの spin は**最悪ケース**を測る。

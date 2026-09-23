@@ -52,15 +52,25 @@ namespace CefUnity.Viewer
             _statistics = statistics;
             _replaySource = replaySource;
             SdlWindowing.Use();
+            // Metal と D3D11 はネイティブハンドルへ後付けするので API は要らないが、
+            // Linux の OpenGLFrameRenderer は Silk が作る GL コンテキストを使う。
+            // ここを None のままにすると Linux では SDL のウィンドウ生成自体が失敗する。
+            var usesOpenGL = FrameRendererFactory.SelectKind() == FrameRendererKind.OpenGL;
+            var graphicsApi = usesOpenGL
+                ? new GraphicsAPI(ContextAPI.OpenGLES, ContextProfile.Core, ContextFlags.Default,
+                                  new APIVersion(3, 0))
+                : GraphicsAPI.None;
             _window = SilkWindow.Create(WindowOptions.Default with
             {
-                API = GraphicsAPI.None,
+                API = graphicsApi,
                 Size = new Vector2D<int>(options.Width, options.Height),
                 Title = "CefUnity.Viewer (loading)",
-                // ペーシングはタイマーではなく CAMetalLayer displaySync + nextDrawable ブロックに任せる
+                // ペーシングはタイマーではなく CAMetalLayer displaySync + nextDrawable ブロックに任せる。
+                // GL にはそれに相当するブロックが無く、放置すると毎秒 1 万回以上
+                // BeginFrame を送ってしまい CEF が paint しなくなるため、GL 経路だけ VSync で律速する。
                 FramesPerSecond = 0,
                 UpdatesPerSecond = 0,
-                VSync = false,
+                VSync = usesOpenGL,
             });
             _sdl = SdlWindowing.GetExistingApi(_window)
                    ?? throw new InvalidOperationException("SDL backend not active");
@@ -82,6 +92,7 @@ namespace CefUnity.Viewer
             if (_window.Size.X != _options.Width || _window.Size.Y != _options.Height)
                 _frameSource.Resize(_window.Size.X, _window.Size.Y);
             _renderer.Initialize(_window);
+            if (_renderer is IBgraFrameUploader bgraUploader) _frameSource.AttachBgraUploader(bgraUploader);
             _input = _window.CreateInput();
             // デバイスが 0 件だと入力が一切効かない (原因が見えにくいので起動時に必ず出す)
             Console.WriteLine($"input devices: mice={_input.Mice.Count} keyboards={_input.Keyboards.Count}");

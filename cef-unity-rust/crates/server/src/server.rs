@@ -1223,6 +1223,17 @@ wrap_browser_process_handler! {
     }
 }
 
+/// GPU 共有テクスチャ (accelerated paint) をクライアントへ渡す経路がこのプラットフォームにあるか。
+///
+/// Linux には受け取り経路が無く、描画は必ず software paint になる。その状態で GPU を
+/// 有効にしても GPU→CPU の読み戻しが増えるだけで、しかも GPU プロセスが起動直後に
+/// 3 回落ちてから Chromium が software へ切り替える (X の GLX BadMatch を 3 回出す。
+/// Viewer と Unity Editor の双方で実測)。クライアントが use_gpu を要求しても
+/// CPU モードとして扱う。
+const fn accelerated_paint_supported() -> bool {
+    !cfg!(target_os = "linux")
+}
+
 wrap_app! {
     struct ServerApp {
         browser_process_handler: BrowserProcessHandler,
@@ -1404,7 +1415,7 @@ impl CefServer {
             next_browser_id: AtomicU32::new(1),
             server_pid: std::process::id(),
             client_pid,
-            use_gpu,
+            use_gpu: use_gpu && accelerated_paint_supported(),
             pending_flush: None,
             paints_at_last_begin_frame_1: 0,
             damage_streak: 0,

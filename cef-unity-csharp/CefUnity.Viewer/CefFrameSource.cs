@@ -5,12 +5,14 @@ namespace CefUnity.Viewer
 {
     /// <summary>
     ///     CEF 側窓口: BeginFrame/Pump/テクスチャ受信/リサイズ (spec §CefFrameSource)。
-    ///     受信 API は macOS (IOSurface → MTLTexture) と Windows (D3D11 共有テクスチャ) で
-    ///     異なるため、その分岐はこのクラスに封じ込める。
+    ///     受信 API は macOS (IOSurface → MTLTexture)、Windows (D3D11 共有テクスチャ)、
+    ///     Linux (software paint の CPU バッファ → GL テクスチャへアップロード) で異なるため、
+    ///     その分岐はこのクラスに封じ込める。
     /// </summary>
     internal sealed class CefFrameSource : IDisposable
     {
         private static readonly bool IsWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+        private static readonly bool IsLinux = RuntimeInformation.IsOSPlatform(OSPlatform.Linux);
 
         private readonly Browser _browser;
         private IntPtr _currentTexture;
@@ -18,6 +20,7 @@ namespace CefUnity.Viewer
         private int _textureHeight;
         private uint _currentFormat;
         private ulong _frameIndex;
+        private IBgraFrameUploader? _bgraUploader;
 
         public CefFrameSource(int width, int height, string url)
         {
@@ -25,6 +28,12 @@ namespace CefUnity.Viewer
         }
 
         public Browser Browser => _browser;
+
+        /// <summary>
+        ///     Linux で CPU バッファを上げる先を設定する。GL コンテキストは窓の生成後にしか
+        ///     無いため、コンストラクタではなく表示バックエンドの初期化後に渡す。
+        /// </summary>
+        public void AttachBgraUploader(IBgraFrameUploader uploader) => _bgraUploader = uploader;
 
         /// <summary>
         ///     毎フレーム 1 回。新フレームが無ければ直前のテクスチャを返し続ける。
@@ -43,6 +52,24 @@ namespace CefUnity.Viewer
                     _textureWidth = d3d11Width;
                     _textureHeight = d3d11Height;
                     _currentFormat = d3d11Format;
+                }
+            }
+            else if (IsLinux)
+            {
+                // 新しいフレームが来たときだけ上げる。来なければ直前のテクスチャを描き続ける。
+                // テクスチャは表示バックエンドの所有物なので、こちらでは解放しない。
+                if (_bgraUploader != null
+                    && _browser.TryGetBuffer(out var bgra, out var bufferWidth, out var bufferHeight)
+                    && !bgra.IsEmpty)
+                {
+                    var uploadedTexture = _bgraUploader.UploadBgra(bgra, bufferWidth, bufferHeight);
+                    if (uploadedTexture != IntPtr.Zero)
+                    {
+                        _currentTexture = uploadedTexture;
+                        _textureWidth = bufferWidth;
+                        _textureHeight = bufferHeight;
+                        _currentFormat = 0;
+                    }
                 }
             }
             else if (Browser.TryReceiveIOSurfaceTexture(out var newTexture, out var newWidth, out var newHeight, out var newFormat))
@@ -65,8 +92,9 @@ namespace CefUnity.Viewer
 
         public void Dispose()
         {
-            // Windows の受信テクスチャは native 側のキャッシュなので解放しない
-            if (_currentTexture != IntPtr.Zero && !IsWindows)
+            // Windows の受信テクスチャは native 側のキャッシュ、Linux は表示バックエンドの
+            // 所有物なので、どちらもここでは解放しない
+            if (_currentTexture != IntPtr.Zero && !IsWindows && !IsLinux)
             {
                 Browser.ReleaseMetalTexture(_currentTexture);
             }
