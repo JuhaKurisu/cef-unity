@@ -161,6 +161,10 @@ apphost がランタイムを見つけられない場合は `export DOTNET_ROOT=
   見つけられず起動しない (26.04 は `libxml2.so.16` のみで ABI が異なる)。24.04 の
   `libxml2` / `libicu74` パッケージを `dpkg-deb -x` で展開したディレクトリを
   `LD_LIBRARY_PATH` に足して起動する。システムへは入れない
+- server は `--disable-extensions` を常に付ける。付けないと Chromium が起動時に
+  `libcef` と同じディレクトリへ `extensions/` を作り (macOS 以外)、Unity では
+  `Plugins/linux-x64/extensions/` とその `.meta` が Play のたびに生まれていた。
+  PDF ビューアなどの組み込み拡張はこのスイッチでも動く (実測)
 - **ヘッドレス環境では `--ozone-platform=headless` が必須。** server が Linux ビルドで
   常時指定している (`crates/server/src/server.rs` の `on_before_command_line_processing`)。
   指定しないと ozone が X11 バックエンドを選び、`Missing X server or $DISPLAY` で

@@ -1256,6 +1256,13 @@ wrap_app! {
                 // 無効 (no_sandbox=1) なので、GPU サンドボックスも不要)
                 command_line.append_switch(Some(&CefString::from("disable-gpu-sandbox")));
 
+                // 外部拡張機能の読み込みを止める。Chromium は起動時に外部拡張機能の置き場
+                // (macOS 以外は libcef と同じディレクトリの extensions/) を作るため、
+                // Unity では Plugins/<platform>/extensions/ が生まれて .meta まで付き、
+                // Play するたびにリポジトリへ差分が出ていた (Linux で実測)。拡張機能は
+                // 使っておらず、PDF ビューアなどの組み込み拡張はこのスイッチでも動く (実測)。
+                command_line.append_switch(Some(&CefString::from("disable-extensions")));
+
                 // Linux: OSR にはウィンドウが無く画面を要求する理由がないため、
                 // headless バックエンドを指定する。X11 が無い環境 (CI ランナー、
                 // コンテナ、サーバー) で初期化が失敗するのを防ぐ。
