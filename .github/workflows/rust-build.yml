@@ -297,6 +297,18 @@ jobs:
             rsync -a --exclude archive.json "$SRC/cef/" "$WD/"
           done
 
+      # upload-artifact はファイル権限を保持しないため、Linux の実行ファイルは実行ビットが
+      # 落ちた状態で届く (mac は zip で包んでいるので影響を受けない)。このまま Assets と
+      # リリース zip に入ると server を起動できないので、両方より前で付け直す。
+      - name: Restore executable bits (linux)
+        run: |
+          for ARCH in x64 arm64; do
+            SOURCE=artifacts/cef-unity-linux-$ARCH
+            if [ -d "$SOURCE" ]; then
+              chmod +x "$SOURCE/cef-unity-server" "$SOURCE/cef-unity-rust-helper"
+            fi
+          done
+
       # Linux は x64 のみ Unity に配置する。Unity にデスクトップ Linux arm64 の
       # ターゲットが無いため、arm64 はリリース zip のみ (Assets には置かない)。
       - name: Update Plugins (linux, フラット展開)

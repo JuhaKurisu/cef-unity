@@ -458,6 +458,23 @@ Raw Input 登録から `WH_GETMESSAGE` 観測に置き換えるもので、macOS
 
 **判定: 回帰は見られない。** いずれも v0.6.0 前の計測と同水準で、`mach_ports` の推移は完全に一致した。
 
+## Linux 実行ビット修正のマージ前計測（2026-09-23）
+
+対象は `fix/linux-plugin-exec-bit`。変更は CI の publish ジョブに Linux 版
+`cef-unity-server` / `cef-unity-rust-helper` の実行ビットを付け直す step を足すものだけで、
+実行コードは変えない (`upload-artifact` が権限を落とし、`Plugins/linux-x64` に 100644 で
+入っていたため Unity から server を起動できなかった)。計測は Ubuntu 26.04 実機
+(RTX 3060 Ti、load 0.08) の main `5cee57b` で行った。Linux は software paint 経路のみ。
+
+| コマンド | 実測 |
+|---|---|
+| `paint-statistics` | サーバー側 `paints=120/s`、`begin_frame_drained=60/s`、`dropped=0`、`poisoned_total=0`、`pump_ticks` 約 900〜990/s。クライアント側 `received=0` は **GPU テクスチャを数える指標で、Linux に GPU 経路が無いため想定どおり** |
+| `zero-frame-wait` | 同じく GPU 経路の指標のため `received=0`・`wait_entered=0` (1F フォールバックのみ 60/s) |
+| `lifecycle 5` | 5/5 サイクル完走、`server_processes_final=0` (`mach_ports` は Linux で -1) |
+| `smoke` / `dump` | `SMOKE_OK frames=2`、`DUMP_OK 1280x720` (example.com を目視確認)。LFS 配布版バイナリは実行ビット無しで `Failed to start cef-unity-server process`、`chmod +x` 後は `DUMP_OK` |
+
+**判定: 実行コードに変更が無く、回帰の余地はない。** Linux の software paint 経路は 60fps で供給されている。
+
 ## 計測上の注意
 
 - harness は BF#1 と recv の間にゲーム処理・描画が入らないため、0F 待ちの spin は**最悪ケース**を測る。
