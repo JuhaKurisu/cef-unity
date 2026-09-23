@@ -147,9 +147,20 @@ apphost がランタイムを見つけられない場合は `export DOTNET_ROOT=
 
 既知の制約:
 
-- **software paint 経路のみ**。GPU ゼロコピー (dmabuf/EGL) は未実装
+- **software paint 経路のみ**。GPU ゼロコピー (dmabuf/EGL) は未実装。クライアントが
+  `use_gpu` を要求しても server は CPU モード (`--disable-gpu`) で動く
+  (`crates/server/src/server.rs` の `accelerated_paint_supported`)。GPU を有効にすると
+  受け取り経路が無いのに GPU プロセスが起動直後に 3 回落ち (GLX `BadMatch`)、
+  paint も BeginFrame の倍 (120/秒) 出ていた
 - ネイティブ音声出力 (macOS の AudioUnit 経路に相当) は無い。Unity ミキサ経路のみ
-- Unity への配置までは対応済み (`deploy-linux.sh`)。**Editor / Player での動作確認は未着手**
+- **Unity Editor では動作確認済み** (Ubuntu 26.04 / Unity 6000.3.8f1、SampleScene の Play で
+  表示・60fps・エラー 0、2026-09-23)。**プレイヤービルドは未対応** —
+  `CefBuildPostProcessor` が CEF ランタイムを同梱するのは macOS / Windows だけで、
+  Linux 向けにビルドしても server と `libcef.so` 等が入らない
+- Ubuntu 26.04 では Unity 6000.3 の Editor が `libxml2.so.2` / `libicu*.so.74` を
+  見つけられず起動しない (26.04 は `libxml2.so.16` のみで ABI が異なる)。24.04 の
+  `libxml2` / `libicu74` パッケージを `dpkg-deb -x` で展開したディレクトリを
+  `LD_LIBRARY_PATH` に足して起動する。システムへは入れない
 - **ヘッドレス環境では `--ozone-platform=headless` が必須。** server が Linux ビルドで
   常時指定している (`crates/server/src/server.rs` の `on_before_command_line_processing`)。
   指定しないと ozone が X11 バックエンドを選び、`Missing X server or $DISPLAY` で
@@ -163,7 +174,7 @@ apphost がランタイムを見つけられない場合は `export DOTNET_ROOT=
 | macOS arm64 | GPU ゼロコピー (IOSurface/Mach/Metal) |
 | Windows x64 | GPU ゼロコピー (D3D11/D3D12 共有テクスチャ + 共有 fence)。Editor / プレイヤーとも動作確認済み |
 | Windows arm64 | クロスビルドのみ。**実行未検証**、プレイヤービルド未対応 |
-| Linux x86_64 | software paint のみ。Unity 配置あり (`linux-x64`) |
+| Linux x86_64 | software paint のみ。Unity 配置あり (`linux-x64`)。Editor 動作確認済み、<br>**プレイヤービルド未対応** |
 | Linux arm64 | software paint のみ。**Unity 配置なし** — Unity にデスクトップ Linux arm64 の<br>ターゲットが存在しないため、CI 検証と GitHub Release の zip のみ |
 | macOS x86_64 (Intel Mac) | **サポートしない** |
 
@@ -172,6 +183,7 @@ apphost がランタイムを見つけられない場合は `export DOTNET_ROOT=
 | 機能 | macOS | Windows | Linux |
 |---|---|---|---|
 | GPU ゼロコピー | IOSurface/Metal | D3D11 / D3D12 | 未実装 (software) |
+| Viewer の表示 | Metal (ゼロコピー) | D3D11 (ゼロコピー) | OpenGL ES (CPU バッファをアップロード) |
 | ネイティブ音声出力 | AudioUnit | WASAPI | 無し (Unity ミキサのみ) |
 | 生スクロール入力 | NSEvent モニタ | メッセージフック (WH_GETMESSAGE) | 無し (frame-polled) |
 | キーリピート設定 | NSEvent の OS 値 | `SystemParametersInfo` の OS 値 | 既定値固定 |

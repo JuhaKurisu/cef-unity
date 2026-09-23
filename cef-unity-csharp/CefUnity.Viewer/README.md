@@ -1,11 +1,13 @@
 # CefUnity.Viewer
 
-Unity 外で CEF を表示+操作する macOS / Windows 単体ブラウザ。スクロールカクツキの
+Unity 外で CEF を表示+操作する macOS / Windows / Linux 単体ブラウザ。スクロールカクツキの
 Unity 固有性切り分けが主目的 (spec: docs/superpowers/specs/2026-07-25-silknet-viewer-design.md、
 Windows 対応: docs/superpowers/specs/2026-07-28-windows-viewer-d3d11-design.md)。
 
-表示はどちらも GPU ゼロコピー経路を使う (macOS: IOSurface → Metal blit / Windows: D3D11 共有
-テクスチャ → DXGI スワップチェーン)。
+表示は macOS / Windows が GPU ゼロコピー経路 (macOS: IOSurface → Metal blit / Windows: D3D11 共有
+テクスチャ → DXGI スワップチェーン)。Linux は GPU 共有経路が無いため、software paint の CPU
+バッファを新しいフレームのときだけ GL テクスチャへアップロードして OpenGL ES で描く
+(OpenGLFrameRenderer)。GL にはフレームを律速するブロックが無いので、Linux だけ VSync で 60Hz に揃える。
 
 ## 実行
 
@@ -16,6 +18,12 @@ dotnet run --project cef-unity-csharp/CefUnity.Viewer -- [--url <url>] [--size 1
 dotnet run --project cef-unity-csharp/CefUnity.Viewer -- spike   # SDL/Metal/NSEvent/IME 疎通確認
 ```
 
+Linux では Rust の debug ビルド (`cargo build`) を先に済ませておくと、`dotnet build` が
+server と CEF ランタイムを出力先へ配置する (`CopyLinuxRuntime`)。`libcef.so` は 1 GB を超えるので
+配置は初回だけで、Rust の成果物 (`libcef_unity_rust.so` / server / helper) は毎回更新を見る。
+`CEFUNITY_CAPTURE=<png>` を指定すると、120 フレーム描いたところで実際に描いた画面を PNG に書き出す
+(表示内容の自動検証用)。
+
 ## 実行時ショートカット
 
 | キー | 動作 |
@@ -23,7 +31,7 @@ dotnet run --project cef-unity-csharp/CefUnity.Viewer -- spike   # SDL/Metal/NSE
 | F1 / F2 / F3 | スクロールモード切替 raw / smoother / resampler (タイトルに表示) |
 | F5 | 生イベント録画トグル → $TMPDIR/cef_scroll_events.csv |
 
-Windows にはネイティブスクロールソース (macOS の NSEvent モニタ相当) が無く、Resampler モードは
+Windows と Linux にはネイティブスクロールソース (macOS の NSEvent モニタ相当) が無く、Resampler モードは
 窓の wheel イベントを無視する仕様のため、起動時に自動的に Smoother へ落ちる (F1/F2/F3 で切替可)。
 
 ## 切り分けの実験プロトコル
@@ -36,7 +44,8 @@ Windows にはネイティブスクロールソース (macOS の NSEvent モニ�
 ## トラブルシューティング
 
 - サーバープロセス残留 (次回起動が永久ハング): macOS は `pkill -f cef-unity-server`、
-  Windows は `taskkill /IM cef-unity-server.exe /F`
+  Windows は `taskkill /IM cef-unity-server.exe /F`、Linux は `pkill -x cef-unity-serve`
+  (プロセス名は 15 文字で切れる。`-f` は ssh 越しだと自分のセッションまで殺す)
 - 起動ハング (キャッシュ破損): macOS は `$TMPDIR`、Windows は `%TEMP%` 配下の cef_unity_cache を削除
 - スクロール resampler モードが効かない: 起動ログの `native scroll source:` を確認
 - 入力が一切効かない: 起動ログの `input devices: mice=N keyboards=N` が 0 件でないか確認

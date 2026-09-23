@@ -81,7 +81,7 @@ try
     var rendererKind = FrameRendererFactory.SelectKind();
     if (rendererKind == FrameRendererKind.Unsupported)
     {
-        Console.Error.WriteLine("このプラットフォームには表示バックエンドがありません (macOS / Windows のみ対応)");
+        Console.Error.WriteLine("このプラットフォームには表示バックエンドがありません (macOS / Windows / Linux のみ対応)");
         return 1;
     }
     if (rendererKind == FrameRendererKind.Direct3D11)
@@ -129,10 +129,17 @@ static Func<Sdl, IFrameRenderer> RendererFactoryFor(FrameRendererKind kind, D3D1
     // D3D11 は Sdl を使わない (HWND は IView から取る)。
     if (kind == FrameRendererKind.Direct3D11)
         return _ => new D3D11FrameRenderer(graphicsDevice!);
+    // Linux も Sdl を使わない (GL コンテキストは IView から取る)。
+    if (kind == FrameRendererKind.OpenGL)
+        return _ => new OpenGLFrameRenderer();
     return sdl => new MetalFrameRenderer(sdl);
 }
 
 static string RecoveryHint()
     => RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
         ? "復旧手順: サーバー残留は `taskkill /IM cef-unity-server.exe /F`、起動ハングはキャッシュ破損の可能性 → %TEMP% の cef_unity_cache を削除"
-        : "復旧手順: サーバー残留は `pkill -f cef-unity-server`、起動ハングはキャッシュ破損の可能性 → $TMPDIR の cef_unity_cache を削除";
+        : RuntimeInformation.IsOSPlatform(OSPlatform.Linux)
+            // pkill -f は ssh 越しだと自分のセッションまで一致して殺すため、プロセス名で完全一致させる
+            // (プロセス名は 15 文字で切れるので cef-unity-serve)
+            ? "復旧手順: サーバー残留は `pkill -x cef-unity-serve`、起動ハングはキャッシュ破損の可能性 → /tmp の cef_unity_cache を削除"
+            : "復旧手順: サーバー残留は `pkill -f cef-unity-server`、起動ハングはキャッシュ破損の可能性 → $TMPDIR の cef_unity_cache を削除";
