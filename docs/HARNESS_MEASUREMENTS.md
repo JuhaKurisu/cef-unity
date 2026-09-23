@@ -444,6 +444,20 @@ moorestech レポートの「dirty rect 面積は 2〜4%」は再現し、実際
   A/B 検証のとおり実装前後とも 20.9〜56.3% と大きくばらつくもので、`wait_entered/s`・
   `spin_share`・`block_avg` は過去の計測と一致している
 
+## PR #20 マージ前の回帰計測（2026-09-23）
+
+対象は `f048608`（PR #20 を main へ rebase したもの）。変更は Windows 専用のスクロールモニタを
+Raw Input 登録から `WH_GETMESSAGE` 観測に置き換えるもので、macOS の実行経路は変えない。
+恒久ルールに従い 3 コマンドを 1 回ずつ実行した。計測直前の load average は 3.79。
+
+| コマンド | 実測 |
+|---|---|
+| `paint-statistics 20 1920 1080 animation` | `mode=async`、立ち上がり後は `paints=60/s`（途中に 91・74 の窓が各 1）、`copies=paints` で `dropped=0`、`poisoned_total=0`、`copy_wait_max` 0.09〜0.95ms（初回窓のみ 12.7ms）、`pump_ticks` 約 985〜1120/s、client 側 `gpu_torn=0` / `gpu_rollback=0` |
+| `zero-frame-wait 20 10 1920 1080 intermittent` | `zero_frame_share=44.2%`、`received/s=5.1`、`wait_entered/s=60.5`、`spin_share=42.6%`、`block_avg=7.04ms`、`delay_2F+=0` |
+| `lifecycle 5` | 5/5 サイクル完走、`mach_ports` 70→72→73→74→75、`server_processes_final=0` |
+
+**判定: 回帰は見られない。** いずれも v0.6.0 前の計測と同水準で、`mach_ports` の推移は完全に一致した。
+
 ## 計測上の注意
 
 - harness は BF#1 と recv の間にゲーム処理・描画が入らないため、0F 待ちの spin は**最悪ケース**を測る。
