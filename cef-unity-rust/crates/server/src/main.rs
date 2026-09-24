@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 // CEF Server entry point.
 //
 // Runs CEF in its own process, communicates with Unity via ipc-channel + shared memory.
