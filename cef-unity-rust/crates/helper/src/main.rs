@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 /// macOS: current_exe() からの相対パスで CEF フレームワークを動的ロードする。
 /// Helper バンドル構造:
 ///   cef-unity-server.app/Contents/Frameworks/
