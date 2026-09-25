@@ -1263,6 +1263,15 @@ wrap_app! {
                 // 使っておらず、PDF ビューアなどの組み込み拡張はこのスイッチでも動く (実測)。
                 command_line.append_switch(Some(&CefString::from("disable-extensions")));
 
+                // Windows: 昇格 (管理者) で起動されると、Chrome は Explorer 経由で非昇格の
+                // 自分自身を起動し直し、元のプロセスは initialize() を 0 で返して終わる。
+                // 起動し直された側は Chromium 形式に組み直した引数 (`--ipc-server --client-pid
+                // ... -- <UUID> ...`) で動くため Unity と繋がらず、昇格した Unity の
+                // パイプやハンドル共有にも届かない。ゲームを管理者で起動すると WebUI が
+                // 使えなくなっていた (実機で再現)。昇格したまま動かすよう止める。
+                #[cfg(target_os = "windows")]
+                command_line.append_switch(Some(&CefString::from("do-not-de-elevate")));
+
                 // Linux: OSR にはウィンドウが無く画面を要求する理由がないため、
                 // headless バックエンドを指定する。X11 が無い環境 (CI ランナー、
                 // コンテナ、サーバー) で初期化が失敗するのを防ぐ。
