@@ -298,15 +298,13 @@ pub extern "C" fn cef_unity_initialize(use_gpu: i32, enable_log: i32) -> i32 {
         // Windows では D3D11 共有テクスチャを DuplicateHandle で渡すために
         // クライアント PID も渡す。
         let client_pid = std::process::id();
+        // Chromium と同じ `--name=value` 形式で渡す。CEF が自分を起動し直すときに
+        // 引数を Chromium 形式へ組み直すため、空白区切りだと値が位置引数へ分離される。
         let mut child = match std::process::Command::new(&server_app)
-            .arg("--ipc-server")
-            .arg(&server_name)
-            .arg("--client-pid")
-            .arg(client_pid.to_string())
-            .arg("--use-gpu")
-            .arg(if use_gpu_bool { "1" } else { "0" })
-            .arg("--logging")
-            .arg(if enable_log != 0 { "1" } else { "0" })
+            .arg(format!("--ipc-server={}", server_name))
+            .arg(format!("--client-pid={}", client_pid))
+            .arg(format!("--use-gpu={}", if use_gpu_bool { 1 } else { 0 }))
+            .arg(format!("--logging={}", if enable_log != 0 { 1 } else { 0 }))
             .spawn()
         {
             Ok(child) => child,

@@ -532,6 +532,32 @@ GPU プロセスが起動直後に 3 回落ち (X の GLX `BadMatch` を 3 回�
 
 **判定: 回帰なし。** macOS の各指標は過去の計測範囲内で、`mach_ports` の推移も一致した。
 
+## Windows 非昇格化の停止と引数形式変更のマージ前計測（2026-09-25）
+
+対象は `fix/windows-do-not-de-elevate`。Windows で server が `--do-not-de-elevate` を CEF に渡すようにし、
+クライアントは server へ `--name=value` 形式で引数を渡すようにした (server は両形式を受け付ける)。
+後者は全プラットフォームの起動経路に効くため、macOS でも server が新形式で IPC 名を受け取れることを
+`cef_unity_server.log` の `ipc_server_name` で確かめた。
+
+**macOS** (load 3〜4):
+
+| コマンド | 実測 |
+|---|---|
+| `paint-statistics 20 1920 1080 animation` | 立ち上がり後は `paints=60/s` の窓が大半 (途中に 81〜104 の窓が数個)、`dropped=0`・`poisoned_total=0`、`received_median=60`、`gpu_torn=0` / `gpu_rollback=0` |
+| `zero-frame-wait 20 10 1920 1080 intermittent` | `zero_frame_share=51.2%`、`received/s=5.1`、`wait_entered/s=60.6`、`spin_share=42.6%`、`block_avg=7.02ms`、`delay_2F+=0` |
+| `lifecycle 5` | 5/5 完走、`mach_ports` 70→72→73→74→75、`server_processes_final=0` |
+
+**判定: 回帰なし。** 各指標は過去の計測範囲内で、`mach_ports` の推移も一致した。
+
+**Windows 実機** (CI 成果物の `cef_unity_rust.dll` を PowerShell から P/Invoke し、
+`cef_unity_initialize` → `cef_unity_create_browser` を呼んだ):
+
+| 条件 | v0.6.1 | 修正版 |
+|---|---|---|
+| 昇格・デスクトップセッション | `initialize=-6` (server が非昇格で起動し直して早期終了。起動し直された側は `ParseChar 'l' index 4` で panic) | `initialize=0`・ブラウザ作成成功、server は昇格したまま `--ipc-server=<UUID>` 形式で動く |
+| 昇格・session 0 (Explorer なし) | 成功 (起動し直しが起きない) | 成功 |
+| 非昇格・デスクトップ (`runas /trustlevel:0x20000`) | — | 成功 |
+
 ## 計測上の注意
 
 - harness は BF#1 と recv の間にゲーム処理・描画が入らないため、0F 待ちの spin は**最悪ケース**を測る。
