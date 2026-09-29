@@ -404,6 +404,22 @@ unsafe impl Sync for AsyncCopyTarget {}
 #[cfg(target_os = "macos")]
 static ASYNC_COPY_SHARED_MEMORY: Mutex<Option<AsyncCopyTarget>> = Mutex::new(None);
 
+/// 破棄するブラウザの shm を完了ハンドラの書き込み先から外す。static が参照を
+/// 持ち続けると SharedMemoryWriter が drop されず、flink と共有メモリ本体
+/// (約 66MB) が server の終了後も OS に残る (Play/Stop のたびに溜まっていた)。
+#[cfg(target_os = "macos")]
+fn release_async_copy_target(shared_memory: &Arc<SharedMemoryWriter>) {
+    let mut guard = ASYNC_COPY_SHARED_MEMORY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if guard
+        .as_ref()
+        .is_some_and(|target| Arc::ptr_eq(&target.0, shared_memory))
+    {
+        *guard = None;
+    }
+}
+
 /// blit 完了後に Metal 側の直列キューから呼ばれる。この時点で surface は転送して安全。
 #[cfg(target_os = "macos")]
 extern "C" fn on_async_copy_completed(
@@ -2002,6 +2018,8 @@ impl CefServer {
             {
                 BrowserHost::close_browser(&host, 1);
             }
+            #[cfg(target_os = "macos")]
+            release_async_copy_target(&state.shared_memory);
             Response::Ok
         } else {
             Response::Error {
