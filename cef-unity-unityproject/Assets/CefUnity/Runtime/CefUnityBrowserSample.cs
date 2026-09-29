@@ -218,6 +218,7 @@ namespace CefUnity.Runtime
                 // サーバー側がプール構築に失敗した場合は software paint へ自動フォールバックする。
                 CefRuntime.Initialize(useGpu: true, enableLog: _enableLog);
                 _browser = new Browser(_currentWidth, _currentHeight, _url);
+                SubscribeRecoveryEvents();
 
                 // PlayerLoop に EarlyUpdate / PostLateUpdate の hook を挿入。
                 // EarlyUpdate 末尾で「入力送信 + BeginFrame」、PostLateUpdate 内の描画発行前
@@ -442,6 +443,48 @@ namespace CefUnity.Runtime
             return TryUpdateTextureAcceleratedNonBlocking();
         }
 
+        /// <summary>
+        ///     クラッシュからの自動復旧を知らせるイベント。復旧自体は CefRuntime.Pump が自動で
+        ///     行うので、ここではログに残すだけ。ページへ JavaScript を注入している場合は
+        ///     Recreated で入れ直す (作り直すとページは読み込み直しになる)。
+        /// </summary>
+        private void SubscribeRecoveryEvents()
+        {
+            CefRuntime.ServerLost += OnServerLost;
+            CefRuntime.ServerRecovered += OnServerRecovered;
+            CefRuntime.ServerRecoveryFailed += OnServerRecoveryFailed;
+            _browser.RenderProcessTerminated += OnRenderProcessTerminated;
+            _browser.Recreated += OnBrowserRecreated;
+        }
+
+        private void UnsubscribeRecoveryEvents()
+        {
+            // CefRuntime のイベントは static なので、外さないと破棄後のこのインスタンスを掴み続ける。
+            CefRuntime.ServerLost -= OnServerLost;
+            CefRuntime.ServerRecovered -= OnServerRecovered;
+            CefRuntime.ServerRecoveryFailed -= OnServerRecoveryFailed;
+        }
+
+        private static void OnServerLost(CefServerStatus status) =>
+            CefLog.LogWarning($"[CefUnity] CEF server lost, restarting: {status}");
+
+        private static void OnServerRecovered(CefServerStatus status) =>
+            CefLog.Log($"[CefUnity] CEF server recovered: {status}");
+
+        private static void OnServerRecoveryFailed(CefServerStatus status) =>
+            CefLog.LogError($"[CefUnity] CEF server recovery gave up: {status}");
+
+        private static void OnRenderProcessTerminated(Browser browser, CefBrowserRecoveryStatus status)
+        {
+            if (status.RenderProcessReloadSuppressed)
+                CefLog.LogError($"[CefUnity] render process keeps crashing; automatic reload stopped: {status}");
+            else
+                CefLog.LogWarning($"[CefUnity] render process terminated, reloading: {status}");
+        }
+
+        private static void OnBrowserRecreated(Browser browser, CefBrowserRecoveryStatus status) =>
+            CefLog.Log($"[CefUnity] browser recreated: {status}");
+
         public void LoadUrl(string url)
         {
             // グライド途中の残距離/履歴を新ページへ流し込まない。
@@ -475,6 +518,7 @@ namespace CefUnity.Runtime
                 _nativeAudio.Browser = null;
             }
 
+            UnsubscribeRecoveryEvents();
             _browser?.Dispose();
             _browser = null;
 

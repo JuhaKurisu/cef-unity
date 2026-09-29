@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Text;
+using CefUnity.Runtime;
 
 namespace CefUnity.Interop
 {
@@ -185,6 +187,7 @@ namespace CefUnity.Interop
                     -5 => "cef-unity-server started but failed to connect. The server may have crashed on startup — check the server log at $TMPDIR/cef_unity_debug.log.",
                     _ => $"CEF initialization failed (code {result})"
                 });
+            ServerStatusTracker.Reset(GetServerStatus());
         }
 
         public static void Shutdown()
@@ -193,11 +196,63 @@ namespace CefUnity.Interop
         }
 
         /// <summary>
-        ///     CEF メッセージループを駆動する。毎フレーム、メインスレッドから呼ぶこと。
+        ///     毎フレーム、メインスレッドから呼ぶこと。server がクラッシュ・無応答になっていたら
+        ///     再起動してブラウザを作り直す (<see cref="Browser" /> はそのまま使い続けてよい)。
+        ///     状態が変わったフレームで <see cref="ServerLost" /> などのイベントを発行する。
         /// </summary>
         public static void Pump()
         {
             NativeMethods.cef_unity_pump();
+            RaiseRecoveryEvents();
+        }
+
+        /// <summary>
+        ///     server を失った (クラッシュ・無応答)。以降、復旧するまで描画は止まり入力は捨てられる。
+        ///     復旧は自動で行われる。
+        /// </summary>
+        public static event Action<CefServerStatus>? ServerLost;
+
+        /// <summary>
+        ///     server を再起動し、全ブラウザを作り直した。開いていたページは読み込み直しになるため、
+        ///     ページ内の状態 (入力中のフォーム、JavaScript の状態) は失われる。
+        ///     ExecuteJavaScript で注入していたものがあれば、ここで入れ直す。
+        /// </summary>
+        public static event Action<CefServerStatus>? ServerRecovered;
+
+        /// <summary>
+        ///     復旧を諦めた (短時間に落ち続けた、または起動できなかった)。
+        ///     再開するには Shutdown → Initialize からやり直す。
+        /// </summary>
+        public static event Action<CefServerStatus>? ServerRecoveryFailed;
+
+        public static unsafe CefServerStatus GetServerStatus()
+        {
+            CefUnityServerStatus status;
+            NativeMethods.cef_unity_get_server_status(&status);
+            return new CefServerStatus((CefServerState)status.state, (CefServerLossReason)status.last_loss_reason,
+                status.loss_count, status.recovery_count);
+        }
+
+        private static readonly CefServerStatusTracker ServerStatusTracker = new CefServerStatusTracker();
+
+        /// <summary>障害と復旧を見張るブラウザ。メインスレッドからのみ触る。</summary>
+        private static readonly List<Browser> LiveBrowsers = new List<Browser>();
+
+        internal static void RegisterBrowser(Browser browser) => LiveBrowsers.Add(browser);
+
+        internal static void UnregisterBrowser(Browser browser) => LiveBrowsers.Remove(browser);
+
+        private static void RaiseRecoveryEvents()
+        {
+            var status = GetServerStatus();
+            var transitions = ServerStatusTracker.Observe(status);
+            if ((transitions & CefServerTransitions.Lost) != 0) ServerLost?.Invoke(status);
+            if ((transitions & CefServerTransitions.Recovered) != 0) ServerRecovered?.Invoke(status);
+            if ((transitions & CefServerTransitions.RecoveryFailed) != 0) ServerRecoveryFailed?.Invoke(status);
+
+            // イベント内で Dispose されても列挙が壊れないよう複製してから回す。
+            if (LiveBrowsers.Count == 0) return;
+            foreach (var browser in LiveBrowsers.ToArray()) browser.PollRecoveryStatus();
         }
 
         public static string[] GetLogs()
@@ -235,12 +290,53 @@ namespace CefUnity.Interop
                 if (_handle == null)
                     throw new InvalidOperationException("Failed to create browser");
             }
+
+            CefRuntime.RegisterBrowser(this);
+        }
+
+        /// <summary>
+        ///     レンダラープロセスが終了した (クラッシュ・メモリ不足・無応答での強制終了)。
+        ///     通常は自動で再読み込みされて元に戻る。短時間に続いた場合は再読み込みを止め、
+        ///     <see cref="CefBrowserRecoveryStatus.RenderProcessReloadSuppressed" /> が true になる
+        ///     (その場合は LoadUrl で別のページを開く)。<see cref="CefRuntime.Pump" /> の中で発行する。
+        /// </summary>
+        public event Action<Browser, CefBrowserRecoveryStatus>? RenderProcessTerminated;
+
+        /// <summary>
+        ///     ブラウザを作り直した (server の再起動、または GPU プロセスの再起動で描画が
+        ///     止まったため)。このハンドルはそのまま使えるが、ページは読み込み直しになっている。
+        ///     ExecuteJavaScript で注入していたものがあれば、ここで入れ直す。
+        ///     <see cref="CefRuntime.Pump" /> の中で発行する。
+        /// </summary>
+        public event Action<Browser, CefBrowserRecoveryStatus>? Recreated;
+
+        private readonly CefBrowserRecoveryTracker _recoveryTracker = new CefBrowserRecoveryTracker();
+
+        public unsafe CefBrowserRecoveryStatus GetRecoveryStatus()
+        {
+            ThrowIfDisposed();
+            CefUnityBrowserRecoveryStatus status;
+            NativeMethods.cef_unity_get_browser_recovery_status(_handle, &status);
+            return new CefBrowserRecoveryStatus(status.render_process_termination_count,
+                (CefRenderProcessTerminationStatus)status.last_render_process_termination_status,
+                status.render_process_reload_suppressed != 0, status.recreation_count);
+        }
+
+        internal void PollRecoveryStatus()
+        {
+            if (_disposed) return;
+            var status = GetRecoveryStatus();
+            var transitions = _recoveryTracker.Observe(status);
+            if ((transitions & CefBrowserTransitions.RenderProcessTerminated) != 0)
+                RenderProcessTerminated?.Invoke(this, status);
+            if ((transitions & CefBrowserTransitions.Recreated) != 0) Recreated?.Invoke(this, status);
         }
 
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
+            CefRuntime.UnregisterBrowser(this);
 
             unsafe
             {

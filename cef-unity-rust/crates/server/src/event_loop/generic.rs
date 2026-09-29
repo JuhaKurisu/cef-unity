@@ -60,9 +60,12 @@ fn tick(state: &mut ServerState) {
 
     // server-side flush: 保留中の BeginFrame#2 (flush) を発行時刻が来ていれば撃つ。
     state.cef_server.process_pending_flushes();
+    // GPU プロセスの再起動で合成経路が死んだブラウザを見つけて作り直す。
+    state.cef_server.check_compositors();
 
     cef::do_message_loop_work();
     state.pump_count += 1;
+    state.cef_server.record_heartbeat();
 
     // 1 秒窓の paint 統計 (macos.rs と同じ)。
     crate::server::report_paint_statistics(state.pump_count);

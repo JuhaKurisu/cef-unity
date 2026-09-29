@@ -5,6 +5,7 @@
 // Runs CEF in its own process, communicates with Unity via ipc-channel + shared memory.
 // Platform-specific event loop is in the event_loop module.
 
+mod compositor_probe;
 mod d3d11_pool;
 mod event_loop;
 mod server;
@@ -95,9 +96,16 @@ fn main() {
         .unwrap_or(true);
     log(&format!("use_gpu = {}", use_gpu));
 
+    // Parse --reset-cache (optional; default 0)。再起動の再試行でクライアントが指定する。
+    let reset_cache: bool = argument_value(&arguments, "--reset-cache")
+        .and_then(|text| text.parse::<i32>().ok())
+        .map(|value| value != 0)
+        .unwrap_or(false);
+    log(&format!("reset_cache = {}", reset_cache));
+
     // Initialize CEF first (server must be ready before accepting connections)
     let cef_server = server::CefServer::new(client_pid, use_gpu);
-    if !cef_server.initialize_cef() {
+    if !cef_server.initialize_cef(reset_cache) {
         log("CEF initialization failed");
         std::process::exit(1);
     }

@@ -26,15 +26,30 @@ mod wasapi_output;
 mod scroll_monitor;
 #[cfg(target_os = "windows")]
 mod scroll_monitor_windows;
+mod recovery_policy;
+mod watchdog;
 
 use std::ffi::{CStr, c_char};
 use std::path::PathBuf;
-use std::sync::{Mutex, PoisonError};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::time::Instant;
 
+use ipc_channel::TryRecvError;
 use ipc_channel::ipc::{IpcOneShotServer, IpcReceiver, IpcSender};
 
-use cef_unity_ipc::{AudioSharedMemoryReader, Bootstrap, Command, CommandEnvelope, Response, SharedMemoryReader};
+use cef_unity_ipc::crash_loop_guard::CrashLoopGuard;
+use cef_unity_ipc::{
+    AudioSharedMemoryReader, Bootstrap, Command, CommandEnvelope, Response, ServerStatusReader,
+    SharedMemoryReader,
+};
+
+use recovery_policy::{
+    RESPONSE_TIMEOUT, SERVER_RECOVERIES_PER_WINDOW, SERVER_RECOVERY_WINDOW, launch_retry_delay,
+    should_reset_cache,
+};
+use watchdog::{Watchdog, kill_server};
 
 // ---------------------------------------------------------------------------
 // dylib location helpers
@@ -156,15 +171,54 @@ struct ClientBrowserInstance {
     /// ネイティブ音声出力 (Windows)。Unity ミキサを迂回して WASAPI で再生。
     #[cfg(target_os = "windows")]
     native_voice: Option<wasapi_output::WasapiOutput>,
+    /// 利用側がネイティブ音声を要求しているときの開始パラメータ
+    /// (target_milliseconds, io_frames)。server の再起動で止めた音声を再開するのに使う。
+    /// 要求中なのに `native_voice` が None なら再開待ち。
+    native_voice_parameters: Option<(f32, i32)>,
+    // ---- server の再起動でブラウザを作り直すための情報 ----
+    /// 接続している server の世代。現在の世代と違えば、その server はもう無い。
+    server_generation: u64,
+    width: i32,
+    height: i32,
+    /// 作り直すときに開く URL。作成時と LoadUrl で更新し、作り直しの直前に
+    /// server が記録していたメインフレームの URL で上書きする。
+    restore_url: String,
+    /// 作り直す前の server で数えたレンダラー終了回数の累計。共有メモリは server ごとに
+    /// 0 から数えるので、利用側へは足し合わせて単調増加で見せる。
+    render_process_termination_count_base: u32,
+    /// accelerated_frame_id の同様の累計。0F 待ちは増分で到着を判定するため、
+    /// 作り直しで値が戻ると待ちが抜けられなくなる。
+    accelerated_frame_id_base: u64,
+    /// 前の server までに作り直した回数 (server の再起動による作り直しを含む)。
+    recreation_count_base: u32,
 }
 
 fn handle_to_reference<'a>(handle: *mut CefUnityBrowser) -> &'a mut ClientBrowserInstance {
     unsafe { &mut *(handle as *mut ClientBrowserInstance) }
 }
 
+/// 生きているブラウザハンドルの一覧。server を再起動したとき全ブラウザを作り直すのに使う。
+/// ハンドルを触るのはメインスレッドだけ (FFI の呼び出し規約) なので、ここにはアドレスだけを持つ。
+static BROWSER_REGISTRY: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn register_browser(handle: *mut CefUnityBrowser) {
+    BROWSER_REGISTRY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(handle as usize);
+}
+
+fn unregister_browser(handle: *mut CefUnityBrowser) {
+    BROWSER_REGISTRY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|&address| address != handle as usize);
+}
+
 /// ネイティブ音声を停止する (排水待ち)。destroy の先頭で呼ぶこと —
 /// NativeVoice は自前 reader/Shmem を持ち instance と参照関係がないため、
 /// stop (排水待ち) さえ済めば以降の解放順序で UAF は構造的に起きない。
+/// 利用側の要求 (`native_voice_parameters`) は消さない。
 fn stop_native_voice(instance: &mut ClientBrowserInstance) {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
@@ -173,6 +227,51 @@ fn stop_native_voice(instance: &mut ClientBrowserInstance) {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = instance;
+    }
+}
+
+fn native_voice_running(instance: &ClientBrowserInstance) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        instance.native_voice.is_some()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = instance;
+        false
+    }
+}
+
+/// ネイティブ音声出力を開始する。出力デバイス層だけがプラットフォーム依存
+/// (macOS: AudioUnit / Windows: WASAPI)。start のシグネチャは揃えてある。
+fn start_native_voice(
+    instance: &mut ClientBrowserInstance,
+    target_milliseconds: f32,
+    io_frames: i32,
+) -> Result<(), String> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        if instance.audio_flink.is_empty() {
+            return Err("audio is disabled for this browser".to_string());
+        }
+        #[cfg(target_os = "macos")]
+        let started =
+            native_voice::NativeVoice::start(&instance.audio_flink, target_milliseconds, io_frames);
+        #[cfg(target_os = "windows")]
+        let started =
+            wasapi_output::WasapiOutput::start(&instance.audio_flink, target_milliseconds, io_frames);
+        let voice = started?;
+        instance.native_voice = Some(voice);
+        log_to_file(&format!(
+            "native audio started (target={}ms io_frames={})",
+            target_milliseconds, io_frames
+        ));
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (instance, target_milliseconds, io_frames);
+        Err("native audio output is not supported on this platform".to_string())
     }
 }
 
@@ -193,15 +292,60 @@ struct ServerConnection {
     command_sender: IpcSender<CommandEnvelope>,
     response_receiver: IpcReceiver<Response>,
     /// server プロセスのハンドル。保持しないと終了後にゾンビとして残る
-    /// (Editor は長寿命なので Play/Stop の繰り返しで蓄積する)。
-    child: std::process::Child,
+    /// (Editor は長寿命なので Play/Stop の繰り返しで蓄積する)。監視スレッドと共有する。
+    process: Arc<Mutex<Child>>,
+    /// この server の世代。障害の報告に添えて、古い server の報告を無視できるようにする。
+    generation: u64,
 }
 
 static CONNECTION: Mutex<Option<ServerConnection>> = Mutex::new(None);
+static WATCHDOG: Mutex<Option<Watchdog>> = Mutex::new(None);
+
+/// 接続中の server の世代。0 は「server なし」(未初期化・復旧中・終了処理中)。
+static CURRENT_GENERATION: AtomicU64 = AtomicU64::new(0);
+static LAST_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// server を失った理由。値は C# 側 (`CefServerLossReason`) と揃える。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ServerLossReason {
+    /// プロセスが終了した (クラッシュ・外部からの kill)。
+    Exited = 1,
+    /// heartbeat が止まった、または応答が時間内に返らなかった。
+    Unresponsive = 2,
+    /// IPC の送受信に失敗した。
+    ConnectionLost = 3,
+}
+
+/// 監視スレッドや IPC エラーから届いた、まだ処理していない障害。
+static LOSS_REPORT: Mutex<Option<ServerLossReason>> = Mutex::new(None);
+/// `LOSS_REPORT` が埋まっているか。毎フレームの確認でロックを取らないためのもの。
+static LOSS_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// server を失ったことを報告する。どのスレッドから呼んでもよい。実際の復旧は
+/// 次の `cef_unity_pump` (メインスレッド) で行う。
+pub(crate) fn report_server_lost(generation: u64, reason: ServerLossReason) {
+    if generation == 0 || generation != CURRENT_GENERATION.load(Ordering::Acquire) {
+        return; // 既に手放した server の報告
+    }
+    let mut report = LOSS_REPORT.lock().unwrap_or_else(PoisonError::into_inner);
+    if report.is_none() {
+        log_to_file(&format!("server lost (generation={}): {:?}", generation, reason));
+        *report = Some(reason);
+        LOSS_REPORTED.store(true, Ordering::Release);
+    }
+}
+
+fn take_loss_report() -> Option<ServerLossReason> {
+    if !LOSS_REPORTED.load(Ordering::Acquire) {
+        return None;
+    }
+    LOSS_REPORTED.store(false, Ordering::Release);
+    LOSS_REPORT.lock().unwrap_or_else(PoisonError::into_inner).take()
+}
 
 /// ログ出力の有効/無効は `logging` モジュールが一元管理する
 /// (d3d11/d3d12 の経路も同じフラグとファイルハンドルを共有する)。
-fn log_to_file(message: &str) {
+pub(crate) fn log_to_file(message: &str) {
     logging::write("", message);
 }
 
@@ -227,27 +371,490 @@ fn ffi_guard<T>(default: T, function: impl FnOnce() -> T) -> T {
 // IPC helpers
 // ---------------------------------------------------------------------------
 
+/// 応答を待つ送信。`RESPONSE_TIMEOUT` 以内に応答が無ければ server が固まったとみなして
+/// kill し、復旧を要求する (待ち続けると Unity のメインスレッドが永久に止まる)。
 fn send_command(connection: &ServerConnection, command: Command) -> Result<Response, String> {
-    connection.command_sender
-        .send(CommandEnvelope {
-            command,
-            expects_response: true,
-        })
-        .map_err(|error| format!("send: {}", error))?;
-    connection.response_receiver.recv().map_err(|error| format!("recv: {}", error))
+    if let Err(error) = connection.command_sender.send(CommandEnvelope {
+        command,
+        expects_response: true,
+    }) {
+        report_server_lost(connection.generation, ServerLossReason::ConnectionLost);
+        return Err(format!("send: {}", error));
+    }
+    match connection.response_receiver.try_recv_timeout(RESPONSE_TIMEOUT) {
+        Ok(response) => Ok(response),
+        Err(TryRecvError::Empty) => {
+            log_to_file(&format!(
+                "no response within {:?}; killing the server",
+                RESPONSE_TIMEOUT
+            ));
+            // 報告を kill より先にする理由は watchdog と同じ。
+            report_server_lost(connection.generation, ServerLossReason::Unresponsive);
+            kill_server(&connection.process);
+            Err("recv: timed out".to_string())
+        }
+        Err(TryRecvError::IpcError(error)) => {
+            report_server_lost(connection.generation, ServerLossReason::ConnectionLost);
+            Err(format!("recv: {:?}", error))
+        }
+    }
 }
 
 /// Fire-and-forget: send only, don't wait for response.
 fn send_command_no_wait(connection: &ServerConnection, command: Command) {
-    let _ = connection.command_sender.send(CommandEnvelope {
-        command,
-        expects_response: false,
-    });
+    if connection
+        .command_sender
+        .send(CommandEnvelope {
+            command,
+            expects_response: false,
+        })
+        .is_err()
+    {
+        report_server_lost(connection.generation, ServerLossReason::ConnectionLost);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Global functions
 // ---------------------------------------------------------------------------
+
+/// 起動して bootstrap まで済んだ server。まだ `CONNECTION` には入れていない。
+struct LaunchedServer {
+    command_sender: IpcSender<CommandEnvelope>,
+    response_receiver: IpcReceiver<Response>,
+    process: Arc<Mutex<Child>>,
+    server_pid: u32,
+}
+
+/// server プロセスを起動し、bootstrap を受け取るまで待つ。失敗時は
+/// `cef_unity_initialize` の戻り値と同じ負の値を返す。
+/// どのスレッドから呼んでもよい (復旧時は専用スレッドで呼ぶ)。
+fn launch_server(use_gpu: bool, enable_log: bool, reset_cache: bool) -> Result<LaunchedServer, i32> {
+    // Find server binary next to dylib
+    let plugin_directory = dylib_directory();
+    let server_app = server_binary_path(&plugin_directory);
+    if !server_app.exists() {
+        log_to_file(&format!(
+            "server binary not found: {}",
+            server_app.display()
+        ));
+        return Err(-3);
+    }
+    log_to_file(&format!("server binary: {}", server_app.display()));
+
+    // Create one-shot server for bootstrap
+    let (oneshot_server, server_name) = match IpcOneShotServer::<Bootstrap>::new() {
+        Ok(pair) => pair,
+        Err(error) => {
+            log_to_file(&format!("failed to create one-shot server: {}", error));
+            return Err(-4);
+        }
+    };
+    log_to_file(&format!("one-shot server name = {}", server_name));
+
+    // Launch server process with --ipc-server argument。
+    // Windows では D3D11 共有テクスチャを DuplicateHandle で渡すために
+    // クライアント PID も渡す。
+    let client_pid = std::process::id();
+    // Chromium と同じ `--name=value` 形式で渡す。CEF が自分を起動し直すときに
+    // 引数を Chromium 形式へ組み直すため、空白区切りだと値が位置引数へ分離される。
+    let mut child = match std::process::Command::new(&server_app)
+        .arg(format!("--ipc-server={}", server_name))
+        .arg(format!("--client-pid={}", client_pid))
+        .arg(format!("--use-gpu={}", if use_gpu { 1 } else { 0 }))
+        .arg(format!("--logging={}", if enable_log { 1 } else { 0 }))
+        .arg(format!("--reset-cache={}", if reset_cache { 1 } else { 0 }))
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            log_to_file(&format!("failed to spawn server: {}", error));
+            return Err(-4);
+        }
+    };
+    log_to_file(&format!("server spawned (pid={})", child.id()));
+
+    // Wait for server to connect and send bootstrap.
+    // accept() 自体は無期限ブロックするため別スレッドで行い、server の早期死亡
+    // (codesign 不備・framework 欠落・CEF 初期化失敗等) とタイムアウトを監視する。
+    // これがないと server 起動失敗時に Unity main thread が永久フリーズする。
+    let (bootstrap_sender, bootstrap_receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = bootstrap_sender.send(oneshot_server.accept());
+    });
+    let deadline = Instant::now() + std::time::Duration::from_secs(15);
+    let bootstrap = loop {
+        match bootstrap_receiver.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(Ok((_receiver, bootstrap))) => break bootstrap,
+            Ok(Err(error)) => {
+                log_to_file(&format!("failed to accept bootstrap: {}", error));
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(-5);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    log_to_file(&format!("server exited during init: {}", status));
+                    return Err(-6);
+                }
+                if Instant::now() >= deadline {
+                    log_to_file("bootstrap accept timed out (15s); killing server");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(-7);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                log_to_file("bootstrap accept thread terminated unexpectedly");
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(-5);
+            }
+        }
+    };
+    log_to_file("bootstrap received from server");
+
+    Ok(LaunchedServer {
+        command_sender: bootstrap.command_sender,
+        response_receiver: bootstrap.response_receiver,
+        process: Arc::new(Mutex::new(child)),
+        server_pid: bootstrap.server_pid,
+    })
+}
+
+/// 起動した server を接続中の server にし、監視を始める。メインスレッドから呼ぶ。
+fn install_server(launched: LaunchedServer, use_gpu: bool) {
+    let generation = LAST_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+
+    let status_flink = cef_unity_ipc::server_status_flink_path(launched.server_pid);
+    let status_reader = match ServerStatusReader::open(&status_flink) {
+        Ok(reader) => Some(reader),
+        Err(error) => {
+            // heartbeat が読めなくても、プロセス終了と IPC エラーの検出は効く。
+            log_to_file(&format!("server status open failed (heartbeat not watched): {}", error));
+            None
+        }
+    };
+    let watchdog = Watchdog::start(Arc::clone(&launched.process), status_reader, generation);
+
+    *CONNECTION.lock().unwrap_or_else(PoisonError::into_inner) = Some(ServerConnection {
+        command_sender: launched.command_sender,
+        response_receiver: launched.response_receiver,
+        process: launched.process,
+        generation,
+    });
+    *WATCHDOG.lock().unwrap_or_else(PoisonError::into_inner) = Some(watchdog);
+    *LOSS_REPORT.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    LOSS_REPORTED.store(false, Ordering::Release);
+    CURRENT_GENERATION.store(generation, Ordering::Release);
+    log_to_file(&format!(
+        "server installed (pid={}, generation={})",
+        launched.server_pid, generation
+    ));
+
+    // Connect to server's Mach IOSurface port service (macOS only)
+    // GPU モード時のみ接続する。CPU モードでは IOSURFACE_CONNECTED は false のまま。
+    #[cfg(target_os = "macos")]
+    if use_gpu {
+        let service_name = cef_unity_ipc::iosurface_service_name(launched.server_pid);
+        log_to_file(&format!("connecting to Mach IOSurface service: {}", service_name));
+        if let Ok(c_service_name) = std::ffi::CString::new(service_name.as_str()) {
+            let result = unsafe { mach_iosurface_client_connect(c_service_name.as_ptr()) };
+            IOSURFACE_CONNECTED.store(result == 0, Ordering::SeqCst);
+            if result == 0 {
+                log_to_file("Mach IOSurface service connected");
+            } else {
+                log_to_file(&format!("Mach IOSurface service connect failed: {}", result));
+            }
+        } else {
+            // service name に NUL が混入した場合のみ。接続失敗と同じく非致命 (CPU 経路へ)。
+            log_to_file("iosurface service name contained NUL; skipping connect");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = use_gpu;
+}
+
+/// 接続中の server を手放す。`server_died`: 異常終了した (または固まった) server か。
+/// その場合は kill して回収し、server が後始末できなかった共有メモリを引き取って消す。
+/// メインスレッドから呼ぶ。
+fn release_server(server_died: bool) {
+    CURRENT_GENERATION.store(0, Ordering::Release);
+    let watchdog = WATCHDOG.lock().unwrap_or_else(PoisonError::into_inner).take();
+    let status_reader = watchdog.and_then(Watchdog::stop);
+    let connection = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner).take();
+    if server_died {
+        if let Some(mut reader) = status_reader {
+            reader.claim_ownership();
+        }
+        if let Some(connection) = connection {
+            kill_server(&connection.process);
+        }
+    } else if let Some(connection) = connection {
+        // fire-and-forget: server プロセスが無応答でも Unity main thread を
+        // 永久ブロックさせないため、応答は待たない。server 側は
+        // expects_response=false でも Shutdown を正しく処理して running=false にする
+        // (event_loop/generic.rs の drain_commands 参照)。
+        send_command_no_wait(&connection, Command::Shutdown);
+        // Server が Shutdown を処理して cef::shutdown() を呼び終わるまで少し待つ。
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // 終了済みならここで回収してゾンビ化を防ぐ (未終了なら従来どおり放置)。
+        let _ = connection
+            .process
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .try_wait();
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        mach_iosurface_client_disconnect();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// server の自動復旧
+//
+// 監視スレッド・IPC エラーが `report_server_lost` で障害を報告し、メインスレッドの
+// `cef_unity_pump` が次の段階へ進める。server の起動 (最大 15 秒) は専用スレッドで
+// 行い、メインスレッドを止めない。起動できたら全ブラウザを同じハンドルのまま
+// 新しい server 上に作り直す。
+// ---------------------------------------------------------------------------
+
+enum RecoveryPhase {
+    /// 未初期化 (Initialize 前・Shutdown 後)。
+    Idle,
+    Running,
+    /// `attempt` 回目 (0 始まり) の起動を `launch_at` に行う。
+    WaitingToLaunch { launch_at: Instant, attempt: usize },
+    Launching {
+        receiver: mpsc::Receiver<Result<LaunchedServer, i32>>,
+        attempt: usize,
+    },
+    /// 復旧を諦めた。次の Initialize までそのまま。
+    Failed,
+}
+
+struct RecoveryState {
+    phase: RecoveryPhase,
+    use_gpu: bool,
+    enable_log: bool,
+    loss_guard: CrashLoopGuard,
+    loss_count: u32,
+    recovery_count: u32,
+    last_loss_reason: Option<ServerLossReason>,
+}
+
+static RECOVERY: Mutex<RecoveryState> = Mutex::new(RecoveryState {
+    phase: RecoveryPhase::Idle,
+    use_gpu: true,
+    enable_log: false,
+    loss_guard: CrashLoopGuard::new(SERVER_RECOVERIES_PER_WINDOW, SERVER_RECOVERY_WINDOW),
+    loss_count: 0,
+    recovery_count: 0,
+    last_loss_reason: None,
+});
+
+/// 復旧待ちのネイティブ音声があるか。毎フレームのブラウザ走査を省くためのもの。
+static NATIVE_VOICE_RESTART_PENDING: AtomicBool = AtomicBool::new(false);
+
+fn drive_recovery() {
+    let mut recovery = RECOVERY.lock().unwrap_or_else(PoisonError::into_inner);
+    let now = Instant::now();
+    match &recovery.phase {
+        RecoveryPhase::Idle | RecoveryPhase::Failed => {}
+        RecoveryPhase::Running => {
+            let Some(reason) = take_loss_report() else {
+                return;
+            };
+            let reason = refine_loss_reason(reason);
+            recovery.loss_count += 1;
+            recovery.last_loss_reason = Some(reason);
+            release_server(true);
+            suspend_browsers();
+            if recovery.loss_guard.record_failure(now) {
+                log_to_file(&format!("recovery: restarting the server ({:?})", reason));
+                recovery.phase = RecoveryPhase::WaitingToLaunch {
+                    launch_at: now,
+                    attempt: 0,
+                };
+            } else {
+                log_to_file(&format!(
+                    "recovery: server lost {} times within {:?}; giving up",
+                    SERVER_RECOVERIES_PER_WINDOW + 1,
+                    SERVER_RECOVERY_WINDOW
+                ));
+                recovery.phase = RecoveryPhase::Failed;
+            }
+        }
+        RecoveryPhase::WaitingToLaunch { launch_at, attempt } => {
+            if now < *launch_at {
+                return;
+            }
+            let attempt = *attempt;
+            let (use_gpu, enable_log) = (recovery.use_gpu, recovery.enable_log);
+            let reset_cache = should_reset_cache(attempt);
+            log_to_file(&format!(
+                "recovery: launch attempt {} (reset_cache={})",
+                attempt + 1,
+                reset_cache
+            ));
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let result = launch_server(use_gpu, enable_log, reset_cache);
+                // 受け手が居ない (待っている間に Shutdown された) なら起動した server を片付ける。
+                if let Err(mpsc::SendError(Ok(launched))) = sender.send(result) {
+                    kill_server(&launched.process);
+                }
+            });
+            recovery.phase = RecoveryPhase::Launching { receiver, attempt };
+        }
+        RecoveryPhase::Launching { receiver, attempt } => {
+            let attempt = *attempt;
+            let launched = match receiver.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => return,
+                Ok(Ok(launched)) => Some(launched),
+                Ok(Err(code)) => {
+                    log_to_file(&format!("recovery: launch attempt {} failed ({})", attempt + 1, code));
+                    None
+                }
+                Err(mpsc::TryRecvError::Disconnected) => None,
+            };
+            let recovered = launched.is_some_and(|launched| {
+                install_server(launched, recovery.use_gpu);
+                if reattach_browsers() {
+                    true
+                } else {
+                    release_server(true);
+                    false
+                }
+            });
+            if recovered {
+                recovery.recovery_count += 1;
+                recovery.phase = RecoveryPhase::Running;
+                log_to_file(&format!("recovery: server recovered (#{})", recovery.recovery_count));
+                return;
+            }
+            recovery.phase = match launch_retry_delay(attempt + 1) {
+                Some(delay) => RecoveryPhase::WaitingToLaunch {
+                    launch_at: now + delay,
+                    attempt: attempt + 1,
+                },
+                None => {
+                    log_to_file("recovery: all launch attempts failed; giving up");
+                    RecoveryPhase::Failed
+                }
+            };
+        }
+    }
+}
+
+/// IPC のエラーは、server が死んだ直後に監視スレッドより先に見つかることが多い。
+/// プロセスが終了していれば、原因として分かりやすい `Exited` を報告する。
+/// kill された直後は IPC のポートが先に壊れ、終了状態が取れるまでわずかに遅れる
+/// (実測) ため、短時間だけ終了を待つ。
+fn refine_loss_reason(reason: ServerLossReason) -> ServerLossReason {
+    const EXIT_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+    if reason != ServerLossReason::ConnectionLost {
+        return reason;
+    }
+    let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(connection) = guard.as_ref() else {
+        return reason;
+    };
+    let deadline = Instant::now() + EXIT_WAIT;
+    loop {
+        let exited = matches!(
+            connection
+                .process
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .try_wait(),
+            Ok(Some(_))
+        );
+        if exited {
+            return ServerLossReason::Exited;
+        }
+        if Instant::now() >= deadline {
+            return reason;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+fn registered_browsers() -> Vec<*mut CefUnityBrowser> {
+    BROWSER_REGISTRY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .map(|&address| address as *mut CefUnityBrowser)
+        .collect()
+}
+
+/// server を失ったブラウザの音声を止める。音声は死んだ server のリングを読み続けても
+/// 無音になるだけなので、止めて作り直し後に再開する。
+fn suspend_browsers() {
+    for handle in registered_browsers() {
+        let instance = handle_to_reference(handle);
+        stop_native_voice(instance);
+        if instance.native_voice_parameters.is_some() {
+            NATIVE_VOICE_RESTART_PENDING.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// 全ブラウザを接続中の server 上に作り直す。ハンドルは変えない。
+fn reattach_browsers() -> bool {
+    let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(connection) = guard.as_ref() else {
+        return false;
+    };
+    for handle in registered_browsers() {
+        let instance = handle_to_reference(handle);
+        if let Some(url) = instance.shared_memory.read_main_frame_url() {
+            instance.restore_url = url;
+        }
+        log_to_file(&format!(
+            "recovery: recreating browser {}x{} at {}",
+            instance.width, instance.height, instance.restore_url
+        ));
+        match open_browser(connection, instance.width, instance.height, &instance.restore_url) {
+            Ok(opened) => instance.attach(opened, connection.generation),
+            Err(error) => {
+                log_to_file(&format!("recovery: recreating a browser failed: {}", error));
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// server の再起動で止めたネイティブ音声を、新しい server の音声フォーマットが
+/// 確定したら再開する (確定前は開始できない)。
+fn restart_pending_native_voices() {
+    if !NATIVE_VOICE_RESTART_PENDING.load(Ordering::Acquire)
+        || CURRENT_GENERATION.load(Ordering::Acquire) == 0
+    {
+        return;
+    }
+    let mut pending = false;
+    for handle in registered_browsers() {
+        let instance = handle_to_reference(handle);
+        let Some((target_milliseconds, io_frames)) = instance.native_voice_parameters else {
+            continue;
+        };
+        if native_voice_running(instance) {
+            continue;
+        }
+        let format_known = instance
+            .audio_shared_memory
+            .as_ref()
+            .is_some_and(|reader| reader.format().2);
+        if !format_known || start_native_voice(instance, target_milliseconds, io_frames).is_err() {
+            pending = true;
+        }
+    }
+    NATIVE_VOICE_RESTART_PENDING.store(pending, Ordering::Release);
+}
 
 /// Initialize: launch CEF server process and connect via ipc-channel.
 /// `use_gpu`: 非 0 で accelerated paint (GPU 共有テクスチャ / IOSurface) を使う。
@@ -272,114 +879,21 @@ pub extern "C" fn cef_unity_initialize(use_gpu: i32, enable_log: i32) -> i32 {
             use_gpu_bool
         ));
 
-        // Find server binary next to dylib
-        let plugin_directory = dylib_directory();
-        let server_app = server_binary_path(&plugin_directory);
-        if !server_app.exists() {
-            log_to_file(&format!(
-                "server binary not found: {}",
-                server_app.display()
-            ));
-            return -3;
-        }
-        log_to_file(&format!("server binary: {}", server_app.display()));
-
-        // Create one-shot server for bootstrap
-        let (oneshot_server, server_name) = match IpcOneShotServer::<Bootstrap>::new() {
-            Ok(pair) => pair,
-            Err(error) => {
-                log_to_file(&format!("failed to create one-shot server: {}", error));
-                return -4;
-            }
+        let launched = match launch_server(use_gpu_bool, enable_log != 0, false) {
+            Ok(launched) => launched,
+            Err(code) => return code,
         };
-        log_to_file(&format!("one-shot server name = {}", server_name));
+        install_server(launched, use_gpu_bool);
 
-        // Launch server process with --ipc-server argument。
-        // Windows では D3D11 共有テクスチャを DuplicateHandle で渡すために
-        // クライアント PID も渡す。
-        let client_pid = std::process::id();
-        // Chromium と同じ `--name=value` 形式で渡す。CEF が自分を起動し直すときに
-        // 引数を Chromium 形式へ組み直すため、空白区切りだと値が位置引数へ分離される。
-        let mut child = match std::process::Command::new(&server_app)
-            .arg(format!("--ipc-server={}", server_name))
-            .arg(format!("--client-pid={}", client_pid))
-            .arg(format!("--use-gpu={}", if use_gpu_bool { 1 } else { 0 }))
-            .arg(format!("--logging={}", if enable_log != 0 { 1 } else { 0 }))
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                log_to_file(&format!("failed to spawn server: {}", error));
-                return -4;
-            }
-        };
-        log_to_file("server spawned");
-
-        // Wait for server to connect and send bootstrap.
-        // accept() 自体は無期限ブロックするため別スレッドで行い、server の早期死亡
-        // (codesign 不備・framework 欠落・CEF 初期化失敗等) とタイムアウトを監視する。
-        // これがないと server 起動失敗時に Unity main thread が永久フリーズする。
-        let (bootstrap_sender, bootstrap_receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = bootstrap_sender.send(oneshot_server.accept());
-        });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        let bootstrap = loop {
-            match bootstrap_receiver.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(Ok((_receiver, bootstrap))) => break bootstrap,
-                Ok(Err(error)) => {
-                    log_to_file(&format!("failed to accept bootstrap: {}", error));
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return -5;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if let Ok(Some(status)) = child.try_wait() {
-                        log_to_file(&format!("server exited during init: {}", status));
-                        return -6;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        log_to_file("bootstrap accept timed out (15s); killing server");
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return -7;
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    log_to_file("bootstrap accept thread terminated unexpectedly");
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return -5;
-                }
-            }
-        };
-        log_to_file("bootstrap received from server");
-
-        *CONNECTION.lock().unwrap_or_else(PoisonError::into_inner) = Some(ServerConnection {
-            command_sender: bootstrap.command_sender,
-            response_receiver: bootstrap.response_receiver,
-            child,
-        });
-
-        // Connect to server's Mach IOSurface port service (macOS only)
-        // GPU モード時のみ接続する。CPU モードでは IOSURFACE_CONNECTED は false のまま。
-        #[cfg(target_os = "macos")]
-        if use_gpu_bool {
-            let service_name = cef_unity_ipc::iosurface_service_name(bootstrap.server_pid);
-            log_to_file(&format!("connecting to Mach IOSurface service: {}", service_name));
-            if let Ok(c_service_name) = std::ffi::CString::new(service_name.as_str()) {
-                let result = unsafe { mach_iosurface_client_connect(c_service_name.as_ptr()) };
-                if result == 0 {
-                    IOSURFACE_CONNECTED.store(true, Ordering::SeqCst);
-                    log_to_file("Mach IOSurface service connected");
-                } else {
-                    log_to_file(&format!("Mach IOSurface service connect failed: {}", result));
-                }
-            } else {
-                // service name に NUL が混入した場合のみ。接続失敗と同じく非致命 (CPU 経路へ)。
-                log_to_file("iosurface service name contained NUL; skipping connect");
-            }
-        }
+        let mut recovery = RECOVERY.lock().unwrap_or_else(PoisonError::into_inner);
+        recovery.phase = RecoveryPhase::Running;
+        recovery.use_gpu = use_gpu_bool;
+        recovery.enable_log = enable_log != 0;
+        recovery.loss_guard.reset();
+        recovery.loss_count = 0;
+        recovery.recovery_count = 0;
+        recovery.last_loss_reason = None;
+        drop(recovery);
 
         INITIALIZED.store(true, Ordering::SeqCst);
         log_to_file("initialized successfully (IPC client)");
@@ -387,11 +901,58 @@ pub extern "C" fn cef_unity_initialize(use_gpu: i32, enable_log: i32) -> i32 {
     })
 }
 
-/// Pump CEF message loop — no-op in IPC mode (server has its own loop).
+/// 毎フレーム、メインスレッドから呼ぶ。server を失っていたら復旧を進める。
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_pump() {
     ffi_guard((), || {
         PUMP_COUNT.fetch_add(1, Ordering::Relaxed);
+        drive_recovery();
+        restart_pending_native_voices();
+    })
+}
+
+/// server の状態。値は C# 側 (`CefServerState`) と揃える。
+pub const CEF_UNITY_SERVER_STATE_NOT_STARTED: i32 = 0;
+pub const CEF_UNITY_SERVER_STATE_RUNNING: i32 = 1;
+pub const CEF_UNITY_SERVER_STATE_RECOVERING: i32 = 2;
+pub const CEF_UNITY_SERVER_STATE_FAILED: i32 = 3;
+
+#[repr(C)]
+pub struct CefUnityServerStatus {
+    /// `CEF_UNITY_SERVER_STATE_*`。
+    pub state: i32,
+    /// 直近に server を失った理由 (`ServerLossReason` の値、0 = まだ失っていない)。
+    pub last_loss_reason: i32,
+    /// Initialize 以降に server を失った回数。
+    pub loss_count: u32,
+    /// Initialize 以降に復旧できた回数。増えたら作り直しが終わっている。
+    pub recovery_count: u32,
+}
+
+/// server の状態を取得する。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_get_server_status(out_status: *mut CefUnityServerStatus) {
+    ffi_guard((), || {
+        if out_status.is_null() {
+            return;
+        }
+        let recovery = RECOVERY.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = match recovery.phase {
+            RecoveryPhase::Idle => CEF_UNITY_SERVER_STATE_NOT_STARTED,
+            RecoveryPhase::Running => CEF_UNITY_SERVER_STATE_RUNNING,
+            RecoveryPhase::WaitingToLaunch { .. } | RecoveryPhase::Launching { .. } => {
+                CEF_UNITY_SERVER_STATE_RECOVERING
+            }
+            RecoveryPhase::Failed => CEF_UNITY_SERVER_STATE_FAILED,
+        };
+        unsafe {
+            *out_status = CefUnityServerStatus {
+                state,
+                last_loss_reason: recovery.last_loss_reason.map_or(0, |reason| reason as i32),
+                loss_count: recovery.loss_count,
+                recovery_count: recovery.recovery_count,
+            };
+        }
     })
 }
 
@@ -420,24 +981,24 @@ pub extern "C" fn cef_unity_shutdown() {
         }
         log_to_file("cef_unity_shutdown()");
 
-        // 先に take してガードを解放する: 保持したまま 500ms sleep すると
-        // 他スレッドの全 FFI 呼び出しがその間ロック待ちになる。
-        let connection = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner).take();
-        if let Some(mut connection) = connection {
-            // fire-and-forget: server プロセスが無応答でも Unity main thread を
-            // 永久ブロックさせないため、応答は待たない。server 側は
-            // expects_response=false でも Shutdown を正しく処理して running=false にする
-            // (event_loop/generic.rs の drain_commands 参照)。
-            send_command_no_wait(&connection, Command::Shutdown);
-            // Server が Shutdown を処理して cef::shutdown() を呼び終わるまで少し待つ。
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            // 終了済みならここで回収してゾンビ化を防ぐ (未終了なら従来どおり放置)。
-            let _ = connection.child.try_wait();
+        let phase = std::mem::replace(
+            &mut RECOVERY.lock().unwrap_or_else(PoisonError::into_inner).phase,
+            RecoveryPhase::Idle,
+        );
+        if let RecoveryPhase::Launching { receiver, .. } = phase {
+            // 復旧のための起動が途中。待たずに返り、起動し終えた server は片付ける。
+            std::thread::spawn(move || {
+                if let Ok(Ok(launched)) = receiver.recv() {
+                    kill_server(&launched.process);
+                }
+            });
         }
+        release_server(false);
 
         INITIALIZED.store(false, Ordering::SeqCst);
         IOSURFACE_CONNECTED.store(false, Ordering::SeqCst);
         USE_GPU_MODE.store(true, Ordering::SeqCst);
+        NATIVE_VOICE_RESTART_PENDING.store(false, Ordering::Release);
         log_to_file("shutdown complete");
     })
 }
@@ -543,6 +1104,101 @@ pub extern "C" fn cef_scroll_monitor_now() -> f64 {
 // Per-browser functions
 // ---------------------------------------------------------------------------
 
+/// server 上に作ったブラウザと、それを読むための共有メモリ。
+struct OpenedBrowser {
+    browser_id: u32,
+    shared_memory: SharedMemoryReader,
+    audio_shared_memory: Option<AudioSharedMemoryReader>,
+    audio_flink: String,
+}
+
+/// server にブラウザを作らせ、共有メモリを開く。
+fn open_browser(
+    connection: &ServerConnection,
+    width: i32,
+    height: i32,
+    url: &str,
+) -> Result<OpenedBrowser, String> {
+    let command = Command::CreateBrowser {
+        width,
+        height,
+        url: url.to_string(),
+    };
+    match send_command(connection, command)? {
+        Response::BrowserCreated {
+            browser_id,
+            shared_memory_flink,
+            d3d11_fence_handle,
+            audio_shared_memory_flink,
+        } => {
+            log_to_file(&format!(
+                "browser created: id={}, shm={}, fence_handle=0x{:x}, audio_shm={}",
+                browser_id, shared_memory_flink, d3d11_fence_handle, audio_shared_memory_flink
+            ));
+            let shared_memory = SharedMemoryReader::open(&shared_memory_flink)
+                .map_err(|error| format!("shm_open failed: {}", error))?;
+            let audio_shared_memory = match AudioSharedMemoryReader::open(&audio_shared_memory_flink) {
+                Ok(reader) => Some(reader),
+                Err(error) => {
+                    // 音声は必須ではないので open 失敗時は警告のみ。
+                    log_to_file(&format!("audio_shm_open failed (audio disabled): {}", error));
+                    None
+                }
+            };
+            #[cfg(target_os = "windows")]
+            {
+                if d3d11_fence_handle != 0 {
+                    // Unity の graphics backend に応じて開ける方を試す。
+                    // D3D11/D3D12 双方無接続でも fence_handle 自体は同じ NT 共有 HANDLE。
+                    if d3d11::is_connected() {
+                        if let Err(error) = d3d11::open_fence(d3d11_fence_handle) {
+                            log_to_file(&format!("d3d11::open_fence failed: {}", error));
+                        }
+                    }
+                    if d3d12::is_connected() {
+                        if let Err(error) = d3d12::open_fence(d3d11_fence_handle) {
+                            log_to_file(&format!("d3d12::open_fence failed: {}", error));
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            let _ = d3d11_fence_handle;
+            Ok(OpenedBrowser {
+                browser_id,
+                shared_memory,
+                audio_shared_memory,
+                audio_flink: audio_shared_memory_flink,
+            })
+        }
+        Response::Error { message } => Err(format!("create_browser error: {}", message)),
+        _ => Err("unexpected response to CreateBrowser".to_string()),
+    }
+}
+
+impl ClientBrowserInstance {
+    /// 作り直したブラウザへ差し替える。前の server の共有メモリは、その server が
+    /// 後始末できない (死んでいる) ので所有権を引き取って消す。
+    fn attach(&mut self, opened: OpenedBrowser, server_generation: u64) {
+        let (termination_count, _, _) = self.shared_memory.read_render_process_termination();
+        self.render_process_termination_count_base += termination_count;
+        // server 内での作り直し + 今回の server 再起動による作り直し。
+        self.recreation_count_base += self.shared_memory.read_browser_recreation_count() + 1;
+        self.accelerated_frame_id_base += self.shared_memory.peek_accelerated_frame_id();
+
+        let mut previous_shared_memory = std::mem::replace(&mut self.shared_memory, opened.shared_memory);
+        previous_shared_memory.claim_ownership();
+        if let Some(mut previous_audio) =
+            std::mem::replace(&mut self.audio_shared_memory, opened.audio_shared_memory)
+        {
+            previous_audio.claim_ownership();
+        }
+        self.browser_id = opened.browser_id;
+        self.audio_flink = opened.audio_flink;
+        self.server_generation = server_generation;
+    }
+}
+
 /// Create a browser instance via IPC.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_create_browser(
@@ -567,84 +1223,48 @@ pub extern "C" fn cef_unity_create_browser(
             None => return std::ptr::null_mut(),
         };
 
-        let command = Command::CreateBrowser {
-            width,
-            height,
-            url: url_string.to_string(),
-        };
-        let response = match send_command(connection, command) {
-            Ok(response) => response,
+        let opened = match open_browser(connection, width, height, url_string) {
+            Ok(opened) => opened,
             Err(error) => {
-                log_to_file(&format!("create_browser IPC error: {}", error));
+                log_to_file(&format!("create_browser failed: {}", error));
                 return std::ptr::null_mut();
             }
         };
-
-        match response {
-            Response::BrowserCreated {
-                browser_id,
-                shared_memory_flink,
-                d3d11_fence_handle,
-                audio_shared_memory_flink,
-            } => {
-                log_to_file(&format!(
-                    "browser created: id={}, shm={}, fence_handle=0x{:x}, audio_shm={}",
-                    browser_id, shared_memory_flink, d3d11_fence_handle, audio_shared_memory_flink
-                ));
-                let shared_memory = match SharedMemoryReader::open(&shared_memory_flink) {
-                    Ok(reader) => reader,
-                    Err(error) => {
-                        log_to_file(&format!("shm_open failed: {}", error));
-                        return std::ptr::null_mut();
-                    }
-                };
-                let audio_shared_memory = match AudioSharedMemoryReader::open(&audio_shared_memory_flink) {
-                    Ok(reader) => Some(reader),
-                    Err(error) => {
-                        // 音声は必須ではないので open 失敗時は警告のみ。
-                        log_to_file(&format!("audio_shm_open failed (audio disabled): {}", error));
-                        None
-                    }
-                };
-                #[cfg(target_os = "windows")]
-                {
-                    if d3d11_fence_handle != 0 {
-                        // Unity の graphics backend に応じて開ける方を試す。
-                        // D3D11/D3D12 双方無接続でも fence_handle 自体は同じ NT 共有 HANDLE。
-                        if d3d11::is_connected() {
-                            if let Err(error) = d3d11::open_fence(d3d11_fence_handle) {
-                                log_to_file(&format!("d3d11::open_fence failed: {}", error));
-                            }
-                        }
-                        if d3d12::is_connected() {
-                            if let Err(error) = d3d12::open_fence(d3d11_fence_handle) {
-                                log_to_file(&format!("d3d12::open_fence failed: {}", error));
-                            }
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "windows"))]
-                let _ = d3d11_fence_handle;
-                let instance = Box::new(ClientBrowserInstance {
-                    browser_id,
-                    shared_memory,
-                    audio_shared_memory,
-                    audio_flink: audio_shared_memory_flink.clone(),
-                    #[cfg(any(target_os = "macos", target_os = "windows"))]
-                    native_voice: None,
-                });
-                Box::into_raw(instance) as *mut CefUnityBrowser
-            }
-            Response::Error { message } => {
-                log_to_file(&format!("create_browser error: {}", message));
-                std::ptr::null_mut()
-            }
-            _ => {
-                log_to_file("unexpected response to CreateBrowser");
-                std::ptr::null_mut()
-            }
-        }
+        let instance = Box::new(ClientBrowserInstance {
+            browser_id: opened.browser_id,
+            shared_memory: opened.shared_memory,
+            audio_shared_memory: opened.audio_shared_memory,
+            audio_flink: opened.audio_flink,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            native_voice: None,
+            native_voice_parameters: None,
+            server_generation: connection.generation,
+            width,
+            height,
+            restore_url: url_string.to_string(),
+            render_process_termination_count_base: 0,
+            accelerated_frame_id_base: 0,
+            recreation_count_base: 0,
+        });
+        let handle = Box::into_raw(instance) as *mut CefUnityBrowser;
+        register_browser(handle);
+        handle
     })
+}
+
+/// ブラウザのインスタンスを片付ける。server が既に無い (復旧中・別の server へ
+/// 作り直す前に破棄された) なら、共有メモリの所有権を引き取って消す。
+fn dispose_instance(handle: *mut CefUnityBrowser) -> Box<ClientBrowserInstance> {
+    unregister_browser(handle);
+    let mut instance = unsafe { Box::from_raw(handle as *mut ClientBrowserInstance) };
+    stop_native_voice(&mut instance);
+    if instance.server_generation != CURRENT_GENERATION.load(Ordering::Acquire) {
+        instance.shared_memory.claim_ownership();
+        if let Some(audio) = instance.audio_shared_memory.as_mut() {
+            audio.claim_ownership();
+        }
+    }
+    instance
 }
 
 /// Destroy a browser instance.
@@ -654,8 +1274,7 @@ pub extern "C" fn cef_unity_destroy_browser(handle: *mut CefUnityBrowser) {
         if handle.is_null() {
             return;
         }
-        let mut instance = unsafe { Box::from_raw(handle as *mut ClientBrowserInstance) };
-        stop_native_voice(&mut instance);
+        let instance = dispose_instance(handle);
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(connection) = guard.as_ref() {
@@ -668,6 +1287,44 @@ pub extern "C" fn cef_unity_destroy_browser(handle: *mut CefUnityBrowser) {
     })
 }
 
+/// ブラウザの障害と復旧の状態。
+#[repr(C)]
+pub struct CefUnityBrowserRecoveryStatus {
+    /// ブラウザ作成以降にレンダラーが終了 (クラッシュ・強制終了) した累計回数。
+    pub render_process_termination_count: u32,
+    /// 直近のレンダラーの終了理由 (`cef_termination_status_t` の値)。
+    pub last_render_process_termination_status: i32,
+    /// 1 = 短時間にクラッシュが続いたため自動再読み込みを止めている。LoadUrl で解除される。
+    pub render_process_reload_suppressed: i32,
+    /// ブラウザを作り直した累計回数 (server の再起動、GPU プロセスの再起動による)。
+    /// 作り直すとページは読み込み直しになる。
+    pub recreation_count: u32,
+}
+
+/// ブラウザの障害と復旧の状態を取得する。
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_unity_get_browser_recovery_status(
+    handle: *mut CefUnityBrowser,
+    out_status: *mut CefUnityBrowserRecoveryStatus,
+) {
+    ffi_guard((), || {
+        if handle.is_null() || out_status.is_null() {
+            return;
+        }
+        let instance = handle_to_reference(handle);
+        let (count, status, reload_suppressed) = instance.shared_memory.read_render_process_termination();
+        unsafe {
+            *out_status = CefUnityBrowserRecoveryStatus {
+                render_process_termination_count: instance.render_process_termination_count_base + count,
+                last_render_process_termination_status: status as i32,
+                render_process_reload_suppressed: reload_suppressed as i32,
+                recreation_count: instance.recreation_count_base
+                    + instance.shared_memory.read_browser_recreation_count(),
+            };
+        }
+    })
+}
+
 /// Load a URL in the browser.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_load_url(handle: *mut CefUnityBrowser, url: *const c_char) {
@@ -677,6 +1334,7 @@ pub extern "C" fn cef_unity_load_url(handle: *mut CefUnityBrowser, url: *const c
         }
         let instance = handle_to_reference(handle);
         let url_string = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
+        instance.restore_url = url_string.to_string();
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(connection) = guard.as_ref() {
@@ -697,6 +1355,8 @@ pub extern "C" fn cef_unity_resize(handle: *mut CefUnityBrowser, width: i32, hei
             return;
         }
         let instance = handle_to_reference(handle);
+        instance.width = width;
+        instance.height = height;
 
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(connection) = guard.as_ref() {
@@ -1105,42 +1765,26 @@ pub extern "C" fn cef_unity_audio_native_start(
         if handle.is_null() {
             return -1;
         }
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        {
-            let instance = handle_to_reference(handle);
-            if instance.native_voice.is_some() {
-                return 0;
-            }
-            if instance.audio_flink.is_empty() {
-                return -1;
-            }
-            // 出力デバイス層だけがプラットフォーム依存 (macOS: AudioUnit /
-            // Windows: WASAPI)。start のシグネチャは揃えてある。
-            #[cfg(target_os = "macos")]
-            let started =
-                native_voice::NativeVoice::start(&instance.audio_flink, target_milliseconds, io_frames);
-            #[cfg(target_os = "windows")]
-            let started =
-                wasapi_output::WasapiOutput::start(&instance.audio_flink, target_milliseconds, io_frames);
-            match started {
-                Ok(voice) => {
-                    instance.native_voice = Some(voice);
-                    log_to_file(&format!(
-                        "native audio started (target={}ms io_frames={})",
-                        target_milliseconds, io_frames
-                    ));
-                    0
-                }
-                Err(error) => {
-                    log_to_file(&format!("native audio start failed: {}", error));
-                    -1
-                }
-            }
+        let instance = handle_to_reference(handle);
+        if native_voice_running(instance) {
+            return 0;
         }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        {
-            let _ = (target_milliseconds, io_frames);
-            -1
+        if instance.server_generation != CURRENT_GENERATION.load(Ordering::Acquire) {
+            // server の復旧中。今開くと死んだ server のリングを読んでしまうので、
+            // 要求だけ覚えて作り直し後に開始する。
+            instance.native_voice_parameters = Some((target_milliseconds, io_frames));
+            NATIVE_VOICE_RESTART_PENDING.store(true, Ordering::Release);
+            return 0;
+        }
+        match start_native_voice(instance, target_milliseconds, io_frames) {
+            Ok(()) => {
+                instance.native_voice_parameters = Some((target_milliseconds, io_frames));
+                0
+            }
+            Err(error) => {
+                log_to_file(&format!("native audio start failed: {}", error));
+                -1
+            }
         }
     })
 }
@@ -1152,12 +1796,11 @@ pub extern "C" fn cef_unity_audio_native_stop(handle: *mut CefUnityBrowser) {
         if handle.is_null() {
             return;
         }
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        {
-            let instance = handle_to_reference(handle);
-            if instance.native_voice.take().is_some() {
-                log_to_file("native audio stopped");
-            }
+        let instance = handle_to_reference(handle);
+        instance.native_voice_parameters = None;
+        if native_voice_running(instance) {
+            stop_native_voice(instance);
+            log_to_file("native audio stopped");
         }
     })
 }
@@ -1253,8 +1896,7 @@ pub extern "C" fn cef_unity_destroy_browser_blocking(handle: *mut CefUnityBrowse
         if handle.is_null() {
             return -1;
         }
-        let mut instance = unsafe { Box::from_raw(handle as *mut ClientBrowserInstance) };
-        stop_native_voice(&mut instance);
+        let instance = dispose_instance(handle);
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
         let result = if let Some(connection) = guard.as_ref() {
             blocking_simple(
@@ -1283,6 +1925,7 @@ pub extern "C" fn cef_unity_load_url_blocking(
         }
         let instance = handle_to_reference(handle);
         let url_string = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
+        instance.restore_url = url_string.to_string();
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(connection) = guard.as_ref() {
             blocking_simple(
@@ -1310,6 +1953,8 @@ pub extern "C" fn cef_unity_resize_blocking(
             return -1;
         }
         let instance = handle_to_reference(handle);
+        instance.width = width;
+        instance.height = height;
         let guard = CONNECTION.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(connection) = guard.as_ref() {
             blocking_simple(
@@ -1598,7 +2243,7 @@ pub extern "C" fn cef_unity_peek_accelerated_frame_id(handle: *mut CefUnityBrows
             return 0;
         }
         let instance = handle_to_reference(handle);
-        instance.shared_memory.peek_accelerated_frame_id()
+        instance.accelerated_frame_id_base + instance.shared_memory.peek_accelerated_frame_id()
     })
 }
 
@@ -1632,6 +2277,8 @@ unsafe extern "C" {
     fn cef_unity_release_metal_texture_objc(texture_pointer: *mut std::ffi::c_void);
 
     fn mach_iosurface_client_connect(service_name: *const std::ffi::c_char) -> i32;
+
+    fn mach_iosurface_client_disconnect();
 
     fn mach_iosurface_receive_texture(
         out_width: *mut i32,

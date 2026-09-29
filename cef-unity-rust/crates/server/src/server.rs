@@ -3,7 +3,7 @@
 use cef::*;
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
@@ -53,8 +53,12 @@ unsafe extern "C" {
     fn iosurface_pool_poison_copies_reading(source: *mut std::os::raw::c_void) -> i32;
 }
 
-use cef_unity_ipc::{self as ipc, AudioSharedMemoryWriter, Command, Response, SharedMemoryWriter};
+use cef_unity_ipc::crash_loop_guard::CrashLoopGuard;
+use cef_unity_ipc::{
+    self as ipc, AudioSharedMemoryWriter, Command, Response, ServerStatusWriter, SharedMemoryWriter,
+};
 
+use crate::compositor_probe::{CompositorProbe, ProbeAction};
 use crate::d3d11_pool::D3D11Pool;
 
 // ---------------------------------------------------------------------------
@@ -135,7 +139,6 @@ fn load_cef_auto() {
 
 struct BrowserState {
     /// Kept alive so SharedMemoryWriter::drop cleans up shared memory on browser destroy.
-    #[allow(dead_code)]
     shared_memory: Arc<SharedMemoryWriter>,
     /// 音声リングバッファ。AudioHandler が PCM を書き込む。ブラウザ破棄まで生かす。
     #[allow(dead_code)]
@@ -147,7 +150,27 @@ struct BrowserState {
     /// 非 Windows / 失敗時は None で software 経路にフォールバック。
     #[allow(dead_code)]
     d3d11_pool: Option<Arc<D3D11Pool>>,
+    /// レンダラーのクラッシュループ判定。LoadUrl で別のページへ移ったらリセットする。
+    crash_loop_guard: Arc<Mutex<CrashLoopGuard>>,
+    /// このブラウザの paint の累計 (合成経路の生存確認に使う)。
+    paint_count: Arc<AtomicU64>,
+    /// レンダラーが生きているか。終了で false、次の読み込み開始で true。
+    renderer_alive: Arc<AtomicBool>,
+    /// 最後に BeginFrame を受け取った時刻。
+    last_begin_frame_at: Option<Instant>,
+    compositor_probe: CompositorProbe,
+    /// 合成経路が死んだときの作り直しのループ判定。
+    recreation_guard: CrashLoopGuard,
 }
+
+/// 合成経路が死んだブラウザを作り直す回数の上限と窓。GPU が壊れ続けている場合に
+/// 作り直し (= ページの読み込み直し) を繰り返さないため。
+const BROWSER_RECREATIONS_PER_WINDOW: usize = 3;
+const BROWSER_RECREATION_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// 合成経路の生存確認の間隔と、「BeginFrame が流れている」とみなす期間。
+const COMPOSITOR_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const BEGIN_FRAME_FLOWING_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
 // CEF Handlers
@@ -381,6 +404,22 @@ unsafe impl Sync for AsyncCopyTarget {}
 #[cfg(target_os = "macos")]
 static ASYNC_COPY_SHARED_MEMORY: Mutex<Option<AsyncCopyTarget>> = Mutex::new(None);
 
+/// 破棄するブラウザの shm を完了ハンドラの書き込み先から外す。static が参照を
+/// 持ち続けると SharedMemoryWriter が drop されず、flink と共有メモリ本体
+/// (約 66MB) が server の終了後も OS に残る (Play/Stop のたびに溜まっていた)。
+#[cfg(target_os = "macos")]
+fn release_async_copy_target(shared_memory: &Arc<SharedMemoryWriter>) {
+    let mut guard = ASYNC_COPY_SHARED_MEMORY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if guard
+        .as_ref()
+        .is_some_and(|target| Arc::ptr_eq(&target.0, shared_memory))
+    {
+        *guard = None;
+    }
+}
+
 /// blit 完了後に Metal 側の直列キューから呼ばれる。この時点で surface は転送して安全。
 #[cfg(target_os = "macos")]
 extern "C" fn on_async_copy_completed(
@@ -586,6 +625,7 @@ wrap_render_handler! {
         viewport_width: Arc<AtomicI32>,
         viewport_height: Arc<AtomicI32>,
         d3d11_pool: Option<Arc<D3D11Pool>>,
+        paint_count: Arc<AtomicU64>,
     }
     impl RenderHandler {
         fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
@@ -634,6 +674,7 @@ wrap_render_handler! {
             if type_.get_raw() != PaintElementType::VIEW.get_raw() {
                 return;
             }
+            self.paint_count.fetch_add(1, Ordering::Relaxed);
             let (width, height) = (width as u32, height as u32);
             // software 経路の shared_memory バッファは MAX_WIDTH×MAX_HEIGHT 固定長。超過フレームを
             // write_frame に渡すと assert panic → CEF コールバック越しの unwind で
@@ -664,6 +705,7 @@ wrap_render_handler! {
             if type_.get_raw() != PaintElementType::VIEW.get_raw() {
                 return;
             }
+            self.paint_count.fetch_add(1, Ordering::Relaxed);
             #[cfg(target_os = "macos")]
             if let Some(info) = info {
                 let io_surface = info.shared_texture_io_surface;
@@ -942,6 +984,20 @@ wrap_display_handler! {
         shared_memory: Arc<SharedMemoryWriter>,
     }
     impl DisplayHandler {
+        fn on_address_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            url: Option<&CefString>,
+        ) {
+            // server が異常終了したとき、クライアントはこの URL でブラウザを作り直す。
+            if let (Some(frame), Some(url)) = (frame, url)
+                && frame.is_main() != 0
+            {
+                self.shared_memory.write_main_frame_url(&url.to_string());
+            }
+        }
+
         fn on_console_message(
             &self,
             _browser: Option<&mut Browser>,
@@ -973,9 +1029,24 @@ wrap_display_handler! {
 
 wrap_load_handler! {
     struct ServerLoadHandler {
-        browser_slot: Arc<Mutex<Option<Browser>>>,
+        renderer_alive: Arc<AtomicBool>,
     }
     impl LoadHandler {
+        fn on_load_start(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _transition_type: TransitionType,
+        ) {
+            // 読み込みが始まった = 新しいレンダラーが動いている (クラッシュ後の再読み込み・
+            // LoadUrl)。合成経路の生存確認を再開してよい。
+            if let Some(frame) = frame
+                && frame.is_main() != 0
+            {
+                self.renderer_alive.store(true, Ordering::Release);
+            }
+        }
+
         fn on_load_end(
             &self,
             _browser: Option<&mut Browser>,
@@ -991,6 +1062,70 @@ wrap_load_handler! {
                         0,
                     );
                 }
+        }
+    }
+}
+
+/// 短時間にレンダラーが落ち続けたら自動再読み込みを諦めるまでの回数と窓。
+/// ページ自体が確実にクラッシュさせる場合、再読み込みは同じクラッシュを繰り返すだけになる。
+const RENDER_PROCESS_RELOADS_PER_WINDOW: usize = 2;
+const RENDER_PROCESS_RELOAD_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn new_render_process_crash_loop_guard() -> CrashLoopGuard {
+    CrashLoopGuard::new(RENDER_PROCESS_RELOADS_PER_WINDOW, RENDER_PROCESS_RELOAD_WINDOW)
+}
+
+wrap_request_handler! {
+    struct ServerRequestHandler {
+        shared_memory: Arc<SharedMemoryWriter>,
+        crash_loop_guard: Arc<Mutex<CrashLoopGuard>>,
+        renderer_alive: Arc<AtomicBool>,
+    }
+    impl RequestHandler {
+        fn on_render_process_unresponsive(
+            &self,
+            _browser: Option<&mut Browser>,
+            callback: Option<&mut UnresponsiveProcessCallback>,
+        ) -> ::std::os::raw::c_int {
+            // OSR には「待つ/終了」を選ぶダイアログが無く、既定のまま待つとページは
+            // 固まり続ける。強制終了すれば on_render_process_terminated の再読み込みで戻る。
+            log("on_render_process_unresponsive: terminating the render process");
+            match callback {
+                Some(callback) => {
+                    callback.terminate();
+                    1
+                }
+                None => 0,
+            }
+        }
+
+        fn on_render_process_terminated(
+            &self,
+            browser: Option<&mut Browser>,
+            status: TerminationStatus,
+            error_code: ::std::os::raw::c_int,
+            error_string: Option<&CefString>,
+        ) {
+            self.renderer_alive.store(false, Ordering::Release);
+            let reload_allowed = self
+                .crash_loop_guard
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .record_failure(Instant::now());
+            let status_value = status.get_raw() as u32;
+            log(&format!(
+                "on_render_process_terminated: status={} error_code={} error={} reload={}",
+                status_value,
+                error_code,
+                error_string.map(|text| text.to_string()).unwrap_or_default(),
+                reload_allowed
+            ));
+            self.shared_memory
+                .record_render_process_termination(status_value, !reload_allowed);
+            // 再読み込みすると新しいレンダラーが起動し、最後にコミットしたページが戻る。
+            if reload_allowed && let Some(browser) = browser {
+                browser.reload();
+            }
         }
     }
 }
@@ -1309,6 +1444,7 @@ wrap_client! {
         display_handler: DisplayHandler,
         load_handler: LoadHandler,
         audio_handler: AudioHandler,
+        request_handler: RequestHandler,
     }
     impl Client {
         fn render_handler(&self) -> Option<RenderHandler> {
@@ -1325,6 +1461,9 @@ wrap_client! {
         }
         fn audio_handler(&self) -> Option<AudioHandler> {
             Some(self.audio_handler.clone())
+        }
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(self.request_handler.clone())
         }
     }
 }
@@ -1388,6 +1527,77 @@ fn streak_cooldown_enabled() -> bool {
     *ENABLED.get_or_init(|| !std::env::temp_dir().join("cef_no_streak_cooldown").exists())
 }
 
+/// `state` の共有メモリ・ビューポート等に描画する CEF ブラウザを開く。
+/// 作成時と、合成経路が死んだときの作り直しで使う。
+fn open_cef_browser(state: &BrowserState, use_gpu: bool, url: &str) -> bool {
+    let render_handler = ServerRenderHandler::new(
+        Arc::clone(&state.shared_memory),
+        Arc::clone(&state.viewport_width),
+        Arc::clone(&state.viewport_height),
+        state.d3d11_pool.clone(),
+        Arc::clone(&state.paint_count),
+    );
+    let life_span_handler = ServerLifeSpanHandler::new(Arc::clone(&state.browser));
+    let display_handler = ServerDisplayHandler::new(Arc::clone(&state.shared_memory));
+    let load_handler = ServerLoadHandler::new(Arc::clone(&state.renderer_alive));
+    let audio_handler = ServerAudioHandler::new(Arc::clone(&state.audio_shared_memory));
+    let request_handler = ServerRequestHandler::new(
+        Arc::clone(&state.shared_memory),
+        Arc::clone(&state.crash_loop_guard),
+        Arc::clone(&state.renderer_alive),
+    );
+    let mut client = ServerClient::new(
+        render_handler,
+        life_span_handler,
+        display_handler,
+        load_handler,
+        audio_handler,
+        request_handler,
+    );
+
+    // cef_window_handle_t はプラットフォーム依存:
+    //   macOS: *mut c_void
+    //   Linux: c_ulong (X11 Window / XID)
+    //   Windows: HWND (newtype wrapping *mut c_void)
+    #[cfg(target_os = "windows")]
+    let parent_handle = cef::sys::HWND(std::ptr::null_mut());
+    #[cfg(target_os = "macos")]
+    let parent_handle = std::ptr::null_mut();
+    #[cfg(target_os = "linux")]
+    let parent_handle: cef::sys::cef_window_handle_t = 0;
+    let mut window_info = WindowInfo::default().set_as_windowless(parent_handle);
+    // macOS: IOSurface Mach port 転送を使用 (use_gpu=true のときのみ)。
+    // Windows: D3D11 共有テクスチャプールが構築できた場合のみ accelerated paint を有効化。
+    // CPU モード (use_gpu=false) ではどのプラットフォームでも立てない。
+    #[cfg(target_os = "macos")]
+    if use_gpu {
+        window_info.shared_texture_enabled = 1;
+    }
+    #[cfg(target_os = "windows")]
+    if state.d3d11_pool.is_some() {
+        window_info.shared_texture_enabled = 1;
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = use_gpu;
+    // External BeginFrame: Unity の LateUpdate から SendExternalBeginFrame で 1 フレーム
+    // ずつ駆動する。これにより CEF の Viz Compositor は自発的に paint せず、
+    // Unity のフレーム周期と完全に同期する (二重レート/位相ドリフトの解消)。
+    // windowless_frame_rate はこのモードでは無視される。
+    window_info.external_begin_frame_enabled = 1;
+    browser_host_create_browser(
+        Some(&window_info),
+        Some(&mut client),
+        Some(&CefString::from(url)),
+        Some(&BrowserSettings {
+            background_color: 0x00000000,
+            windowless_frame_rate: 120,
+            ..Default::default()
+        }),
+        None,
+        None,
+    ) != 0
+}
+
 pub struct CefServer {
     browsers: HashMap<u32, BrowserState>,
     next_browser_id: AtomicU32,
@@ -1412,6 +1622,11 @@ pub struct CefServer {
     /// GPU コピー未完了で発行を見送った BF#1。tick でゲートが開き次第発行する。
     /// (browser_id, unity_frame)。新しい BF#1 が来たら上書きする — 溜めても意味がない。
     deferred_begin_frame: Option<(u32, u64)>,
+    /// クライアントの監視スレッドが見る heartbeat。作れなかった場合 (共有メモリの
+    /// 作成失敗) は None で、クライアントはプロセス終了の検出だけで監視する。
+    status: Option<ServerStatusWriter>,
+    /// 次に合成経路の生存確認をする時刻。
+    next_compositor_check_at: Instant,
 }
 
 /// 抑止トライアル失敗 (抑止フレームで paint が来ない = BF#1-only パイプラインが
@@ -1438,11 +1653,29 @@ impl CefServer {
             last_begin_frame_1_suppressed: false,
             suppression_cooldown: 0,
             deferred_begin_frame: None,
+            next_compositor_check_at: Instant::now(),
+            status: match ServerStatusWriter::new(&ipc::server_status_flink_path(std::process::id())) {
+                Ok(writer) => Some(writer),
+                Err(error) => {
+                    log(&format!("server status shm create failed (heartbeat disabled): {}", error));
+                    None
+                }
+            },
+        }
+    }
+
+    /// イベントループの tick ごとに呼ぶ。クライアントはこれが進まなくなったら
+    /// server が固まったと判断して再起動する。
+    pub fn record_heartbeat(&self) {
+        if let Some(status) = self.status.as_ref() {
+            status.beat();
         }
     }
 
     /// Initialize CEF. Must be called on main thread before anything else.
-    pub fn initialize_cef(&self) -> bool {
+    /// `reset_cache`: キャッシュディレクトリを消してから起動する。前回の server が
+    /// 異常終了してキャッシュが壊れ、起動できなかったときの再試行でクライアントが指定する。
+    pub fn initialize_cef(&self, reset_cache: bool) -> bool {
         log("initialize_cef() starting");
 
         #[cfg(target_os = "macos")]
@@ -1460,6 +1693,12 @@ impl CefServer {
         log(&format!("helper_path = {}", helper_path.display()));
 
         let cache_dir = std::env::temp_dir().join("cef_unity_cache");
+        if reset_cache {
+            // 強制終了が繰り返されるとキャッシュが壊れ、CEF の起動がハングすることがある
+            // (実測: 復旧には削除が必要だった)。
+            log(&format!("reset_cache: removing {}", cache_dir.display()));
+            let _ = std::fs::remove_dir_all(&cache_dir);
+        }
         let _ = std::fs::create_dir_all(&cache_dir);
 
         let mut settings = Settings::default();
@@ -1662,96 +1901,113 @@ impl CefServer {
             }
         };
 
-        let render_handler = ServerRenderHandler::new(
-            Arc::clone(&shared_memory),
-            Arc::clone(&viewport_width),
-            Arc::clone(&viewport_height),
-            d3d11_pool.clone(),
-        );
-        let life_span_handler = ServerLifeSpanHandler::new(Arc::clone(&browser_slot));
-        let display_handler = ServerDisplayHandler::new(Arc::clone(&shared_memory));
-        let load_handler = ServerLoadHandler::new(Arc::clone(&browser_slot));
-        let audio_handler = ServerAudioHandler::new(Arc::clone(&audio_shared_memory));
-        let mut client = ServerClient::new(
-            render_handler,
-            life_span_handler,
-            display_handler,
-            load_handler,
-            audio_handler,
-        );
-
-        // cef_window_handle_t はプラットフォーム依存:
-        //   macOS: *mut c_void
-        //   Linux: c_ulong (X11 Window / XID)
-        //   Windows: HWND (newtype wrapping *mut c_void)
-        #[cfg(target_os = "windows")]
-        let parent_handle = cef::sys::HWND(std::ptr::null_mut());
-        #[cfg(target_os = "macos")]
-        let parent_handle = std::ptr::null_mut();
-        #[cfg(target_os = "linux")]
-        let parent_handle: cef::sys::cef_window_handle_t = 0;
-        let mut window_info = WindowInfo::default().set_as_windowless(parent_handle);
-        // macOS: IOSurface Mach port 転送を使用 (use_gpu=true のときのみ)。
-        // Windows: D3D11 共有テクスチャプールが構築できた場合のみ accelerated paint を有効化。
-        // CPU モード (use_gpu=false) ではどのプラットフォームでも立てない。
-        #[cfg(target_os = "macos")]
-        if self.use_gpu {
-            window_info.shared_texture_enabled = 1;
-        }
-        #[cfg(target_os = "windows")]
-        if d3d11_pool.is_some() {
-            window_info.shared_texture_enabled = 1;
-        }
-        // External BeginFrame: Unity の LateUpdate から SendExternalBeginFrame で 1 フレーム
-        // ずつ駆動する。これにより CEF の Viz Compositor は自発的に paint せず、
-        // Unity のフレーム周期と完全に同期する (二重レート/位相ドリフトの解消)。
-        // windowless_frame_rate はこのモードでは無視される。
-        window_info.external_begin_frame_enabled = 1;
-        let ok = browser_host_create_browser(
-            Some(&window_info),
-            Some(&mut client),
-            Some(&CefString::from(url)),
-            Some(&BrowserSettings {
-                background_color: 0x00000000,
-                windowless_frame_rate: 120,
-                ..Default::default()
-            }),
-            None,
-            None,
-        );
-        log(&format!(
-            "browser_host_create_browser id={} returned {}",
-            id, ok
-        ));
-
-        if ok == 0 {
-            return Response::Error {
-                message: "browser_host_create_browser failed".to_string(),
-            };
-        }
-
         let d3d11_fence_handle = d3d11_pool
             .as_ref()
             .map(|pool| pool.client_fence_handle())
             .unwrap_or(0);
 
-        self.browsers.insert(
-            id,
-            BrowserState {
-                shared_memory,
-                audio_shared_memory,
-                browser: browser_slot,
-                viewport_width,
-                viewport_height,
-                d3d11_pool,
-            },
-        );
+        let state = BrowserState {
+            shared_memory,
+            audio_shared_memory,
+            browser: browser_slot,
+            viewport_width,
+            viewport_height,
+            d3d11_pool,
+            crash_loop_guard: Arc::new(Mutex::new(new_render_process_crash_loop_guard())),
+            paint_count: Arc::new(AtomicU64::new(0)),
+            renderer_alive: Arc::new(AtomicBool::new(true)),
+            last_begin_frame_at: None,
+            compositor_probe: CompositorProbe::new(),
+            recreation_guard: CrashLoopGuard::new(
+                BROWSER_RECREATIONS_PER_WINDOW,
+                BROWSER_RECREATION_WINDOW,
+            ),
+        };
+        let ok = open_cef_browser(&state, self.use_gpu, url);
+        log(&format!(
+            "browser_host_create_browser id={} returned {}",
+            id, ok
+        ));
+        if !ok {
+            return Response::Error {
+                message: "browser_host_create_browser failed".to_string(),
+            };
+        }
+        self.browsers.insert(id, state);
 
         Response::BrowserCreated {
             browser_id: id,
             shared_memory_flink,
             d3d11_fence_handle,
             audio_shared_memory_flink,
+        }
+    }
+
+    /// 合成経路が死んだブラウザを同じ server 内で作り直す。共有メモリ・ビューポート・
+    /// browser_id はそのまま使うので、クライアントは何も差し替えなくてよい。
+    fn recreate_browser(&mut self, browser_id: u32) {
+        let Some(state) = self.browsers.get_mut(&browser_id) else {
+            return;
+        };
+        if !state.recreation_guard.record_failure(Instant::now()) {
+            log(&format!(
+                "browser {}: compositor is dead but recreated {} times within {:?}; giving up",
+                browser_id, BROWSER_RECREATIONS_PER_WINDOW, BROWSER_RECREATION_WINDOW
+            ));
+            return;
+        }
+        let previous = state.browser.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let url = previous
+            .as_ref()
+            .and_then(Browser::main_frame)
+            .map(|frame| CefString::from(&frame.url()).to_string())
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| "about:blank".to_string());
+        if let Some(host) = previous.as_ref().and_then(Browser::host) {
+            BrowserHost::close_browser(&host, 1);
+        }
+        state.renderer_alive.store(true, Ordering::Release);
+        let ok = open_cef_browser(state, self.use_gpu, &url);
+        state.shared_memory.record_browser_recreation();
+        log(&format!(
+            "browser {}: compositor stopped responding (GPU process restart); recreated at {} (ok={})",
+            browser_id, url, ok
+        ));
+    }
+
+    /// 合成経路の生存確認。event loop の tick から呼ぶ ([`CompositorProbe`] 参照)。
+    pub fn check_compositors(&mut self) {
+        let now = Instant::now();
+        if now < self.next_compositor_check_at {
+            return;
+        }
+        self.next_compositor_check_at = now + COMPOSITOR_CHECK_INTERVAL;
+
+        let mut dead = Vec::new();
+        for (&browser_id, state) in self.browsers.iter_mut() {
+            let begin_frames_flowing = state
+                .last_begin_frame_at
+                .is_some_and(|at| now.saturating_duration_since(at) < BEGIN_FRAME_FLOWING_WINDOW);
+            let action = state.compositor_probe.update(
+                now,
+                state.paint_count.load(Ordering::Relaxed),
+                state.renderer_alive.load(Ordering::Acquire),
+                begin_frames_flowing,
+            );
+            match action {
+                ProbeAction::None => {}
+                ProbeAction::Invalidate => {
+                    if let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
+                        && let Some(host) = Browser::host(browser)
+                    {
+                        host.invalidate(PaintElementType::VIEW);
+                    }
+                }
+                ProbeAction::Recreate => dead.push(browser_id),
+            }
+        }
+        for browser_id in dead {
+            self.recreate_browser(browser_id);
         }
     }
 
@@ -1762,6 +2018,8 @@ impl CefServer {
             {
                 BrowserHost::close_browser(&host, 1);
             }
+            #[cfg(target_os = "macos")]
+            release_async_copy_target(&state.shared_memory);
             Response::Ok
         } else {
             Response::Error {
@@ -1776,6 +2034,13 @@ impl CefServer {
             if let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
                 && let Some(frame) = Browser::main_frame(browser)
             {
+                // 利用者が明示的に移動した先は、それまでのクラッシュと無関係として扱う。
+                state
+                    .crash_loop_guard
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .reset();
+                state.shared_memory.clear_render_process_reload_suppressed();
                 Frame::load_url(&frame, Some(&CefString::from(url)));
                 return Response::Ok;
             }
@@ -2138,11 +2403,12 @@ impl CefServer {
     /// 同フレーム内の最新内容 (0F) を得られる。
     /// `unity_frame` は発行時の Time.frameCount。
     fn send_external_begin_frame(&mut self, browser_id: u32, unity_frame: u64) -> Response {
-        if !self.browsers.contains_key(&browser_id) {
+        let Some(state) = self.browsers.get_mut(&browser_id) else {
             return Response::Error {
                 message: format!("browser {} not found", browser_id),
             };
-        }
+        };
+        state.last_begin_frame_at = Some(Instant::now());
         // 前フレームの GPU コピーが転送元をまだ読んでいる間は発行できない (issue #7)。
         // 待たずに保留し、tick で再試行する。damage streak の判定はここでは進めない
         // — 実際に発行するときに 1 回だけ行う。

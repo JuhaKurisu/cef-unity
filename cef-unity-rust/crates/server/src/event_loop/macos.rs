@@ -154,9 +154,12 @@ fn timer_callback_inner() {
     // server-side flush: 保留中の BeginFrame#2 (flush) を発行時刻が来ていれば撃つ。
     // do_message_loop_work の前に行い、同じ pump サイクルで compositor が draw する。
     state.cef_server.process_pending_flushes();
+    // GPU プロセスの再起動で合成経路が死んだブラウザを見つけて作り直す。
+    state.cef_server.check_compositors();
 
     cef::do_message_loop_work();
     state.pump_count += 1;
+    state.cef_server.record_heartbeat();
 
     // 1 秒窓の paint 統計 (pump tick 数 / paint 数 / GPU コピー待ち) を出す。
     // tick から呼ぶため、コピー待ちで pump が凍結した分は窓長の伸びとして現れる。
