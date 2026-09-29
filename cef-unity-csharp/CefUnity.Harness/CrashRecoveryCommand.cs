@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using CefUnity.Interop;
 using CefUnity.Runtime;
@@ -88,13 +89,13 @@ internal static class CrashRecoveryCommand
         var passed = true;
         // 1 回目は CEF のデバッグ URL で落とす (LoadUrl はクラッシュ判定の履歴を消すので
         // ループ判定には使えない)。2 回目以降は利用者の操作なしに落ち続ける状況を模して、
-        // レンダラープロセスへ直接 SIGSEGV を送る。
+        // レンダラープロセスを外から落とす。
         for (var crashIndex = 1; crashIndex <= 3; crashIndex++)
         {
             if (crashIndex == 1)
                 browser.LoadUrl("chrome://crash");
             else
-                foreach (var renderer in FindRendererProcessIdentifiers()) Signal("SEGV", renderer);
+                foreach (var renderer in ProcessControl.FindRendererProcessIdentifiers()) ProcessControl.Crash(renderer);
             var terminated = WaitFor(browser, () => browser.GetRecoveryStatus().RenderProcessTerminationCount >= crashIndex, 10);
             var status = browser.GetRecoveryStatus();
             var frames = PumpFrames(browser, 120);
@@ -124,9 +125,9 @@ internal static class CrashRecoveryCommand
         PumpFrames(browser, 120);
         Console.WriteLine($"url before kill={browser.GetUrl()}");
 
-        var serverProcessIdentifier = FindServerProcessIdentifier();
+        var serverProcessIdentifier = ProcessControl.FindServerProcessIdentifier();
         Console.WriteLine($"killing server pid={serverProcessIdentifier}");
-        Signal("KILL", serverProcessIdentifier);
+        ProcessControl.Kill(serverProcessIdentifier);
 
         var recovered = WaitFor(browser, () => CefRuntime.GetServerStatus().RecoveryCount >= 1, 30);
         Console.WriteLine($"recovered={recovered} status={CefRuntime.GetServerStatus()}");
@@ -134,7 +135,7 @@ internal static class CrashRecoveryCommand
 
         var frames = PumpFrames(browser, 180);
         var url = browser.GetUrl();
-        var newServerProcessIdentifier = FindServerProcessIdentifier();
+        var newServerProcessIdentifier = ProcessControl.FindServerProcessIdentifier();
         var leftovers = Directory.GetFiles(Path.GetTempPath(), $"cef-unity-*-{serverProcessIdentifier}*");
         Console.WriteLine($"frames after recovery={frames} url={url} new_server_pid={newServerProcessIdentifier} " +
                           $"leftover_shared_memory={leftovers.Length}");
@@ -145,10 +146,10 @@ internal static class CrashRecoveryCommand
 
     private static bool RunServerHang(Browser browser)
     {
-        var serverProcessIdentifier = FindServerProcessIdentifier();
+        var serverProcessIdentifier = ProcessControl.FindServerProcessIdentifier();
         Console.WriteLine($"stopping server pid={serverProcessIdentifier}");
         var stoppedAt = Stopwatch.StartNew();
-        Signal("STOP", serverProcessIdentifier);
+        ProcessControl.Suspend(serverProcessIdentifier);
 
         var recovered = WaitFor(browser, () => CefRuntime.GetServerStatus().RecoveryCount >= 1, 40);
         Console.WriteLine($"recovered={recovered} after {stoppedAt.Elapsed.TotalSeconds:F1}s " +
@@ -209,6 +210,8 @@ internal static class CrashRecoveryCommand
         Console.WriteLine($"  event: {entry}");
     }
 
+    private static ulong s_observedAcceleratedFrameId;
+
     /// <summary>1 フレームぶん Unity と同じ手順を回し、新しいフレームを受け取れたら true。</summary>
     private static bool PumpOnce(Browser browser, ulong frameIndex)
     {
@@ -216,8 +219,18 @@ internal static class CrashRecoveryCommand
         CefRuntime.Pump();
         Thread.Sleep(16);
         if (!s_useGpu) return browser.TryGetBuffer(out _, out _, out _);
-        if (!Browser.TryReceiveIOSurfaceTexture(out var texture, out _, out _, out _)) return false;
-        Browser.ReleaseMetalTexture(texture);
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            // macOS は Mach 経由でテクスチャを実際に受け取る (server 再起動後の再接続も確かめる)。
+            if (!Browser.TryReceiveIOSurfaceTexture(out var texture, out _, out _, out _)) return false;
+            Browser.ReleaseMetalTexture(texture);
+            return true;
+        }
+        // Windows の共有テクスチャを開くには D3D11/D3D12 の device が要る。harness は持たないので、
+        // server が共有メモリに公開する accelerated paint の通し番号の増分で数える。
+        var acceleratedFrameId = browser.PeekAcceleratedFrameId();
+        if (acceleratedFrameId == s_observedAcceleratedFrameId) return false;
+        s_observedAcceleratedFrameId = acceleratedFrameId;
         return true;
     }
 
@@ -256,43 +269,5 @@ internal static class CrashRecoveryCommand
         return condition();
     }
 
-    /// <summary>このプロセスが起動した server (helper はその子なので含まれない)。</summary>
-    private static int FindServerProcessIdentifier()
-    {
-        using var process = Process.Start(new ProcessStartInfo
-        {
-            FileName = "/usr/bin/pgrep",
-            Arguments = $"-P {Environment.ProcessId} -f cef-unity-server",
-            RedirectStandardOutput = true,
-            UseShellExecute = false,
-        })!;
-        var output = process.StandardOutput.ReadToEnd();
-        process.WaitForExit();
-        return output.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(int.Parse).Single();
-    }
-
-    /// <summary>
-    ///     server の子のうち、レンダラープロセス。Chromium は次のナビゲーション用に予備の
-    ///     レンダラーを持つことがあるので複数返り得る (予備を落としてもブラウザには影響しない)。
-    /// </summary>
-    private static int[] FindRendererProcessIdentifiers()
-    {
-        using var process = Process.Start(new ProcessStartInfo
-        {
-            FileName = "/usr/bin/pgrep",
-            Arguments = $"-P {FindServerProcessIdentifier()} -f type=renderer",
-            RedirectStandardOutput = true,
-            UseShellExecute = false,
-        })!;
-        var output = process.StandardOutput.ReadToEnd();
-        process.WaitForExit();
-        return output.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(int.Parse).ToArray();
-    }
-
-    private static void Signal(string signal, int processIdentifier)
-    {
-        using var process = Process.Start("/bin/kill", $"-{signal} {processIdentifier}");
-        process.WaitForExit();
-    }
 }
 }

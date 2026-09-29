@@ -125,10 +125,22 @@ server もすぐ動き出すので観測回数なら誤検出しない。
 Unity Editor (6000.3.8f1) でも、Play 中に server を SIGKILL して自動で描画が戻ること、
 Stop 後に server・共有メモリが残らないことを確認した。
 
+**Windows 実機** (2026-09-29, x64・実デスクトップ。CI 成果物の `Plugins/win-x64` を使用):
+
+| 確認 | 結果 |
+|---|---|
+| Harness `renderer` / `server-kill` / `server-hang` (GPU・CPU)、`gpu-crash` (GPU) | 7 ケースすべて OK。hang の検出は 10.7〜10.8 秒。server の残存 0 |
+| Viewer (D3D11 ゼロコピー表示) で server を kill | 数秒でページが読み込み直され、描画が進み続ける |
+| Viewer で GPU プロセス (`--type=gpu-process`) だけを kill | 約 12 秒以内に server 内で作り直され、描画が戻る (server は生きたまま) |
+
+Windows ではレンダラーを外から落とす手段が強制終了しかないが、終了理由は `ProcessCrashed` として
+報告された。Harness は Windows で共有テクスチャを開く D3D11 device を持たないため、GPU モードの
+フレームは server が共有メモリに公開する `accelerated_frame_id` の増分で数える
+(client 側でテクスチャを開き直す経路は Viewer で確認した)。
+
 ## 既知の制約
 
-- Windows・Linux は CI でのビルドのみで、クラッシュ試験は未実施 (Harness の `crash-recovery` は
-  `pgrep` / `kill` を使うため macOS・Linux 用)
+- Linux は CI でのビルドのみで、クラッシュ試験は未実施
 - server が固まった場合、検出までの最大 10 秒間は描画が止まる。その間に IPC の送信キューが
   溢れると、送信するメインスレッドもその間止まる
 - 復旧中 (`Recovering`) に `new Browser(...)` すると失敗する (例外)。復旧後に作り直すこと
