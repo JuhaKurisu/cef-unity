@@ -30,10 +30,16 @@ namespace CefUnity
         public static extern int cef_unity_initialize(int use_gpu, int enable_log);
 
         /// <summary>
-        ///  Pump CEF message loop — no-op in IPC mode (server has its own loop).
+        ///  毎フレーム、メインスレッドから呼ぶ。server を失っていたら復旧を進める。
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_pump", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern void cef_unity_pump();
+
+        /// <summary>
+        ///  server の状態を取得する。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_get_server_status", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_get_server_status(CefUnityServerStatus* out_status);
 
         /// <summary>
         ///  Returns the number of on_paint calls (tracked per-frame reads in IPC mode).
@@ -90,6 +96,12 @@ namespace CefUnity
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_destroy_browser", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         public static extern void cef_unity_destroy_browser(CefUnityBrowser* handle);
+
+        /// <summary>
+        ///  レンダラープロセスの状態を取得する。
+        /// </summary>
+        [DllImport(__DllName, EntryPoint = "cef_unity_get_render_process_status", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_get_render_process_status(CefUnityBrowser* handle, CefUnityRenderProcessStatus* out_status);
 
         /// <summary>
         ///  Load a URL in the browser.
@@ -450,6 +462,27 @@ namespace CefUnity
         public byte _opaque;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public unsafe partial struct CefUnityServerStatus
+    {
+        /// <summary>
+        ///  `CEF_UNITY_SERVER_STATE_*`。
+        /// </summary>
+        public int state;
+        /// <summary>
+        ///  直近に server を失った理由 (`ServerLossReason` の値、0 = まだ失っていない)。
+        /// </summary>
+        public int last_loss_reason;
+        /// <summary>
+        ///  Initialize 以降に server を失った回数。
+        /// </summary>
+        public uint loss_count;
+        /// <summary>
+        ///  Initialize 以降に復旧できた回数。増えたら作り直しが終わっている。
+        /// </summary>
+        public uint recovery_count;
+    }
+
     /// <summary>
     ///  生スクロールイベント (scroll_monitor.m / C# 側と同一レイアウト)。
     ///  phase: 0=None 1=GestureBegan 2=GestureChanged 3=GestureEnded
@@ -463,6 +496,26 @@ namespace CefUnity
         public float delta_y;
         public byte phase;
         public byte precise;
+    }
+
+    /// <summary>
+    ///  レンダラープロセスの状態。
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public unsafe partial struct CefUnityRenderProcessStatus
+    {
+        /// <summary>
+        ///  ブラウザ作成以降にレンダラーが終了 (クラッシュ・強制終了) した累計回数。
+        /// </summary>
+        public uint termination_count;
+        /// <summary>
+        ///  直近の終了理由 (`cef_termination_status_t` の値)。
+        /// </summary>
+        public int last_termination_status;
+        /// <summary>
+        ///  1 = 短時間にクラッシュが続いたため自動再読み込みを止めている。LoadUrl で解除される。
+        /// </summary>
+        public int reload_suppressed;
     }
 
 

@@ -53,7 +53,10 @@ unsafe extern "C" {
     fn iosurface_pool_poison_copies_reading(source: *mut std::os::raw::c_void) -> i32;
 }
 
-use cef_unity_ipc::{self as ipc, AudioSharedMemoryWriter, Command, Response, SharedMemoryWriter};
+use cef_unity_ipc::crash_loop_guard::CrashLoopGuard;
+use cef_unity_ipc::{
+    self as ipc, AudioSharedMemoryWriter, Command, Response, ServerStatusWriter, SharedMemoryWriter,
+};
 
 use crate::d3d11_pool::D3D11Pool;
 
@@ -135,7 +138,6 @@ fn load_cef_auto() {
 
 struct BrowserState {
     /// Kept alive so SharedMemoryWriter::drop cleans up shared memory on browser destroy.
-    #[allow(dead_code)]
     shared_memory: Arc<SharedMemoryWriter>,
     /// 音声リングバッファ。AudioHandler が PCM を書き込む。ブラウザ破棄まで生かす。
     #[allow(dead_code)]
@@ -147,6 +149,8 @@ struct BrowserState {
     /// 非 Windows / 失敗時は None で software 経路にフォールバック。
     #[allow(dead_code)]
     d3d11_pool: Option<Arc<D3D11Pool>>,
+    /// レンダラーのクラッシュループ判定。LoadUrl で別のページへ移ったらリセットする。
+    crash_loop_guard: Arc<Mutex<CrashLoopGuard>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -942,6 +946,20 @@ wrap_display_handler! {
         shared_memory: Arc<SharedMemoryWriter>,
     }
     impl DisplayHandler {
+        fn on_address_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            url: Option<&CefString>,
+        ) {
+            // server が異常終了したとき、クライアントはこの URL でブラウザを作り直す。
+            if let (Some(frame), Some(url)) = (frame, url)
+                && frame.is_main() != 0
+            {
+                self.shared_memory.write_main_frame_url(&url.to_string());
+            }
+        }
+
         fn on_console_message(
             &self,
             _browser: Option<&mut Browser>,
@@ -991,6 +1009,68 @@ wrap_load_handler! {
                         0,
                     );
                 }
+        }
+    }
+}
+
+/// 短時間にレンダラーが落ち続けたら自動再読み込みを諦めるまでの回数と窓。
+/// ページ自体が確実にクラッシュさせる場合、再読み込みは同じクラッシュを繰り返すだけになる。
+const RENDER_PROCESS_RELOADS_PER_WINDOW: usize = 2;
+const RENDER_PROCESS_RELOAD_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn new_render_process_crash_loop_guard() -> CrashLoopGuard {
+    CrashLoopGuard::new(RENDER_PROCESS_RELOADS_PER_WINDOW, RENDER_PROCESS_RELOAD_WINDOW)
+}
+
+wrap_request_handler! {
+    struct ServerRequestHandler {
+        shared_memory: Arc<SharedMemoryWriter>,
+        crash_loop_guard: Arc<Mutex<CrashLoopGuard>>,
+    }
+    impl RequestHandler {
+        fn on_render_process_unresponsive(
+            &self,
+            _browser: Option<&mut Browser>,
+            callback: Option<&mut UnresponsiveProcessCallback>,
+        ) -> ::std::os::raw::c_int {
+            // OSR には「待つ/終了」を選ぶダイアログが無く、既定のまま待つとページは
+            // 固まり続ける。強制終了すれば on_render_process_terminated の再読み込みで戻る。
+            log("on_render_process_unresponsive: terminating the render process");
+            match callback {
+                Some(callback) => {
+                    callback.terminate();
+                    1
+                }
+                None => 0,
+            }
+        }
+
+        fn on_render_process_terminated(
+            &self,
+            browser: Option<&mut Browser>,
+            status: TerminationStatus,
+            error_code: ::std::os::raw::c_int,
+            error_string: Option<&CefString>,
+        ) {
+            let reload_allowed = self
+                .crash_loop_guard
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .record_failure(Instant::now());
+            let status_value = status.get_raw() as u32;
+            log(&format!(
+                "on_render_process_terminated: status={} error_code={} error={} reload={}",
+                status_value,
+                error_code,
+                error_string.map(|text| text.to_string()).unwrap_or_default(),
+                reload_allowed
+            ));
+            self.shared_memory
+                .record_render_process_termination(status_value, !reload_allowed);
+            // 再読み込みすると新しいレンダラーが起動し、最後にコミットしたページが戻る。
+            if reload_allowed && let Some(browser) = browser {
+                browser.reload();
+            }
         }
     }
 }
@@ -1309,6 +1389,7 @@ wrap_client! {
         display_handler: DisplayHandler,
         load_handler: LoadHandler,
         audio_handler: AudioHandler,
+        request_handler: RequestHandler,
     }
     impl Client {
         fn render_handler(&self) -> Option<RenderHandler> {
@@ -1325,6 +1406,9 @@ wrap_client! {
         }
         fn audio_handler(&self) -> Option<AudioHandler> {
             Some(self.audio_handler.clone())
+        }
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(self.request_handler.clone())
         }
     }
 }
@@ -1412,6 +1496,9 @@ pub struct CefServer {
     /// GPU コピー未完了で発行を見送った BF#1。tick でゲートが開き次第発行する。
     /// (browser_id, unity_frame)。新しい BF#1 が来たら上書きする — 溜めても意味がない。
     deferred_begin_frame: Option<(u32, u64)>,
+    /// クライアントの監視スレッドが見る heartbeat。作れなかった場合 (共有メモリの
+    /// 作成失敗) は None で、クライアントはプロセス終了の検出だけで監視する。
+    status: Option<ServerStatusWriter>,
 }
 
 /// 抑止トライアル失敗 (抑止フレームで paint が来ない = BF#1-only パイプラインが
@@ -1438,11 +1525,28 @@ impl CefServer {
             last_begin_frame_1_suppressed: false,
             suppression_cooldown: 0,
             deferred_begin_frame: None,
+            status: match ServerStatusWriter::new(&ipc::server_status_flink_path(std::process::id())) {
+                Ok(writer) => Some(writer),
+                Err(error) => {
+                    log(&format!("server status shm create failed (heartbeat disabled): {}", error));
+                    None
+                }
+            },
+        }
+    }
+
+    /// イベントループの tick ごとに呼ぶ。クライアントはこれが進まなくなったら
+    /// server が固まったと判断して再起動する。
+    pub fn record_heartbeat(&self) {
+        if let Some(status) = self.status.as_ref() {
+            status.beat();
         }
     }
 
     /// Initialize CEF. Must be called on main thread before anything else.
-    pub fn initialize_cef(&self) -> bool {
+    /// `reset_cache`: キャッシュディレクトリを消してから起動する。前回の server が
+    /// 異常終了してキャッシュが壊れ、起動できなかったときの再試行でクライアントが指定する。
+    pub fn initialize_cef(&self, reset_cache: bool) -> bool {
         log("initialize_cef() starting");
 
         #[cfg(target_os = "macos")]
@@ -1460,6 +1564,12 @@ impl CefServer {
         log(&format!("helper_path = {}", helper_path.display()));
 
         let cache_dir = std::env::temp_dir().join("cef_unity_cache");
+        if reset_cache {
+            // 強制終了が繰り返されるとキャッシュが壊れ、CEF の起動がハングすることがある
+            // (実測: 復旧には削除が必要だった)。
+            log(&format!("reset_cache: removing {}", cache_dir.display()));
+            let _ = std::fs::remove_dir_all(&cache_dir);
+        }
         let _ = std::fs::create_dir_all(&cache_dir);
 
         let mut settings = Settings::default();
@@ -1672,12 +1782,16 @@ impl CefServer {
         let display_handler = ServerDisplayHandler::new(Arc::clone(&shared_memory));
         let load_handler = ServerLoadHandler::new(Arc::clone(&browser_slot));
         let audio_handler = ServerAudioHandler::new(Arc::clone(&audio_shared_memory));
+        let crash_loop_guard = Arc::new(Mutex::new(new_render_process_crash_loop_guard()));
+        let request_handler =
+            ServerRequestHandler::new(Arc::clone(&shared_memory), Arc::clone(&crash_loop_guard));
         let mut client = ServerClient::new(
             render_handler,
             life_span_handler,
             display_handler,
             load_handler,
             audio_handler,
+            request_handler,
         );
 
         // cef_window_handle_t はプラットフォーム依存:
@@ -1744,6 +1858,7 @@ impl CefServer {
                 viewport_width,
                 viewport_height,
                 d3d11_pool,
+                crash_loop_guard,
             },
         );
 
@@ -1776,6 +1891,13 @@ impl CefServer {
             if let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
                 && let Some(frame) = Browser::main_frame(browser)
             {
+                // 利用者が明示的に移動した先は、それまでのクラッシュと無関係として扱う。
+                state
+                    .crash_loop_guard
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .reset();
+                state.shared_memory.clear_render_process_reload_suppressed();
                 Frame::load_url(&frame, Some(&CefString::from(url)));
                 return Response::Ok;
             }

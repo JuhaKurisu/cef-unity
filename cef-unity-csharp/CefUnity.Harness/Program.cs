@@ -78,6 +78,13 @@ if (command == "lifecycle")
     var framesPerCycle = args.Length > 3 && int.TryParse(args[3], out var parsedFrames) ? parsedFrames : 60;
     return CefUnity.Harness.LifecycleCommand.Run(cycles, listenPort, framesPerCycle);
 }
+if (command == "crash-recovery")
+{
+    // usage: crash-recovery <renderer|server-kill|server-hang|gpu-crash> [gpu|cpu]
+    var scenario = args.Length > 1 ? args[1] : "server-kill";
+    var useGpu = args.Length <= 2 || args[2] != "cpu";
+    return CefUnity.Harness.CrashRecoveryCommand.Run(scenario, useGpu);
+}
 if (command == "replay")
 {
     if (args.Length < 2) { Console.Error.WriteLine("usage: replay <recording-csv>"); return 2; }

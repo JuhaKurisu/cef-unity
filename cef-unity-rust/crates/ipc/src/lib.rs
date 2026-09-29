@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use shared_memory::{Shmem, ShmemConf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+pub mod crash_loop_guard;
+
 // ---------------------------------------------------------------------------
 // Wire protocol
 // ---------------------------------------------------------------------------
@@ -155,7 +157,6 @@ pub const MAX_WIDTH: u32 = 3840;
 pub const MAX_HEIGHT: u32 = 2160;
 pub const BUFFER_SIZE: usize = (MAX_WIDTH * MAX_HEIGHT * 4) as usize;
 pub const SHARED_MEMORY_HEADER_SIZE: usize = 128;
-pub const SHARED_MEMORY_TOTAL_SIZE: usize = SHARED_MEMORY_HEADER_SIZE + BUFFER_SIZE * 2;
 
 /// Header at offset 0 of shared memory. 128 bytes, cache-line aligned.
 #[repr(C, align(64))]
@@ -190,11 +191,29 @@ pub struct SharedMemoryHeader {
     /// Unity フレーム番号 (Time.frameCount)。Unity 側はこれと現在の frameCount の
     /// 差分で end-to-end のフレーム遅延を測れる。0 = 未設定。
     pub accelerated_paint_unity_frame: AtomicU64,
+    // ---- レンダラープロセスの終了 (クラッシュ・強制終了) ----
+    /// レンダラープロセスが終了した累積回数。クライアントは増分でクラッシュを検知する。
+    /// 書き込み順は status → reload_suppressed → count (count の増分を見てから他を読むため)。
+    pub render_process_termination_count: AtomicU32,
+    /// 直近の終了理由 (`cef_termination_status_t` の値)。
+    pub render_process_termination_status: AtomicU32,
+    /// 1 = 短時間にクラッシュが続いたため自動再読み込みを止めている。LoadUrl で 0 に戻る。
+    pub render_process_reload_suppressed: AtomicU32,
+    /// メインフレーム URL 領域の seqlock。奇数の間は書き込み中。
+    pub main_frame_url_sequence: AtomicU32,
 }
 
 use std::sync::atomic::AtomicI32;
 
 const _: () = assert!(std::mem::size_of::<SharedMemoryHeader>() == SHARED_MEMORY_HEADER_SIZE);
+
+/// メインフレーム URL 領域の容量 (バイト)。これを超える URL (巨大な data: URL 等) は
+/// 記録しない — 切り詰めた URL を復元に使うと別のページを開いてしまうため。
+pub const MAIN_FRAME_URL_CAPACITY: usize = 8192;
+/// メインフレーム URL 領域の位置。2 枚のフレームバッファの後ろに置く。
+/// 先頭 4 バイトが長さ、続いて UTF-8 のバイト列。
+const MAIN_FRAME_URL_OFFSET: usize = SHARED_MEMORY_HEADER_SIZE + BUFFER_SIZE * 2;
+pub const SHARED_MEMORY_TOTAL_SIZE: usize = MAIN_FRAME_URL_OFFSET + 4 + MAIN_FRAME_URL_CAPACITY;
 
 /// Generate a shared memory flink path for a browser.
 pub fn shared_memory_flink_path(server_pid: u32, browser_id: u32) -> String {
@@ -203,6 +222,92 @@ pub fn shared_memory_flink_path(server_pid: u32, browser_id: u32) -> String {
         .to_str()
         .unwrap()
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Server status (server プロセスに 1 つ)
+//
+// クライアントの監視スレッドが server の生存を確かめるための小さなセグメント。
+// ブラウザの有無に関係なく存在する。
+// ---------------------------------------------------------------------------
+
+pub const SERVER_STATUS_SIZE: usize = 64;
+
+#[repr(C, align(64))]
+pub struct ServerStatusHeader {
+    /// server のイベントループが tick ごとに +1 する。進まなくなったら server の
+    /// メインスレッド (CEF の UI スレッド) が固まっている。
+    pub heartbeat: AtomicU64,
+}
+
+const _: () = assert!(std::mem::size_of::<ServerStatusHeader>() == SERVER_STATUS_SIZE);
+
+/// server status 共有メモリの flink パス。PID から導出するので Bootstrap で渡す必要はない。
+pub fn server_status_flink_path(server_pid: u32) -> String {
+    let temporary_directory = std::env::temp_dir();
+    temporary_directory.join(format!("cef-unity-status-{}", server_pid))
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// server 側: heartbeat を書き込むハンドル。
+pub struct ServerStatusWriter {
+    shared_memory: Shmem,
+}
+
+unsafe impl Send for ServerStatusWriter {}
+
+impl ServerStatusWriter {
+    pub fn new(flink: &str) -> std::io::Result<Self> {
+        let _ = std::fs::remove_file(flink);
+        let shared_memory = ShmemConf::new()
+            .size(SERVER_STATUS_SIZE)
+            .flink(flink)
+            .create()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        unsafe {
+            std::ptr::write_bytes(shared_memory.as_ptr(), 0, SERVER_STATUS_SIZE);
+        }
+        Ok(ServerStatusWriter { shared_memory })
+    }
+
+    fn header(&self) -> &ServerStatusHeader {
+        unsafe { &*(self.shared_memory.as_ptr() as *const ServerStatusHeader) }
+    }
+
+    /// イベントループの 1 tick が回ったことを記録する。
+    pub fn beat(&self) {
+        self.header().heartbeat.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// クライアント側: heartbeat を読むハンドル。
+pub struct ServerStatusReader {
+    shared_memory: Shmem,
+}
+
+unsafe impl Send for ServerStatusReader {}
+
+impl ServerStatusReader {
+    pub fn open(flink: &str) -> std::io::Result<Self> {
+        let shared_memory = ShmemConf::new()
+            .flink(flink)
+            .open()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        Ok(ServerStatusReader { shared_memory })
+    }
+
+    pub fn heartbeat(&self) -> u64 {
+        let header = unsafe { &*(self.shared_memory.as_ptr() as *const ServerStatusHeader) };
+        header.heartbeat.load(Ordering::Acquire)
+    }
+
+    /// server が異常終了して自分で後始末できないとき、drop で共有メモリと flink を
+    /// 削除させる。
+    pub fn claim_ownership(&mut self) {
+        self.shared_memory.set_owner(true);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +486,12 @@ impl AudioSharedMemoryReader {
         unsafe { &*(self.shared_memory.as_ptr() as *const AudioSharedMemoryHeader) }
     }
 
+    /// server が異常終了して自分で後始末できないとき、drop で共有メモリと flink を
+    /// 削除させる。
+    pub fn claim_ownership(&mut self) {
+        self.shared_memory.set_owner(true);
+    }
+
     fn ring_base(&self) -> *const f32 {
         unsafe { self.shared_memory.as_ptr().add(AUDIO_SHARED_MEMORY_HEADER_SIZE) as *const f32 }
     }
@@ -541,6 +652,46 @@ impl SharedMemoryWriter {
         header.accelerated_frame_id.fetch_add(1, Ordering::Release);
     }
 
+    /// レンダラープロセスの終了を記録する。`reload_suppressed` は自動再読み込みを
+    /// 止めたかどうか。count を最後に進める (クライアントは count の増分を見て他を読む)。
+    pub fn record_render_process_termination(&self, status: u32, reload_suppressed: bool) {
+        let header = self.header();
+        header.render_process_termination_status.store(status, Ordering::Release);
+        header
+            .render_process_reload_suppressed
+            .store(reload_suppressed as u32, Ordering::Release);
+        header.render_process_termination_count.fetch_add(1, Ordering::Release);
+    }
+
+    /// 自動再読み込みの停止を解除する (LoadUrl で新しいページへ移ったとき)。
+    pub fn clear_render_process_reload_suppressed(&self) {
+        self.header()
+            .render_process_reload_suppressed
+            .store(0, Ordering::Release);
+    }
+
+    /// メインフレームの URL を記録する。server が異常終了したとき、クライアントは
+    /// これを読んで同じページでブラウザを作り直す。書き手は CEF の UI スレッドだけ
+    /// (単一 writer の seqlock)。容量を超える URL は空として記録する。
+    pub fn write_main_frame_url(&self, url: &str) {
+        let bytes = url.as_bytes();
+        let length = if bytes.len() <= MAIN_FRAME_URL_CAPACITY { bytes.len() } else { 0 };
+        let header = self.header();
+        let sequence = header.main_frame_url_sequence.load(Ordering::Relaxed);
+        header
+            .main_frame_url_sequence
+            .store(sequence.wrapping_add(1), Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+        unsafe {
+            let region = self.shared_memory.as_ptr().add(MAIN_FRAME_URL_OFFSET);
+            std::ptr::write_unaligned(region as *mut u32, length as u32);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), region.add(4), length);
+        }
+        header
+            .main_frame_url_sequence
+            .store(sequence.wrapping_add(2), Ordering::Release);
+    }
+
     /// Write a frame. The buffer must be width*height*4 BGRA bytes.
     pub fn write_frame(&self, pixels: &[u8], width: u32, height: u32) {
         // u32 のまま乗算すると巨大寸法で wrap し境界チェックをすり抜けるため usize で計算
@@ -657,6 +808,50 @@ impl SharedMemoryReader {
     pub fn peek_accelerated_frame_id(&self) -> u64 {
         let header = unsafe { &*(self.shared_memory.as_ptr() as *const SharedMemoryHeader) };
         header.accelerated_frame_id.load(Ordering::Acquire)
+    }
+
+    /// レンダラープロセスの終了記録を読む `(累積回数, 直近の終了理由, 再読み込み停止中か)`。
+    pub fn read_render_process_termination(&self) -> (u32, u32, bool) {
+        let header = unsafe { &*(self.shared_memory.as_ptr() as *const SharedMemoryHeader) };
+        let count = header.render_process_termination_count.load(Ordering::Acquire);
+        (
+            count,
+            header.render_process_termination_status.load(Ordering::Acquire),
+            header.render_process_reload_suppressed.load(Ordering::Acquire) != 0,
+        )
+    }
+
+    /// server が最後に記録したメインフレームの URL を読む。未記録・容量超過・
+    /// 書き込み途中で server が止まった場合は None。
+    pub fn read_main_frame_url(&self) -> Option<String> {
+        let header = unsafe { &*(self.shared_memory.as_ptr() as *const SharedMemoryHeader) };
+        const MAX_ATTEMPTS: usize = 4;
+        for _ in 0..MAX_ATTEMPTS {
+            let before = header.main_frame_url_sequence.load(Ordering::Acquire);
+            if before % 2 == 1 {
+                // 書き込み途中。server が生きていれば次の試行で終わっている。
+                // 死んでいれば最後まで奇数のまま = 信用できないので None。
+                std::hint::spin_loop();
+                continue;
+            }
+            let bytes = unsafe {
+                let region = self.shared_memory.as_ptr().add(MAIN_FRAME_URL_OFFSET);
+                let length =
+                    (std::ptr::read_unaligned(region as *const u32) as usize).min(MAIN_FRAME_URL_CAPACITY);
+                std::slice::from_raw_parts(region.add(4), length).to_vec()
+            };
+            std::sync::atomic::fence(Ordering::Acquire);
+            if header.main_frame_url_sequence.load(Ordering::Relaxed) == before {
+                return String::from_utf8(bytes).ok().filter(|url| !url.is_empty());
+            }
+        }
+        None
+    }
+
+    /// server が異常終了して自分で後始末できないとき、drop で共有メモリと flink を
+    /// 削除させる。
+    pub fn claim_ownership(&mut self) {
+        self.shared_memory.set_owner(true);
     }
 
     /// Read IME caret rect from the shared memory header.
@@ -1556,5 +1751,98 @@ mod tests {
             Some((0xabcd, 800, 600, 0, 7)),
             "afi 増分を観測した時点で d3d11 フレームが取得できること"
         );
+    }
+
+    fn test_flink(name: &str) -> String {
+        std::env::temp_dir().join(name).to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn main_frame_url_roundtrip() {
+        let flink = test_flink("cef-unity-test-shm-main-frame-url");
+        let writer = SharedMemoryWriter::new(&flink).expect("SharedMemoryWriter::new");
+        let reader = SharedMemoryReader::open(&flink).expect("SharedMemoryReader::open");
+
+        assert_eq!(reader.read_main_frame_url(), None, "未記録なら None");
+
+        writer.write_main_frame_url("https://example.com/");
+        assert_eq!(reader.read_main_frame_url().as_deref(), Some("https://example.com/"));
+
+        // 短い URL で上書きしても前の URL の残りが混ざらない。
+        writer.write_main_frame_url("about:blank");
+        assert_eq!(reader.read_main_frame_url().as_deref(), Some("about:blank"));
+    }
+
+    /// 容量を超える URL は切り詰めずに「記録なし」にする
+    /// (切り詰めた URL で復元すると別のページを開いてしまう)。
+    #[test]
+    fn main_frame_url_over_capacity_is_not_recorded() {
+        let flink = test_flink("cef-unity-test-shm-main-frame-url-overflow");
+        let writer = SharedMemoryWriter::new(&flink).expect("SharedMemoryWriter::new");
+        let reader = SharedMemoryReader::open(&flink).expect("SharedMemoryReader::open");
+
+        writer.write_main_frame_url("https://example.com/");
+        let huge = format!("data:text/plain,{}", "a".repeat(MAIN_FRAME_URL_CAPACITY));
+        writer.write_main_frame_url(&huge);
+        assert_eq!(reader.read_main_frame_url(), None);
+    }
+
+    /// 書き込み途中 (sequence が奇数) のまま server が死んだ場合は信用しない。
+    #[test]
+    fn main_frame_url_torn_write_is_rejected() {
+        let flink = test_flink("cef-unity-test-shm-main-frame-url-torn");
+        let writer = SharedMemoryWriter::new(&flink).expect("SharedMemoryWriter::new");
+        let reader = SharedMemoryReader::open(&flink).expect("SharedMemoryReader::open");
+
+        writer.write_main_frame_url("https://example.com/");
+        writer.header().main_frame_url_sequence.fetch_add(1, Ordering::Release);
+        assert_eq!(reader.read_main_frame_url(), None);
+    }
+
+    #[test]
+    fn render_process_termination_roundtrip() {
+        let flink = test_flink("cef-unity-test-shm-render-process-termination");
+        let writer = SharedMemoryWriter::new(&flink).expect("SharedMemoryWriter::new");
+        let reader = SharedMemoryReader::open(&flink).expect("SharedMemoryReader::open");
+
+        assert_eq!(reader.read_render_process_termination(), (0, 0, false));
+
+        writer.record_render_process_termination(2, false);
+        assert_eq!(reader.read_render_process_termination(), (1, 2, false));
+
+        writer.record_render_process_termination(1, true);
+        assert_eq!(reader.read_render_process_termination(), (2, 1, true));
+
+        writer.clear_render_process_reload_suppressed();
+        assert_eq!(reader.read_render_process_termination(), (2, 1, false));
+    }
+
+    #[test]
+    fn server_status_heartbeat_roundtrip() {
+        let flink = test_flink("cef-unity-test-server-status");
+        let writer = ServerStatusWriter::new(&flink).expect("ServerStatusWriter::new");
+        let reader = ServerStatusReader::open(&flink).expect("ServerStatusReader::open");
+
+        assert_eq!(reader.heartbeat(), 0);
+        writer.beat();
+        writer.beat();
+        assert_eq!(reader.heartbeat(), 2);
+    }
+
+    /// server が死んだ後、クライアントが所有権を引き取って drop すると flink が消える
+    /// (server の異常終了で共有メモリが溜まり続けないこと)。
+    #[test]
+    fn claimed_reader_removes_segment_on_drop() {
+        let flink = test_flink("cef-unity-test-shm-claim-ownership");
+        let writer = SharedMemoryWriter::new(&flink).expect("SharedMemoryWriter::new");
+        let mut reader = SharedMemoryReader::open(&flink).expect("SharedMemoryReader::open");
+
+        // server の異常終了を模す: writer の後始末を走らせない。
+        std::mem::forget(writer);
+        assert!(std::path::Path::new(&flink).exists());
+
+        reader.claim_ownership();
+        drop(reader);
+        assert!(!std::path::Path::new(&flink).exists(), "flink が残っている");
     }
 }

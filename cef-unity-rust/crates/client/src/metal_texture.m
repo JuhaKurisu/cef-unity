@@ -47,11 +47,23 @@ static mach_port_t g_receive_port = MACH_PORT_NULL;
 static IOSurfaceRef _lastReceivedSurface = NULL;
 static id<MTLTexture> _lastReceivedTexture = nil;
 
+/// 受信ポートを破棄する。server を手放すとき (Shutdown・server の異常終了) に呼ぶ。
+/// 破棄しないと接続のたびに受信権が 1 つずつ溜まる。
+void mach_iosurface_client_disconnect(void) {
+    if (g_receive_port != MACH_PORT_NULL) {
+        mach_port_mod_refs(mach_task_self(), g_receive_port, MACH_PORT_RIGHT_RECEIVE, -1);
+        g_receive_port = MACH_PORT_NULL;
+    }
+}
+
 /// Connect to the server's Mach IOSurface service and send subscription.
 /// Returns 0 on success, negative on error.
 int mach_iosurface_client_connect(const char* service_name) {
     kern_return_t kern_return_value;
     mach_port_t server_port;
+
+    // 前の server の受信ポートが残っていれば捨てる (再接続でのリーク防止)。
+    mach_iosurface_client_disconnect();
 
     kern_return_value = bootstrap_look_up(bootstrap_port, service_name, &server_port);
     if (kern_return_value != KERN_SUCCESS) {
