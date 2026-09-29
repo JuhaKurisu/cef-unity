@@ -558,6 +558,25 @@ GPU プロセスが起動直後に 3 回落ち (X の GLX `BadMatch` を 3 回�
 | 昇格・session 0 (Explorer なし) | 成功 (起動し直しが起きない) | 成功 |
 | 非昇格・デスクトップ (`runas /trustlevel:0x20000`) | — | 成功 |
 
+## クラッシュ自動復旧のマージ前計測（2026-09-29）
+
+対象は `feat/crash-recovery` (`docs/CRASH_RECOVERY.md`)。毎 tick の heartbeat 書き込み、100ms ごとの
+合成経路の生存確認、client の監視スレッドが加わった。
+
+**macOS** (load 3.4〜4.8):
+
+| コマンド | 実測 |
+|---|---|
+| `paint-statistics 20 1920 1080 animation` | 立ち上がり後は `paints=60/s` の窓が大半 (途中に 97・69 の窓が 1 つずつ)、`dropped=0`・`poisoned_total=0`、`received_median=61`、`gpu_torn=0` / `gpu_rollback=0` |
+| `zero-frame-wait 20 10 1920 1080 intermittent` | `zero_frame_share=54.7%`、`received/s=5.1`、`wait_entered/s=60.5`、`spin_share=42.6%`、`block_avg=7.04ms`、`delay_2F+=0` |
+| `lifecycle 5` | 5/5 完走、`mach_ports` 70→71→71→71→71、`receive_port=0`、`server_processes_final=0` |
+
+**判定: 回帰なし。** `mach_ports` は従来の 70→75 (サイクルごとに +1) が 71 で止まった。
+Shutdown・server 再起動時に Mach 受信ポートを破棄するようにしたため。
+あわせて、破棄したブラウザの映像用共有メモリ (約 66MB) が server 終了後も OS に残っていた
+既存の問題 (非同期コピーの完了ハンドラ用 static が参照を持ち続けていた) を直し、
+Harness の全コマンド実行後に `$TMPDIR/cef-unity-shm-*` が 0 件になることを確認した。
+
 ## 計測上の注意
 
 - harness は BF#1 と recv の間にゲーム処理・描画が入らないため、0F 待ちの spin は**最悪ケース**を測る。
