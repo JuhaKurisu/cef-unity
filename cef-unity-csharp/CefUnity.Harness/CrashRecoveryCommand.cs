@@ -56,6 +56,7 @@ internal static class CrashRecoveryCommand
         {
             using var browser = new Browser(Width, Height, firstUrl);
             browser.RenderProcessTerminated += (_, status) => Record($"RenderProcessTerminated {status}");
+            browser.Recreated += (_, status) => Record($"Recreated {status}");
             var frames = PumpFrames(browser, 120);
             Console.WriteLine($"initial frames={frames}");
             if (frames == 0)
@@ -94,24 +95,24 @@ internal static class CrashRecoveryCommand
                 browser.LoadUrl("chrome://crash");
             else
                 foreach (var renderer in FindRendererProcessIdentifiers()) Signal("SEGV", renderer);
-            var terminated = WaitFor(browser, () => browser.GetRenderProcessStatus().TerminationCount >= crashIndex, 10);
-            var status = browser.GetRenderProcessStatus();
+            var terminated = WaitFor(browser, () => browser.GetRecoveryStatus().RenderProcessTerminationCount >= crashIndex, 10);
+            var status = browser.GetRecoveryStatus();
             var frames = PumpFrames(browser, 120);
             var url = browser.GetUrl();
             Console.WriteLine($"crash #{crashIndex}: terminated={terminated} {status} frames after={frames} url={url}");
             passed &= terminated;
             if (crashIndex < 3)
-                passed &= !status.ReloadSuppressed && frames > 0 && url == pageUrl;
+                passed &= !status.RenderProcessReloadSuppressed && frames > 0 && url == pageUrl;
             else
-                passed &= status.ReloadSuppressed && frames == 0; // 3 回目はクラッシュループとして諦める
+                passed &= status.RenderProcessReloadSuppressed && frames == 0; // 3 回目はクラッシュループとして諦める
         }
 
         // 利用者が明示的に開き直せば戻る。
         browser.LoadUrl(pageUrl);
         var framesAfterLoad = PumpFrames(browser, 120);
-        var statusAfterLoad = browser.GetRenderProcessStatus();
+        var statusAfterLoad = browser.GetRecoveryStatus();
         Console.WriteLine($"after LoadUrl: frames={framesAfterLoad} {statusAfterLoad}");
-        passed &= framesAfterLoad > 0 && !statusAfterLoad.ReloadSuppressed;
+        passed &= framesAfterLoad > 0 && !statusAfterLoad.RenderProcessReloadSuppressed;
         passed &= Events.Count(entry => entry.StartsWith("RenderProcessTerminated")) == 3;
         return passed;
     }
@@ -158,22 +159,41 @@ internal static class CrashRecoveryCommand
         return frames > 0 && Events.Any(entry => entry.Contains("lastLossReason=Unresponsive"));
     }
 
+    /// <summary>
+    ///     GPU プロセスが落ちると既存ブラウザの描画が止まる (CEF の挙動)。server が
+    ///     合成経路の停止を検出してブラウザを作り直し、描画が戻ることを確かめる。
+    ///     静止ページで作り直しが誤って起きないことも確かめる。
+    /// </summary>
     private static bool RunGpuCrash(Browser browser)
     {
-        browser.LoadUrl("chrome://gpucrash");
-        Console.WriteLine($"after gpucrash: frames={PumpFrames(browser, 240)}");
-        browser.Resize(Width + 1, Height);
-        Console.WriteLine($"after resize: frames={PumpFrames(browser, 120)}");
-        browser.Resize(Width, Height);
-        Console.WriteLine($"after resize back: frames={PumpFrames(browser, 120)}");
-        var url = browser.GetUrl();
-        browser.LoadUrl(url);
-        Console.WriteLine($"after reload: frames={PumpFrames(browser, 240)}");
-        using (var second = new Browser(Width, Height, url))
+        var passed = true;
+        // 静止ページ (描画が止まって当然の状態) で誤って作り直さないこと。
+        var staticUrl = WriteStaticPage();
+        browser.LoadUrl(staticUrl);
+        PumpFrames(browser, 12 * 60);
+        var idleStatus = browser.GetRecoveryStatus();
+        Console.WriteLine($"static page for 12s: {idleStatus}");
+        passed &= idleStatus.RecreationCount == 0;
+
+        for (var crashIndex = 1; crashIndex <= 2; crashIndex++)
         {
-            Console.WriteLine($"new browser in the same server: frames={PumpFrames(second, 240)}");
+            browser.LoadUrl("chrome://gpucrash");
+            var recreated = WaitFor(browser, () => browser.GetRecoveryStatus().RecreationCount >= crashIndex, 20);
+            var frames = PumpFrames(browser, 120);
+            var url = browser.GetUrl();
+            Console.WriteLine($"gpucrash #{crashIndex}: recreated={recreated} frames after={frames} url={url} " +
+                              $"{browser.GetRecoveryStatus()} server={CefRuntime.GetServerStatus()}");
+            passed &= recreated && frames > 0 && url == staticUrl;
         }
-        return true;
+        passed &= Events.Count(entry => entry.StartsWith("Recreated")) == 2;
+        return passed;
+    }
+
+    private static string WriteStaticPage()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "cef_unity_crash_recovery_static.html");
+        File.WriteAllText(path, "<!doctype html><meta charset=\"utf-8\"><body style=\"background:#264\">static</body>");
+        return new Uri(path).AbsoluteUri;
     }
 
     private static string WritePage(string name, string color)

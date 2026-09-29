@@ -154,6 +154,8 @@ fn timer_callback_inner() {
     // server-side flush: 保留中の BeginFrame#2 (flush) を発行時刻が来ていれば撃つ。
     // do_message_loop_work の前に行い、同じ pump サイクルで compositor が draw する。
     state.cef_server.process_pending_flushes();
+    // GPU プロセスの再起動で合成経路が死んだブラウザを見つけて作り直す。
+    state.cef_server.check_compositors();
 
     cef::do_message_loop_work();
     state.pump_count += 1;

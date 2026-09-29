@@ -98,10 +98,10 @@ namespace CefUnity
         public static extern void cef_unity_destroy_browser(CefUnityBrowser* handle);
 
         /// <summary>
-        ///  レンダラープロセスの状態を取得する。
+        ///  ブラウザの障害と復旧の状態を取得する。
         /// </summary>
-        [DllImport(__DllName, EntryPoint = "cef_unity_get_render_process_status", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern void cef_unity_get_render_process_status(CefUnityBrowser* handle, CefUnityRenderProcessStatus* out_status);
+        [DllImport(__DllName, EntryPoint = "cef_unity_get_browser_recovery_status", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        public static extern void cef_unity_get_browser_recovery_status(CefUnityBrowser* handle, CefUnityBrowserRecoveryStatus* out_status);
 
         /// <summary>
         ///  Load a URL in the browser.
@@ -499,23 +499,28 @@ namespace CefUnity
     }
 
     /// <summary>
-    ///  レンダラープロセスの状態。
+    ///  ブラウザの障害と復旧の状態。
     /// </summary>
     [StructLayout(LayoutKind.Sequential)]
-    public unsafe partial struct CefUnityRenderProcessStatus
+    public unsafe partial struct CefUnityBrowserRecoveryStatus
     {
         /// <summary>
         ///  ブラウザ作成以降にレンダラーが終了 (クラッシュ・強制終了) した累計回数。
         /// </summary>
-        public uint termination_count;
+        public uint render_process_termination_count;
         /// <summary>
-        ///  直近の終了理由 (`cef_termination_status_t` の値)。
+        ///  直近のレンダラーの終了理由 (`cef_termination_status_t` の値)。
         /// </summary>
-        public int last_termination_status;
+        public int last_render_process_termination_status;
         /// <summary>
         ///  1 = 短時間にクラッシュが続いたため自動再読み込みを止めている。LoadUrl で解除される。
         /// </summary>
-        public int reload_suppressed;
+        public int render_process_reload_suppressed;
+        /// <summary>
+        ///  ブラウザを作り直した累計回数 (server の再起動、GPU プロセスの再起動による)。
+        ///  作り直すとページは読み込み直しになる。
+        /// </summary>
+        public uint recreation_count;
     }
 
 

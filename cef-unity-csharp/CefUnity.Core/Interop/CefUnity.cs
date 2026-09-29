@@ -235,7 +235,7 @@ namespace CefUnity.Interop
 
         private static readonly CefServerStatusTracker ServerStatusTracker = new CefServerStatusTracker();
 
-        /// <summary>レンダラーの終了を見張るブラウザ。メインスレッドからのみ触る。</summary>
+        /// <summary>障害と復旧を見張るブラウザ。メインスレッドからのみ触る。</summary>
         private static readonly List<Browser> LiveBrowsers = new List<Browser>();
 
         internal static void RegisterBrowser(Browser browser) => LiveBrowsers.Add(browser);
@@ -252,7 +252,7 @@ namespace CefUnity.Interop
 
             // イベント内で Dispose されても列挙が壊れないよう複製してから回す。
             if (LiveBrowsers.Count == 0) return;
-            foreach (var browser in LiveBrowsers.ToArray()) browser.PollRenderProcessStatus();
+            foreach (var browser in LiveBrowsers.ToArray()) browser.PollRecoveryStatus();
         }
 
         public static string[] GetLogs()
@@ -297,28 +297,39 @@ namespace CefUnity.Interop
         /// <summary>
         ///     レンダラープロセスが終了した (クラッシュ・メモリ不足・無応答での強制終了)。
         ///     通常は自動で再読み込みされて元に戻る。短時間に続いた場合は再読み込みを止め、
-        ///     <see cref="CefRenderProcessStatus.ReloadSuppressed" /> が true になる
+        ///     <see cref="CefBrowserRecoveryStatus.RenderProcessReloadSuppressed" /> が true になる
         ///     (その場合は LoadUrl で別のページを開く)。<see cref="CefRuntime.Pump" /> の中で発行する。
         /// </summary>
-        public event Action<Browser, CefRenderProcessStatus>? RenderProcessTerminated;
+        public event Action<Browser, CefBrowserRecoveryStatus>? RenderProcessTerminated;
 
-        private readonly CefRenderProcessTerminationTracker _renderProcessTerminationTracker =
-            new CefRenderProcessTerminationTracker();
+        /// <summary>
+        ///     ブラウザを作り直した (server の再起動、または GPU プロセスの再起動で描画が
+        ///     止まったため)。このハンドルはそのまま使えるが、ページは読み込み直しになっている。
+        ///     ExecuteJavaScript で注入していたものがあれば、ここで入れ直す。
+        ///     <see cref="CefRuntime.Pump" /> の中で発行する。
+        /// </summary>
+        public event Action<Browser, CefBrowserRecoveryStatus>? Recreated;
 
-        public unsafe CefRenderProcessStatus GetRenderProcessStatus()
+        private readonly CefBrowserRecoveryTracker _recoveryTracker = new CefBrowserRecoveryTracker();
+
+        public unsafe CefBrowserRecoveryStatus GetRecoveryStatus()
         {
             ThrowIfDisposed();
-            CefUnityRenderProcessStatus status;
-            NativeMethods.cef_unity_get_render_process_status(_handle, &status);
-            return new CefRenderProcessStatus(status.termination_count,
-                (CefRenderProcessTerminationStatus)status.last_termination_status, status.reload_suppressed != 0);
+            CefUnityBrowserRecoveryStatus status;
+            NativeMethods.cef_unity_get_browser_recovery_status(_handle, &status);
+            return new CefBrowserRecoveryStatus(status.render_process_termination_count,
+                (CefRenderProcessTerminationStatus)status.last_render_process_termination_status,
+                status.render_process_reload_suppressed != 0, status.recreation_count);
         }
 
-        internal void PollRenderProcessStatus()
+        internal void PollRecoveryStatus()
         {
             if (_disposed) return;
-            var status = GetRenderProcessStatus();
-            if (_renderProcessTerminationTracker.Observe(status)) RenderProcessTerminated?.Invoke(this, status);
+            var status = GetRecoveryStatus();
+            var transitions = _recoveryTracker.Observe(status);
+            if ((transitions & CefBrowserTransitions.RenderProcessTerminated) != 0)
+                RenderProcessTerminated?.Invoke(this, status);
+            if ((transitions & CefBrowserTransitions.Recreated) != 0) Recreated?.Invoke(this, status);
         }
 
         public void Dispose()

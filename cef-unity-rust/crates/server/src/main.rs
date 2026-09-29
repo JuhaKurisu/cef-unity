@@ -5,6 +5,7 @@
 // Runs CEF in its own process, communicates with Unity via ipc-channel + shared memory.
 // Platform-specific event loop is in the event_loop module.
 
+mod compositor_probe;
 mod d3d11_pool;
 mod event_loop;
 mod server;

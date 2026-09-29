@@ -3,7 +3,7 @@ using NUnit.Framework;
 namespace CefUnity.Runtime.Tests
 {
     /// <summary>
-    ///     <see cref="CefServerStatusTracker" /> と <see cref="CefRenderProcessTerminationTracker" /> の単体テスト。
+    ///     <see cref="CefServerStatusTracker" /> と <see cref="CefBrowserRecoveryTracker" /> の単体テスト。
     ///     Pump ごとの観測から、復旧イベントを重複も取りこぼしもなく一度ずつ発行できること。
     /// </summary>
     public class CrashRecoveryTrackerTests
@@ -67,15 +67,19 @@ namespace CefUnity.Runtime.Tests
         }
 
         [Test]
-        public void RenderProcessTermination_IsReportedOncePerIncrease()
+        public void BrowserEvents_AreReportedOncePerIncrease()
         {
-            var tracker = new CefRenderProcessTerminationTracker();
-            var none = new CefRenderProcessStatus(0, CefRenderProcessTerminationStatus.AbnormalTermination, false);
-            var crashed = new CefRenderProcessStatus(1, CefRenderProcessTerminationStatus.ProcessCrashed, false);
+            var tracker = new CefBrowserRecoveryTracker();
+            CefBrowserRecoveryStatus Status(uint terminations, uint recreations) =>
+                new CefBrowserRecoveryStatus(terminations, CefRenderProcessTerminationStatus.ProcessCrashed, false,
+                    recreations);
 
-            Assert.IsFalse(tracker.Observe(none));
-            Assert.IsTrue(tracker.Observe(crashed));
-            Assert.IsFalse(tracker.Observe(crashed), "同じ終了を二度報告しない");
+            Assert.AreEqual(CefBrowserTransitions.None, tracker.Observe(Status(0, 0)));
+            Assert.AreEqual(CefBrowserTransitions.RenderProcessTerminated, tracker.Observe(Status(1, 0)));
+            Assert.AreEqual(CefBrowserTransitions.None, tracker.Observe(Status(1, 0)), "同じ出来事を二度報告しない");
+            Assert.AreEqual(CefBrowserTransitions.Recreated, tracker.Observe(Status(1, 1)));
+            Assert.AreEqual(CefBrowserTransitions.RenderProcessTerminated | CefBrowserTransitions.Recreated,
+                tracker.Observe(Status(2, 2)));
         }
     }
 }

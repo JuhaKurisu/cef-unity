@@ -201,6 +201,8 @@ pub struct SharedMemoryHeader {
     pub render_process_reload_suppressed: AtomicU32,
     /// メインフレーム URL 領域の seqlock。奇数の間は書き込み中。
     pub main_frame_url_sequence: AtomicU32,
+    /// GPU プロセスの再起動で合成経路が死に、server 内でブラウザを作り直した回数。
+    pub browser_recreation_count: AtomicU32,
 }
 
 use std::sync::atomic::AtomicI32;
@@ -663,6 +665,11 @@ impl SharedMemoryWriter {
         header.render_process_termination_count.fetch_add(1, Ordering::Release);
     }
 
+    /// server 内でブラウザを作り直したことを記録する。
+    pub fn record_browser_recreation(&self) {
+        self.header().browser_recreation_count.fetch_add(1, Ordering::Release);
+    }
+
     /// 自動再読み込みの停止を解除する (LoadUrl で新しいページへ移ったとき)。
     pub fn clear_render_process_reload_suppressed(&self) {
         self.header()
@@ -819,6 +826,12 @@ impl SharedMemoryReader {
             header.render_process_termination_status.load(Ordering::Acquire),
             header.render_process_reload_suppressed.load(Ordering::Acquire) != 0,
         )
+    }
+
+    /// server 内でブラウザを作り直した回数。
+    pub fn read_browser_recreation_count(&self) -> u32 {
+        let header = unsafe { &*(self.shared_memory.as_ptr() as *const SharedMemoryHeader) };
+        header.browser_recreation_count.load(Ordering::Acquire)
     }
 
     /// server が最後に記録したメインフレームの URL を読む。未記録・容量超過・
@@ -1815,6 +1828,17 @@ mod tests {
 
         writer.clear_render_process_reload_suppressed();
         assert_eq!(reader.read_render_process_termination(), (2, 1, false));
+    }
+
+    #[test]
+    fn browser_recreation_count_roundtrip() {
+        let flink = test_flink("cef-unity-test-shm-browser-recreation");
+        let writer = SharedMemoryWriter::new(&flink).expect("SharedMemoryWriter::new");
+        let reader = SharedMemoryReader::open(&flink).expect("SharedMemoryReader::open");
+
+        assert_eq!(reader.read_browser_recreation_count(), 0);
+        writer.record_browser_recreation();
+        assert_eq!(reader.read_browser_recreation_count(), 1);
     }
 
     #[test]

@@ -189,6 +189,8 @@ struct ClientBrowserInstance {
     /// accelerated_frame_id の同様の累計。0F 待ちは増分で到着を判定するため、
     /// 作り直しで値が戻ると待ちが抜けられなくなる。
     accelerated_frame_id_base: u64,
+    /// 前の server までに作り直した回数 (server の再起動による作り直しを含む)。
+    recreation_count_base: u32,
 }
 
 fn handle_to_reference<'a>(handle: *mut CefUnityBrowser) -> &'a mut ClientBrowserInstance {
@@ -1180,6 +1182,8 @@ impl ClientBrowserInstance {
     fn attach(&mut self, opened: OpenedBrowser, server_generation: u64) {
         let (termination_count, _, _) = self.shared_memory.read_render_process_termination();
         self.render_process_termination_count_base += termination_count;
+        // server 内での作り直し + 今回の server 再起動による作り直し。
+        self.recreation_count_base += self.shared_memory.read_browser_recreation_count() + 1;
         self.accelerated_frame_id_base += self.shared_memory.peek_accelerated_frame_id();
 
         let mut previous_shared_memory = std::mem::replace(&mut self.shared_memory, opened.shared_memory);
@@ -1240,6 +1244,7 @@ pub extern "C" fn cef_unity_create_browser(
             restore_url: url_string.to_string(),
             render_process_termination_count_base: 0,
             accelerated_frame_id_base: 0,
+            recreation_count_base: 0,
         });
         let handle = Box::into_raw(instance) as *mut CefUnityBrowser;
         register_browser(handle);
@@ -1282,22 +1287,25 @@ pub extern "C" fn cef_unity_destroy_browser(handle: *mut CefUnityBrowser) {
     })
 }
 
-/// レンダラープロセスの状態。
+/// ブラウザの障害と復旧の状態。
 #[repr(C)]
-pub struct CefUnityRenderProcessStatus {
+pub struct CefUnityBrowserRecoveryStatus {
     /// ブラウザ作成以降にレンダラーが終了 (クラッシュ・強制終了) した累計回数。
-    pub termination_count: u32,
-    /// 直近の終了理由 (`cef_termination_status_t` の値)。
-    pub last_termination_status: i32,
+    pub render_process_termination_count: u32,
+    /// 直近のレンダラーの終了理由 (`cef_termination_status_t` の値)。
+    pub last_render_process_termination_status: i32,
     /// 1 = 短時間にクラッシュが続いたため自動再読み込みを止めている。LoadUrl で解除される。
-    pub reload_suppressed: i32,
+    pub render_process_reload_suppressed: i32,
+    /// ブラウザを作り直した累計回数 (server の再起動、GPU プロセスの再起動による)。
+    /// 作り直すとページは読み込み直しになる。
+    pub recreation_count: u32,
 }
 
-/// レンダラープロセスの状態を取得する。
+/// ブラウザの障害と復旧の状態を取得する。
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_get_render_process_status(
+pub extern "C" fn cef_unity_get_browser_recovery_status(
     handle: *mut CefUnityBrowser,
-    out_status: *mut CefUnityRenderProcessStatus,
+    out_status: *mut CefUnityBrowserRecoveryStatus,
 ) {
     ffi_guard((), || {
         if handle.is_null() || out_status.is_null() {
@@ -1306,10 +1314,12 @@ pub extern "C" fn cef_unity_get_render_process_status(
         let instance = handle_to_reference(handle);
         let (count, status, reload_suppressed) = instance.shared_memory.read_render_process_termination();
         unsafe {
-            *out_status = CefUnityRenderProcessStatus {
-                termination_count: instance.render_process_termination_count_base + count,
-                last_termination_status: status as i32,
-                reload_suppressed: reload_suppressed as i32,
+            *out_status = CefUnityBrowserRecoveryStatus {
+                render_process_termination_count: instance.render_process_termination_count_base + count,
+                last_render_process_termination_status: status as i32,
+                render_process_reload_suppressed: reload_suppressed as i32,
+                recreation_count: instance.recreation_count_base
+                    + instance.shared_memory.read_browser_recreation_count(),
             };
         }
     })
