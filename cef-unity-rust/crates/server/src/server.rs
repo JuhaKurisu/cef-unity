@@ -2,7 +2,6 @@
 
 use cef::*;
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
@@ -54,6 +53,7 @@ unsafe extern "C" {
 }
 
 use cef_unity_ipc::crash_loop_guard::CrashLoopGuard;
+use cef_unity_ipc::log_file::{self, LogLevel};
 use cef_unity_ipc::{
     self as ipc, AudioSharedMemoryWriter, Command, Response, ServerStatusWriter, SharedMemoryWriter,
 };
@@ -65,30 +65,33 @@ use crate::d3d11_pool::D3D11Pool;
 // Logging
 // ---------------------------------------------------------------------------
 
+// 書き込み先とレベルは `cef_unity_ipc::log_file` が持つ (client と共用)。main が
+// `--log-directory` / `--log-verbose` に従って開く。
+//
+// Verbose の行は GetLogs でクライアントへ返すためのメモリにも溜める (Harness が
+// STATISTICS 行を読む)。Essential だけの運用では溜めない。
+
 const MAX_LOG_ENTRIES: usize = 1000;
 static LOG_BUFFER: Mutex<Vec<String>> = Mutex::new(Vec::new());
-/// ログ有効/無効。main で --logging に従って設定される。false で全ログ抑制
-/// (ファイル書き込み・バッファ蓄積の双方を行わない → GetLogs も空を返す)。
-static LOG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// ログ出力の有効/無効を設定する。CEF 初期化前に呼ぶこと。
-pub fn set_logging(enabled: bool) {
-    LOG_ENABLED.store(enabled, Ordering::Relaxed);
+/// 起動・終了・障害・復旧・エラー。常に書く。
+pub(crate) fn log_essential(message: &str) {
+    write_log(LogLevel::Essential, message);
 }
 
-fn log(message: &str) {
-    if !LOG_ENABLED.load(Ordering::Relaxed) {
+/// 毎フレーム級の診断。`--log-verbose=1` のときだけ書く。
+pub(crate) fn log(message: &str) {
+    write_log(LogLevel::Verbose, message);
+}
+
+fn write_log(level: LogLevel, message: &str) {
+    if level == LogLevel::Verbose && !log_file::is_verbose() {
         return;
     }
-    let path = std::env::temp_dir().join("cef_unity_server.log");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(file, "[{:?}] {}", std::time::SystemTime::now(), message);
+    log_file::write(level, message);
+    if !log_file::is_verbose() {
+        return;
     }
-
     let mut buffer = LOG_BUFFER.lock().unwrap_or_else(PoisonError::into_inner);
     if buffer.len() >= MAX_LOG_ENTRIES {
         buffer.remove(0);
@@ -211,7 +214,7 @@ static LATENCY_SAMPLES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 // on_accelerated_paint はメッセージ pump スレッド (CFRunLoop) 上で実行されるため、
 // GPU コピー完了待ちが伸びると pump 自体が止まる。1 秒窓で「pump tick 数」と
 // 「コピー待ち時間」を並べて出すことで、その因果を時系列で確認できるようにする。
-// `--logging` 有効時のみ計測する (無効時は Instant::now() も呼ばない)。
+// `--log-verbose=1` のときのみ計測する (無効時は Instant::now() も呼ばない)。
 
 static COPY_COUNT: AtomicU64 = AtomicU64::new(0);
 /// 非同期モードで in-flight 追跡スロットが枯渇して捨てた paint 数。
@@ -303,9 +306,9 @@ fn process_cpu_milliseconds() -> u64 {
     to_milliseconds(kernel_time) + to_milliseconds(user_time)
 }
 
-/// 統計を有効化するか (= ログ有効か) を返す。
+/// 統計を有効化するか (= 詳細ログが有効か) を返す。
 fn paint_statistics_enabled() -> bool {
-    LOG_ENABLED.load(Ordering::Relaxed)
+    log_file::is_verbose()
 }
 
 // ---------------------------------------------------------------------------
@@ -581,7 +584,7 @@ pub fn report_paint_statistics(pump_count: u64) {
 fn record_paint_latency() {
     // on_accelerated_paint の hot path から毎フレーム呼ばれるため、
     // ログ無効時は lock/push/sort を一切行わず素通しする。
-    if !LOG_ENABLED.load(Ordering::Relaxed) {
+    if !log_file::is_verbose() {
         return;
     }
     let begin_nanoseconds = LAST_BEGIN_FRAME_NANOSECONDS.load(Ordering::Relaxed);
@@ -1089,7 +1092,7 @@ wrap_request_handler! {
         ) -> ::std::os::raw::c_int {
             // OSR には「待つ/終了」を選ぶダイアログが無く、既定のまま待つとページは
             // 固まり続ける。強制終了すれば on_render_process_terminated の再読み込みで戻る。
-            log("on_render_process_unresponsive: terminating the render process");
+            log_essential("on_render_process_unresponsive: terminating the render process");
             match callback {
                 Some(callback) => {
                     callback.terminate();
@@ -1113,7 +1116,7 @@ wrap_request_handler! {
                 .unwrap_or_else(PoisonError::into_inner)
                 .record_failure(Instant::now());
             let status_value = status.get_raw() as u32;
-            log(&format!(
+            log_essential(&format!(
                 "on_render_process_terminated: status={} error_code={} error={} reload={}",
                 status_value,
                 error_code,
@@ -1343,7 +1346,7 @@ wrap_audio_handler! {
 
         fn on_audio_stream_error(&self, _browser: Option<&mut Browser>, message: Option<&CefString>) {
             let message = message.map(|text| text.to_string()).unwrap_or_default();
-            log(&format!("on_audio_stream_error: {}", message));
+            log_essential(&format!("on_audio_stream_error: {}", message));
             self.audio_shared_memory.stop_stream();
         }
     }
@@ -1657,7 +1660,7 @@ impl CefServer {
             status: match ServerStatusWriter::new(&ipc::server_status_flink_path(std::process::id())) {
                 Ok(writer) => Some(writer),
                 Err(error) => {
-                    log(&format!("server status shm create failed (heartbeat disabled): {}", error));
+                    log_essential(&format!("server status shm create failed (heartbeat disabled): {}", error));
                     None
                 }
             },
@@ -1675,7 +1678,14 @@ impl CefServer {
     /// Initialize CEF. Must be called on main thread before anything else.
     /// `reset_cache`: キャッシュディレクトリを消してから起動する。前回の server が
     /// 異常終了してキャッシュが壊れ、起動できなかったときの再試行でクライアントが指定する。
-    pub fn initialize_cef(&self, reset_cache: bool) -> bool {
+    /// `log_directory`: CEF 本体のログ (`cef-<時刻>-<pid>.log`) を置く場所。None なら書かない。
+    /// `log_verbose`: CEF 本体のログを VERBOSE にする。false なら WARNING 以上だけ。
+    pub fn initialize_cef(
+        &self,
+        reset_cache: bool,
+        log_directory: Option<&std::path::Path>,
+        log_verbose: bool,
+    ) -> bool {
         log("initialize_cef() starting");
 
         #[cfg(target_os = "macos")]
@@ -1696,7 +1706,7 @@ impl CefServer {
         if reset_cache {
             // 強制終了が繰り返されるとキャッシュが壊れ、CEF の起動がハングすることがある
             // (実測: 復旧には削除が必要だった)。
-            log(&format!("reset_cache: removing {}", cache_dir.display()));
+            log_essential(&format!("reset_cache: removing {}", cache_dir.display()));
             let _ = std::fs::remove_dir_all(&cache_dir);
         }
         let _ = std::fs::create_dir_all(&cache_dir);
@@ -1735,9 +1745,28 @@ impl CefServer {
             }
         }
 
-        let cef_log = std::env::temp_dir().join("cef_debug.log");
-        settings.log_file = CefString::from(cef_log.to_str().unwrap());
-        settings.log_severity = LogSeverity::VERBOSE;
+        // CEF 本体のログ。レンダラー・GPU プロセスも同じファイルへ追記する。
+        // log_file を空のままにすると CEF は実行ファイルの隣に debug.log を作るため、
+        // 保存先が無いときは明示的に止める。
+        match log_directory {
+            Some(directory) => {
+                let cef_log = log_file::session_path(
+                    directory,
+                    "cef",
+                    std::process::id(),
+                    std::time::SystemTime::now(),
+                );
+                log_file::prune(directory, "cef", log_file::KEPT_FILES_PER_PREFIX - 1);
+                log_essential(&format!("cef log = {}", cef_log.display()));
+                settings.log_file = CefString::from(cef_log.to_string_lossy().as_ref());
+                settings.log_severity = if log_verbose {
+                    LogSeverity::VERBOSE
+                } else {
+                    LogSeverity::WARNING
+                };
+            }
+            None => settings.log_severity = LogSeverity::DISABLE,
+        }
 
         let browser_process_handler = ServerBrowserProcessHandler::new();
         let mut app = ServerApp::new(browser_process_handler, self.use_gpu);
@@ -1747,7 +1776,7 @@ impl CefServer {
             Some(&mut app),
             std::ptr::null_mut(),
         );
-        log(&format!("initialize() returned {}", result));
+        log_essential(&format!("initialize() returned {}", result));
         result != 0
     }
 
@@ -1879,12 +1908,12 @@ impl CefServer {
         // 非 Windows ではスタブ実装が常に Err を返すので None になる。
         // CPU モード (use_gpu=false) では作らず、software paint を強制する。
         let d3d11_pool: Option<Arc<D3D11Pool>> = if !self.use_gpu {
-            log("use_gpu=false: skipping D3D11Pool, forcing software paint");
+            log_essential("use_gpu=false: skipping D3D11Pool, forcing software paint");
             None
         } else {
             match D3D11Pool::new(self.client_pid) {
                 Ok(pool) => {
-                    log(&format!(
+                    log_essential(&format!(
                         "D3D11Pool created (client_pid={:?})",
                         self.client_pid
                     ));
@@ -1892,7 +1921,7 @@ impl CefServer {
                 }
                 Err(_error) => {
                     #[cfg(target_os = "windows")]
-                    log(&format!(
+                    log_essential(&format!(
                         "D3D11Pool::new failed, falling back to software paint: {}",
                         _error
                     ));
@@ -1924,7 +1953,7 @@ impl CefServer {
             ),
         };
         let ok = open_cef_browser(&state, self.use_gpu, url);
-        log(&format!(
+        log_essential(&format!(
             "browser_host_create_browser id={} returned {}",
             id, ok
         ));
@@ -1950,7 +1979,7 @@ impl CefServer {
             return;
         };
         if !state.recreation_guard.record_failure(Instant::now()) {
-            log(&format!(
+            log_essential(&format!(
                 "browser {}: compositor is dead but recreated {} times within {:?}; giving up",
                 browser_id, BROWSER_RECREATIONS_PER_WINDOW, BROWSER_RECREATION_WINDOW
             ));
@@ -1969,7 +1998,7 @@ impl CefServer {
         state.renderer_alive.store(true, Ordering::Release);
         let ok = open_cef_browser(state, self.use_gpu, &url);
         state.shared_memory.record_browser_recreation();
-        log(&format!(
+        log_essential(&format!(
             "browser {}: compositor stopped responding (GPU process restart); recreated at {} (ok={})",
             browser_id, url, ok
         ));
@@ -2029,7 +2058,7 @@ impl CefServer {
     }
 
     fn load_url(&mut self, browser_id: u32, url: &str) -> Response {
-        log(&format!("load_url: browser_id={}, url={}", browser_id, url));
+        log_essential(&format!("load_url: browser_id={}, url={}", browser_id, url));
         if let Some(state) = self.browsers.get(&browser_id) {
             if let Some(ref browser) = *state.browser.lock().unwrap_or_else(PoisonError::into_inner)
                 && let Some(frame) = Browser::main_frame(browser)
@@ -2528,7 +2557,7 @@ impl CefServer {
 
     /// Shut down all browsers and CEF.
     pub fn shutdown(&mut self) {
-        log("shutting down all browsers");
+        log_essential("shutting down all browsers");
         let ids: Vec<u32> = self.browsers.keys().copied().collect();
         for id in ids {
             self.destroy_browser(id);
@@ -2538,7 +2567,7 @@ impl CefServer {
             do_message_loop_work();
         }
         cef::shutdown();
-        log("CEF shutdown complete");
+        log_essential("CEF shutdown complete");
     }
 }
 

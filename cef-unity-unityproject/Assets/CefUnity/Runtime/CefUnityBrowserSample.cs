@@ -211,12 +211,13 @@ namespace CefUnity.Runtime
                     _zeroFrameWaitMilliseconds = 10f;
 #endif
 
-                // ログのマスタースイッチ: Unity 側 (CefLog) と Rust 側 (client/server)
-                // の両方を _enableLog 一つで制御する。
+                // 詳細ログのスイッチ: Unity 側 (CefLog) の情報ログと、Rust 側 (client/server/CEF)
+                // の毎フレーム級の診断を _enableLog 一つで制御する。起動・終了・障害・復旧・エラーは
+                // これに関係なく CefRuntime.LogDirectory のファイルへ常に書かれる。
                 CefLog.Enabled = _enableLog;
                 // GPU 経路 (macOS: IOSurface / Windows: D3D11 共有テクスチャ) を常に要求する。
                 // サーバー側がプール構築に失敗した場合は software paint へ自動フォールバックする。
-                CefRuntime.Initialize(useGpu: true, enableLog: _enableLog);
+                CefRuntime.Initialize(useGpu: true, verboseLog: _enableLog);
                 _browser = new Browser(_currentWidth, _currentHeight, _url);
                 SubscribeRecoveryEvents();
 

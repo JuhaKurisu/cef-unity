@@ -40,6 +40,7 @@ use ipc_channel::TryRecvError;
 use ipc_channel::ipc::{IpcOneShotServer, IpcReceiver, IpcSender};
 
 use cef_unity_ipc::crash_loop_guard::CrashLoopGuard;
+use cef_unity_ipc::log_file;
 use cef_unity_ipc::{
     AudioSharedMemoryReader, Bootstrap, Command, CommandEnvelope, Response, ServerStatusReader,
     SharedMemoryReader,
@@ -262,7 +263,7 @@ fn start_native_voice(
             wasapi_output::WasapiOutput::start(&instance.audio_flink, target_milliseconds, io_frames);
         let voice = started?;
         instance.native_voice = Some(voice);
-        log_to_file(&format!(
+        log_essential(&format!(
             "native audio started (target={}ms io_frames={})",
             target_milliseconds, io_frames
         ));
@@ -329,7 +330,7 @@ pub(crate) fn report_server_lost(generation: u64, reason: ServerLossReason) {
     }
     let mut report = LOSS_REPORT.lock().unwrap_or_else(PoisonError::into_inner);
     if report.is_none() {
-        log_to_file(&format!("server lost (generation={}): {:?}", generation, reason));
+        log_essential(&format!("server lost (generation={}): {:?}", generation, reason));
         *report = Some(reason);
         LOSS_REPORTED.store(true, Ordering::Release);
     }
@@ -343,10 +344,14 @@ fn take_loss_report() -> Option<ServerLossReason> {
     LOSS_REPORT.lock().unwrap_or_else(PoisonError::into_inner).take()
 }
 
-/// ログ出力の有効/無効は `logging` モジュールが一元管理する
-/// (d3d11/d3d12 の経路も同じフラグとファイルハンドルを共有する)。
-pub(crate) fn log_to_file(message: &str) {
-    logging::write("", message);
+/// 起動・終了・障害・復旧・エラー。常に書く (`logging` モジュール参照)。
+pub(crate) fn log_essential(message: &str) {
+    logging::essential("", message);
+}
+
+/// 毎フレーム級の診断。詳細ログが有効なときだけ書く。
+pub(crate) fn log_verbose(message: &str) {
+    logging::verbose("", message);
 }
 
 /// FFI 境界のパニックガード。extern "C" 越しの unwind は edition 2024 で即 abort
@@ -361,7 +366,7 @@ fn ffi_guard<T>(default: T, function: impl FnOnce() -> T) -> T {
                 .map(|string| string.to_string())
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "<non-string panic payload>".to_string());
-            let _ = std::panic::catch_unwind(|| log_to_file(&format!("FFI panic: {}", message)));
+            let _ = std::panic::catch_unwind(|| log_essential(&format!("FFI panic: {}", message)));
             default
         }
     }
@@ -384,7 +389,7 @@ fn send_command(connection: &ServerConnection, command: Command) -> Result<Respo
     match connection.response_receiver.try_recv_timeout(RESPONSE_TIMEOUT) {
         Ok(response) => Ok(response),
         Err(TryRecvError::Empty) => {
-            log_to_file(&format!(
+            log_essential(&format!(
                 "no response within {:?}; killing the server",
                 RESPONSE_TIMEOUT
             ));
@@ -429,28 +434,32 @@ struct LaunchedServer {
 /// server プロセスを起動し、bootstrap を受け取るまで待つ。失敗時は
 /// `cef_unity_initialize` の戻り値と同じ負の値を返す。
 /// どのスレッドから呼んでもよい (復旧時は専用スレッドで呼ぶ)。
-fn launch_server(use_gpu: bool, enable_log: bool, reset_cache: bool) -> Result<LaunchedServer, i32> {
+fn launch_server(
+    use_gpu: bool,
+    log_settings: &LogSettings,
+    reset_cache: bool,
+) -> Result<LaunchedServer, i32> {
     // Find server binary next to dylib
     let plugin_directory = dylib_directory();
     let server_app = server_binary_path(&plugin_directory);
     if !server_app.exists() {
-        log_to_file(&format!(
+        log_essential(&format!(
             "server binary not found: {}",
             server_app.display()
         ));
         return Err(-3);
     }
-    log_to_file(&format!("server binary: {}", server_app.display()));
+    log_essential(&format!("server binary: {}", server_app.display()));
 
     // Create one-shot server for bootstrap
     let (oneshot_server, server_name) = match IpcOneShotServer::<Bootstrap>::new() {
         Ok(pair) => pair,
         Err(error) => {
-            log_to_file(&format!("failed to create one-shot server: {}", error));
+            log_essential(&format!("failed to create one-shot server: {}", error));
             return Err(-4);
         }
     };
-    log_to_file(&format!("one-shot server name = {}", server_name));
+    log_verbose(&format!("one-shot server name = {}", server_name));
 
     // Launch server process with --ipc-server argument。
     // Windows では D3D11 共有テクスチャを DuplicateHandle で渡すために
@@ -458,21 +467,26 @@ fn launch_server(use_gpu: bool, enable_log: bool, reset_cache: bool) -> Result<L
     let client_pid = std::process::id();
     // Chromium と同じ `--name=value` 形式で渡す。CEF が自分を起動し直すときに
     // 引数を Chromium 形式へ組み直すため、空白区切りだと値が位置引数へ分離される。
-    let mut child = match std::process::Command::new(&server_app)
+    let mut command = std::process::Command::new(&server_app);
+    command
         .arg(format!("--ipc-server={}", server_name))
         .arg(format!("--client-pid={}", client_pid))
         .arg(format!("--use-gpu={}", if use_gpu { 1 } else { 0 }))
-        .arg(format!("--logging={}", if enable_log { 1 } else { 0 }))
-        .arg(format!("--reset-cache={}", if reset_cache { 1 } else { 0 }))
-        .spawn()
-    {
+        .arg(format!("--log-verbose={}", if log_settings.verbose { 1 } else { 0 }))
+        .arg(format!("--reset-cache={}", if reset_cache { 1 } else { 0 }));
+    if let Some(directory) = &log_settings.directory {
+        let mut argument = std::ffi::OsString::from("--log-directory=");
+        argument.push(directory);
+        command.arg(argument);
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            log_to_file(&format!("failed to spawn server: {}", error));
+            log_essential(&format!("failed to spawn server: {}", error));
             return Err(-4);
         }
     };
-    log_to_file(&format!("server spawned (pid={})", child.id()));
+    log_essential(&format!("server spawned (pid={})", child.id()));
 
     // Wait for server to connect and send bootstrap.
     // accept() 自体は無期限ブロックするため別スレッドで行い、server の早期死亡
@@ -487,32 +501,32 @@ fn launch_server(use_gpu: bool, enable_log: bool, reset_cache: bool) -> Result<L
         match bootstrap_receiver.recv_timeout(std::time::Duration::from_millis(50)) {
             Ok(Ok((_receiver, bootstrap))) => break bootstrap,
             Ok(Err(error)) => {
-                log_to_file(&format!("failed to accept bootstrap: {}", error));
+                log_essential(&format!("failed to accept bootstrap: {}", error));
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(-5);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if let Ok(Some(status)) = child.try_wait() {
-                    log_to_file(&format!("server exited during init: {}", status));
+                    log_essential(&format!("server exited during init: {}", status));
                     return Err(-6);
                 }
                 if Instant::now() >= deadline {
-                    log_to_file("bootstrap accept timed out (15s); killing server");
+                    log_essential("bootstrap accept timed out (15s); killing server");
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(-7);
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                log_to_file("bootstrap accept thread terminated unexpectedly");
+                log_essential("bootstrap accept thread terminated unexpectedly");
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(-5);
             }
         }
     };
-    log_to_file("bootstrap received from server");
+    log_verbose("bootstrap received from server");
 
     Ok(LaunchedServer {
         command_sender: bootstrap.command_sender,
@@ -531,7 +545,7 @@ fn install_server(launched: LaunchedServer, use_gpu: bool) {
         Ok(reader) => Some(reader),
         Err(error) => {
             // heartbeat が読めなくても、プロセス終了と IPC エラーの検出は効く。
-            log_to_file(&format!("server status open failed (heartbeat not watched): {}", error));
+            log_essential(&format!("server status open failed (heartbeat not watched): {}", error));
             None
         }
     };
@@ -547,7 +561,7 @@ fn install_server(launched: LaunchedServer, use_gpu: bool) {
     *LOSS_REPORT.lock().unwrap_or_else(PoisonError::into_inner) = None;
     LOSS_REPORTED.store(false, Ordering::Release);
     CURRENT_GENERATION.store(generation, Ordering::Release);
-    log_to_file(&format!(
+    log_essential(&format!(
         "server installed (pid={}, generation={})",
         launched.server_pid, generation
     ));
@@ -557,18 +571,18 @@ fn install_server(launched: LaunchedServer, use_gpu: bool) {
     #[cfg(target_os = "macos")]
     if use_gpu {
         let service_name = cef_unity_ipc::iosurface_service_name(launched.server_pid);
-        log_to_file(&format!("connecting to Mach IOSurface service: {}", service_name));
+        log_verbose(&format!("connecting to Mach IOSurface service: {}", service_name));
         if let Ok(c_service_name) = std::ffi::CString::new(service_name.as_str()) {
             let result = unsafe { mach_iosurface_client_connect(c_service_name.as_ptr()) };
             IOSURFACE_CONNECTED.store(result == 0, Ordering::SeqCst);
             if result == 0 {
-                log_to_file("Mach IOSurface service connected");
+                log_verbose("Mach IOSurface service connected");
             } else {
-                log_to_file(&format!("Mach IOSurface service connect failed: {}", result));
+                log_essential(&format!("Mach IOSurface service connect failed: {}", result));
             }
         } else {
             // service name に NUL が混入した場合のみ。接続失敗と同じく非致命 (CPU 経路へ)。
-            log_to_file("iosurface service name contained NUL; skipping connect");
+            log_essential("iosurface service name contained NUL; skipping connect");
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -634,10 +648,18 @@ enum RecoveryPhase {
     Failed,
 }
 
+/// server に渡すログの設定。Initialize で受け取り、復旧で起動し直すときも同じものを渡す。
+#[derive(Clone)]
+struct LogSettings {
+    verbose: bool,
+    /// None ならファイルに書かない。
+    directory: Option<PathBuf>,
+}
+
 struct RecoveryState {
     phase: RecoveryPhase,
     use_gpu: bool,
-    enable_log: bool,
+    log_settings: LogSettings,
     loss_guard: CrashLoopGuard,
     loss_count: u32,
     recovery_count: u32,
@@ -647,7 +669,10 @@ struct RecoveryState {
 static RECOVERY: Mutex<RecoveryState> = Mutex::new(RecoveryState {
     phase: RecoveryPhase::Idle,
     use_gpu: true,
-    enable_log: false,
+    log_settings: LogSettings {
+        verbose: false,
+        directory: None,
+    },
     loss_guard: CrashLoopGuard::new(SERVER_RECOVERIES_PER_WINDOW, SERVER_RECOVERY_WINDOW),
     loss_count: 0,
     recovery_count: 0,
@@ -672,13 +697,13 @@ fn drive_recovery() {
             release_server(true);
             suspend_browsers();
             if recovery.loss_guard.record_failure(now) {
-                log_to_file(&format!("recovery: restarting the server ({:?})", reason));
+                log_essential(&format!("recovery: restarting the server ({:?})", reason));
                 recovery.phase = RecoveryPhase::WaitingToLaunch {
                     launch_at: now,
                     attempt: 0,
                 };
             } else {
-                log_to_file(&format!(
+                log_essential(&format!(
                     "recovery: server lost {} times within {:?}; giving up",
                     SERVER_RECOVERIES_PER_WINDOW + 1,
                     SERVER_RECOVERY_WINDOW
@@ -691,16 +716,16 @@ fn drive_recovery() {
                 return;
             }
             let attempt = *attempt;
-            let (use_gpu, enable_log) = (recovery.use_gpu, recovery.enable_log);
+            let (use_gpu, log_settings) = (recovery.use_gpu, recovery.log_settings.clone());
             let reset_cache = should_reset_cache(attempt);
-            log_to_file(&format!(
+            log_essential(&format!(
                 "recovery: launch attempt {} (reset_cache={})",
                 attempt + 1,
                 reset_cache
             ));
             let (sender, receiver) = mpsc::channel();
             std::thread::spawn(move || {
-                let result = launch_server(use_gpu, enable_log, reset_cache);
+                let result = launch_server(use_gpu, &log_settings, reset_cache);
                 // 受け手が居ない (待っている間に Shutdown された) なら起動した server を片付ける。
                 if let Err(mpsc::SendError(Ok(launched))) = sender.send(result) {
                     kill_server(&launched.process);
@@ -714,7 +739,7 @@ fn drive_recovery() {
                 Err(mpsc::TryRecvError::Empty) => return,
                 Ok(Ok(launched)) => Some(launched),
                 Ok(Err(code)) => {
-                    log_to_file(&format!("recovery: launch attempt {} failed ({})", attempt + 1, code));
+                    log_essential(&format!("recovery: launch attempt {} failed ({})", attempt + 1, code));
                     None
                 }
                 Err(mpsc::TryRecvError::Disconnected) => None,
@@ -731,7 +756,7 @@ fn drive_recovery() {
             if recovered {
                 recovery.recovery_count += 1;
                 recovery.phase = RecoveryPhase::Running;
-                log_to_file(&format!("recovery: server recovered (#{})", recovery.recovery_count));
+                log_essential(&format!("recovery: server recovered (#{})", recovery.recovery_count));
                 return;
             }
             recovery.phase = match launch_retry_delay(attempt + 1) {
@@ -740,7 +765,7 @@ fn drive_recovery() {
                     attempt: attempt + 1,
                 },
                 None => {
-                    log_to_file("recovery: all launch attempts failed; giving up");
+                    log_essential("recovery: all launch attempts failed; giving up");
                     RecoveryPhase::Failed
                 }
             };
@@ -813,14 +838,14 @@ fn reattach_browsers() -> bool {
         if let Some(url) = instance.shared_memory.read_main_frame_url() {
             instance.restore_url = url;
         }
-        log_to_file(&format!(
+        log_essential(&format!(
             "recovery: recreating browser {}x{} at {}",
             instance.width, instance.height, instance.restore_url
         ));
         match open_browser(connection, instance.width, instance.height, &instance.restore_url) {
             Ok(opened) => instance.attach(opened, connection.generation),
             Err(error) => {
-                log_to_file(&format!("recovery: recreating a browser failed: {}", error));
+                log_essential(&format!("recovery: recreating a browser failed: {}", error));
                 return false;
             }
         }
@@ -859,27 +884,44 @@ fn restart_pending_native_voices() {
 /// Initialize: launch CEF server process and connect via ipc-channel.
 /// `use_gpu`: 非 0 で accelerated paint (GPU 共有テクスチャ / IOSurface) を使う。
 /// 0 で software paint (CPU 経由の shm BGRA 転送) を強制する。
-/// `enable_log`: 非 0 で client/server のファイルログを有効にする。0 で全ログ抑制。
-/// Unity 側のマスターログフラグから渡す。
+/// `log_verbose`: 非 0 で毎フレーム級の診断ログも書く (CEF 本体のログも VERBOSE)。
+/// 0 なら起動・終了・障害・復旧・エラーだけを書く。
+/// `log_directory`: ログを置くディレクトリ (NUL 終端 UTF-8)。client / server / CEF 本体が
+/// 起動ごとに別ファイルを作る。null または空文字ならファイルに書かない。
 /// Returns 0 on success, non-zero on failure.
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_unity_initialize(use_gpu: i32, enable_log: i32) -> i32 {
+pub extern "C" fn cef_unity_initialize(
+    use_gpu: i32,
+    log_verbose: i32,
+    log_directory: *const c_char,
+) -> i32 {
     ffi_guard(-1, || {
-        // ログ有効/無効を最初に確定させる (以降の log_to_file がこれに従う)。
-        logging::set_enabled(enable_log != 0);
-
         if INITIALIZED.load(Ordering::SeqCst) {
             return 0;
         }
 
+        // ログの設定を最初に確定させる (以降の log_essential / log_verbose がこれに従う)。
+        let log_settings = LogSettings {
+            verbose: log_verbose != 0,
+            directory: (!log_directory.is_null())
+                .then(|| unsafe { CStr::from_ptr(log_directory) }.to_string_lossy().into_owned())
+                .filter(|directory| !directory.is_empty())
+                .map(PathBuf::from),
+        };
+        open_client_log(&log_settings);
+
         let use_gpu_bool = use_gpu != 0;
         USE_GPU_MODE.store(use_gpu_bool, Ordering::SeqCst);
-        log_to_file(&format!(
-            "---- cef_unity_initialize(use_gpu={}) called (IPC client mode) ----",
-            use_gpu_bool
+        log_essential(&format!(
+            "---- cef_unity_initialize(use_gpu={}, log_verbose={}) client_pid={} os={} arch={} ----",
+            use_gpu_bool,
+            log_settings.verbose,
+            std::process::id(),
+            std::env::consts::OS,
+            std::env::consts::ARCH
         ));
 
-        let launched = match launch_server(use_gpu_bool, enable_log != 0, false) {
+        let launched = match launch_server(use_gpu_bool, &log_settings, false) {
             Ok(launched) => launched,
             Err(code) => return code,
         };
@@ -888,7 +930,7 @@ pub extern "C" fn cef_unity_initialize(use_gpu: i32, enable_log: i32) -> i32 {
         let mut recovery = RECOVERY.lock().unwrap_or_else(PoisonError::into_inner);
         recovery.phase = RecoveryPhase::Running;
         recovery.use_gpu = use_gpu_bool;
-        recovery.enable_log = enable_log != 0;
+        recovery.log_settings = log_settings;
         recovery.loss_guard.reset();
         recovery.loss_count = 0;
         recovery.recovery_count = 0;
@@ -896,9 +938,20 @@ pub extern "C" fn cef_unity_initialize(use_gpu: i32, enable_log: i32) -> i32 {
         drop(recovery);
 
         INITIALIZED.store(true, Ordering::SeqCst);
-        log_to_file("initialized successfully (IPC client)");
+        log_essential("initialized successfully (IPC client)");
         0
     })
+}
+
+/// client のログファイルを開く (Initialize のたびに新しいファイル)。
+fn open_client_log(log_settings: &LogSettings) {
+    log_file::close();
+    log_file::set_verbose(log_settings.verbose);
+    log_file::install_panic_hook();
+    if let Some(directory) = &log_settings.directory {
+        // 開けなくても初期化は続ける (ログが無いだけ)。
+        let _ = log_file::open(directory, "client");
+    }
 }
 
 /// 毎フレーム、メインスレッドから呼ぶ。server を失っていたら復旧を進める。
@@ -979,7 +1032,7 @@ pub extern "C" fn cef_unity_shutdown() {
         if !INITIALIZED.load(Ordering::SeqCst) {
             return;
         }
-        log_to_file("cef_unity_shutdown()");
+        log_essential("cef_unity_shutdown()");
 
         let phase = std::mem::replace(
             &mut RECOVERY.lock().unwrap_or_else(PoisonError::into_inner).phase,
@@ -999,7 +1052,8 @@ pub extern "C" fn cef_unity_shutdown() {
         IOSURFACE_CONNECTED.store(false, Ordering::SeqCst);
         USE_GPU_MODE.store(true, Ordering::SeqCst);
         NATIVE_VOICE_RESTART_PENDING.store(false, Ordering::Release);
-        log_to_file("shutdown complete");
+        log_essential("shutdown complete");
+        log_file::close();
     })
 }
 
@@ -1131,7 +1185,7 @@ fn open_browser(
             d3d11_fence_handle,
             audio_shared_memory_flink,
         } => {
-            log_to_file(&format!(
+            log_essential(&format!(
                 "browser created: id={}, shm={}, fence_handle=0x{:x}, audio_shm={}",
                 browser_id, shared_memory_flink, d3d11_fence_handle, audio_shared_memory_flink
             ));
@@ -1141,7 +1195,7 @@ fn open_browser(
                 Ok(reader) => Some(reader),
                 Err(error) => {
                     // 音声は必須ではないので open 失敗時は警告のみ。
-                    log_to_file(&format!("audio_shm_open failed (audio disabled): {}", error));
+                    log_essential(&format!("audio_shm_open failed (audio disabled): {}", error));
                     None
                 }
             };
@@ -1152,12 +1206,12 @@ fn open_browser(
                     // D3D11/D3D12 双方無接続でも fence_handle 自体は同じ NT 共有 HANDLE。
                     if d3d11::is_connected() {
                         if let Err(error) = d3d11::open_fence(d3d11_fence_handle) {
-                            log_to_file(&format!("d3d11::open_fence failed: {}", error));
+                            log_essential(&format!("d3d11::open_fence failed: {}", error));
                         }
                     }
                     if d3d12::is_connected() {
                         if let Err(error) = d3d12::open_fence(d3d11_fence_handle) {
-                            log_to_file(&format!("d3d12::open_fence failed: {}", error));
+                            log_essential(&format!("d3d12::open_fence failed: {}", error));
                         }
                     }
                 }
@@ -1212,7 +1266,7 @@ pub extern "C" fn cef_unity_create_browser(
         }
 
         let url_string = unsafe { CStr::from_ptr(url) }.to_str().unwrap_or("");
-        log_to_file(&format!(
+        log_essential(&format!(
             "cef_unity_create_browser({}x{}, {})",
             width, height, url_string
         ));
@@ -1226,7 +1280,7 @@ pub extern "C" fn cef_unity_create_browser(
         let opened = match open_browser(connection, width, height, url_string) {
             Ok(opened) => opened,
             Err(error) => {
-                log_to_file(&format!("create_browser failed: {}", error));
+                log_essential(&format!("create_browser failed: {}", error));
                 return std::ptr::null_mut();
             }
         };
@@ -1579,15 +1633,15 @@ pub extern "C" fn cef_unity_get_url(
         ) {
             Ok(Response::CurrentUrl { url }) => url,
             Ok(Response::Error { message }) => {
-                log_to_file(&format!("get_url error: {}", message));
+                log_verbose(&format!("get_url error: {}", message));
                 return 0;
             }
             Ok(other) => {
-                log_to_file(&format!("get_url unexpected response: {:?}", other));
+                log_verbose(&format!("get_url unexpected response: {:?}", other));
                 return 0;
             }
             Err(error) => {
-                log_to_file(&format!("get_url IPC error: {}", error));
+                log_verbose(&format!("get_url IPC error: {}", error));
                 return 0;
             }
         };
@@ -1782,7 +1836,7 @@ pub extern "C" fn cef_unity_audio_native_start(
                 0
             }
             Err(error) => {
-                log_to_file(&format!("native audio start failed: {}", error));
+                log_essential(&format!("native audio start failed: {}", error));
                 -1
             }
         }
@@ -1800,7 +1854,7 @@ pub extern "C" fn cef_unity_audio_native_stop(handle: *mut CefUnityBrowser) {
         instance.native_voice_parameters = None;
         if native_voice_running(instance) {
             stop_native_voice(instance);
-            log_to_file("native audio stopped");
+            log_verbose("native audio stopped");
         }
     })
 }
@@ -1878,12 +1932,12 @@ fn blocking_simple(connection: &ServerConnection, command: Command) -> i32 {
     match send_command(connection, command) {
         Ok(Response::Ok) => 0,
         Ok(Response::Error { message }) => {
-            log_to_file(&format!("blocking command error: {}", message));
+            log_verbose(&format!("blocking command error: {}", message));
             -1
         }
         Ok(_) => 0,
         Err(error) => {
-            log_to_file(&format!("blocking command IPC error: {}", error));
+            log_verbose(&format!("blocking command IPC error: {}", error));
             -1
         }
     }
@@ -2323,7 +2377,7 @@ pub extern "C" fn cef_unity_get_iosurface_info(
             Some((surface_id, width, height, format)) => {
                 let count = ACCELERATED_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                 if count <= 5 || count % 100 == 0 {
-                    log_to_file(&format!(
+                    log_verbose(&format!(
                         "get_iosurface_info #{}: surface_id={} {}x{} fmt={}",
                         count, surface_id, width, height, format
                     ));
@@ -2557,7 +2611,7 @@ pub extern "C" fn cef_unity_execute_javascript_blocking(
 #[unsafe(no_mangle)]
 pub extern "C" fn UnityPluginLoad(unity_interfaces: *mut std::ffi::c_void) {
     ffi_guard((), || {
-        log_to_file(&format!(
+        log_essential(&format!(
             "UnityPluginLoad called (interfaces={:p})",
             unity_interfaces
         ));
@@ -2565,7 +2619,7 @@ pub extern "C" fn UnityPluginLoad(unity_interfaces: *mut std::ffi::c_void) {
         {
             d3d11::set_unity_interfaces(unity_interfaces as *mut d3d11::IUnityInterfaces);
             d3d12::set_unity_interfaces(unity_interfaces);
-            log_to_file(&format!(
+            log_essential(&format!(
                 "UnityPluginLoad: d3d11_connected={} d3d12_connected={}",
                 d3d11::is_connected(),
                 d3d12::is_connected()
@@ -2603,7 +2657,7 @@ pub extern "C" fn cef_unity_set_external_d3d11_device(device: *mut std::ffi::c_v
         #[cfg(target_os = "windows")]
         {
             d3d11::set_external_device(device);
-            log_to_file(&format!("external d3d11 device set: {:p}", device));
+            log_essential(&format!("external d3d11 device set: {:p}", device));
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -2680,7 +2734,7 @@ pub extern "C" fn cef_unity_receive_d3d11_texture(
             // GPU-side wait: Unity の immediate context に fence_value 到達待ちを発行する。
             // CPU はブロックせず、Unity の以降の描画コマンドが GPU 上で server.Copy 完了を待つ。
             if let Err(error) = d3d11::wait_fence(fence_value) {
-                log_to_file(&format!("d3d11::wait_fence({}) failed: {}", fence_value, error));
+                log_verbose(&format!("d3d11::wait_fence({}) failed: {}", fence_value, error));
             }
             let Some((texture_pointer, opened_width, opened_height)) = d3d11::open_or_cached(handle_value, width, height) else {
                 return std::ptr::null_mut();
@@ -2729,7 +2783,7 @@ pub extern "C" fn cef_unity_receive_d3d12_texture(
             // GPU-side wait: Unity の D3D12 queue に fence_value 到達待ちを発行する。
             // CPU はブロックせず、Unity の以降の queue 操作が GPU 上で server.Copy 完了を待つ。
             if let Err(error) = d3d12::wait_fence(fence_value) {
-                log_to_file(&format!("d3d12::wait_fence({}) failed: {}", fence_value, error));
+                log_verbose(&format!("d3d12::wait_fence({}) failed: {}", fence_value, error));
             }
             let Some((resource_pointer, opened_width, opened_height)) = d3d12::open_or_cached(handle_value, width, height) else {
                 return std::ptr::null_mut();

@@ -161,17 +161,42 @@ namespace CefUnity.Interop
     public static class CefRuntime
     {
         /// <summary>
+        ///     <see cref="Initialize" /> で <c>logDirectory</c> を省略したときのログの保存先。
+        ///     Unity では Runtime アセンブリが起動時に
+        ///     <c>Application.persistentDataPath/CefUnity/Logs</c> を入れる。null ならファイルに書かない。
+        /// </summary>
+        public static string? DefaultLogDirectory { get; set; }
+
+        /// <summary>今回の <see cref="Initialize" /> がログを書いているディレクトリ (書いていなければ null)。</summary>
+        public static string? LogDirectory { get; private set; }
+
+        /// <summary>
         ///     CEF サーバープロセスを起動し IPC を初期化する。
         ///     <paramref name="useGpu" /> が true なら GPU 経路 (accelerated paint: macOS の IOSurface、
         ///     Windows の D3D11/D3D12 共有テクスチャ) を使い、false なら CPU 経路 (software paint:
         ///     共有メモリ経由の BGRA 転送) を強制する。
+        ///     <para>
+        ///     ログは <paramref name="logDirectory" /> (省略時は <see cref="DefaultLogDirectory" />) に
+        ///     client / server / CEF 本体がそれぞれ起動ごとに別ファイルで書く。起動・終了・障害・復旧・
+        ///     エラーは常に書き、<paramref name="verboseLog" /> が true なら毎フレーム級の診断も書く。
+        ///     古いファイルは種類ごとに 10 個を残して消える。
+        ///     </para>
         /// </summary>
-        public static void Initialize(bool useGpu = true, bool enableLog = false)
+        public static void Initialize(bool useGpu = true, bool verboseLog = false, string? logDirectory = null)
         {
+            var directory = logDirectory ?? DefaultLogDirectory;
+            if (string.IsNullOrEmpty(directory)) directory = null;
             int result;
             try
             {
-                result = NativeMethods.cef_unity_initialize(useGpu ? 1 : 0, enableLog ? 1 : 0);
+                unsafe
+                {
+                    fixed (byte* directoryPointer = directory == null ? null : Browser.ToUtf8Null(directory))
+                    {
+                        result = NativeMethods.cef_unity_initialize(useGpu ? 1 : 0, verboseLog ? 1 : 0,
+                            directoryPointer);
+                    }
+                }
             }
             catch (DllNotFoundException)
             {
@@ -184,9 +209,10 @@ namespace CefUnity.Interop
                 {
                     -3 => "cef-unity-server binary not found.",
                     -4 => "Failed to start cef-unity-server process. Check file permissions and console log for details.",
-                    -5 => "cef-unity-server started but failed to connect. The server may have crashed on startup — check the server log at $TMPDIR/cef_unity_debug.log.",
+                    -5 => $"cef-unity-server started but failed to connect. The server may have crashed on startup — check the logs in {directory ?? "(no log directory)"}.",
                     _ => $"CEF initialization failed (code {result})"
                 });
+            LogDirectory = directory;
             ServerStatusTracker.Reset(GetServerStatus());
         }
 
@@ -996,7 +1022,7 @@ namespace CefUnity.Interop
             if (_disposed) throw new ObjectDisposedException(nameof(Browser));
         }
 
-        private static byte[] ToUtf8Null(string text)
+        internal static byte[] ToUtf8Null(string text)
         {
             var bytes = new byte[Encoding.UTF8.GetByteCount(text) + 1];
             Encoding.UTF8.GetBytes(text, bytes);

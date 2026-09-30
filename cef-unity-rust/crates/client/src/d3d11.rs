@@ -25,7 +25,11 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::core::Interface;
 
 fn log_debug(message: &str) {
-    crate::logging::write("d3d11", message);
+    crate::logging::verbose("d3d11", message);
+}
+
+fn log_essential(message: &str) {
+    crate::logging::essential("d3d11", message);
 }
 
 // ---- Unity Native Plugin Interface (subset) ----
@@ -311,7 +315,7 @@ pub fn open_or_cached(
             match ID3D11Device::from_raw_borrowed(&raw) {
                 Some(device) => device.clone(),
                 None => {
-                    log_debug(&format!(
+                    log_essential(&format!(
                         "open_or_cached: from_raw_borrowed failed (device_pointer={:p})",
                         device_pointer
                     ));
@@ -322,7 +326,7 @@ pub fn open_or_cached(
         let device1: ID3D11Device1 = match device.cast() {
             Ok(device1) => device1,
             Err(error) => {
-                log_debug(&format!("cast to ID3D11Device1 failed: {:?}", error));
+                log_essential(&format!("cast to ID3D11Device1 failed: {:?}", error));
                 return None;
             }
         };
@@ -331,7 +335,7 @@ pub fn open_or_cached(
         let texture: ID3D11Texture2D = match unsafe { device1.OpenSharedResource1(handle) } {
             Ok(texture) => texture,
             Err(error) => {
-                log_debug(&format!(
+                log_essential(&format!(
                     "OpenSharedResource1 failed for handle=0x{:x}: {:?}",
                     handle_value, error
                 ));

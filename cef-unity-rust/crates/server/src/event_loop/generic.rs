@@ -27,6 +27,10 @@ fn log(message: &str) {
     crate::log(message);
 }
 
+fn log_essential(message: &str) {
+    crate::log_essential(message);
+}
+
 pub fn run_event_loop(mut state: ServerState) -> ServerState {
     log("entering generic event loop");
 
@@ -35,7 +39,7 @@ pub fn run_event_loop(mut state: ServerState) -> ServerState {
             tick(&mut state);
         }));
         if result.is_err() {
-            log("event loop tick panicked, shutting down");
+            log_essential("event loop tick panicked, shutting down");
             state.running = false;
         }
 
@@ -91,7 +95,7 @@ fn drain_commands(state: &mut ServerState) {
                 let response = state.cef_server.handle_command(envelope.command);
                 if envelope.expects_response {
                     if let Err(error) = state.response_sender.send(response) {
-                        log(&format!("send error: {}", error));
+                        log_essential(&format!("send error: {}", error));
                         state.running = false;
                         break;
                     }
@@ -103,7 +107,7 @@ fn drain_commands(state: &mut ServerState) {
             }
             Err(mpsc::TryRecvError::Empty) => break,
             Err(mpsc::TryRecvError::Disconnected) => {
-                log("IPC bridge disconnected");
+                log_essential("IPC bridge disconnected");
                 state.running = false;
                 break;
             }

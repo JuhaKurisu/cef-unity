@@ -74,7 +74,8 @@ if (viewerOptions.Record)
 Environment.SetEnvironmentVariable("SDL_IME_SUPPORT_EXTENDED_TEXT", "1");
 MacMomentumScrollSupport.Enable();
 
-CefRuntime.Initialize(useGpu: true);
+CefRuntime.Initialize(useGpu: true, logDirectory: Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CefUnity.Viewer", "Logs"));
 D3D11GraphicsDevice? graphicsDevice = null;
 try
 {

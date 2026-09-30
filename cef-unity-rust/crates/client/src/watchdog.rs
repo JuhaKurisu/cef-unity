@@ -14,7 +14,7 @@ use std::thread::JoinHandle;
 use cef_unity_ipc::ServerStatusReader;
 
 use crate::recovery_policy::{HEARTBEAT_STALL_POLLS, HeartbeatMonitor, WATCHDOG_POLL_INTERVAL};
-use crate::{ServerLossReason, log_to_file, report_server_lost};
+use crate::{ServerLossReason, log_essential, report_server_lost};
 
 pub struct Watchdog {
     stop_requested: Arc<AtomicBool>,
@@ -73,7 +73,7 @@ fn watch(
             .ok()
             .flatten();
         if let Some(exit_status) = exit_status {
-            log_to_file(&format!("watchdog: server exited ({})", exit_status));
+            log_essential(&format!("watchdog: server exited ({})", exit_status));
             report_server_lost(generation, ServerLossReason::Exited);
             return status_reader;
         }
@@ -81,7 +81,7 @@ fn watch(
         if let Some(reader) = status_reader.as_ref()
             && heartbeat_monitor.observe(reader.heartbeat())
         {
-            log_to_file(&format!(
+            log_essential(&format!(
                 "watchdog: server heartbeat stalled for {:?}; killing it",
                 WATCHDOG_POLL_INTERVAL * HEARTBEAT_STALL_POLLS
             ));
