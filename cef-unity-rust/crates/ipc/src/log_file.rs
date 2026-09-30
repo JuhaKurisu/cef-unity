@@ -93,8 +93,12 @@ pub fn write(level: LogLevel, message: &str) {
     if level == LogLevel::Verbose && !is_verbose() {
         return;
     }
+    let state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+    write_locked(state, level, message);
+}
+
+fn write_locked(mut state: std::sync::MutexGuard<'_, State>, level: LogLevel, message: &str) {
     let line = format!("{} {}\n", format_timestamp(SystemTime::now()), message);
-    let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
     match state.sink.as_mut() {
         Some(sink) => sink.write_line(&line),
         None => {
@@ -132,7 +136,17 @@ pub fn install_panic_hook() {
         std::panic::set_hook(Box::new(move |information| {
             let backtrace = std::backtrace::Backtrace::force_capture();
             let thread = std::thread::current();
-            write(
+            // ログを書いている最中 (ロック保持中) の panic で待ち続けないよう、取れなければ諦める。
+            let state = match STATE.try_lock() {
+                Ok(state) => state,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    previous_hook(information);
+                    return;
+                }
+            };
+            write_locked(
+                state,
                 LogLevel::Essential,
                 &format!(
                     "panic on thread '{}': {}\n{}",
@@ -239,6 +253,33 @@ mod tests {
         let later = session_path(directory, "server", 1, UNIX_EPOCH + Duration::from_secs(1_790_000_001));
         assert_eq!(earlier, directory.join("server-20260921T141320Z-999.log"));
         assert!(earlier.file_name() < later.file_name(), "名前順が古い順になること");
+    }
+
+    /// STATE はプロセスで 1 つなので、書き込み先を開くテストはこの 1 本にまとめる。
+    #[test]
+    fn writes_essential_lines_pending_lines_and_panics_to_the_session_file() {
+        let directory = std::env::temp_dir().join(format!("cef_unity_log_write_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        set_verbose(false);
+        write(LogLevel::Essential, "before open");
+        write(LogLevel::Verbose, "verbose while disabled");
+
+        let path = open(&directory, "client").unwrap();
+        install_panic_hook();
+        write(LogLevel::Essential, "after open");
+        let _ = std::panic::catch_unwind(|| panic!("test panic"));
+        close();
+        write(LogLevel::Essential, "after close");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&directory);
+        let before = text.find("before open").expect("開く前の Essential 行が書き出されること");
+        let after = text.find("after open").expect("開いた後の行が書かれること");
+        assert!(before < after, "開く前の行が先頭に来ること");
+        assert!(!text.contains("verbose while disabled"), "無効な Verbose 行は書かないこと");
+        assert!(text.contains("test panic"), "panic の内容が書かれること: {}", text);
+        assert!(text.contains("log_file.rs"), "panic の発生箇所が書かれること");
+        assert!(!text.contains("after close"), "閉じた後の行は書かないこと");
     }
 
     #[test]
