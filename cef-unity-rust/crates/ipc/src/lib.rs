@@ -9,6 +9,7 @@ use shared_memory::{Shmem, ShmemConf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub mod crash_loop_guard;
+pub mod log_file;
 
 // ---------------------------------------------------------------------------
 // Wire protocol

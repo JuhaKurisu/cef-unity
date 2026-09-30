@@ -101,6 +101,10 @@ fn log(message: &str) {
     crate::log(message);
 }
 
+fn log_essential(message: &str) {
+    crate::log_essential(message);
+}
+
 unsafe extern "C" fn timer_callback(_timer: CFRunLoopTimerRef, _info: *mut std::ffi::c_void) {
     if IN_TICK.with(|flag| flag.replace(true)) {
         return; // 再入 (ネスト run loop からの再発火) — &mut の二重作成を避ける
@@ -116,7 +120,7 @@ unsafe extern "C" fn timer_callback(_timer: CFRunLoopTimerRef, _info: *mut std::
             .map(|text| text.to_string())
             .or_else(|| payload.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "<non-string panic payload>".to_string());
-        log(&format!("timer_callback panicked: {}", message));
+        log_essential(&format!("timer_callback panicked: {}", message));
         PANICKED.store(true, Ordering::Release);
         unsafe {
             CFRunLoopStop(CFRunLoopGetMain());
@@ -190,7 +194,7 @@ fn drain_commands(state: &mut ServerState) {
                 let response = state.cef_server.handle_command(envelope.command);
                 if envelope.expects_response
                     && let Err(error) = state.response_sender.send(response) {
-                        log(&format!("send error: {}", error));
+                        log_essential(&format!("send error: {}", error));
                         state.running = false;
                         break;
                     }
@@ -201,7 +205,7 @@ fn drain_commands(state: &mut ServerState) {
             }
             Err(mpsc::TryRecvError::Empty) => break,
             Err(mpsc::TryRecvError::Disconnected) => {
-                log("IPC bridge disconnected");
+                log_essential("IPC bridge disconnected");
                 state.running = false;
                 break;
             }

@@ -577,11 +577,39 @@ Shutdown・server 再起動時に Mach 受信ポートを破棄するように�
 既存の問題 (非同期コピーの完了ハンドラ用 static が参照を持ち続けていた) を直し、
 Harness の全コマンド実行後に `$TMPDIR/cef-unity-shm-*` が 0 件になることを確認した。
 
+## ログの常時記録のマージ前計測（2026-09-30）
+
+対象は `feat/persistent-logs` (`docs/LOGGING.md`)。ログの保存先を利用側が渡すようにし、
+起動・終了・障害・復旧・エラーは常にファイルへ書くようにした。毎フレーム級の計装の有無は
+従来の `--logging` から `--log-verbose` の判定に変わった (harness は従来どおり有効で計測)。
+
+**macOS** (load 5.6〜10.9 と高い):
+
+| コマンド | 実測 |
+|---|---|
+| `paint-statistics 20 1920 1080 animation` | 立ち上がり後は `paints=59〜61/s`、`dropped=0`・`poisoned_total=0`、`received_median=61`、`gpu_torn=0` / `gpu_rollback=0` |
+| `zero-frame-wait 15 10 1920 1080 intermittent` を main (A) と交互に 3 回ずつ | A: `zero_frame_share=29.5% / 26.7% / 61.7%`、B: `14.8% / 63.9% / 67.2%`。`received/s=5.0〜5.1`・`spin_share=42.4〜43.4%`・`block_avg=7.0〜7.4ms` は両者同じ |
+| `lifecycle 5` | 5/5 完走、`mach_ports` 70→71→71→71→71、`server_processes_final=0` |
+
+`zero_frame_share` は負荷が高いと main でも 27〜62% と揺れるため、前回の記録 (51〜55%) との
+比較ではなく同じ負荷での A/B で判定した。
+
+**Windows 実機** (CI 成果物 + win-x64 の harness を、スペースと日本語を含む
+`G:\tmp\cef-unity\log test ログ\harness` に置いて実行):
+
+| コマンド | 実測 |
+|---|---|
+| `smoke` | `SMOKE_OK frames=136`。`logs\` に client / server / cef の 3 ファイル (verbose 無効で cef は WARNING の 1 行 208 バイト) |
+| `crash-recovery server-kill gpu` | OK。落とした server のログが残り、client のログに `server lost` → `recovery: server recovered (#1)` |
+| `crash-recovery renderer gpu` | OK。server のログに `on_render_process_terminated: status=2 error_code=-1073741819 error=STATUS_ACCESS_VIOLATION` など 3 回分 |
+
+**判定: 回帰なし。**
+
 ## 計測上の注意
 
 - harness は BF#1 と recv の間にゲーム処理・描画が入らないため、0F 待ちの spin は**最悪ケース**を測る。
   実 Unity では重いフレームほど窓が食われて spin は減る
 - `received/s` は「fresh フレームを取得できたポーリング回数」で、サーバーの paint 数とは別物
   （サーバー側の `paints` は STATISTICS 参照）
-- 計装は `--logging` 有効時のみ動作する（無効時は `Instant::now()` すら呼ばない）
-- 1 回の実行ごとに `$TMPDIR/cef_unity_server.log` は作り直される（前回分は残らない）
+- 計装は詳細ログ (`verboseLog` / `--log-verbose=1`) のときのみ動作する（無効時は `Instant::now()` すら呼ばない）
+- ログは harness の隣の `logs/` に実行ごとの別ファイルで残る (種類ごとに 10 個。2026-09-30 以前は `$TMPDIR/cef_unity_server.log` を毎回作り直していた)

@@ -28,7 +28,8 @@ CefRuntime.GetServerStatus();   // 状態・最後に失った理由・回数
 browser.GetRecoveryStatus();    // レンダラー終了回数・再読み込み停止中か・作り直し回数
 ```
 
-`CefUnityBrowserSample` はこれらをログに出している。
+`CefUnityBrowserSample` はこれらをログに出している。障害と復旧の経緯は client / server の
+ログファイルにも常に残る (`docs/LOGGING.md`)。
 
 ## ① レンダラー
 

@@ -34,7 +34,11 @@ use windows::Win32::Graphics::Direct3D12::{
 use windows::core::Interface;
 
 fn log_debug(message: &str) {
-    crate::logging::write("d3d12", message);
+    crate::logging::verbose("d3d12", message);
+}
+
+fn log_essential(message: &str) {
+    crate::logging::essential("d3d12", message);
 }
 
 // ---- Unity Native Plugin Interface (subset) ----
@@ -179,7 +183,7 @@ fn try_resolve_d3d12_device() -> *mut c_void {
                 device, queue
             ));
         } else {
-            log_debug("get_command_queue returned null");
+            log_essential("get_command_queue returned null");
         }
         device
     }
@@ -409,7 +413,7 @@ pub fn open_or_cached(
         if let Err(error) = unsafe {
             device.OpenSharedHandle(HANDLE(handle_value as *mut _), &mut resource_option)
         } {
-            log_debug(&format!(
+            log_essential(&format!(
                 "OpenSharedHandle (D3D12) failed for handle=0x{:x}: {:?}",
                 handle_value, error
             ));
@@ -440,7 +444,7 @@ pub fn open_or_cached(
     if is_new {
         let resource = state.current.as_ref()?.resource.clone();
         if let Err(error) = declare_initial_state(&mut state, &device, &resource) {
-            log_debug(&format!("declare_initial_state failed: {}", error));
+            log_essential(&format!("declare_initial_state failed: {}", error));
             // 初期状態が宣言できないと Unity のサンプルで validation error になりうる。
             // とりあえずポインタは返すが、issue は ログに記録。
         }

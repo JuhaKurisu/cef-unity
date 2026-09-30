@@ -10,30 +10,13 @@ mod d3d11_pool;
 mod event_loop;
 mod server;
 
-use std::io::Write;
+use cef_unity_ipc::log_file;
 
 use ipc_channel::ipc::{self as ipc, IpcSender};
 
 use cef_unity_ipc::{Bootstrap, CommandEnvelope, Response};
 
-/// main 内ローカルログの有効/無効。--logging で設定。server::log とは別系統だが
-/// 同じフラグに従わせる。
-static MAIN_LOG_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-fn log(message: &str) {
-    if !MAIN_LOG_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    let path = std::env::temp_dir().join("cef_unity_server.log");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(file, "[{:?}] {}", std::time::SystemTime::now(), message);
-    }
-}
+use server::{log, log_essential};
 
 /// `--name=value` と `--name value` の両形式から値を取り出す。
 ///
@@ -61,24 +44,32 @@ fn argument_value(arguments: &[String], name: &str) -> Option<String> {
 fn main() {
     let arguments: Vec<String> = std::env::args().collect();
 
-    // 最初に --logging を確定させ、以降の log() (main / server 双方) を従わせる。
-    let logging: bool = argument_value(&arguments, "--logging")
+    // 最初にログを開き、以降の log() / log_essential() を従わせる。
+    let log_verbose: bool = argument_value(&arguments, "--log-verbose")
         .and_then(|text| text.parse::<i32>().ok())
         .map(|value| value != 0)
         .unwrap_or(false);
-    MAIN_LOG_ENABLED.store(logging, std::sync::atomic::Ordering::Relaxed);
-    server::set_logging(logging);
-
-    if logging {
-        let _ = std::fs::write(std::env::temp_dir().join("cef_unity_server.log"), "");
+    let log_directory: Option<std::path::PathBuf> = argument_value(&arguments, "--log-directory")
+        .filter(|directory| !directory.is_empty())
+        .map(std::path::PathBuf::from);
+    log_file::set_verbose(log_verbose);
+    log_file::install_panic_hook();
+    if let Some(directory) = &log_directory {
+        let _ = log_file::open(directory, "server");
     }
-    log(&format!("server started, pid={}", std::process::id()));
+    log_essential(&format!(
+        "server started, pid={} log_verbose={} os={} arch={}",
+        std::process::id(),
+        log_verbose,
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ));
 
     // Parse --ipc-server argument
     let Some(ipc_server_name) = argument_value(&arguments, "--ipc-server") else {
         // Unity 以外から起動された (または引数が壊れた) 場合。GUI サブシステムで
         // panic メッセージは誰にも見えないので、ログへ残して終了する。
-        log(&format!("--ipc-server argument required, arguments = {:?}", arguments));
+        log_essential(&format!("--ipc-server argument required, arguments = {:?}", arguments));
         eprintln!("--ipc-server argument required");
         std::process::exit(2);
     };
@@ -94,22 +85,22 @@ fn main() {
         .and_then(|text| text.parse::<i32>().ok())
         .map(|value| value != 0)
         .unwrap_or(true);
-    log(&format!("use_gpu = {}", use_gpu));
+    log_essential(&format!("use_gpu = {}", use_gpu));
 
     // Parse --reset-cache (optional; default 0)。再起動の再試行でクライアントが指定する。
     let reset_cache: bool = argument_value(&arguments, "--reset-cache")
         .and_then(|text| text.parse::<i32>().ok())
         .map(|value| value != 0)
         .unwrap_or(false);
-    log(&format!("reset_cache = {}", reset_cache));
+    log_essential(&format!("reset_cache = {}", reset_cache));
 
     // Initialize CEF first (server must be ready before accepting connections)
     let cef_server = server::CefServer::new(client_pid, use_gpu);
-    if !cef_server.initialize_cef(reset_cache) {
-        log("CEF initialization failed");
+    if !cef_server.initialize_cef(reset_cache, log_directory.as_deref(), log_verbose) {
+        log_essential("CEF initialization failed");
         std::process::exit(1);
     }
-    log("CEF initialized successfully");
+    log_essential("CEF initialized successfully");
 
     // Initialize Mach IOSurface port service (macOS only, GPU モード時のみ)
     #[cfg(target_os = "macos")]
@@ -123,7 +114,7 @@ fn main() {
         if result == 0 {
             log(&format!("Mach IOSurface service registered: {}", service_name));
         } else {
-            log(&format!("Mach IOSurface service init failed: {}", result));
+            log_essential(&format!("Mach IOSurface service init failed: {}", result));
         }
     }
 
@@ -142,7 +133,7 @@ fn main() {
             server_pid: std::process::id(),
         })
         .expect("failed to send bootstrap");
-    log("bootstrap sent to client");
+    log_essential("bootstrap sent to client");
 
     // IPC → mpsc ブリッジスレッド: IPC recv をブロッキング待ちし、
     // コマンド到着時に即座にイベントループを起こす。
@@ -173,11 +164,11 @@ fn main() {
     let state = event_loop::run_event_loop(state);
 
     // Cleanup
-    log(&format!("shutting down after {} pumps", state.pump_count));
+    log_essential(&format!("shutting down after {} pumps", state.pump_count));
     let mut cef_server = state.cef_server;
     cef_server.shutdown();
 
-    log("server exit");
+    log_essential("server exit");
 }
 
 #[cfg(test)]
@@ -207,7 +198,7 @@ mod tests {
     #[test]
     fn does_not_take_next_switch_as_value() {
         let list = arguments(
-            "server --ipc-server --client-pid --use-gpu --logging --do-not-de-elevate abc 42 1 0",
+            "server --ipc-server --client-pid --use-gpu --log-verbose --do-not-de-elevate abc 42 1 0",
         );
         assert_eq!(argument_value(&list, "--ipc-server"), None);
         assert_eq!(argument_value(&list, "--client-pid"), None);

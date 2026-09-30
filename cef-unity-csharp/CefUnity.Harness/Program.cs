@@ -1,6 +1,8 @@
 using CefUnity.Interop;
 
 // サブコマンド: (なし)=スモーク, dump=1 フレームを PNG 保存, replay=Phase 4 で追加
+// ログは実行ファイルの隣の logs/ に書く (client / server / CEF 本体の 3 種、起動ごとに別ファイル)。
+CefRuntime.DefaultLogDirectory = Path.Combine(AppContext.BaseDirectory, "logs");
 var command = args.Length > 0 ? args[0] : "smoke";
 if (command == "smoke")
 {

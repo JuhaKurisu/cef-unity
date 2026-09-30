@@ -119,7 +119,7 @@ impl WasapiOutput {
             }
         }
 
-        crate::logging::write(
+        crate::logging::essential(
             "wasapi",
             &format!("native audio started (source_rate={})", source_rate),
         );
@@ -160,7 +160,7 @@ impl Drop for WasapiOutput {
         unsafe {
             let _ = CloseHandle(self.control.stop_event);
         }
-        crate::logging::write("wasapi", "native audio stopped");
+        crate::logging::verbose("wasapi", "native audio stopped");
     }
 }
 
@@ -198,7 +198,7 @@ fn render_thread_main(
         if let Err(message) = result {
             // ready をまだ送っていない場合に備えて送る (送信済みなら無視される)。
             let _ = ready.send(Err(message.clone()));
-            crate::logging::write("wasapi", &format!("render loop ended with error: {}", message));
+            crate::logging::essential("wasapi", &format!("render loop ended with error: {}", message));
         }
         CoUninitialize();
     }
@@ -297,7 +297,7 @@ unsafe fn run_render_loop(
             source_rate as f64 / device_rate as f64
         };
 
-        crate::logging::write(
+        crate::logging::essential(
             "wasapi",
             &format!(
                 "device opened: rate={} channels={} buffer_frames={} autoconvert={} base_step={:.4}",

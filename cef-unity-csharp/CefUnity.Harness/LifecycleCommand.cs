@@ -73,7 +73,7 @@ internal static class LifecycleCommand
 
         for (var cycle = 1; cycle <= cycleCount; cycle++)
         {
-            CefRuntime.Initialize(useGpu: true, enableLog: true);
+            CefRuntime.Initialize(useGpu: true, verboseLog: true);
             using (var browser = new Browser(1280, 720, url))
             {
                 for (var frameIndex = 0; frameIndex < framesPerCycle; frameIndex++)

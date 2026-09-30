@@ -72,7 +72,7 @@ internal static class PaintStatisticsCommand
         File.WriteAllText(pagePath, smallDamage ? SmallDamageHtml : AnimationHtml);
         var url = new Uri(pagePath).AbsoluteUri;
 
-        CefRuntime.Initialize(useGpu: true, enableLog: true);
+        CefRuntime.Initialize(useGpu: true, verboseLog: true);
         try
         {
             using var browser = new Browser(viewportWidth, viewportHeight, url);

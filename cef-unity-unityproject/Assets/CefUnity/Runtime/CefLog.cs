@@ -7,9 +7,11 @@ namespace CefUnity.Runtime
     ///     <para>
     ///     <see cref="Enabled" /> が <c>false</c> の間は <see cref="Log" /> /
     ///     <see cref="LogWarning" /> が抑制される。これがプロジェクト全体の診断ログの
-    ///     単一の真実の源であり、Unity 側 (CefUnityBrowserSample / CefAudioOutput) と
-    ///     Rust 側 (client/server のファイルログ) の両方が同じフラグに従う
-    ///     (Rust 側へは <see cref="CefRuntime.Initialize" /> の <c>enableLog</c> 引数で伝搬する)。
+    ///     単一の真実の源であり、Unity 側 (CefUnityBrowserSample / CefAudioOutput) の情報ログと
+    ///     Rust 側 (client/server/CEF) の詳細ログの両方が同じフラグに従う
+    ///     (Rust 側へは <see cref="CefRuntime.Initialize" /> の <c>verboseLog</c> 引数で伝搬する)。
+    ///     Rust 側の起動・終了・障害・復旧・エラーはこのフラグに関係なく
+    ///     <see cref="CefRuntime.LogDirectory" /> のファイルへ常に書かれる。
     ///     </para>
     ///     <para>
     ///     <see cref="LogError" /> は障害の握りつぶしを防ぐため既定で常に出力する。

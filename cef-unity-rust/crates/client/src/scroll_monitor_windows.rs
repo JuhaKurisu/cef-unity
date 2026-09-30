@@ -204,11 +204,11 @@ pub fn start() -> i32 {
     match hook {
         Ok(handle) => {
             *guard = Some(handle.0 as isize);
-            crate::logging::write("scroll", "message hook monitor started");
+            crate::logging::essential("scroll", "message hook monitor started");
             1
         }
         Err(_) => {
-            crate::logging::write("scroll", "message hook monitor failed to start");
+            crate::logging::essential("scroll", "message hook monitor failed to start");
             0
         }
     }
@@ -226,7 +226,7 @@ pub fn stop() {
         let _ = UnhookWindowsHookEx(HHOOK(hook_handle_value as *mut _));
     }
     BUFFER.clear();
-    crate::logging::write("scroll", "message hook monitor stopped");
+    crate::logging::verbose("scroll", "message hook monitor stopped");
 }
 
 /// 新着イベントを `out` へ書き、件数を返す。

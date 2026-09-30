@@ -49,8 +49,9 @@ Windows と Linux にはネイティブスクロールソース (macOS の NSEve
 - 起動ハング (キャッシュ破損): macOS は `$TMPDIR`、Windows は `%TEMP%` 配下の cef_unity_cache を削除
 - スクロール resampler モードが効かない: 起動ログの `native scroll source:` を確認
 - 入力が一切効かない: 起動ログの `input devices: mice=N keyboards=N` が 0 件でないか確認
-- Windows で黒画面のまま: `%TEMP%\cef_unity_debug.log` の `external d3d11 device set` /
-  `opened handle=` 行を確認する (デバイス注入と共有テクスチャの open が成功しているか)
+- Windows で黒画面のまま: `%LOCALAPPDATA%\CefUnity.Viewer\Logs\client-*.log` の
+  `external d3d11 device set` 行と `OpenSharedResource1 failed` / `OpenSharedHandle` 失敗の行が
+  無いかを確認する (デバイス注入と共有テクスチャの open が成功しているか)。ログの詳細は `docs/LOGGING.md`
 
 ## 既知の制限
 
