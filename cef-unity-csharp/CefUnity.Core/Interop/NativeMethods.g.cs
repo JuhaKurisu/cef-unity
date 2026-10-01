@@ -22,14 +22,15 @@ namespace CefUnity
         ///  Initialize: launch CEF server process and connect via ipc-channel.
         ///  `use_gpu`: 非 0 で accelerated paint (GPU 共有テクスチャ / IOSurface) を使う。
         ///  0 で software paint (CPU 経由の shm BGRA 転送) を強制する。
-        ///  `log_verbose`: 非 0 で毎フレーム級の診断ログも書く (CEF 本体のログも VERBOSE)。
-        ///  0 なら起動・終了・障害・復旧・エラーだけを書く。
+        ///  `log_level`: 0 = 何も書かない、1 = essential (起動・終了・障害・復旧・エラーと、
+        ///  プロセスごとのメモリの推移)、2 = verbose (essential に加えて毎フレーム級の診断。
+        ///  CEF 本体のログも VERBOSE)。範囲外は essential として扱う。
         ///  `log_directory`: ログを置くディレクトリ (NUL 終端 UTF-8)。client / server / CEF 本体が
         ///  起動ごとに別ファイルを作る。null または空文字ならファイルに書かない。
         ///  Returns 0 on success, non-zero on failure.
         /// </summary>
         [DllImport(__DllName, EntryPoint = "cef_unity_initialize", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        public static extern int cef_unity_initialize(int use_gpu, int log_verbose, byte* log_directory);
+        public static extern int cef_unity_initialize(int use_gpu, int log_level, byte* log_directory);
 
         /// <summary>
         ///  毎フレーム、メインスレッドから呼ぶ。server を失っていたら復旧を進める。

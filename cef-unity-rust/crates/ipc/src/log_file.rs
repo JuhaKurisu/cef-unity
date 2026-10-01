@@ -5,14 +5,15 @@
 // 書き込む (バッファしない)。プロセスが落ちても直前の行まで残すためで、落ちた server の
 // 記録が次の server の起動で消えないよう、ファイルは起動ごとに分けて古いものから消す。
 //
-// レベルは 2 段階:
-// - Essential: 起動・終了・障害・復旧・エラー。常に書く。量が少ないのでリリースでも常時 ON
-// - Verbose: 毎フレーム級の診断。`verbose` を立てたときだけ書く
+// レベルは 3 段階で、利用側が選ぶ (設定したレベル以下の行を書く):
+// - None: 何も書かない (ファイルも作らない)
+// - Essential: 起動・終了・障害・復旧・エラーと、プロセスごとのメモリの推移
+// - Verbose: Essential に加えて毎フレーム級の診断
 
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, Once, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,10 +27,41 @@ pub const MAXIMUM_FILE_BYTES: u64 = 16 * 1024 * 1024;
 /// ファイルを開く前に書かれた Essential 行を溜めておく数 (UnityPluginLoad など)。
 const MAXIMUM_PENDING_LINES: usize = 64;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// ログのレベル。設定値としては「どこまで書くか」、行に付けるときは「どのレベルの行か」を表す。
+/// 値は FFI (`cef_unity_initialize` の `log_level`) と共通。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[repr(u8)]
 pub enum LogLevel {
-    Essential,
-    Verbose,
+    None = 0,
+    Essential = 1,
+    Verbose = 2,
+}
+
+impl LogLevel {
+    /// FFI の数値から。範囲外は None を返す。
+    pub fn from_number(number: i32) -> Option<LogLevel> {
+        match number {
+            0 => Some(LogLevel::None),
+            1 => Some(LogLevel::Essential),
+            2 => Some(LogLevel::Verbose),
+            _ => None,
+        }
+    }
+
+    /// server へ渡す引数 (`--log-level=<name>`) の表記。
+    pub fn name(self) -> &'static str {
+        match self {
+            LogLevel::None => "none",
+            LogLevel::Essential => "essential",
+            LogLevel::Verbose => "verbose",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<LogLevel> {
+        [LogLevel::None, LogLevel::Essential, LogLevel::Verbose]
+            .into_iter()
+            .find(|level| level.name() == name)
+    }
 }
 
 struct Sink {
@@ -44,19 +76,33 @@ struct State {
     pending_lines: Vec<String>,
 }
 
-static VERBOSE: AtomicBool = AtomicBool::new(false);
+static LEVEL: AtomicU8 = AtomicU8::new(LogLevel::Essential as u8);
 static STATE: Mutex<State> = Mutex::new(State {
     sink: None,
     pending_lines: Vec::new(),
 });
 
-/// Verbose 行を書くか。毎フレームの計測を行うかどうかの判定にも使う。
-pub fn is_verbose() -> bool {
-    VERBOSE.load(Ordering::Relaxed)
+/// 設定されているレベル。
+pub fn level() -> LogLevel {
+    match LEVEL.load(Ordering::Relaxed) {
+        0 => LogLevel::None,
+        1 => LogLevel::Essential,
+        _ => LogLevel::Verbose,
+    }
 }
 
-pub fn set_verbose(verbose: bool) {
-    VERBOSE.store(verbose, Ordering::Relaxed);
+pub fn set_level(level: LogLevel) {
+    LEVEL.store(level as u8, Ordering::Relaxed);
+}
+
+/// Verbose 行を書くか。毎フレームの計測を行うかどうかの判定にも使う。
+pub fn is_verbose() -> bool {
+    level() == LogLevel::Verbose
+}
+
+/// `level` の行を書くか。
+pub fn is_enabled(level: LogLevel) -> bool {
+    level != LogLevel::None && level <= self::level()
 }
 
 /// `directory` に今回のログファイルを作って書き込み先にする。古いファイルは
@@ -88,9 +134,9 @@ pub fn close() {
     STATE.lock().unwrap_or_else(PoisonError::into_inner).sink = None;
 }
 
-/// 1 行書く。Verbose は `is_verbose()` のときだけ書く。
+/// 1 行書く。設定したレベルより詳しい行は書かない。
 pub fn write(level: LogLevel, message: &str) {
-    if level == LogLevel::Verbose && !is_verbose() {
+    if !is_enabled(level) {
         return;
     }
     let state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -260,7 +306,9 @@ mod tests {
     fn writes_essential_lines_pending_lines_and_panics_to_the_session_file() {
         let directory = std::env::temp_dir().join(format!("cef_unity_log_write_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
-        set_verbose(false);
+        set_level(LogLevel::None);
+        write(LogLevel::Essential, "essential while none");
+        set_level(LogLevel::Essential);
         write(LogLevel::Essential, "before open");
         write(LogLevel::Verbose, "verbose while disabled");
 
@@ -277,9 +325,20 @@ mod tests {
         let after = text.find("after open").expect("開いた後の行が書かれること");
         assert!(before < after, "開く前の行が先頭に来ること");
         assert!(!text.contains("verbose while disabled"), "無効な Verbose 行は書かないこと");
+        assert!(!text.contains("essential while none"), "None のときは Essential 行も溜めないこと");
         assert!(text.contains("test panic"), "panic の内容が書かれること: {}", text);
         assert!(text.contains("log_file.rs"), "panic の発生箇所が書かれること");
         assert!(!text.contains("after close"), "閉じた後の行は書かないこと");
+    }
+
+    #[test]
+    fn level_round_trips_through_number_and_name() {
+        for level in [LogLevel::None, LogLevel::Essential, LogLevel::Verbose] {
+            assert_eq!(LogLevel::from_number(level as i32), Some(level));
+            assert_eq!(LogLevel::from_name(level.name()), Some(level));
+        }
+        assert_eq!(LogLevel::from_number(3), None);
+        assert_eq!(LogLevel::from_name("debug"), None);
     }
 
     #[test]
