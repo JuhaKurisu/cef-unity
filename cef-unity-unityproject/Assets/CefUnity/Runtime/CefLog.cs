@@ -9,9 +9,10 @@ namespace CefUnity.Runtime
     ///     <see cref="LogWarning" /> が抑制される。これがプロジェクト全体の診断ログの
     ///     単一の真実の源であり、Unity 側 (CefUnityBrowserSample / CefAudioOutput) の情報ログと
     ///     Rust 側 (client/server/CEF) の詳細ログの両方が同じフラグに従う
-    ///     (Rust 側へは <see cref="CefRuntime.Initialize" /> の <c>verboseLog</c> 引数で伝搬する)。
-    ///     Rust 側の起動・終了・障害・復旧・エラーはこのフラグに関係なく
-    ///     <see cref="CefRuntime.LogDirectory" /> のファイルへ常に書かれる。
+    ///     (<see cref="CefUnityBrowserSample" /> はログのレベルが <see cref="CefLogLevel.Verbose" /> のとき
+    ///     これを立て、同じレベルを <see cref="CefRuntime.Initialize" /> の <c>logLevel</c> 引数で Rust 側へ渡す)。
+    ///     Rust 側が <see cref="CefRuntime.LogDirectory" /> のファイルへ書く量はレベルで決まり、
+    ///     このフラグには従わない。
     ///     </para>
     ///     <para>
     ///     <see cref="LogError" /> は障害の握りつぶしを防ぐため既定で常に出力する。

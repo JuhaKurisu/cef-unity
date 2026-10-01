@@ -158,6 +158,21 @@ namespace CefUnity.Interop
         }
     }
 
+    /// <summary>
+    ///     ログのレベル。値はネイティブ側 (<c>cef_unity_initialize</c> の <c>log_level</c>) と共通。
+    /// </summary>
+    public enum CefLogLevel
+    {
+        /// <summary>何も書かない (ファイルも作らない)。</summary>
+        None = 0,
+
+        /// <summary>起動・終了・障害・復旧・エラーと、プロセスごとのメモリの推移。</summary>
+        Essential = 1,
+
+        /// <summary>Essential に加えて毎フレーム級の診断 (CEF 本体のログも VERBOSE)。</summary>
+        Verbose = 2
+    }
+
     public static class CefRuntime
     {
         /// <summary>
@@ -177,12 +192,13 @@ namespace CefUnity.Interop
         ///     共有メモリ経由の BGRA 転送) を強制する。
         ///     <para>
         ///     ログは <paramref name="logDirectory" /> (省略時は <see cref="DefaultLogDirectory" />) に
-        ///     client / server / CEF 本体がそれぞれ起動ごとに別ファイルで書く。起動・終了・障害・復旧・
-        ///     エラーは常に書き、<paramref name="verboseLog" /> が true なら毎フレーム級の診断も書く。
+        ///     client / server / CEF 本体がそれぞれ起動ごとに別ファイルで書く。書く量は
+        ///     <paramref name="logLevel" /> で選ぶ (<see cref="CefLogLevel" />)。
         ///     古いファイルは種類ごとに 10 個を残して消える。
         ///     </para>
         /// </summary>
-        public static void Initialize(bool useGpu = true, bool verboseLog = false, string? logDirectory = null)
+        public static void Initialize(bool useGpu = true, CefLogLevel logLevel = CefLogLevel.Essential,
+            string? logDirectory = null)
         {
             var directory = logDirectory ?? DefaultLogDirectory;
             if (string.IsNullOrEmpty(directory)) directory = null;
@@ -193,7 +209,7 @@ namespace CefUnity.Interop
                 {
                     fixed (byte* directoryPointer = directory == null ? null : Browser.ToUtf8Null(directory))
                     {
-                        result = NativeMethods.cef_unity_initialize(useGpu ? 1 : 0, verboseLog ? 1 : 0,
+                        result = NativeMethods.cef_unity_initialize(useGpu ? 1 : 0, (int)logLevel,
                             directoryPointer);
                     }
                 }
@@ -212,7 +228,7 @@ namespace CefUnity.Interop
                     -5 => $"cef-unity-server started but failed to connect. The server may have crashed on startup — check the logs in {directory ?? "(no log directory)"}.",
                     _ => $"CEF initialization failed (code {result})"
                 });
-            LogDirectory = directory;
+            LogDirectory = logLevel == CefLogLevel.None ? null : directory;
             ServerStatusTracker.Reset(GetServerStatus());
         }
 

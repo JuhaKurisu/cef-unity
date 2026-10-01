@@ -611,5 +611,5 @@ Harness の全コマンド実行後に `$TMPDIR/cef-unity-shm-*` が 0 件にな
   実 Unity では重いフレームほど窓が食われて spin は減る
 - `received/s` は「fresh フレームを取得できたポーリング回数」で、サーバーの paint 数とは別物
   （サーバー側の `paints` は STATISTICS 参照）
-- 計装は詳細ログ (`verboseLog` / `--log-verbose=1`) のときのみ動作する（無効時は `Instant::now()` すら呼ばない）
+- 計装はログのレベルが verbose (`logLevel: CefLogLevel.Verbose` / `--log-level=verbose`) のときのみ動作する（無効時は `Instant::now()` すら呼ばない）
 - ログは harness の隣の `logs/` に実行ごとの別ファイルで残る (種類ごとに 10 個。2026-09-30 以前は `$TMPDIR/cef_unity_server.log` を毎回作り直していた)

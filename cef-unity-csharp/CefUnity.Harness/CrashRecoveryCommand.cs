@@ -51,7 +51,7 @@ internal static class CrashRecoveryCommand
         CefRuntime.ServerRecovered += status => Record($"ServerRecovered {status}");
         CefRuntime.ServerRecoveryFailed += status => Record($"ServerRecoveryFailed {status}");
 
-        CefRuntime.Initialize(useGpu: useGpu, verboseLog: true);
+        CefRuntime.Initialize(useGpu: useGpu, logLevel: CefLogLevel.Verbose);
         var passed = false;
         try
         {

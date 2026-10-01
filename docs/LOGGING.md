@@ -34,15 +34,36 @@ Unity では `CefLogDirectory` (Runtime アセンブリ) が起動時に `CefRun
   CEF 本体のファイルは Chromium が書くのでこの上限は効かない
 - 行は 1 行ずつ直接書き込む (バッファしない)。プロセスが落ちても直前の行まで残る
 - Rust の panic は発生箇所とバックトレースを書く
+- レベルが None のときはどのファイルも作らない
 
 ## レベル
 
-| レベル | 書く条件 | 内容 |
+利用側が `CefRuntime.Initialize(logLevel: ...)` で選ぶ (既定は Essential。サンプルでは `_logLevel`)。
+選んだレベル以下の行を書く。
+
+| レベル | client / server | CEF 本体 |
 |---|---|---|
-| Essential | 常に | 起動・終了・障害・復旧・エラー。CEF 本体は WARNING 以上 |
-| Verbose | `Initialize(verboseLog: true)` (サンプルでは `_enableLog`) | 毎フレーム級の診断・paint 統計 (`STATISTICS` 行)。CEF 本体は VERBOSE |
+| None | 何も書かない (ファイルも作らない) | 書かない |
+| Essential | 起動・終了・障害・復旧・エラーと、プロセスごとのメモリの推移 | WARNING 以上 |
+| Verbose | Essential に加えて毎フレーム級の診断・paint 統計 (`STATISTICS` 行) | VERBOSE |
 
 Verbose の行は `CefRuntime.GetLogs()` でも取れる (Harness が統計を読むのに使う)。
+
+## メモリの推移
+
+Essential 以上のとき、server が 60 秒ごと (起動直後に 1 回目) に `server-*` へ 1 行書く。
+対象は server 自身と、その子孫のプロセスすべて (CEF のレンダラー・GPU プロセス・ユーティリティなど)。
+どのプロセスがいつから増えたかを、報告者のログだけで追うためのもの。全 OS 共通。
+
+```
+memory: server pid=25792 resident=130.2MiB virtual=97.4MiB | gpu-process pid=23988 resident=81.0MiB virtual=117.3MiB | renderer pid=27804 resident=44.1MiB virtual=18.6MiB | ...
+```
+
+- 種類はコマンドラインの `--type=` (無ければ `unknown`)。server 自身は `server`
+- `resident`: 物理メモリ上の使用量 (Windows: working set、macOS / Linux: RSS)
+- `virtual`: Windows では private bytes (リソースモニターの「プライベート」)、
+  macOS / Linux では仮想アドレス空間の大きさ
+- システム全体のプロセス一覧を走査するので、pump を止めないよう専用スレッドで取る
 
 ## 不具合報告を受けたとき
 
@@ -52,6 +73,7 @@ Verbose の行は `CefRuntime.GetLogs()` でも取れる (Harness が統計を�
 2. `server-*`: `on_render_process_terminated` (status と error_code) で、レンダラーが落ちたか・
    再読み込みを止めたか。`compositor stopped responding` なら GPU プロセスの障害
 3. `cef-*`: 同じ時刻の前後にある Chromium のエラー
+4. メモリが増えたという報告なら `server-*` の `memory:` 行で、どのプロセスがいつから増えたか
 
 `status` は `cef_termination_status_t` (0 = 正常終了、1 = 異常終了、2 = kill / クラッシュ、
 3 = クラッシュ、4 = 起動失敗、5 = メモリ不足、6 = 整合性エラー)。
