@@ -56,10 +56,12 @@ Essential 以上のとき、server が 60 秒ごと (起動直後に 1 回目) �
 どのプロセスがいつから増えたかを、報告者のログだけで追うためのもの。全 OS 共通。
 
 ```
-memory: server pid=25792 resident=130.2MiB virtual=97.4MiB | gpu-process pid=23988 resident=81.0MiB virtual=117.3MiB | renderer pid=27804 resident=44.1MiB virtual=18.6MiB | ...
+memory: server pid=33312 resident=115.9MiB virtual=79.9MiB | gpu-process pid=33580 resident=85.4MiB virtual=117.7MiB | renderer pid=8052 resident=49.8MiB virtual=24.2MiB | renderer pid=33440 resident=26.7MiB virtual=13.1MiB | utility pid=1008 resident=16.0MiB virtual=7.4MiB | utility pid=32244 resident=26.9MiB virtual=11.7MiB
 ```
 
-- 種類はコマンドラインの `--type=` (無ければ `unknown`)。server 自身は `server`
+- (上は Windows の実例)
+- 種類はコマンドラインの `--type=` (無ければ `unknown`)。server 自身は `server`。
+  起動直後の 1 回目は、起動途中のプロセスが `unknown` で出ることがある
 - `resident`: 物理メモリ上の使用量 (Windows: working set、macOS / Linux: RSS)
 - `virtual`: Windows では private bytes (リソースモニターの「プライベート」)、
   macOS / Linux では仮想アドレス空間の大きさ
