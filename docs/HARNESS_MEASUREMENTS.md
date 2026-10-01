@@ -630,6 +630,31 @@ harness は `TEMP` を別フォルダにして実行):
 
 **判定: 回帰なし。** 各指標は過去の計測範囲内。
 
+## MediaRouter 無効化のマージ前計測（2026-10-01）
+
+対象は `fix/windows-location-prompt` (`docs/WINDOWS_LOCATION_PROMPT.md`)。server が全プラットフォームで
+`--disable-features=MediaRouter` を付けるようにした。Windows 11 24H2 以降で起動時に位置情報の許可
+ダイアログが出ていたのを止めるため。
+
+**macOS** (load 4.3〜5.0。別作業と並行のため `TMPDIR` を分けて実行):
+
+| コマンド | 実測 |
+|---|---|
+| `paint-statistics 20 1920 1080 animation` | 立ち上がり後は `paints=59〜61/s` (終盤に 70〜99 の窓が 4 つ)、`dropped=0`・`poisoned_total=0`、`received_median=61`、`gpu_torn=0` / `gpu_rollback=0` |
+| `zero-frame-wait 20 10 1920 1080 intermittent` | `zero_frame_share=50.0%`、`received/s=5.1`、`wait_entered/s=60.7`、`spin_share=42.7%`、`block_avg=7.03ms`、`delay_2F+=0` |
+| `lifecycle 5` | 5/5 完走、`mach_ports` 68→69→69→69→69、`receive_port=0`、`server_processes_final=0` |
+
+**Windows 実機** (Windows でビルドした修正版の server を、win-x64 の harness に入れて実行。
+同時に動いている moorestech の CEF とキャッシュが競合しないよう `TEMP`/`TMP` を分けた):
+
+| コマンド | 実測 |
+|---|---|
+| `smoke` × 3 | `SMOKE_OK frames=137 / 135 / 134`。位置情報へのアクセス記録は付かない (v0.6.4 の server は毎回付く) |
+| `crash-recovery server-kill gpu` | `CRASH_RECOVERY_OK`。再起動した server でも位置情報へのアクセス記録は付かない |
+| `crash-recovery renderer gpu` | `CRASH_RECOVERY_OK` |
+
+**判定: 回帰なし。** macOS の各指標は過去の計測範囲内で、`mach_ports` もサイクル 2 以降は増えない。
+
 ## 計測上の注意
 
 - harness は BF#1 と recv の間にゲーム処理・描画が入らないため、0F 待ちの spin は**最悪ケース**を測る。

@@ -1401,6 +1401,17 @@ wrap_app! {
                 // 使っておらず、PDF ビューアなどの組み込み拡張はこのスイッチでも動く (実測)。
                 command_line.append_switch(Some(&CefString::from("disable-extensions")));
 
+                // キャスト (MediaRouter) を止める。Windows では起動直後に MediaRouter の
+                // DiscoveryNetworkMonitor が WlanQueryInterface で接続中の SSID を取りに行き、
+                // Windows 11 24H2 以降はこれが位置情報へのアクセスとして扱われる。位置情報を
+                // オフにしている利用者には「Windows とアプリに位置情報へのアクセスを許可
+                // しますか?」が cef-unity-server 名義で出ていた (実機で確認。このスイッチで
+                // 位置情報へのアクセス記録が付かなくなる)。キャストは使っていない。
+                command_line.append_switch_with_value(
+                    Some(&CefString::from("disable-features")),
+                    Some(&CefString::from("MediaRouter")),
+                );
+
                 // Windows: 昇格 (管理者) で起動されると、Chrome は Explorer 経由で非昇格の
                 // 自分自身を起動し直し、元のプロセスは initialize() を 0 で返して終わる。
                 // 起動し直された側は Chromium 形式に組み直した引数 (`--ipc-server --client-pid
