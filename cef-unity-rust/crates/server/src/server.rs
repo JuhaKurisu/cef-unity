@@ -1690,12 +1690,13 @@ impl CefServer {
     /// `reset_cache`: キャッシュディレクトリを消してから起動する。前回の server が
     /// 異常終了してキャッシュが壊れ、起動できなかったときの再試行でクライアントが指定する。
     /// `log_directory`: CEF 本体のログ (`cef-<時刻>-<pid>.log`) を置く場所。None なら書かない。
-    /// `log_verbose`: CEF 本体のログを VERBOSE にする。false なら WARNING 以上だけ。
+    /// `log_level`: CEF 本体のログの量。None で書かない、Essential で WARNING 以上、
+    /// Verbose で VERBOSE。
     pub fn initialize_cef(
         &self,
         reset_cache: bool,
         log_directory: Option<&std::path::Path>,
-        log_verbose: bool,
+        log_level: LogLevel,
     ) -> bool {
         log("initialize_cef() starting");
 
@@ -1758,8 +1759,8 @@ impl CefServer {
 
         // CEF 本体のログ。レンダラー・GPU プロセスも同じファイルへ追記する。
         // log_file を空のままにすると CEF は実行ファイルの隣に debug.log を作るため、
-        // 保存先が無いときは明示的に止める。
-        match log_directory {
+        // 保存先が無いとき (またはレベルが None のとき) は明示的に止める。
+        match log_directory.filter(|_| log_level != LogLevel::None) {
             Some(directory) => {
                 let cef_log = log_file::session_path(
                     directory,
@@ -1770,7 +1771,7 @@ impl CefServer {
                 log_file::prune(directory, "cef", log_file::KEPT_FILES_PER_PREFIX - 1);
                 log_essential(&format!("cef log = {}", cef_log.display()));
                 settings.log_file = CefString::from(cef_log.to_string_lossy().as_ref());
-                settings.log_severity = if log_verbose {
+                settings.log_severity = if log_level == LogLevel::Verbose {
                     LogSeverity::VERBOSE
                 } else {
                     LogSeverity::WARNING

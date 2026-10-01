@@ -28,7 +28,11 @@ namespace CefUnity.Runtime
         [SerializeField] private string _url;
         [SerializeField] private RawImage _rawImage;
         [SerializeField] private float _resolutionScale = 1;
-        [SerializeField] private bool _enableLog;
+        [Tooltip("ログのレベル。None=書かない / Essential=起動・終了・障害・復旧・エラーとプロセスごとのメモリの推移 / " +
+                 "Verbose=Essential に加えて毎フレーム級の診断 (Unity 側の情報ログも出す)")]
+        [SerializeField] private CefLogLevel _logLevel = CefLogLevel.Essential;
+
+        private bool VerboseLogEnabled => _logLevel == CefLogLevel.Verbose;
 
         [Header("Audio")]
         [Tooltip("CEF の音声を Unity の AudioSource で再生する (CEF/ブラウザ側では鳴らさない)")]
@@ -211,13 +215,12 @@ namespace CefUnity.Runtime
                     _zeroFrameWaitMilliseconds = 10f;
 #endif
 
-                // 詳細ログのスイッチ: Unity 側 (CefLog) の情報ログと、Rust 側 (client/server/CEF)
-                // の毎フレーム級の診断を _enableLog 一つで制御する。起動・終了・障害・復旧・エラーは
-                // これに関係なく CefRuntime.LogDirectory のファイルへ常に書かれる。
-                CefLog.Enabled = _enableLog;
+                // ログのレベル: Rust 側 (client/server/CEF) が書く量を _logLevel で選ぶ。Verbose のときは
+                // Unity 側 (CefLog) の情報ログも出す。
+                CefLog.Enabled = VerboseLogEnabled;
                 // GPU 経路 (macOS: IOSurface / Windows: D3D11 共有テクスチャ) を常に要求する。
                 // サーバー側がプール構築に失敗した場合は software paint へ自動フォールバックする。
-                CefRuntime.Initialize(useGpu: true, verboseLog: _enableLog);
+                CefRuntime.Initialize(useGpu: true, logLevel: _logLevel);
                 _browser = new Browser(_currentWidth, _currentHeight, _url);
                 SubscribeRecoveryEvents();
 
@@ -232,10 +235,10 @@ namespace CefUnity.Runtime
                 // 共通: macOS は Mach port 経由の IOSurface、Windows は D3D11 共有テクスチャ。
                 // Init() がサーバーを起動し接続を行うため、その後にチェック。
                 _useAcceleratedPaint = Browser.IsAcceleratedConnected();
-                if (_enableLog) CefLog.Log($"[CefUnity] Initialized ({_currentWidth}x{_currentHeight}), acceleratedPaint={_useAcceleratedPaint}");
+                if (VerboseLogEnabled) CefLog.Log($"[CefUnity] Initialized ({_currentWidth}x{_currentHeight}), acceleratedPaint={_useAcceleratedPaint}");
                 // キーリピートは OS 設定から取得する (取得失敗時は既定値に落ちる)。
                 // 既定値と一致しているかを実機で判別できるようログに出す。
-                if (_enableLog)
+                if (VerboseLogEnabled)
                     CefLog.Log($"[CefUnity] key repeat: delay={CefKeyboardMapper.KeyRepeatDelay:F3}s rate={CefKeyboardMapper.KeyRepeatRate:F4}s");
                 SetupImeProxy();
                 // Native レンダラは FMOD ミキサを使わないので DSP バッファ変更は不要。
@@ -350,7 +353,7 @@ namespace CefUnity.Runtime
             {
                 _diagnosticsTimer = 0f;
 
-                if (_enableLog)
+                if (VerboseLogEnabled)
                 {
                     var paintCount = NativeMethods.cef_unity_get_paint_count();
                     var pumpCount = NativeMethods.cef_unity_get_pump_count();
@@ -394,7 +397,7 @@ namespace CefUnity.Runtime
                         _recentSamples.Clear();
                     }
 
-                    // 0F 待ち専用メトリクス (このブロックは外側の if (_enableLog) の内側でのみ
+                    // 0F 待ち専用メトリクス (このブロックは外側の if (VerboseLogEnabled) の内側でのみ
                     // 実行される)。ログ出力は待ちを有効にしたときだけだが、Reset() はログを
                     // 有効にしている間は待ちが無効でも毎窓リセットする。if の内側に置くと
                     // ログ有効・待ち無効の構成で RecordNoWaitReceive が窓をまたいで加算され続け、
@@ -536,7 +539,7 @@ namespace CefUnity.Runtime
             }
 
             CefRuntime.Shutdown();
-            if (_enableLog) CefLog.Log("[CefUnity] Shutdown");
+            if (VerboseLogEnabled) CefLog.Log("[CefUnity] Shutdown");
         }
 
         // -----------------------------------------------------------------------
@@ -846,7 +849,7 @@ namespace CefUnity.Runtime
             cfg.dspBufferSize = _audioDspBufferSize;
             if (AudioSettings.Reset(cfg))
             {
-                if (_enableLog) CefLog.Log($"[CefUnity] DSP buffer {before} -> {_audioDspBufferSize}");
+                if (VerboseLogEnabled) CefLog.Log($"[CefUnity] DSP buffer {before} -> {_audioDspBufferSize}");
             }
             else
             {
@@ -1236,7 +1239,7 @@ namespace CefUnity.Runtime
                 _currentWidth = scaledWidth;
                 _currentHeight = scaledHeight;
                 _browser?.Resize(_currentWidth, _currentHeight);
-                if (_enableLog) CefLog.Log($"[CefUnity] Resized to {_currentWidth}x{_currentHeight}");
+                if (VerboseLogEnabled) CefLog.Log($"[CefUnity] Resized to {_currentWidth}x{_currentHeight}");
             }
         }
 
@@ -1338,7 +1341,7 @@ namespace CefUnity.Runtime
 
             if (_acceleratedProfilingCount >= 120)
             {
-                if (_enableLog) CefLog.Log($"[CefUnity-Prof] C# accel x{_acceleratedProfilingCount}: recv={_acceleratedProfilingReceiveTotal * 1000f:F2}ms update={_acceleratedProfilingUpdateTotal * 1000f:F2}ms release={_acceleratedProfilingReleaseTotal * 1000f:F2}ms total={(_acceleratedProfilingReceiveTotal + _acceleratedProfilingUpdateTotal + _acceleratedProfilingReleaseTotal) * 1000f:F2}ms");
+                if (VerboseLogEnabled) CefLog.Log($"[CefUnity-Prof] C# accel x{_acceleratedProfilingCount}: recv={_acceleratedProfilingReceiveTotal * 1000f:F2}ms update={_acceleratedProfilingUpdateTotal * 1000f:F2}ms release={_acceleratedProfilingReleaseTotal * 1000f:F2}ms total={(_acceleratedProfilingReceiveTotal + _acceleratedProfilingUpdateTotal + _acceleratedProfilingReleaseTotal) * 1000f:F2}ms");
                 _acceleratedProfilingCount = 0;
                 _acceleratedProfilingReceiveTotal = _acceleratedProfilingUpdateTotal = _acceleratedProfilingReleaseTotal = 0;
             }

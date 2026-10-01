@@ -605,6 +605,31 @@ Harness の全コマンド実行後に `$TMPDIR/cef-unity-shm-*` が 0 件にな
 
 **判定: 回帰なし。**
 
+## ログのレベル 3 段階化とメモリの推移の記録のマージ前計測（2026-10-01）
+
+対象は `feat/log-levels-resource-monitor` (`docs/LOGGING.md`)。ログのレベルを None / Essential / Verbose に
+し、Essential で server が 60 秒ごとに自身と子孫プロセスのメモリを 1 行書くようにした。プロセス一覧の
+走査は専用スレッドで行い、pump には入れていない。
+
+**macOS** (load 3.7〜8.2):
+
+| コマンド | 実測 |
+|---|---|
+| `paint-statistics 20 1920 1080 animation` | `paints=60/s` が 17 窓 (他は 66・57・50・48)、`dropped=0`・`poisoned_total=0`、`received_median=61`、`gpu_torn=0` / `gpu_rollback=0` |
+| `zero-frame-wait 15 10 1920 1080 intermittent` × 3 | `zero_frame_share=44.3% / 63.9% / 52.5%`、`received/s=5.1`、`wait_entered/s=60.6`、`spin_share=42.4〜42.7%`、`block_avg=7.01〜7.05ms`、`delay_2F+=0` |
+| `lifecycle 5` | 5/5 完走、`mach_ports` 70→71→71→71→71、`receive_port=0`、`server_processes_final=0` |
+
+**Windows 実機** (CI 成果物 + win-x64 の harness。moorestech が同じ CEF キャッシュを使用中だったため、
+harness は `TEMP` を別フォルダにして実行):
+
+| コマンド | 実測 |
+|---|---|
+| `paint-statistics 70 1920 1080 animation` | `server-*` に `memory:` 行が起動直後と 60 秒後に出る。60 秒後は server・gpu-process・renderer ×2・utility ×2 の 6 プロセス |
+
+レベル None では server が `--log-directory` を渡されてもファイルを作らないことを macOS で確かめた。
+
+**判定: 回帰なし。** 各指標は過去の計測範囲内。
+
 ## MediaRouter 無効化のマージ前計測（2026-10-01）
 
 対象は `fix/windows-location-prompt` (`docs/WINDOWS_LOCATION_PROMPT.md`)。server が全プラットフォームで
@@ -636,5 +661,5 @@ Harness の全コマンド実行後に `$TMPDIR/cef-unity-shm-*` が 0 件にな
   実 Unity では重いフレームほど窓が食われて spin は減る
 - `received/s` は「fresh フレームを取得できたポーリング回数」で、サーバーの paint 数とは別物
   （サーバー側の `paints` は STATISTICS 参照）
-- 計装は詳細ログ (`verboseLog` / `--log-verbose=1`) のときのみ動作する（無効時は `Instant::now()` すら呼ばない）
+- 計装はログのレベルが verbose (`logLevel: CefLogLevel.Verbose` / `--log-level=verbose`) のときのみ動作する（無効時は `Instant::now()` すら呼ばない）
 - ログは harness の隣の `logs/` に実行ごとの別ファイルで残る (種類ごとに 10 個。2026-09-30 以前は `$TMPDIR/cef_unity_server.log` を毎回作り直していた)

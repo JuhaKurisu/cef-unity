@@ -80,7 +80,7 @@ D3D11/D3D12 の両方を試し、生きている方が使われる:
 Unity のメインスレッドからのみ呼ぶこと。`ID3D11DeviceContext` は非スレッドセーフで、
 Unity の render thread と競合し得る (D3D12 の `ID3D12CommandQueue::Wait` はスレッドセーフ
 なのでこの制約は無い)。違反を検出できるよう呼び出しスレッド ID を記録しており、
-変化すると詳細ログ (`verboseLog`) の `client-*.log` に WARNING が出る (保存先は `docs/LOGGING.md`)。
+変化するとログのレベルが verbose のとき `client-*.log` に WARNING が出る (保存先は `docs/LOGGING.md`)。
 
 client が使う D3D11 device の取得元は 2 系統ある:
 

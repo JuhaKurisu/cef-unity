@@ -40,7 +40,7 @@ use ipc_channel::TryRecvError;
 use ipc_channel::ipc::{IpcOneShotServer, IpcReceiver, IpcSender};
 
 use cef_unity_ipc::crash_loop_guard::CrashLoopGuard;
-use cef_unity_ipc::log_file;
+use cef_unity_ipc::log_file::{self, LogLevel};
 use cef_unity_ipc::{
     AudioSharedMemoryReader, Bootstrap, Command, CommandEnvelope, Response, ServerStatusReader,
     SharedMemoryReader,
@@ -472,7 +472,7 @@ fn launch_server(
         .arg(format!("--ipc-server={}", server_name))
         .arg(format!("--client-pid={}", client_pid))
         .arg(format!("--use-gpu={}", if use_gpu { 1 } else { 0 }))
-        .arg(format!("--log-verbose={}", if log_settings.verbose { 1 } else { 0 }))
+        .arg(format!("--log-level={}", log_settings.level.name()))
         .arg(format!("--reset-cache={}", if reset_cache { 1 } else { 0 }));
     if let Some(directory) = &log_settings.directory {
         let mut argument = std::ffi::OsString::from("--log-directory=");
@@ -651,7 +651,7 @@ enum RecoveryPhase {
 /// server に渡すログの設定。Initialize で受け取り、復旧で起動し直すときも同じものを渡す。
 #[derive(Clone)]
 struct LogSettings {
-    verbose: bool,
+    level: LogLevel,
     /// None ならファイルに書かない。
     directory: Option<PathBuf>,
 }
@@ -670,7 +670,7 @@ static RECOVERY: Mutex<RecoveryState> = Mutex::new(RecoveryState {
     phase: RecoveryPhase::Idle,
     use_gpu: true,
     log_settings: LogSettings {
-        verbose: false,
+        level: LogLevel::Essential,
         directory: None,
     },
     loss_guard: CrashLoopGuard::new(SERVER_RECOVERIES_PER_WINDOW, SERVER_RECOVERY_WINDOW),
@@ -884,15 +884,16 @@ fn restart_pending_native_voices() {
 /// Initialize: launch CEF server process and connect via ipc-channel.
 /// `use_gpu`: 非 0 で accelerated paint (GPU 共有テクスチャ / IOSurface) を使う。
 /// 0 で software paint (CPU 経由の shm BGRA 転送) を強制する。
-/// `log_verbose`: 非 0 で毎フレーム級の診断ログも書く (CEF 本体のログも VERBOSE)。
-/// 0 なら起動・終了・障害・復旧・エラーだけを書く。
+/// `log_level`: 0 = 何も書かない、1 = essential (起動・終了・障害・復旧・エラーと、
+/// プロセスごとのメモリの推移)、2 = verbose (essential に加えて毎フレーム級の診断。
+/// CEF 本体のログも VERBOSE)。範囲外は essential として扱う。
 /// `log_directory`: ログを置くディレクトリ (NUL 終端 UTF-8)。client / server / CEF 本体が
 /// 起動ごとに別ファイルを作る。null または空文字ならファイルに書かない。
 /// Returns 0 on success, non-zero on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_unity_initialize(
     use_gpu: i32,
-    log_verbose: i32,
+    log_level: i32,
     log_directory: *const c_char,
 ) -> i32 {
     ffi_guard(-1, || {
@@ -902,7 +903,7 @@ pub extern "C" fn cef_unity_initialize(
 
         // ログの設定を最初に確定させる (以降の log_essential / log_verbose がこれに従う)。
         let log_settings = LogSettings {
-            verbose: log_verbose != 0,
+            level: LogLevel::from_number(log_level).unwrap_or(LogLevel::Essential),
             directory: (!log_directory.is_null())
                 .then(|| unsafe { CStr::from_ptr(log_directory) }.to_string_lossy().into_owned())
                 .filter(|directory| !directory.is_empty())
@@ -913,9 +914,9 @@ pub extern "C" fn cef_unity_initialize(
         let use_gpu_bool = use_gpu != 0;
         USE_GPU_MODE.store(use_gpu_bool, Ordering::SeqCst);
         log_essential(&format!(
-            "---- cef_unity_initialize(use_gpu={}, log_verbose={}) client_pid={} os={} arch={} ----",
+            "---- cef_unity_initialize(use_gpu={}, log_level={}) client_pid={} os={} arch={} ----",
             use_gpu_bool,
-            log_settings.verbose,
+            log_settings.level.name(),
             std::process::id(),
             std::env::consts::OS,
             std::env::consts::ARCH
@@ -946,8 +947,11 @@ pub extern "C" fn cef_unity_initialize(
 /// client のログファイルを開く (Initialize のたびに新しいファイル)。
 fn open_client_log(log_settings: &LogSettings) {
     log_file::close();
-    log_file::set_verbose(log_settings.verbose);
+    log_file::set_level(log_settings.level);
     log_file::install_panic_hook();
+    if log_settings.level == LogLevel::None {
+        return;
+    }
     if let Some(directory) = &log_settings.directory {
         // 開けなくても初期化は続ける (ログが無いだけ)。
         let _ = log_file::open(directory, "client");

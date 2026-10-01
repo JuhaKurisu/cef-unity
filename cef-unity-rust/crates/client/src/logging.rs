@@ -4,8 +4,8 @@
 //! 保存先は `cef_unity_initialize` で利用側から受け取り、起動ごとに
 //! `client-<時刻>-<pid>.log` を作る。
 //!
-//! - `essential`: 起動・終了・障害・復旧・エラー。常に書く
-//! - `verbose`: 毎フレーム級の診断。利用側が詳細ログを有効にしたときだけ書く
+//! - `essential`: 起動・終了・障害・復旧・エラー。レベルが essential 以上のとき書く
+//! - `verbose`: 毎フレーム級の診断。レベルが verbose のときだけ書く
 //!   (無効時は即 return し、異常系で毎フレーム呼ばれても file I/O を起こさない)
 
 use cef_unity_ipc::log_file::{self, LogLevel};
@@ -20,7 +20,7 @@ pub fn verbose(prefix: &str, message: &str) {
 
 /// `prefix` は経路の識別子 ("d3d11" / "d3d12" など)。空文字なら付けない。
 fn write(level: LogLevel, prefix: &str, message: &str) {
-    if level == LogLevel::Verbose && !log_file::is_verbose() {
+    if !log_file::is_enabled(level) {
         return;
     }
     if prefix.is_empty() {

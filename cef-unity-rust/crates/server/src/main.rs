@@ -8,9 +8,10 @@
 mod compositor_probe;
 mod d3d11_pool;
 mod event_loop;
+mod memory_monitor;
 mod server;
 
-use cef_unity_ipc::log_file;
+use cef_unity_ipc::log_file::{self, LogLevel};
 
 use ipc_channel::ipc::{self as ipc, IpcSender};
 
@@ -45,22 +46,22 @@ fn main() {
     let arguments: Vec<String> = std::env::args().collect();
 
     // 最初にログを開き、以降の log() / log_essential() を従わせる。
-    let log_verbose: bool = argument_value(&arguments, "--log-verbose")
-        .and_then(|text| text.parse::<i32>().ok())
-        .map(|value| value != 0)
-        .unwrap_or(false);
+    let log_level: LogLevel = argument_value(&arguments, "--log-level")
+        .and_then(|text| LogLevel::from_name(&text))
+        .unwrap_or(LogLevel::Essential);
     let log_directory: Option<std::path::PathBuf> = argument_value(&arguments, "--log-directory")
         .filter(|directory| !directory.is_empty())
         .map(std::path::PathBuf::from);
-    log_file::set_verbose(log_verbose);
+    log_file::set_level(log_level);
     log_file::install_panic_hook();
-    if let Some(directory) = &log_directory {
-        let _ = log_file::open(directory, "server");
-    }
+    let log_opened = match &log_directory {
+        Some(directory) if log_level != LogLevel::None => log_file::open(directory, "server").is_ok(),
+        _ => false,
+    };
     log_essential(&format!(
-        "server started, pid={} log_verbose={} os={} arch={}",
+        "server started, pid={} log_level={} os={} arch={}",
         std::process::id(),
-        log_verbose,
+        log_level.name(),
         std::env::consts::OS,
         std::env::consts::ARCH
     ));
@@ -96,11 +97,15 @@ fn main() {
 
     // Initialize CEF first (server must be ready before accepting connections)
     let cef_server = server::CefServer::new(client_pid, use_gpu);
-    if !cef_server.initialize_cef(reset_cache, log_directory.as_deref(), log_verbose) {
+    if !cef_server.initialize_cef(reset_cache, log_directory.as_deref(), log_level) {
         log_essential("CEF initialization failed");
         std::process::exit(1);
     }
     log_essential("CEF initialized successfully");
+    // essential 以上でファイルに書いているときだけ、プロセスごとのメモリの推移を記録する。
+    if log_opened {
+        memory_monitor::start();
+    }
 
     // Initialize Mach IOSurface port service (macOS only, GPU モード時のみ)
     #[cfg(target_os = "macos")]
@@ -198,7 +203,7 @@ mod tests {
     #[test]
     fn does_not_take_next_switch_as_value() {
         let list = arguments(
-            "server --ipc-server --client-pid --use-gpu --log-verbose --do-not-de-elevate abc 42 1 0",
+            "server --ipc-server --client-pid --use-gpu --log-level --do-not-de-elevate abc 42 1 essential",
         );
         assert_eq!(argument_value(&list, "--ipc-server"), None);
         assert_eq!(argument_value(&list, "--client-pid"), None);
